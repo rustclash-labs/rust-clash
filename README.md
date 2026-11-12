@@ -1,17 +1,165 @@
-# rust-clash
+<div align="center">
 
-> **Experimental Pure-Rust Multi-Platform Proxy Client, Userspace TUN Stack & Desktop/Mobile Apps (`v0.3.2`, Pre-1.0) — VLESS (`mlkem768x25519plus`), Trojan, AnyTLS v2, Shadowsocks-2022, WebSocket 0-RTT, Multi-Transport DNS, Tauri 2 & Jetpack Compose.**
+# RustClash (`rust-clash`)
 
-`rust-clash` is an experimental pure-Rust proxy engine (`crates/proxy-core`), CLI daemon (`crates/proxy-cli`), Tauri 2 desktop client (`crates/tauri-app`), JNI/C-ABI bridge (`crates/proxy-ffi`), Jetpack Compose Android `VpnService` client (`android/`), and React 19 Web Console (`ui/`), written without Go (`mihomo`/`sing-box`/`xray-core`) or C/C++ proxy sidecars.
+**Glass-box pure-Rust proxy engine, userspace TUN stack, and cross-platform client — built-in static config security audit (`Clippy for Clash`), per-stage timing waterfall diagnostics, and credential-redacted `MCP` integration.**
 
-> **Experimental & AI-Authored Notice / 实验性项目与 AI 编写声明**
-> - **AI-Authored Prototype**: This codebase is **experimental** in nature and was written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review. It has **not** undergone an independent third-party cryptographic or security audit. Do not rely on it for high-stakes anonymity or production workloads.
-> - **Verification & Signing Scope**: Only Linux (`ip netns` `/dev/net/tun` + policy routing) and localhost (`127.0.0.1`) protocol interoperability are executed end-to-end in automated CI today. Live privileged TUN/VPN packet capture on **physical Windows, macOS, and Android devices** has not yet undergone hardware UAT sign-off, and Windows/macOS desktop installers are currently unsigned. Review the [Platform & Verification Matrix](#platform--verification-status) below before use.
-> - **中文说明**：本项目为**实验性质**的纯 Rust 跨平台代理客户端原型，代码全程由 **Gemini 4 Argon** 与 **Gemini 4 Carbon** 编写，尚未经过独立第三方密码学或安全审计，且 Windows / macOS / Android 真机系统级 TUN 仍待实机验收，仅供技术研究、学习与受控环境测试使用。
+纯 Rust 编写的透明可观测代理内核与跨平台客户端 —— 内置配置安全静态审计、全链路耗时瀑布图诊断与隐私脱敏 `MCP` 服务（无 Go / C 代理边车依赖）。
+
+[![CI](https://github.com/rustclash-labs/rust-clash/actions/workflows/ci.yml/badge.svg)](https://github.com/rustclash-labs/rust-clash/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rustclash-labs/rust-clash?label=release&color=10b981)](https://github.com/rustclash-labs/rust-clash/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-38bdf8)](LICENSE-MIT)
+[![Pure Rust](https://img.shields.io/badge/engine-Pure%20Rust%20(no%20Go%2FC%20sidecar)-f59e0b)](crates/proxy-core)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS%20%7C%20Android-818cf8)](#platform-compatibility--verification-status)
+
+[**Screenshots**](#product-screenshots) · [**Why RustClash?**](#why-rustclash) · [**Download & Quick Start**](#download--quick-start) · [**Compatibility & Experimental Notice**](#platform-compatibility--verification-status) · [**Architecture & Protocols**](#architecture--implemented-capabilities) · [**Benchmarks**](#single-host-loopback-benchmark-summary-v020-linux-x86_64-n--6-rounds) · [**Docs**](#documentation-security--contributing)
+
+</div>
 
 ---
 
-## Platform & Verification Status
+`rust-clash` combines a pure-Rust proxy kernel (`crates/proxy-core`), CLI daemon (`crates/proxy-cli`), Tauri 2 desktop client (`crates/tauri-app`), JNI/C-ABI bridge (`crates/proxy-ffi`), Jetpack Compose Android `VpnService` app (`android/`), and embedded React 19 Web Console (`ui/`) — supporting **VLESS (`mlkem768x25519plus` Post-Quantum 0-RTT/1-RTT)**, **Trojan**, **AnyTLS v2**, **Shadowsocks-2022 (`SIP022`)**, **SOCKS5 / HTTP(S)**, **Multi-Transport Fake-IP DNS**, and **event-driven `smoltcp` Userspace TUN** without Go (`mihomo`/`sing-box`/`xray-core`) or C/C++ proxy sidecars.
+
+> [!IMPORTANT]
+> **Experimental & AI-Authored Prototype (`v0.3.2`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
+
+---
+
+## Product Screenshots
+
+> All screenshots below are captured directly from the live `rust-clash v0.3.2` daemon and embedded Web Console using the built-in `--demo` local loopback sandbox and synthetic RFC 2606 (`*.example.com`) configurations — zero mockups and zero real server credentials.
+
+### Dashboard, Real-Time Encrypted Throughput & OS Integration
+
+![RustClash Dashboard Overview and Live Encrypted Loopback Throughput](docs/images/dashboard-overview.png)
+
+*Live `Overview` console in `--demo` mode driving 8 parallel encrypted streams across local loopback `VLESS + ML-KEM-768`, `AnyTLS v2`, and `Shadowsocks-2022` servers (`~21.2 MB` RSS, embedded Web UI).*
+
+### Glass-Box Security Audit, Timing Waterfall, AI Matrix & `MCP` Studio
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/config-security-audit.png">
+        <img src="docs/images/config-security-audit.png" alt="Clippy for Clash Static Config Security Audit and Split-DNS Route Simulator" />
+      </a>
+      <br />
+      <strong>1. Config Security Audit (<code>Clippy for Clash</code>)</strong> — Static linter catching <code>skip-cert-verify: true</code> MITM risks, missing <code>no-resolve</code> pre-route DNS leaks, and shadowed rules alongside the Split-DNS route simulator (synthetic <code>*.example.com</code> profile).
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/timing-waterfall.png">
+        <img src="docs/images/timing-waterfall.png" alt="Per-Stage Network Diagnostic Timing Waterfall and Policy Groups" />
+      </a>
+      <br />
+      <strong>2. Per-Stage Timing Waterfall + UDP Verification</strong> — Decomposes latency into <code>DNS → Tunnel → TLS → HTTP TTFB</code> alongside parallel RFC 1035 UDP relay verification and multi-protocol policy groups.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/ai-endpoint-matrix.png">
+        <img src="docs/images/ai-endpoint-matrix.png" alt="1-Click AI and Developer Endpoint Readiness Matrix" />
+      </a>
+      <br />
+      <strong>3. AI &amp; Developer Endpoint Readiness Matrix</strong> — 1-click probe across gateway/API origins with stage-isolated failure pinpointing (captured inside an isolated cloud CI sandbox where loopback/HTTP succeed and sandboxed <code>:443</code> surfaces <code>FAILED @ TLS_HANDSHAKE</code>).
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/mcp-integration.png">
+        <img src="docs/images/mcp-integration.png" alt="Credential-Redacted MCP Server and Redacted YAML Studio" />
+      </a>
+      <br />
+      <strong>4. Credential-Redacted <code>MCP</code> &amp; YAML Studio</strong> — Ready-to-copy <code>rust-clash mcp</code> config for Claude Code, Gemini CLI, and Cursor, paired with automatic secret/UUID redaction in live YAML views.
+    </td>
+  </tr>
+</table>
+
+*Desktop & Mobile UI note: `rust-clash-desktop` (Tauri 2) renders this same embedded Web Console inside a native OS window with System Tray controls, while the Android client (`android/`) pairs a native Jetpack Compose Material 3 `VpnService` UI with the embedded console.*
+
+---
+
+## Why RustClash?
+
+Instead of competing purely on legacy protocol sprawl, `rust-clash` targets three everyday pain points across mainstream proxy clients (`Mihomo`, `Clash Verge Rev`, `sing-box`, `v2rayN`): opaque `generate_204` latency numbers, silent subscription security/DNS pitfalls, and manual black-box debugging when AI or developer tools fail behind a proxy.
+
+### 1. Config Security Audit (`Clippy for Clash` — `rust-clash audit` & `/diagnostics/audit`)
+- **Static Security & Rule Linter (`0–100` Score, Grade `A`–`F`)**: Flags MITM-vulnerable `skip-cert-verify: true` nodes, unencrypted remote transports, unauthenticated LAN controllers, shadowed domain/CIDR rules, dead rules after `MATCH`, and `IP-CIDR`/`GEOIP` rules missing `no-resolve` (distinguishing encrypted DoH/DoT pre-route lookups from plaintext `:53` ISP DNS exposure).
+- **Split-DNS Route Simulator & Subscription Diffs**: Separates offline `static_first_member_estimate` previews from live `Router` selector/URLTest state (`live_router_selection`) and optional live DNS resolution (`?resolve_dns=true`), plus **credential-redacted Subscription Refresh Security Diffs** that warn before newly insecure upstream nodes go unnoticed.
+
+### 2. Network Diagnostic Timing Waterfall (`rust-clash probe` & `/proxies/{name}/probe` · `/matrix`)
+- **Stage-Exact Latency Decomposition**: Breaks TCP connection health into `DNS Resolve → Tunnel Connect → TLS Handshake [TLSv1.3 / ALPN] → HTTP TTFB` (isolated from parallel UDP checks so slow or blackholed UDP probes never inflate TCP latency history).
+- **Actionable HTTP & UDP Verdicts**: Distinguishes `Reachable` (`2xx`/`3xx`), `AuthRequired` (`401` unblocked API gateway), `RateLimited` (`429` shared-IP quota/throttle — never misreported as API-ready), and `BlockedOrChallenged` (`403`/`451` Geo/WAF blocks); verifies **real UDP datagram relay** (`verified` vs `blackholed` vs `unsupported`) via RFC 1035 DNS echo; and enforces a built-in **SSRF / private-network guard** (blocking loopback, RFC1918 LAN, link-local `169.254.0.0/16`, and cloud metadata endpoints by default).
+
+### 3. AI / `MCP` Integration (`rust-clash mcp`)
+- **Zero-Config JSON-RPC 2.0 `stdio` MCP Server**: Exposes `audit_config_security`, `explain_route`, `probe_waterfall`, `probe_ai_matrix`, and `get_proxy_status` (plus opt-in `switch_proxy_selector` behind `--allow-mutations`) so **Claude Code**, **Gemini CLI**, or **Cursor** can diagnose routing mismatches, Split-DNS leaks, and `403`/`429` API errors directly.
+- **Privacy & Secret Redaction by Default**: Unconditionally scrubs passwords, UUIDs, private keys, and Bearer tokens; rejects raw YAML secret payloads in tool arguments (auditing local files via `config_path` instead); and defaults to **metadata-privacy mode** (redacting proxy server IPs/domains and destination hosts unless `--include-network-metadata` is explicitly enabled).
+
+---
+
+## Download & Quick Start
+
+### Prebuilt Releases ([`v0.3.2` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
+
+Every release publishes [`SHA256SUMS.txt`](https://github.com/rustclash-labs/rust-clash/releases/latest) across all 14 desktop, CLI, and mobile artifacts:
+
+| Platform | Desktop / Mobile App | Headless CLI (`rust-clash`) | Notes |
+|---|---|---|---|
+| **Linux (`x86_64`)** | `RustClash_0.3.2_amd64.deb`<br/>`RustClash-0.3.2-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
+| **Windows 10/11 (`x86_64`)** | `RustClash_0.3.2_x64-setup.exe`<br/>`RustClash_0.3.2_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
+| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.3.2_aarch64.dmg`<br/>`RustClash_0.3.2_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
+| **Android 8.0+ (`API 26+`)** | `rust-clash-android-arm64-v8a.apk`<br/>`rust-clash-android-universal.apk` | — *(JNI `libproxy_ffi.so` bundled)* | Signed with project release keystore (`x86_64` APK & `.aab` also attached) |
+
+### 60-Second Demo Sandbox & CLI Quick Start
+
+Launch the self-contained local loopback cluster (no external servers or subscriptions needed) and open **`http://127.0.0.1:9090`**:
+
+```bash
+# 1. Start the local multi-protocol Demo Sandbox (VLESS+PQ 0-RTT/1-RTT, AnyTLS v2 & SS-2022 on 127.0.0.1)
+rust-clash run --demo \
+  --mixed-port 7890 \
+  --controller 127.0.0.1:9090 \
+  --dns-listen 127.0.0.1:1053
+
+# 2. Or launch in Real User Mode (creates an empty local Starter Profile with zero third-party nodes)
+rust-clash run
+
+# 3. Validate config syntax & run `Clippy for Clash` static security + Split-DNS audit
+rust-clash check -c configs/clash-demo.yaml
+rust-clash audit -c configs/clash-demo.yaml
+
+# 4. Run per-stage timing waterfall (`DNS -> Tunnel -> TLS -> HTTP TTFB`) + UDP probe or full AI matrix
+#    (loopback/private targets are blocked by default; pass `--allow-private-targets` for local lab testing)
+rust-clash probe --url https://api.github.com/
+rust-clash probe --matrix
+
+# 5. Check OS System TUN driver, privilege & crash-recovery preflight status
+rust-clash tun-check
+
+# 6. Generate Xray-compatible Post-Quantum VLESS (`mlkem768x25519plus`) keypairs
+rust-clash keygen-vless --mode xorpub
+```
+
+#### Connect AI Coding Agents via `MCP` (`Claude Code` / `Gemini CLI` / `Cursor`)
+
+```json
+{
+  "mcpServers": {
+    "rust-clash": {
+      "command": "rust-clash",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+*(Read-only and metadata-private by default; append `"--include-network-metadata"` or `"--allow-mutations"` to `args` only when explicitly needed.)*
+
+---
+
+## Platform Compatibility & Verification Status
+
+> **Experimental & AI-Authored Notice / 实验性项目与 AI 编写声明**
+> - **AI-Authored Prototype**: This codebase is **experimental** in nature and was written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review. It has **not** undergone an independent third-party cryptographic or security audit. Do not rely on it for high-stakes anonymity or production workloads.
+> - **Verification & Signing Scope**: Only Linux (`ip netns` `/dev/net/tun` + policy routing) and localhost (`127.0.0.1`) protocol interoperability are executed end-to-end in automated CI today. Live privileged TUN/VPN packet capture on **physical Windows, macOS, and Android devices** has not yet undergone hardware UAT sign-off, and Windows/macOS desktop installers are currently unsigned. Review the matrix below before use.
+> - **中文说明**：本项目为**实验性质**的纯 Rust 跨平台代理客户端原型，代码全程由 **Gemini 4 Argon** 与 **Gemini 4 Carbon** 编写，尚未经过独立第三方密码学或安全审计，且 Windows / macOS / Android 真机系统级 TUN 仍待实机验收，仅供技术研究、学习与受控环境测试使用。
 
 | Platform / Subsystem | Build & CI Automated Coverage | Live OS / Physical Hardware Status | Signing & Distribution Notes |
 |---|---|---|---|
@@ -20,22 +168,6 @@
 | **macOS 13+ (`arm64` / `x86_64`)** | Rust unit/E2E suite, CLI `.tar.gz` & Tauri `.dmg` packaging, Swift `NEPacketTunnelProvider` (`platforms/macos-ne/`) `swiftc -typecheck` | **`NOT TESTED` on physical macOS hardware** (`PF_SYSTEM` `utun` & `scutil` DNS/route code pending root UAT; `.systemextension` blocked by macOS without paid entitlement) | `.dmg` is **not signed/notarized** with Apple Developer ID; `NEPacketTunnelProvider` requires a paid Apple Developer `networkextension` entitlement |
 | **Android 8.0+ (`API 26+`)** | Cross-compiled `libproxy_ffi.so` (`arm64-v8a`, `x86_64`), Kotlin JUnit + Robolectric UI tests, Android Lint, R8 APK/AAB assembly | **`NOT TESTED` on a physical Android handset or emulator VPN tunnel** (`VpnService`, `protect(fd)`, Per-App VPN & network handoff implemented, pending device UAT per [`docs/USER_ACCEPTANCE_TESTS.md`](docs/USER_ACCEPTANCE_TESTS.md)) | Release APKs (`v1+v2+v3`) signed with project self-signed release keystore (`SHA256SUMS.txt` published) |
 | **External Protocol Interop** | Bidirectional TCP + UDP tests against official `XTLS/Xray-core v26.10.31`, `shadowsocks-rust v1.25.0`, and `anytls-go v0.0.13` (`interop_external_e2e.rs`) | **Verified over local loopback (`127.0.0.1`) in CI** (not benchmarked or soaked across multi-hop WAN/CDN paths) | Reference binaries fetched & SHA-256 checked in CI `/tmp` only; never bundled |
-
----
-
-## Differentiating Highlights: Glass-Box Diagnostics, Static Config Audit & Credential-Redacted `MCP`
-
-Instead of competing purely on legacy protocol sprawl, `rust-clash` focuses on three pain points common across mainstream proxy clients (`Mihomo`, `Clash Verge Rev`, `sing-box`, `v2rayN`): opaque `generate_204` latency numbers, silent subscription security/DNS pitfalls, and manual black-box troubleshooting when AI/developer tools fail behind a proxy:
-
-1. **`Clippy for Clash` Static Config Audit, Rule Shadowing Linter & Route Simulator (`rust-clash audit` + `/diagnostics/audit`)**
-   - Audits Clash YAML and remote subscriptions (`0–100` score, Grade `A`–`F`), flagging MITM-vulnerable `skip-cert-verify: true` nodes, unencrypted remote transports, unauthenticated LAN controllers, shadowed domain/CIDR rules, dead rules after `MATCH`, and `IP-CIDR`/`GEOIP` rules missing `no-resolve` (distinguishing encrypted DoH/DoT pre-route resolver lookups from plaintext `:53` ISP DNS exposure).
-   - Separates offline static first-member estimates (`static_first_member_estimate`) from live `Router` selector/URLTest state (`live_router_selection`) and optional live DNS verification (`?resolve_dns=true`), plus **credential-redacted Subscription Refresh Security Diffs**.
-2. **Surge-Grade Per-Stage Timing Waterfall & AI / Developer Endpoint Matrix (`rust-clash probe` + `/proxies/{name}/probe` & `/matrix`)**
-   - Decomposes TCP latency into `DNS Resolve -> Tunnel Connect -> TLS Handshake [TLSv1.3 / ALPN] -> HTTP TTFB` (isolated from parallel UDP checks so slow/blackholed UDP probes never inflate TCP latency history), distinguishing `Reachable` (`2xx`/`3xx`), `AuthRequired` (`401` unblocked API gateway), `RateLimited` (`429` shared-IP quota/throttle — never misreported as API-ready), and `BlockedOrChallenged` (`403`/`451` Geo/WAF blocks).
-   - Verifies **real UDP datagram relay** (`verified` vs `blackholed` vs `unsupported`) via RFC 1035 DNS echo, and protects diagnostic probe APIs with a built-in **SSRF / private-network guard** (blocking loopback, RFC1918 LAN, link-local `169.254.0.0/16`, and cloud metadata endpoints by default) plus concurrency limiting.
-3. **Built-in Credential-Redacted `MCP` Server (`rust-clash mcp`)**
-   - Native JSON-RPC 2.0 `stdio` Model Context Protocol server (`audit_config_security`, `explain_route`, `probe_waterfall`, `probe_ai_matrix`, `get_proxy_status`, plus opt-in `switch_proxy_selector` behind `--allow-mutations`) so **Claude Code**, **Gemini CLI**, or **Cursor** can diagnose proxy routing, Split-DNS rules, and `403`/`429` responses.
-   - Redacts passwords, UUIDs, private keys, and Bearer tokens unconditionally, rejects raw YAML secret payloads in tool arguments (auditing local files via `config_path` instead), and runs in **metadata privacy mode by default** (hiding proxy server IPs/domains and browsed destination hosts unless `--include-network-metadata` is explicitly enabled).
 
 ---
 
@@ -88,7 +220,7 @@ Instead of competing purely on legacy protocol sprawl, `rust-clash` focuses on t
 
 ---
 
-## Workspace Layout
+## Workspace Layout & Build from Source
 
 ```text
 rust-clash/
@@ -102,57 +234,20 @@ rust-clash/
 ├── ui/                    # Responsive Desktop & Mobile React 19 + TypeScript + Vite 6 Console
 ├── configs/               # Synthetic RFC 2606 example configuration (`clash-demo.yaml`)
 ├── scripts/               # Android NDK build, Wintun verifier, Linux netns E2E & benchmark scripts
-└── docs/                  # Architecture, platform support, security, benchmark, test & UAT reports
+└── docs/                  # Architecture, platform support, security, benchmark, UAT reports & UI screenshots (`images/`)
 ```
-
----
-
-## Quickstart
-
-### 1. Desktop & CLI (Starter Profile or Local Demo Sandbox)
-
-```bash
-# Validate synthetic example YAML syntax, proxy ciphers, DAG groups, and compiled rules
-cargo run --release -p proxy-cli -- check -c configs/clash-demo.yaml
-
-# Launch with the persistent Starter Profile (creates an empty local profile with zero third-party nodes)
-cargo run --release -p proxy-cli -- run
-
-# Or launch the self-contained localhost Demo Cluster (spawns local loopback VLESS+PQ, AnyTLS v2 & SS-2022 servers)
-cargo run --release -p proxy-cli -- run --demo \
-  --mixed-port 7890 \
-  --controller 127.0.0.1:9090 \
-  --dns-listen 127.0.0.1:1053
-
-# Check OS System TUN driver, privilege & crash-recovery preflight status
-cargo run --release -p proxy-cli -- tun-check
-
-# Run static config security audit, rule shadowing linter & Split-DNS route simulator
-cargo run --release -p proxy-cli -- audit -c configs/clash-demo.yaml
-
-# Run per-stage timing waterfall (`DNS -> Tunnel -> TLS -> HTTP TTFB`) + UDP relay probe or full AI matrix
-# (private/loopback targets are blocked by default; pass `--allow-private-targets` for local lab debugging)
-cargo run --release -p proxy-cli -- probe --url https://api.github.com/
-cargo run --release -p proxy-cli -- probe --matrix
-
-# Start the credential-redacted MCP JSON-RPC 2.0 `stdio` server
-# (read-only & metadata-private by default; add `--include-network-metadata` or `--allow-mutations` if desired)
-cargo run --release -p proxy-cli -- mcp
-
-# Generate Xray-compatible Post-Quantum VLESS (`mlkem768x25519plus`) keypairs
-cargo run --release -p proxy-cli -- keygen-vless --mode xorpub
-```
-
-### 2. Build Desktop App (`tauri-app`) & Native Android Client (`android/`)
 
 ```bash
 # 1. Build embedded React 19 Web Console
 cd ui && npm ci && npm run build && cd ..
 
-# 2. Build Tauri 2 Desktop App (Windows WebView2 / macOS WKWebView / Linux WebKitGTK)
-cargo build --release -p tauri-app --features desktop
+# 2. Build Headless CLI & Embedded Web Console (`rust-clash`)
+cargo build --locked --release -p proxy-cli
 
-# 3. Cross-compile Rust JNI (`arm64-v8a` + `x86_64`), run JUnit tests, and assemble Android APK & AAB
+# 3. Build Tauri 2 Desktop App (Windows WebView2 / macOS WKWebView / Linux WebKitGTK)
+cargo build --locked --release -p tauri-app --features desktop
+
+# 4. Cross-compile Rust JNI (`arm64-v8a` + `x86_64`), run JUnit tests, and assemble Android APK & AAB
 ./scripts/build_android.sh
 ```
 
