@@ -629,4 +629,27 @@ class VpnConfigAndLifecycleTest {
         assertEquals("HTTP", parsed.nodes[3].protocolShortBadge)
         assertEquals("corp", parsed.nodes[3].username)
     }
+
+    @Test
+    fun formatCleanBackendErrorStripsConfigurationPrefixAndRedactsSubscriptionSecrets() {
+        val rawErr =
+            "Configuration error: Configuration error: YAML parse error at 'tun.mtu': invalid value " +
+                "from https://sub.example.com:8443/api/v1/client/subscribe?token=SUPER_SECRET_SUB_TOKEN_999"
+        val cleaned = UiJsonParsers.formatCleanBackendError(rawErr, "格式校验未通过")
+        assertFalse("must strip Configuration error prefix: $cleaned", cleaned.contains("Configuration error"))
+        assertFalse("must redact subscription token: $cleaned", cleaned.contains("SUPER_SECRET_SUB_TOKEN_999"))
+        assertTrue("must preserve field path diagnostic: $cleaned", cleaned.contains("tun.mtu"))
+
+        assertEquals("格式校验未通过", UiJsonParsers.formatCleanBackendError("   ", "格式校验未通过"))
+        assertEquals(
+            "格式校验未通过",
+            UiJsonParsers.formatCleanBackendError("Configuration error:   ", "格式校验未通过"),
+        )
+
+        val defaultState = io.github.rustclashlabs.rustclash.ui.model.AppUiState()
+        assertNull(defaultState.modalError)
+        val withErr = defaultState.copy(modalError = "导入失败：$cleaned")
+        assertEquals("导入失败：$cleaned", withErr.modalError)
+        assertNull(withErr.copy(modalError = null).modalError)
+    }
 }

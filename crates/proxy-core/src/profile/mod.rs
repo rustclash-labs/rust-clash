@@ -2736,12 +2736,19 @@ log-level: silent
 external-controller: :9090
 tun:
   enable: "false"
+  stack: system
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  inet6-address:
+    - fdfe:dcba:9876::1/126
   mtu: 0
 dns:
   enable: true
   listen: :53
   enhanced-mode: FAKE-IP
   default-nameserver:
+    - 223.5.5.5#DIRECT
     - system
   nameserver:
     - https://doh.pub/dns-query

@@ -308,6 +308,7 @@ data class AppUiState(
     val enableIpv6: Boolean = true,
     val demoMode: Boolean = false,
     val isImporting: Boolean = false,
+    val modalError: String? = null,
     val isTestingAllDelays: Boolean = false,
     val testingNodeName: String? = null,
     val isUpdatingGeoData: Boolean = false,
@@ -796,5 +797,14 @@ object UiJsonParsers {
         return runCatching {
             SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(epochMs))
         }.getOrDefault("-")
+    }
+
+    fun formatCleanBackendError(raw: String?, fallback: String): String {
+        var cleaned = NodeImportSupport.redactSecretsForUi((raw ?: "").trim())
+        val prefix = "Configuration error:"
+        while (cleaned.startsWith(prefix, ignoreCase = true)) {
+            cleaned = cleaned.substring(prefix.length).trim()
+        }
+        return cleaned.ifEmpty { fallback }
     }
 }

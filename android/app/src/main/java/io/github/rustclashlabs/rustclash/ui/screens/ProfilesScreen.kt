@@ -61,6 +61,7 @@ import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.ProfileUiItem
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
+import io.github.rustclashlabs.rustclash.ui.theme.ModalInlineErrorBanner
 
 @Composable
 fun ProfilesScreen(
@@ -555,6 +556,8 @@ private fun ProfileCard(
 @Composable
 fun CustomRulesEditorDialog(
     initialRulesText: String,
+    errorMessage: String? = null,
+    onClearError: () -> Unit = {},
     onDismiss: () -> Unit,
     onSaveRules: (String) -> Unit,
 ) {
@@ -574,12 +577,22 @@ fun CustomRulesEditorDialog(
                 Spacer(modifier = Modifier.height(10.dp))
                 OutlinedTextField(
                     value = rulesText,
-                    onValueChange = { rulesText = it },
+                    onValueChange = {
+                        rulesText = it
+                        if (!errorMessage.isNullOrBlank()) onClearError()
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(250.dp),
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 )
+                if (!errorMessage.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    ModalInlineErrorBanner(
+                        message = errorMessage,
+                        onDismiss = onClearError,
+                    )
+                }
             }
         },
         confirmButton = {
@@ -605,6 +618,8 @@ fun CustomRulesEditorDialog(
 @Composable
 fun ActiveYamlEditorDialog(
     initialYamlText: String,
+    errorMessage: String? = null,
+    onClearError: () -> Unit = {},
     onDismiss: () -> Unit,
     onSaveYaml: (String) -> Unit,
 ) {
@@ -624,7 +639,10 @@ fun ActiveYamlEditorDialog(
                 Spacer(modifier = Modifier.height(10.dp))
                 OutlinedTextField(
                     value = yamlText,
-                    onValueChange = { yamlText = it },
+                    onValueChange = {
+                        yamlText = it
+                        if (!errorMessage.isNullOrBlank()) onClearError()
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(280.dp),
@@ -633,6 +651,13 @@ fun ActiveYamlEditorDialog(
                         fontWeight = FontWeight.Normal,
                     ),
                 )
+                if (!errorMessage.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    ModalInlineErrorBanner(
+                        message = errorMessage,
+                        onDismiss = onClearError,
+                    )
+                }
             }
         },
         confirmButton = {

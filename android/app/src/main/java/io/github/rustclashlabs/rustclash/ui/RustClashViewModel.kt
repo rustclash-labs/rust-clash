@@ -101,6 +101,21 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         emitMessage(raw)
     }
 
+    fun clearModalError() {
+        if (_uiState.value.modalError != null) {
+            _uiState.update { it.copy(modalError = null) }
+        }
+    }
+
+    private fun reportActionError(raw: String, isModal: Boolean) {
+        val safe = NodeImportSupport.redactSecretsForUi(raw)
+        if (isModal) {
+            _uiState.update { it.copy(modalError = safe) }
+        } else {
+            _messages.tryEmit(safe)
+        }
+    }
+
     fun setActiveDestination(dest: MainDestination) {
         if (_uiState.value.activeDestination == dest) return
         _uiState.update { it.copy(activeDestination = dest) }
@@ -314,24 +329,29 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         autoSelect: Boolean = true,
         onSuccess: (() -> Unit)? = null,
     ) {
+        val isModal = onSuccess != null
         val trimmed = rawPayload.trim()
         if (trimmed.isEmpty()) {
-            emitMessage("导入内容为空，请粘贴节点链接、Base64 订阅、YAML 或订阅地址")
+            reportActionError("导入内容为空，请粘贴节点链接、Base64 订阅、YAML 或订阅地址", isModal)
             return
         }
         if (!NativeBridge.ensureLoaded()) {
-            emitMessage("Rust 核心库未加载")
+            reportActionError("Rust 核心库未加载", isModal)
             return
         }
         viewModelScope.launch {
-            _uiState.update { it.copy(isImporting = true) }
+            _uiState.update { it.copy(isImporting = true, modalError = null) }
             try {
                 val respStr = withContext(Dispatchers.IO) {
                     NativeBridge.nativeImportUnifiedPayload(stateDir, trimmed, deduplicate, autoSelect)
                 }
                 val resp = JSONObject(respStr)
                 if (!resp.optBoolean("ok", false)) {
-                    emitMessage("导入失败：${resp.optString("error", "格式校验未通过")}")
+                    val detail = UiJsonParsers.formatCleanBackendError(
+                        resp.optString("error"),
+                        "格式校验未通过",
+                    )
+                    reportActionError("导入失败：$detail", isModal)
                     return@launch
                 }
                 val added = resp.optInt("count", 0)
@@ -345,6 +365,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                     _uiState.update { it.copy(demoMode = false) }
                 }
 
+                clearModalError()
                 syncSnapshotQuietly()
                 refreshProfilesQuietly()
                 val notes = buildList {
@@ -355,7 +376,11 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 emitMessage("成功导入 $added 个节点$suffixNote · 共 $total 个 · 当前出口：$eff")
                 onSuccess?.invoke()
             } catch (e: Exception) {
-                emitMessage("导入异常：${e.message ?: e.javaClass.simpleName}")
+                val detail = UiJsonParsers.formatCleanBackendError(
+                    e.message,
+                    e.javaClass.simpleName,
+                )
+                reportActionError("导入异常：$detail", isModal)
             } finally {
                 _uiState.update { it.copy(isImporting = false) }
             }
@@ -368,7 +393,12 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         autoSelect: Boolean,
         onSuccess: (() -> Unit)? = null,
     ) {
-        if (!NativeBridge.ensureLoaded()) return
+        val isModal = onSuccess != null
+        if (!NativeBridge.ensureLoaded()) {
+            reportActionError("Rust 核心库未加载", isModal)
+            return
+        }
+        if (isModal) clearModalError()
         viewModelScope.launch {
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeUpsertNodeJson(
@@ -380,13 +410,18 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val resp = runCatching { JSONObject(raw) }.getOrNull()
             if (resp != null && resp.optBoolean("ok", false)) {
+                clearModalError()
                 syncSnapshotQuietly()
                 refreshProfilesQuietly()
                 val name = nodeJson.optString("name")
                 emitMessage(if (originalName != null) "已保存节点：$name" else "已添加节点：$name")
                 onSuccess?.invoke()
             } else {
-                emitMessage(resp?.optString("error") ?: "保存节点失败")
+                val detail = UiJsonParsers.formatCleanBackendError(
+                    resp?.optString("error"),
+                    "保存节点失败",
+                )
+                reportActionError(detail, isModal)
             }
         }
     }
@@ -655,37 +690,51 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun saveCustomRules(rulesText: String, onSuccess: (() -> Unit)? = null) {
-        if (!NativeBridge.ensureLoaded()) return
+        val isModal = onSuccess != null
+        if (!NativeBridge.ensureLoaded()) {
+            reportActionError("Rust 核心库未加载", isModal)
+            return
+        }
+        if (isModal) clearModalError()
         viewModelScope.launch {
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeSaveCustomRulesJson(stateDir, rulesText)
             }
             val obj = runCatching { JSONObject(raw) }.getOrNull()
             if (obj != null && obj.optBoolean("ok", false)) {
+                clearModalError()
                 applyNodeManagerSnapshot(raw)
                 refreshProfilesQuietly()
                 emitMessage("已保存自定义分流规则（已标记为自定义模式，不会被默认模板覆盖）")
                 onSuccess?.invoke()
             } else {
-                emitMessage("规则校验未通过：${obj?.optString("error") ?: "格式错误"}")
+                val detail = UiJsonParsers.formatCleanBackendError(obj?.optString("error"), "格式错误")
+                reportActionError("规则校验未通过：$detail", isModal)
             }
         }
     }
 
     fun saveActiveYaml(yamlText: String, onSuccess: (() -> Unit)? = null) {
-        if (!NativeBridge.ensureLoaded()) return
+        val isModal = onSuccess != null
+        if (!NativeBridge.ensureLoaded()) {
+            reportActionError("Rust 核心库未加载", isModal)
+            return
+        }
+        if (isModal) clearModalError()
         viewModelScope.launch {
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeSaveActiveYamlJson(stateDir, yamlText)
             }
             val obj = runCatching { JSONObject(raw) }.getOrNull()
             if (obj != null && obj.optBoolean("ok", false)) {
+                clearModalError()
                 applyNodeManagerSnapshot(raw)
                 refreshProfilesQuietly()
                 emitMessage("YAML 配置已验证并生效")
                 onSuccess?.invoke()
             } else {
-                emitMessage("YAML 校验失败（未破坏原配置）：${obj?.optString("error") ?: "语法错误"}")
+                val detail = UiJsonParsers.formatCleanBackendError(obj?.optString("error"), "语法错误")
+                reportActionError("YAML 校验失败（未破坏原配置）：$detail", isModal)
             }
         }
     }

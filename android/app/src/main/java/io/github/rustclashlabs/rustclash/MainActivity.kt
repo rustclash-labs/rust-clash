@@ -483,12 +483,16 @@ internal fun RustClashAppScaffold(
                             !state.demoMode &&
                             state.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
                         ) {
+                            viewModel.clearModalError()
                             showImportSheet = true
                         } else {
                             onToggleVpn()
                         }
                     },
-                    onOpenQuickImport = { showImportSheet = true },
+                    onOpenQuickImport = {
+                        viewModel.clearModalError()
+                        showImportSheet = true
+                    },
                     onSelectRoutingPreset = viewModel::setRoutingPreset,
                     onNavigateToNodes = { currentDestination = MainDestination.NODES },
                     onNavigateToRules = { tab ->
@@ -513,21 +517,27 @@ internal fun RustClashAppScaffold(
                     onToggleFavorite = viewModel::toggleFavoriteNode,
                     onTestAllDelays = { viewModel.testLatency(null) },
                     onTestSingleDelay = { name -> viewModel.testLatency(name) },
-                    onOpenImportSheet = { showImportSheet = true },
+                    onOpenImportSheet = {
+                        viewModel.clearModalError()
+                        showImportSheet = true
+                    },
                     onImportClipboardDirect = {
                         val clip = onReadClipboard()
                         if (!clip.isNullOrBlank()) {
                             viewModel.importUnifiedPayload(clip, deduplicate = true, autoSelect = true)
                         } else {
+                            viewModel.clearModalError()
                             showImportSheet = true
                         }
                     },
                     onOpenQrCamera = onLaunchCameraQr,
                     onOpenManualCreate = {
+                        viewModel.clearModalError()
                         editingNode = null
                         showNodeEditor = true
                     },
                     onOpenNodeEdit = { item ->
+                        viewModel.clearModalError()
                         editingNode = item
                         showNodeEditor = true
                     },
@@ -542,6 +552,7 @@ internal fun RustClashAppScaffold(
                     onUpdateGeoData = viewModel::updateGeoDataNow,
                     onOpenCustomRuleEditor = {
                         viewModel.loadActiveYamlAndRules {
+                            viewModel.clearModalError()
                             showCustomRulesDialog = true
                         }
                     },
@@ -553,18 +564,23 @@ internal fun RustClashAppScaffold(
 
                 MainDestination.PROFILES -> ProfilesScreen(
                     state = state,
-                    onOpenImportSheet = { showImportSheet = true },
+                    onOpenImportSheet = {
+                        viewModel.clearModalError()
+                        showImportSheet = true
+                    },
                     onActivateProfile = viewModel::activateProfile,
                     onRefreshProfile = viewModel::refreshProfileSubscription,
                     onDeleteProfile = viewModel::deleteProfile,
                     onRenameProfile = viewModel::renameProfile,
                     onOpenCustomRulesEditor = {
                         viewModel.loadActiveYamlAndRules {
+                            viewModel.clearModalError()
                             showCustomRulesDialog = true
                         }
                     },
                     onOpenYamlEditor = {
                         viewModel.loadActiveYamlAndRules {
+                            viewModel.clearModalError()
                             showYamlEditorDialog = true
                         }
                     },
@@ -589,11 +605,17 @@ internal fun RustClashAppScaffold(
     if (showImportSheet) {
         ImportPayloadBottomSheet(
             isImporting = state.isImporting,
-            onDismiss = { showImportSheet = false },
+            errorMessage = state.modalError,
+            onClearError = viewModel::clearModalError,
+            onDismiss = {
+                viewModel.clearModalError()
+                showImportSheet = false
+            },
             onReadClipboard = onReadClipboard,
             onLaunchCameraQr = onLaunchCameraQr,
             onLaunchGalleryQr = onLaunchGalleryQr,
             onOpenManualForm = {
+                viewModel.clearModalError()
                 editingNode = null
                 showNodeEditor = true
             },
@@ -602,7 +624,10 @@ internal fun RustClashAppScaffold(
                     rawPayload = payload,
                     deduplicate = dedup,
                     autoSelect = autoSel,
-                    onSuccess = { showImportSheet = false },
+                    onSuccess = {
+                        viewModel.clearModalError()
+                        showImportSheet = false
+                    },
                 )
             },
         )
@@ -611,13 +636,21 @@ internal fun RustClashAppScaffold(
     if (showNodeEditor) {
         NodeEditorDialog(
             existingNode = editingNode,
-            onDismiss = { showNodeEditor = false },
+            backendError = state.modalError,
+            onClearBackendError = viewModel::clearModalError,
+            onDismiss = {
+                viewModel.clearModalError()
+                showNodeEditor = false
+            },
             onSave = { originalName, nodeJson, autoSelect ->
                 viewModel.upsertNode(
                     originalName = originalName,
                     nodeJson = nodeJson,
                     autoSelect = autoSelect,
-                    onSuccess = { showNodeEditor = false },
+                    onSuccess = {
+                        viewModel.clearModalError()
+                        showNodeEditor = false
+                    },
                 )
             },
         )
@@ -626,11 +659,19 @@ internal fun RustClashAppScaffold(
     if (showCustomRulesDialog) {
         CustomRulesEditorDialog(
             initialRulesText = state.editableRulesText,
-            onDismiss = { showCustomRulesDialog = false },
+            errorMessage = state.modalError,
+            onClearError = viewModel::clearModalError,
+            onDismiss = {
+                viewModel.clearModalError()
+                showCustomRulesDialog = false
+            },
             onSaveRules = { text ->
                 viewModel.saveCustomRules(
                     rulesText = text,
-                    onSuccess = { showCustomRulesDialog = false },
+                    onSuccess = {
+                        viewModel.clearModalError()
+                        showCustomRulesDialog = false
+                    },
                 )
             },
         )
@@ -639,11 +680,19 @@ internal fun RustClashAppScaffold(
     if (showYamlEditorDialog) {
         ActiveYamlEditorDialog(
             initialYamlText = state.activeYamlRedacted,
-            onDismiss = { showYamlEditorDialog = false },
+            errorMessage = state.modalError,
+            onClearError = viewModel::clearModalError,
+            onDismiss = {
+                viewModel.clearModalError()
+                showYamlEditorDialog = false
+            },
             onSaveYaml = { yaml ->
                 viewModel.saveActiveYaml(
                     yamlText = yaml,
-                    onSuccess = { showYamlEditorDialog = false },
+                    onSuccess = {
+                        viewModel.clearModalError()
+                        showYamlEditorDialog = false
+                    },
                 )
             },
         )

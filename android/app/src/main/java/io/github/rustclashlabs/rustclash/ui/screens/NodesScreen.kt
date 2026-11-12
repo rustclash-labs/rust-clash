@@ -69,6 +69,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -80,6 +81,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -91,6 +93,7 @@ import io.github.rustclashlabs.rustclash.ui.model.ProxyNodeItem
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LatencyPill
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
+import io.github.rustclashlabs.rustclash.ui.theme.ModalInlineErrorBanner
 import io.github.rustclashlabs.rustclash.ui.theme.ProtocolBadge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import org.json.JSONObject
@@ -739,6 +742,8 @@ private fun NodeRowCard(
 @Composable
 fun ImportPayloadBottomSheet(
     isImporting: Boolean,
+    errorMessage: String? = null,
+    onClearError: () -> Unit = {},
     onDismiss: () -> Unit,
     onReadClipboard: () -> String?,
     onLaunchCameraQr: () -> Unit,
@@ -747,9 +752,17 @@ fun ImportPayloadBottomSheet(
     onSubmitImport: (payload: String, deduplicate: Boolean, autoSelect: Boolean) -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scrollState = rememberScrollState()
+    val focusManager = LocalFocusManager.current
     var payloadText by remember { mutableStateOf("") }
     var deduplicate by remember { mutableStateOf(true) }
     var autoSelect by remember { mutableStateOf(true) }
+
+    LaunchedEffect(errorMessage) {
+        if (!errorMessage.isNullOrBlank()) {
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -761,7 +774,7 @@ fun ImportPayloadBottomSheet(
                 .fillMaxWidth()
                 .navigationBarsPadding()
                 .imePadding()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp, vertical = 8.dp),
         ) {
             Text(
@@ -789,6 +802,7 @@ fun ImportPayloadBottomSheet(
                         val clip = onReadClipboard()
                         if (!clip.isNullOrBlank()) {
                             payloadText = clip
+                            if (!errorMessage.isNullOrBlank()) onClearError()
                         }
                     },
                 ) {
@@ -832,7 +846,10 @@ fun ImportPayloadBottomSheet(
 
             OutlinedTextField(
                 value = payloadText,
-                onValueChange = { payloadText = it },
+                onValueChange = {
+                    payloadText = it
+                    if (!errorMessage.isNullOrBlank()) onClearError()
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(150.dp),
@@ -871,10 +888,21 @@ fun ImportPayloadBottomSheet(
                 Switch(checked = autoSelect, onCheckedChange = { autoSelect = it })
             }
 
+            if (!errorMessage.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                ModalInlineErrorBanner(
+                    message = errorMessage,
+                    onDismiss = onClearError,
+                )
+            }
+
             Spacer(modifier = Modifier.height(14.dp))
 
             Button(
-                onClick = { onSubmitImport(payloadText, deduplicate, autoSelect) },
+                onClick = {
+                    focusManager.clearFocus()
+                    onSubmitImport(payloadText, deduplicate, autoSelect)
+                },
                 enabled = !isImporting && payloadText.isNotBlank(),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -889,7 +917,7 @@ fun ImportPayloadBottomSheet(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                 }
-                Text("验证并保存")
+                Text(if (isImporting) "正在获取并验证…" else "验证并保存")
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -900,10 +928,13 @@ fun ImportPayloadBottomSheet(
 @Composable
 fun NodeEditorDialog(
     existingNode: ProxyNodeItem?,
+    backendError: String? = null,
+    onClearBackendError: () -> Unit = {},
     onDismiss: () -> Unit,
     onSave: (originalName: String?, nodeJson: JSONObject, autoSelect: Boolean) -> Unit,
 ) {
     val isEditing = existingNode != null
+    val dialogScrollState = rememberScrollState()
     val protocols = listOf(
         "ss" to "SS",
         "vless" to "VLESS",
@@ -952,6 +983,12 @@ fun NodeEditorDialog(
     var autoSelect by remember { mutableStateOf(!isEditing) }
     var validationError by remember { mutableStateOf<String?>(null) }
 
+    LaunchedEffect(validationError, backendError) {
+        if (!validationError.isNullOrBlank() || !backendError.isNullOrBlank()) {
+            dialogScrollState.animateScrollTo(dialogScrollState.maxValue)
+        }
+    }
+
     val supportsWs = selectedProto == "vless" || selectedProto == "trojan"
     val isAuthOptional = selectedProto == "socks5" || selectedProto == "http"
 
@@ -964,7 +1001,7 @@ fun NodeEditorDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
+                    .verticalScroll(dialogScrollState),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Row(
@@ -1127,11 +1164,14 @@ fun NodeEditorDialog(
                     Text("保存后立即设为当前节点", style = MaterialTheme.typography.bodySmall)
                 }
 
-                if (validationError != null) {
-                    Text(
-                        text = validationError!!,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
+                val activeError = validationError ?: backendError
+                if (!activeError.isNullOrBlank()) {
+                    ModalInlineErrorBanner(
+                        message = activeError,
+                        onDismiss = {
+                            validationError = null
+                            onClearBackendError()
+                        },
                     )
                 }
             }
@@ -1151,6 +1191,7 @@ fun NodeEditorDialog(
                         validationError = "新建该协议节点必须填写密码或 VLESS UUID"
                         return@Button
                     }
+                    validationError = null
 
                     val json = JSONObject().apply {
                         put("type", selectedProto)

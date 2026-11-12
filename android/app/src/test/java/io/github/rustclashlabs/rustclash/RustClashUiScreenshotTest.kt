@@ -74,6 +74,7 @@ import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashBrandIcon
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashTheme
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -775,5 +776,31 @@ class RustClashUiScreenshotTest {
                 }
             }
         }
+    }
+
+    @Test
+    fun importBottomSheetDisplaysInlineErrorWithoutDismissing() {
+        org.junit.Assume.assumeTrue(
+            "Skipping local Robolectric UI test when /tmp/robolectric-deps is absent",
+            File("/tmp/robolectric-deps").isDirectory,
+        )
+        var cleared = false
+        composeRule.setContent {
+            RustClashTheme(themePreference = ThemePreference.DARK) {
+                io.github.rustclashlabs.rustclash.ui.screens.ImportPayloadBottomSheet(
+                    isImporting = false,
+                    errorMessage = "导入失败：YAML parse error at 'tun.mtu': invalid value",
+                    onClearError = { cleared = true },
+                    onDismiss = {},
+                    onReadClipboard = { null },
+                    onLaunchCameraQr = {},
+                    onLaunchGalleryQr = {},
+                    onOpenManualForm = {},
+                    onSubmitImport = { _, _, _ -> },
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        assertFalse(cleared)
     }
 }

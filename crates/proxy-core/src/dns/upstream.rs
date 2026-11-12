@@ -119,7 +119,7 @@ impl BootstrapDnsServer {
     /// Parse a `default-nameserver` entry. Bootstrap servers MUST specify literal IP addresses
     /// (not domain names) to prevent chicken-and-egg DNS bootstrap loops or OS resolver leaks.
     pub fn parse(raw: &str) -> Result<Self> {
-        let s = raw.trim();
+        let s = raw.trim().split('#').next().unwrap_or("").trim();
         if let Some(rest) = s.strip_prefix("tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
                 ProxyError::Config(format!(
