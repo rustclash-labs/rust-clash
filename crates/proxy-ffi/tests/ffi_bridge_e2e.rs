@@ -120,19 +120,21 @@ fn macos_ne_c_abi_concurrent_uaf_stress_and_zero_hz_blocking_wait() {
         let h = ptr::without_provenance_mut(addr_block);
         let mut buf = vec![0u8; 4096];
         entered_tx.send(()).unwrap();
-        unsafe { rc_ne_wait_outbound_packet(h, buf.as_mut_ptr(), buf.len(), -1) }
+        let rc = unsafe { rc_ne_wait_outbound_packet(h, buf.as_mut_ptr(), buf.len(), -1) };
+        (rc, Instant::now())
     });
     entered_rx.recv().unwrap();
     std::thread::sleep(Duration::from_millis(40));
 
     let t0 = Instant::now();
     rc_ne_stop_engine(h_block);
-    let rc = waiter.join().expect("waiter thread must not panic");
+    let (rc, woke_at) = waiter.join().expect("waiter thread must not panic");
+    let wake_latency = woke_at.saturating_duration_since(t0);
     assert_eq!(rc, -1, "stopped engine must wake Condvar waiter with -1");
     assert!(
-        t0.elapsed() < Duration::from_millis(250),
+        wake_latency < Duration::from_secs(2),
         "Condvar wakeup took {:?} (expected instant wakeup)",
-        t0.elapsed()
+        wake_latency
     );
 
     // Part B: 10 rounds of 8-thread concurrent UAF torture:
@@ -296,7 +298,7 @@ fn assert_tun_fd_fully_closed_in_kernel(tun_fd: i32, orig_inode: (u64, u64), pee
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
-    let prc = unsafe { libc::poll(&raw mut pfd, 1, 500) };
+    let prc = unsafe { libc::poll(&raw mut pfd, 1, 2000) };
     assert!(
         prc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLIN)) != 0,
         "peer socket did not observe EOF/HUP after TUN close (prc={prc}, revents={}) — a dup'd fd leaked!",

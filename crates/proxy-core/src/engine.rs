@@ -1346,6 +1346,7 @@ impl ProxyEngine {
                 if lp_tick.load(std::sync::atomic::Ordering::SeqCst)
                     && hub_tick.active_connection_count() == 0
                     && !last_was_nonzero
+                    && !hub_tick.has_unsampled_traffic()
                 {
                     let wake_lp = lp_wake_tick.notified();
                     let wake_act = hub_tick.activity_notified();
@@ -1355,9 +1356,13 @@ impl ProxyEngine {
                     wake_act.as_mut().enable();
                     if lp_tick.load(std::sync::atomic::Ordering::SeqCst)
                         && hub_tick.active_connection_count() == 0
+                        && !last_was_nonzero
+                        && !hub_tick.has_unsampled_traffic()
                     {
+                        hub_tick.set_telemetry_parked(true);
                         tokio::select! {
                             changed = tick_stop.changed() => {
+                                hub_tick.set_telemetry_parked(false);
                                 if changed.is_err() || *tick_stop.borrow() {
                                     break;
                                 }
@@ -1365,7 +1370,8 @@ impl ProxyEngine {
                             _ = &mut wake_lp => {}
                             _ = &mut wake_act => {}
                         }
-                        interval.reset();
+                        hub_tick.set_telemetry_parked(false);
+                        interval.reset_immediately();
                         continue;
                     }
                 }
@@ -1380,6 +1386,7 @@ impl ProxyEngine {
                         if lp_tick.load(std::sync::atomic::Ordering::SeqCst)
                             && hub_tick.active_connection_count() == 0
                             && !last_was_nonzero
+                            && !hub_tick.has_unsampled_traffic()
                         {
                             continue;
                         }

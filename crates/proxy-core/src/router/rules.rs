@@ -62,6 +62,11 @@ pub enum RuleMatcher {
         raw: String,
         ranges: Vec<(u16, u16)>,
     },
+    SrcPort {
+        raw: String,
+        ranges: Vec<(u16, u16)>,
+    },
+    Network(SocketTransport),
     GeoIp {
         code: String,
         builtin: Option<&'static GeoIpMatcher>,
@@ -102,6 +107,8 @@ impl std::fmt::Debug for RuleMatcher {
                 .finish(),
             Self::SrcIpCidr(net) => f.debug_tuple("SrcIpCidr").field(net).finish(),
             Self::DstPort { raw, .. } => f.debug_struct("DstPort").field("raw", raw).finish(),
+            Self::SrcPort { raw, .. } => f.debug_struct("SrcPort").field("raw", raw).finish(),
+            Self::Network(t) => f.debug_tuple("Network").field(t).finish(),
             Self::GeoIp {
                 code, no_resolve, ..
             } => f
@@ -135,6 +142,11 @@ fn normalize_builtin_rule_target(raw: &str) -> String {
     }
 }
 
+fn parse_ip_net_or_host(raw: &str) -> std::result::Result<IpNet, ipnet::AddrParseError> {
+    raw.parse::<IpNet>()
+        .or_else(|e| raw.parse::<IpAddr>().map(IpNet::from).map_err(|_| e))
+}
+
 impl CompiledRule {
     pub fn parse(line: &str) -> Result<Self> {
         Self::parse_with_context(line, None, None)
@@ -145,7 +157,7 @@ impl CompiledRule {
         mmdb: Option<&Arc<MmdbReader>>,
         rule_sets: Option<&HashMap<String, Arc<RuleSetMatcher>>>,
     ) -> Result<Self> {
-        let trimmed = line.trim();
+        let trimmed = crate::config::uri::trim_bom_and_controls(line);
         let parts: Vec<&str> = trimmed.split(',').map(|s| s.trim()).collect();
         if parts.len() < 2 {
             return Err(ProxyError::Config(format!(
@@ -187,15 +199,19 @@ impl CompiledRule {
         }
         let target = normalize_builtin_rule_target(raw_target);
 
-        let no_resolve = match parts.get(3).copied() {
-            None | Some("") => false,
-            Some(opt) if opt.eq_ignore_ascii_case("no-resolve") => true,
-            Some(other) => {
+        let mut no_resolve = false;
+        for &opt in &parts[3..] {
+            if opt.is_empty() {
+                continue;
+            }
+            if opt.eq_ignore_ascii_case("no-resolve") {
+                no_resolve = true;
+            } else {
                 return Err(ProxyError::Config(format!(
-                    "unsupported rule option '{other}' in '{trimmed}'"
+                    "unsupported rule option '{opt}' in '{trimmed}'"
                 )));
             }
-        };
+        }
 
         let matcher = match kind.as_str() {
             "DOMAIN" => RuleMatcher::Domain(payload.trim_end_matches('.').to_ascii_lowercase()),
@@ -216,13 +232,14 @@ impl CompiledRule {
                 }
             }
             "GEOSITE" => {
-                let Some(gs_matcher) = lookup_builtin_geosite(payload) else {
+                let norm_cat = payload.trim().to_ascii_lowercase();
+                let Some(gs_matcher) = lookup_builtin_geosite(&norm_cat) else {
                     return Err(ProxyError::Config(format!(
                         "unsupported or unknown GEOSITE category '{payload}' in rule '{trimmed}'"
                     )));
                 };
                 RuleMatcher::GeoSite {
-                    category: payload.to_string(),
+                    category: norm_cat,
                     matcher: gs_matcher,
                 }
             }
@@ -265,13 +282,12 @@ impl CompiledRule {
                 RuleMatcher::ProcessPath(payload.to_string())
             }
             "IP-CIDR" | "IP-CIDR6" => {
-                let net: IpNet = payload
-                    .parse()
+                let net = parse_ip_net_or_host(payload)
                     .map_err(|e| ProxyError::Config(format!("invalid {kind} '{payload}': {e}")))?;
                 RuleMatcher::IpCidr { net, no_resolve }
             }
             "SRC-IP-CIDR" => {
-                let net: IpNet = payload.parse().map_err(|e| {
+                let net = parse_ip_net_or_host(payload).map_err(|e| {
                     ProxyError::Config(format!("invalid SRC-IP-CIDR '{payload}': {e}"))
                 })?;
                 RuleMatcher::SrcIpCidr(net)
@@ -283,6 +299,22 @@ impl CompiledRule {
                     ranges,
                 }
             }
+            "SRC-PORT" => {
+                let ranges = parse_port_ranges(payload)?;
+                RuleMatcher::SrcPort {
+                    raw: payload.to_string(),
+                    ranges,
+                }
+            }
+            "NETWORK" => match payload.to_ascii_lowercase().as_str() {
+                "tcp" => RuleMatcher::Network(SocketTransport::Tcp),
+                "udp" => RuleMatcher::Network(SocketTransport::Udp),
+                other => {
+                    return Err(ProxyError::Config(format!(
+                        "invalid NETWORK '{other}' in '{trimmed}' (expected tcp or udp)"
+                    )));
+                }
+            },
             "GEOIP" => {
                 let code = payload.to_ascii_uppercase();
                 let builtin = lookup_builtin_geoip(&code);
@@ -412,6 +444,12 @@ impl CompiledRule {
             RuleMatcher::DstPort { ranges, .. } => ranges
                 .iter()
                 .any(|(lo, hi)| target.port >= *lo && target.port <= *hi),
+            RuleMatcher::SrcPort { ranges, .. } => src_addr.is_some_and(|sa| {
+                ranges
+                    .iter()
+                    .any(|(lo, hi)| sa.port() >= *lo && sa.port() <= *hi)
+            }),
+            RuleMatcher::Network(expected) => transport == *expected,
             RuleMatcher::GeoIp {
                 code,
                 builtin,
@@ -450,6 +488,8 @@ impl CompiledRule {
             RuleMatcher::IpCidr { .. } => "IPCIDR",
             RuleMatcher::SrcIpCidr(_) => "SrcIPCIDR",
             RuleMatcher::DstPort { .. } => "DstPort",
+            RuleMatcher::SrcPort { .. } => "SrcPort",
+            RuleMatcher::Network(_) => "Network",
             RuleMatcher::GeoIp { .. } => "GeoIP",
             RuleMatcher::Match => "Match",
         }
@@ -466,7 +506,9 @@ impl CompiledRule {
             RuleMatcher::GeoSite { category, .. } => category.clone(),
             RuleMatcher::RuleSet { provider_name, .. } => provider_name.clone(),
             RuleMatcher::IpCidr { net, .. } | RuleMatcher::SrcIpCidr(net) => net.to_string(),
-            RuleMatcher::DstPort { raw, .. } => raw.clone(),
+            RuleMatcher::DstPort { raw, .. } | RuleMatcher::SrcPort { raw, .. } => raw.clone(),
+            RuleMatcher::Network(SocketTransport::Tcp) => "tcp".to_string(),
+            RuleMatcher::Network(SocketTransport::Udp) => "udp".to_string(),
             RuleMatcher::GeoIp { code, .. } => code.clone(),
             RuleMatcher::Match => String::new(),
         }

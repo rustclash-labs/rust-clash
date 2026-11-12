@@ -149,6 +149,7 @@ pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAd
         .route("/memory", get(get_or_ws_memory))
         .route("/logs", get(get_or_ws_logs))
         .fallback(serve_embedded_spa)
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             api_state,
             security_and_auth_middleware,

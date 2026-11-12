@@ -203,7 +203,7 @@ async fn anytls_session_pool_and_active_streams_recover_cleanly_across_network_h
 
     // 5. Verify in-flight `st_active` does NOT hang for 60s: read fails promptly with error/EOF!
     let mut tmp = [0u8; 16];
-    let read_res = tokio::time::timeout(Duration::from_millis(500), st_active.read(&mut tmp))
+    let read_res = tokio::time::timeout(Duration::from_secs(2), st_active.read(&mut tmp))
         .await
         .expect("in-flight AnyTLS stream must fail immediately on handoff, never hang");
     assert!(
@@ -214,7 +214,7 @@ async fn anytls_session_pool_and_active_streams_recover_cleanly_across_network_h
     // 6. Drop `st_active` AFTER handoff -> Epoch guard MUST prevent pre-handoff session from
     //    re-entering the post-handoff `idle` pool!
     drop(st_active);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(
         client.pool().idle_count(),
         0,

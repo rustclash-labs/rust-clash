@@ -54,7 +54,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ logs, onClear }) => {
           <input
             id="log-search-input"
             className="input"
-            style={{ width: 260 }}
+            style={{ width: 260, maxWidth: "100%" }}
             placeholder="Filter log payload..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}

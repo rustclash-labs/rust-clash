@@ -130,11 +130,11 @@ object NodeImportSupport {
      */
     fun redactSecretsForUi(raw: String): String {
         var out = raw
-        // Redact proxy share URIs (including Trojan, SOCKS5, HTTP-Proxy)
-        out = Regex("""(?i)\b(ss|vless|anytls|trojan|socks5|socks|http-proxy|https-proxy|clash)://[^\s"'<>]*""")
+        // Redact proxy share URIs (including Trojan, SOCKS5, HTTP-Proxy, VMess, Hysteria2, TUIC, WireGuard)
+        out = Regex("""(?i)\b(ss|ssr|vless|vmess|anytls|trojan|socks5|socks5h|socks|http-proxy|https-proxy|hysteria2|hy2|hysteria|tuic|wireguard|wg|clash)://[^\s"'`<>\]})]*""")
             .replace(out) { m -> "${m.groupValues[1].lowercase()}://***REDACTED***" }
         // Redact HTTP(S) query strings and userinfo
-        out = Regex("""(?i)\b(https?)://([^\s/"'<>@]+@)?([^\s?#"'>]+)(\?[^\s"'<>]*)?""")
+        out = Regex("""(?i)\b(https?)://([^\s/"'`<>@]+@)?([^\s?#"'>`\])}]+)(\?[^\s"'<>`\])}]*)?""")
             .replace(out) { m ->
                 val scheme = m.groupValues[1].lowercase()
                 val hasUserInfo = m.groupValues[2].isNotEmpty()
@@ -144,8 +144,13 @@ object NodeImportSupport {
                 if (hasQuery) "$scheme://$authPrefix$hostPath?***REDACTED***" else "$scheme://$authPrefix$hostPath"
             }
         // Redact sensitive key=value or key: value pairs
-        out = Regex("""(?i)\b(password|passwd|uuid|secret|token|auth|pbk|public-key|encryption|decryption)\s*([=:])\s*([^\s,;"')\]}]+)""")
+        out = Regex("""(?i)\b(password|passwd|uuid|secret|token|access_token|auth|pbk|public-key|private-key|encryption|decryption|sid)\s*([=:])\s*([^\s,;"'`)\]}>]+)""")
             .replace(out) { m -> "${m.groupValues[1]}${m.groupValues[2]}***REDACTED***" }
+        // Redact standalone non-nil UUIDs
+        out = Regex("""\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b""")
+            .replace(out) { m ->
+                if (m.value == "00000000-0000-0000-0000-000000000000") m.value else "***REDACTED***"
+            }
         return out
     }
 }

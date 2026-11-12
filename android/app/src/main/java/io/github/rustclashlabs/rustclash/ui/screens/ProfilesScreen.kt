@@ -12,13 +12,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -45,15 +49,19 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -238,25 +246,63 @@ fun ProfilesScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(bottom = 20.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            items(state.profiles, key = { it.id }) { profile ->
-                val isActive = profile.id == state.activeProfileId
-                val isRefreshing = state.refreshingProfileId == profile.id
-                val displayName = state.resolveProfileDisplayName(profile)
-                ProfileCard(
-                    profile = profile,
-                    displayName = displayName,
-                    isActive = isActive,
-                    isRefreshing = isRefreshing,
-                    onActivate = { if (!isActive) onActivateProfile(profile.id) },
-                    onRefresh = { onRefreshProfile(profile.id) },
-                    onRename = { pendingRenameProfile = profile },
-                    onDelete = { pendingDeleteProfile = profile },
-                )
+        if (state.profiles.isEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = extColors.cardSurface,
+                border = BorderStroke(1.dp, extColors.hairline),
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = "暂无已保存的配置档案",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "点击右上角「导入/订阅」添加 Clash YAML 配置、HTTPS 订阅链接或节点分享链接。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Button(
+                        onClick = onOpenImportSheet,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = extColors.emerald,
+                            contentColor = Color.White,
+                        ),
+                    ) {
+                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("导入配置或订阅")
+                    }
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                items(state.profiles, key = { it.id }) { profile ->
+                    val isActive = profile.id == state.activeProfileId
+                    val isRefreshing = state.refreshingProfileId == profile.id
+                    val displayName = state.resolveProfileDisplayName(profile)
+                    ProfileCard(
+                        profile = profile,
+                        displayName = displayName,
+                        isActive = isActive,
+                        isRefreshing = isRefreshing,
+                        onActivate = { if (!isActive) onActivateProfile(profile.id) },
+                        onRefresh = { onRefreshProfile(profile.id) },
+                        onRename = { pendingRenameProfile = profile },
+                        onDelete = { pendingDeleteProfile = profile },
+                    )
+                }
             }
         }
     }
@@ -503,6 +549,7 @@ private fun ProfileCard(
                             DropdownMenuItem(
                                 text = { Text("立即更新订阅") },
                                 leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
+                                enabled = !isRefreshing,
                                 onClick = {
                                     showMenu = false
                                     onRefresh()
@@ -556,19 +603,41 @@ private fun ProfileCard(
 @Composable
 fun CustomRulesEditorDialog(
     initialRulesText: String,
+    isSaving: Boolean = false,
     errorMessage: String? = null,
     onClearError: () -> Unit = {},
     onDismiss: () -> Unit,
     onSaveRules: (String) -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
+    val scrollState = rememberScrollState()
     var rulesText by remember(initialRulesText) { mutableStateOf(initialRulesText) }
+    var localError by remember(initialRulesText) { mutableStateOf<String?>(null) }
+    val activeError = localError ?: errorMessage
+
+    val maxDialogBodyHeight = (LocalConfiguration.current.screenHeightDp * 0.56f).coerceAtLeast(200f).dp
+
+    LaunchedEffect(activeError) {
+        if (!activeError.isNullOrBlank()) {
+            withFrameNanos { }
+            scrollState.scrollTo(scrollState.maxValue)
+        }
+    }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSaving) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(0.92f)
+            .widthIn(max = 520.dp),
         title = { Text("自定义分流规则") },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = maxDialogBodyHeight)
+                    .verticalScroll(scrollState),
+            ) {
                 Text(
                     text = "每行一条 Clash 标准规则（例如 DOMAIN-SUFFIX,bilibili.com,DIRECT / GEOSITE,cn,DIRECT / MATCH,PROXY）。保存后将自动归档为「自定义规则」且不会被默认模板覆盖。",
                     style = MaterialTheme.typography.bodySmall,
@@ -579,36 +648,59 @@ fun CustomRulesEditorDialog(
                     value = rulesText,
                     onValueChange = {
                         rulesText = it
+                        if (localError != null) localError = null
                         if (!errorMessage.isNullOrBlank()) onClearError()
                     },
+                    enabled = !isSaving,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(250.dp),
+                        .heightIn(min = 128.dp, max = 196.dp),
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 )
-                if (!errorMessage.isNullOrBlank()) {
+                if (!activeError.isNullOrBlank()) {
                     Spacer(modifier = Modifier.height(10.dp))
                     ModalInlineErrorBanner(
-                        message = errorMessage,
-                        onDismiss = onClearError,
+                        message = activeError,
+                        onDismiss = {
+                            localError = null
+                            onClearError()
+                        },
                     )
                 }
             }
         },
         confirmButton = {
             Button(
-                onClick = { onSaveRules(rulesText) },
-                enabled = rulesText.isNotBlank(),
+                onClick = {
+                    val hasValidLine = rulesText.lineSequence()
+                        .map { it.trim() }
+                        .any { it.isNotEmpty() && !it.startsWith("#") }
+                    if (!hasValidLine) {
+                        localError = "请至少保留一条有效的非注释分流规则（如 MATCH,PROXY）"
+                        return@Button
+                    }
+                    localError = null
+                    onSaveRules(rulesText)
+                },
+                enabled = !isSaving && rulesText.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = extColors.emerald,
                     contentColor = Color.White,
                 ),
             ) {
-                Text("校验并保存")
+                if (isSaving) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
+                Text(if (isSaving) "保存中…" else "校验并保存")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(enabled = !isSaving, onClick = onDismiss) {
                 Text("取消")
             }
         },
@@ -618,19 +710,38 @@ fun CustomRulesEditorDialog(
 @Composable
 fun ActiveYamlEditorDialog(
     initialYamlText: String,
+    isSaving: Boolean = false,
     errorMessage: String? = null,
     onClearError: () -> Unit = {},
     onDismiss: () -> Unit,
     onSaveYaml: (String) -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
+    val scrollState = rememberScrollState()
     var yamlText by remember(initialYamlText) { mutableStateOf(initialYamlText) }
+    val maxDialogBodyHeight = (LocalConfiguration.current.screenHeightDp * 0.56f).coerceAtLeast(200f).dp
+
+    LaunchedEffect(errorMessage) {
+        if (!errorMessage.isNullOrBlank()) {
+            withFrameNanos { }
+            scrollState.scrollTo(scrollState.maxValue)
+        }
+    }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSaving) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(0.92f)
+            .widthIn(max = 520.dp),
         title = { Text("活跃 YAML 配置（安全脱敏）") },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = maxDialogBodyHeight)
+                    .verticalScroll(scrollState),
+            ) {
                 Text(
                     text = "节点密码与密钥以 ***REDACTED*** 保护显示；直接修改规则、端口或节点参数并保存时，未改动节点的原始密钥会自动从安全存储恢复。",
                     style = MaterialTheme.typography.bodySmall,
@@ -643,9 +754,10 @@ fun ActiveYamlEditorDialog(
                         yamlText = it
                         if (!errorMessage.isNullOrBlank()) onClearError()
                     },
+                    enabled = !isSaving,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(280.dp),
+                        .heightIn(min = 136.dp, max = 208.dp),
                     textStyle = MaterialTheme.typography.bodySmall.copy(
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Normal,
@@ -663,17 +775,25 @@ fun ActiveYamlEditorDialog(
         confirmButton = {
             Button(
                 onClick = { onSaveYaml(yamlText) },
-                enabled = yamlText.isNotBlank(),
+                enabled = !isSaving && yamlText.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = extColors.emerald,
                     contentColor = Color.White,
                 ),
             ) {
-                Text("验证并应用")
+                if (isSaving) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
+                Text(if (isSaving) "应用中…" else "验证并应用")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(enabled = !isSaving, onClick = onDismiss) {
                 Text("关闭")
             }
         },

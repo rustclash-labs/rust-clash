@@ -358,18 +358,46 @@ export const App: React.FC = () => {
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch]);
 
+  const [modeBusy, setModeBusy] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [appError, setAppError] = useState<string | null>(null);
+
   const handleSaveSecret = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthBusy(true);
+    setAuthError(null);
     const cur = loadControllerSettings();
     saveControllerSettings({ ...cur, secret: secretInput });
-    setAuthRequired(false);
-    setWsEpoch((n) => n + 1);
-    await refreshCore();
+    try {
+      await clashApi.getVersion();
+      setAuthRequired(false);
+      setWsEpoch((n) => n + 1);
+      await refreshCore();
+    } catch (err) {
+      if (err instanceof ApiHttpError && err.status === 401) {
+        setAuthRequired(true);
+        setAuthError("Invalid Bearer Secret — authentication rejected (401).");
+      } else {
+        setAuthError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setAuthBusy(false);
+    }
   };
 
   const handleModeChange = async (mode: RunMode) => {
-    await clashApi.patchConfigs({ mode });
-    await refreshCore();
+    if (modeBusy || config?.mode === mode) return;
+    setModeBusy(true);
+    setAppError(null);
+    try {
+      await clashApi.patchConfigs({ mode });
+      await refreshCore();
+    } catch (err) {
+      setAppError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setModeBusy(false);
+    }
   };
 
   const latestTraffic: TrafficPoint = trafficHistory[
@@ -382,6 +410,18 @@ export const App: React.FC = () => {
     total_down: 0,
   };
 
+  const GROUP_PROXY_TYPES = new Set([
+    "Selector",
+    "URLTest",
+    "Fallback",
+    "LoadBalance",
+  ]);
+  const concreteNodeCount = Object.values(proxies).filter(
+    (p) =>
+      !GROUP_PROXY_TYPES.has(p.type) &&
+      p.name !== "DIRECT" &&
+      p.name !== "REJECT",
+  ).length;
   const activeCount = connections?.connections.length ?? 0;
   const tabMeta: Record<NavTab, { title: string; subtitle: string }> = {
     overview: {
@@ -417,7 +457,7 @@ export const App: React.FC = () => {
 
   const mobileTabs: Array<{ id: NavTab; label: string; badge?: number }> = [
     { id: "overview", label: "Home" },
-    { id: "proxies", label: "Proxies", badge: Object.keys(proxies).length },
+    { id: "proxies", label: "Proxies", badge: concreteNodeCount },
     { id: "connections", label: "Streams", badge: activeCount },
     { id: "rules", label: "Rules" },
     { id: "studio", label: "Profiles" },
@@ -468,9 +508,10 @@ export const App: React.FC = () => {
             type="button"
             className={`nav-btn ${tab === "proxies" ? "active" : ""}`}
             onClick={() => setTab("proxies")}
+            title={`${concreteNodeCount} proxy node(s), ${Object.keys(proxies).length} total outbounds/groups`}
           >
             <span className="nav-btn-left">Proxies &amp; Groups</span>
-            <span className="nav-count">{Object.keys(proxies).length}</span>
+            <span className="nav-count">{concreteNodeCount}</span>
           </button>
 
           <button
@@ -596,6 +637,7 @@ export const App: React.FC = () => {
                   key={m}
                   id={`mode-${m}-btn`}
                   type="button"
+                  disabled={modeBusy}
                   className={`seg-btn ${config?.mode === m ? "active" : ""}`}
                   onClick={() => void handleModeChange(m)}
                 >
@@ -618,12 +660,24 @@ export const App: React.FC = () => {
         </header>
 
         <main className="content-scroll">
+          {appError && (
+            <div className="banner banner-err">
+              <span>{appError}</span>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setAppError(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {authRequired && (
             <form
               onSubmit={handleSaveSecret}
               className="banner banner-err"
               style={{
-                marginBottom: 14,
+                marginBottom: 4,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
@@ -631,11 +685,25 @@ export const App: React.FC = () => {
                 flexWrap: "wrap",
               }}
             >
-              <span>
-                Control API requires a <strong>Bearer Secret</strong> to access
-                management endpoints.
-              </span>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span>
+                  Control API requires a <strong>Bearer Secret</strong> to
+                  access management endpoints.
+                </span>
+                {authError && (
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>
+                    {authError}
+                  </span>
+                )}
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 8,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
                 <input
                   id="controller-secret-input"
                   type="password"
@@ -644,8 +712,12 @@ export const App: React.FC = () => {
                   value={secretInput}
                   onChange={(ev) => setSecretInput(ev.target.value)}
                 />
-                <button type="submit" className="btn btn-primary btn-sm">
-                  Authenticate
+                <button
+                  type="submit"
+                  className="btn btn-primary btn-sm"
+                  disabled={authBusy}
+                >
+                  {authBusy ? "Verifying..." : "Authenticate"}
                 </button>
               </div>
             </form>

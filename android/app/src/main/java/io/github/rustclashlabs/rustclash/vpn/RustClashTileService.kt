@@ -37,7 +37,10 @@ class RustClashTileService : TileService() {
     override fun onClick() {
         super.onClick()
         val currentState = RustClashVpnService.stateTracker.state
-        if (currentState == VpnLifecycleState.RUNNING || currentState == VpnLifecycleState.STARTING) {
+        if (currentState == VpnLifecycleState.RUNNING ||
+            currentState == VpnLifecycleState.STARTING ||
+            currentState == VpnLifecycleState.RECONNECTING
+        ) {
             val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
                 action = RustClashVpnService.ACTION_STOP_VPN
             }
@@ -45,11 +48,31 @@ class RustClashTileService : TileService() {
             syncTileUi()
             return
         }
+        if (currentState == VpnLifecycleState.PREPARING || currentState == VpnLifecycleState.STOPPING) {
+            syncTileUi()
+            return
+        }
+
+        val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        val demoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
+        if (!demoMode && NativeBridge.ensureLoaded()) {
+            val snap = io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.parseNodeManagerSnapshot(
+                NativeBridge.nativeGetNodeManagerSnapshot(filesDir.absolutePath),
+            )
+            if (snap.ok &&
+                snap.nodes.isEmpty() &&
+                snap.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
+            ) {
+                val openIntent = Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                launchMainActivityAndCollapse(openIntent)
+                return
+            }
+        }
 
         val prepareIntent = VpnService.prepare(this)
         if (prepareIntent == null) {
-            val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
-            val demoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
             val startIntent = Intent(this, RustClashVpnService::class.java).apply {
                 action = RustClashVpnService.ACTION_START_VPN
                 putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)

@@ -74,6 +74,8 @@ struct AndroidVpnRuntime {
 }
 
 static ANDROID_RUNTIME: Mutex<Option<AndroidVpnRuntime>> = Mutex::new(None);
+/// Serializes offline `ProfileManager::open_or_init` mutations so concurrent JNI calls never race on `profiles_index.json`.
+static OFFLINE_PROFILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn sync_delays_from_router(router: &Router) {
     let snap = router.proxies_snapshot();
@@ -836,6 +838,7 @@ pub fn android_import_unified_core(
         return Ok(build_android_mutation_json(&mgr, &report, true, Some(eff)));
     }
 
+    let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let temp_rt = tokio::runtime::Builder::new_current_thread()
@@ -864,10 +867,13 @@ pub fn android_select_proxy_persisted_core(
         return android_node_manager_snapshot_core(state_dir);
     }
 
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    mgr.save_group_selection(group_name, proxy_name)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        mgr.save_group_selection(group_name, proxy_name)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    }
     android_node_manager_snapshot_core(state_dir)
 }
 
@@ -892,6 +898,7 @@ pub fn android_upsert_node_core(
         return Ok(build_android_mutation_json(&mgr, &report, true, Some(eff)));
     }
 
+    let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let report = mgr
@@ -916,6 +923,7 @@ pub fn android_delete_node_core(
         return Ok(build_android_mutation_json(&mgr, &report, true, Some(eff)));
     }
 
+    let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let report = mgr
@@ -937,6 +945,7 @@ pub fn android_deduplicate_nodes_core(state_dir: &Path) -> Result<serde_json::Va
         return Ok(build_android_mutation_json(&mgr, &report, true, Some(eff)));
     }
 
+    let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let report = mgr
@@ -1841,11 +1850,14 @@ pub fn android_activate_profile_core(
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         return android_profiles_snapshot_core(state_dir);
     }
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let _ = mgr
-        .set_active_profile(profile_id)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let _ = mgr
+            .set_active_profile(profile_id)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    }
     android_profiles_snapshot_core(state_dir)
 }
 
@@ -1862,10 +1874,13 @@ pub fn android_delete_profile_core(
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         return android_profiles_snapshot_core(state_dir);
     }
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    mgr.delete_profile(profile_id)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        mgr.delete_profile(profile_id)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    }
     android_profiles_snapshot_core(state_dir)
 }
 
@@ -1892,15 +1907,18 @@ pub fn android_refresh_profile_core(
         return android_profiles_snapshot_core(state_dir);
     }
 
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let temp_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Tokio init failed: {e}"))?;
-    let _ = temp_rt
-        .block_on(mgr.refresh_subscription(profile_id))
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let temp_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Tokio init failed: {e}"))?;
+        let _ = temp_rt
+            .block_on(mgr.refresh_subscription(profile_id))
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    }
     android_profiles_snapshot_core(state_dir)
 }
 
@@ -1978,22 +1996,25 @@ pub fn android_save_active_yaml_core(
         return android_node_manager_snapshot_core(state_dir);
     }
 
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let (prev_disk_cfg, _) = mgr
-        .load_active_config()
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml_text)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    parsed.restore_redacted_from(&prev_disk_cfg);
-    let raw_override = if yaml_text.contains(REDACTED_SECRET) {
-        None
-    } else {
-        Some(yaml_text)
-    };
-    let _ = mgr
-        .persist_active_yaml(&parsed, raw_override, None)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let (prev_disk_cfg, _) = mgr
+            .load_active_config()
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml_text)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        parsed.restore_redacted_from(&prev_disk_cfg);
+        let raw_override = if yaml_text.contains(REDACTED_SECRET) {
+            None
+        } else {
+            Some(yaml_text)
+        };
+        let _ = mgr
+            .persist_active_yaml(&parsed, raw_override, None)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    }
     android_node_manager_snapshot_core(state_dir)
 }
 

@@ -445,7 +445,12 @@ mod tests {
             h.await.unwrap();
         }
 
-        tokio::time::sleep(Duration::from_millis(90)).await;
+        for _ in 0..150 {
+            if sent.lock().await.len() >= 8 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
             open_calls.load(Ordering::SeqCst),
             1,

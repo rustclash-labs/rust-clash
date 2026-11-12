@@ -78,12 +78,11 @@ impl SsCipherKind {
         if self.is_ss2022() {
             // Take last user PSK if EIH colon-chain is supplied, or single PSK
             let upsk_b64 = password.rsplit(':').next().unwrap_or(password).trim();
-            let raw = STANDARD.decode(upsk_b64).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid SS-2022 base64 PSK: {e}"),
-                )
-            })?;
+            let raw = crate::config::uri::decode_b64_flexible(upsk_b64)
+                .or_else(|| STANDARD.decode(upsk_b64).ok())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid SS-2022 base64 PSK")
+                })?;
             if raw.len() != self.key_len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

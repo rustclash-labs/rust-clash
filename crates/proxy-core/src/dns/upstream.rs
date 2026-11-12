@@ -115,12 +115,27 @@ pub enum BootstrapDnsServer {
     Tcp(SocketAddr),
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len()
+        && s.is_char_boundary(prefix.len())
+        && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 impl BootstrapDnsServer {
     /// Parse a `default-nameserver` entry. Bootstrap servers MUST specify literal IP addresses
     /// (not domain names) to prevent chicken-and-egg DNS bootstrap loops or OS resolver leaks.
     pub fn parse(raw: &str) -> Result<Self> {
-        let s = raw.trim().split('#').next().unwrap_or("").trim();
-        if let Some(rest) = s.strip_prefix("tcp://") {
+        let s = crate::config::uri::trim_bom_and_controls(raw)
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if let Some(rest) = strip_prefix_ignore_ascii_case(s, "tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
                 ProxyError::Config(format!(
                     "default-nameserver '{raw}' must use a literal IP address, not a hostname"
@@ -128,7 +143,7 @@ impl BootstrapDnsServer {
             })?;
             return Ok(Self::Tcp(sa));
         }
-        let rest = s.strip_prefix("udp://").unwrap_or(s);
+        let rest = strip_prefix_ignore_ascii_case(s, "udp://").unwrap_or(s);
         let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
             ProxyError::Config(format!(
                 "default-nameserver '{raw}' must use a literal IP address, not a hostname"
@@ -153,7 +168,7 @@ impl BootstrapDnsServer {
 
 impl DnsUpstream {
     pub fn parse(raw: &str) -> Result<Self> {
-        let trimmed = raw.trim();
+        let trimmed = crate::config::uri::trim_bom_and_controls(raw);
         if trimmed.is_empty() {
             return Err(ProxyError::Config("empty DNS upstream entry".into()));
         }
@@ -171,8 +186,9 @@ impl DnsUpstream {
             })
         });
 
-        if main_part.starts_with("https://") {
-            let parsed = Url::parse(main_part)
+        if let Some(https_rest) = strip_prefix_ignore_ascii_case(main_part, "https://") {
+            let normalized_url = format!("https://{https_rest}");
+            let parsed = Url::parse(&normalized_url)
                 .map_err(|e| ProxyError::Config(format!("invalid DoH URL '{raw}': {e}")))?;
             let host_str = parsed
                 .host_str()
@@ -209,8 +225,18 @@ impl DnsUpstream {
             });
         }
 
-        if main_part.starts_with("tls://") {
-            let parsed = Url::parse(main_part)
+        if let Some(tls_rest) = strip_prefix_ignore_ascii_case(main_part, "tls://") {
+            let clean_rest = tls_rest.trim().trim_end_matches('/');
+            if let Ok(IpAddr::V6(v6)) = clean_rest.parse::<IpAddr>() {
+                return Ok(Self::Tls {
+                    host: DnsEndpointHost::Ip(IpAddr::V6(v6)),
+                    port: 853,
+                    sni: v6.to_string(),
+                    skip_cert_verify,
+                });
+            }
+            let normalized_url = format!("tls://{tls_rest}");
+            let parsed = Url::parse(&normalized_url)
                 .map_err(|e| ProxyError::Config(format!("invalid DoT URL '{raw}': {e}")))?;
             let host_str = parsed
                 .host_str()
@@ -230,7 +256,7 @@ impl DnsUpstream {
             });
         }
 
-        if let Some(rest) = main_part.strip_prefix("tcp://") {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(main_part, "tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
                 ProxyError::Config(format!(
                     "invalid TCP DNS server '{raw}': expected IP[:PORT]"
@@ -239,7 +265,7 @@ impl DnsUpstream {
             return Ok(Self::Tcp(sa));
         }
 
-        let udp_rest = main_part.strip_prefix("udp://").unwrap_or(main_part);
+        let udp_rest = strip_prefix_ignore_ascii_case(main_part, "udp://").unwrap_or(main_part);
         let sa = parse_ip_socket_addr(udp_rest, 53)
             .ok_or_else(|| ProxyError::Config(format!("invalid DNS nameserver '{raw}'")))?;
         Ok(Self::Udp(sa))

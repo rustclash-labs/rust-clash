@@ -29,6 +29,10 @@ fn safe_token_preview(raw: &str) -> String {
     }
 }
 
+pub(crate) fn trim_bom_and_controls(raw: &str) -> &str {
+    raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}' || c == '\0')
+}
+
 /// Scrub proxy share links, subscription URLs/tokens, PQ encryption keys, and inline credentials
 /// from any diagnostic, log, or error string so secrets never leak to UI toasts or logs.
 pub fn redact_sensitive_text(raw: &str) -> String {
@@ -36,18 +40,25 @@ pub fn redact_sensitive_text(raw: &str) -> String {
 
     for scheme in [
         "ss://",
+        "ssr://",
+        "ssd://",
         "vless://",
         "anytls://",
         "vmess://",
         "trojan://",
         "hysteria2://",
+        "hysteria://",
         "hy2://",
         "tuic://",
+        "snell://",
+        "wireguard://",
+        "wg://",
         "socks5s://",
         "socks5://",
         "socks://",
         "https-proxy://",
         "http-proxy://",
+        "clash://",
         "https://",
         "http://",
     ] {
@@ -56,7 +67,8 @@ pub fn redact_sensitive_text(raw: &str) -> String {
             let start = cursor + rel;
             let end = out[start..]
                 .find(|c: char| {
-                    c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>' | ',')
+                    c.is_whitespace()
+                        || matches!(c, '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';')
                 })
                 .map(|len| start + len)
                 .unwrap_or(out.len());
@@ -81,7 +93,9 @@ pub fn redact_sensitive_text(raw: &str) -> String {
     while let Some(rel) = out[cursor..].find(pq_prefix) {
         let start = cursor + rel;
         let end = out[start..]
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '&' | '#' | ')'))
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '&' | '#' | ')' | ']' | '}')
+            })
             .map(|len| start + len)
             .unwrap_or(out.len());
         let replacement = format!("{pq_prefix}{REDACTED_SECRET}");
@@ -91,21 +105,48 @@ pub fn redact_sensitive_text(raw: &str) -> String {
 
     // Scrub sensitive query/kv parameters such as token=..., password=..., secret=..., pbk=...
     for key in [
+        "access_token=",
+        "api_key=",
+        "apikey=",
         "token=",
         "password=",
         "passwd=",
         "secret=",
+        "auth_str=",
+        "auth-str=",
         "auth=",
         "pbk=",
         "publickey=",
+        "public_key=",
+        "public-key=",
+        "private_key=",
+        "private-key=",
+        "psk=",
         "uuid=",
+        "signature=",
+        "sign=",
+        "key=",
     ] {
         let mut k_cursor = 0usize;
         while let Some(rel) = out[k_cursor..].to_ascii_lowercase().find(key) {
-            let val_start = k_cursor + rel + key.len();
+            let match_start = k_cursor + rel;
+            if match_start > 0
+                && out[..match_start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                k_cursor = match_start + key.len();
+                continue;
+            }
+            let val_start = match_start + key.len();
             let val_end = out[val_start..]
                 .find(|c: char| {
-                    c.is_whitespace() || matches!(c, '&' | '#' | '"' | '\'' | ')' | ';' | ',')
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '&' | '#' | '"' | '\'' | '`' | ')' | ']' | '}' | ';' | ','
+                        )
                 })
                 .map(|len| val_start + len)
                 .unwrap_or(out.len());
@@ -114,20 +155,64 @@ pub fn redact_sensitive_text(raw: &str) -> String {
         }
     }
 
-    // Scrub serde quoted string literals (`string "..."`) so malformed scalar inputs never echo
-    let marker = "string \"";
-    let mut s_cursor = 0usize;
-    while let Some(rel) = out[s_cursor..].find(marker) {
-        let val_start = s_cursor + rel + marker.len();
-        if let Some(end_rel) = out[val_start..].find('"') {
-            let val_end = val_start + end_rel;
-            out.replace_range(val_start..val_end, REDACTED_SECRET);
-            s_cursor = val_start + REDACTED_SECRET.len() + 1;
-        } else {
-            break;
+    // Scrub serde quoted string literals (`string "..."`, `string '...'`, ``string `...` ``)
+    for (marker, close_ch) in [("string \"", '"'), ("string '", '\''), ("string `", '`')] {
+        let mut s_cursor = 0usize;
+        while let Some(rel) = out[s_cursor..].find(marker) {
+            let val_start = s_cursor + rel + marker.len();
+            if let Some(end_rel) = out[val_start..].find(close_ch) {
+                let val_end = val_start + end_rel;
+                out.replace_range(val_start..val_end, REDACTED_SECRET);
+                s_cursor = val_start + REDACTED_SECRET.len() + 1;
+            } else {
+                break;
+            }
         }
     }
 
+    // Scrub any non-nil 36-char hex UUID (`8-4-4-4-12`) so raw VLESS/TUIC UUIDs never leak
+    out = redact_non_nil_uuids(&out);
+
+    out
+}
+
+fn redact_non_nil_uuids(input: &str) -> String {
+    let bytes = input.as_bytes();
+    if bytes.len() < 36 {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 36 <= bytes.len()
+            && input.is_char_boundary(i)
+            && input.is_char_boundary(i + 36)
+            && (i == 0 || !bytes[i - 1].is_ascii_hexdigit())
+            && (i + 36 == bytes.len() || !bytes[i + 36].is_ascii_hexdigit())
+        {
+            let slice = &input[i..i + 36];
+            let s_bytes = slice.as_bytes();
+            let looks_uuid = s_bytes[8] == b'-'
+                && s_bytes[13] == b'-'
+                && s_bytes[18] == b'-'
+                && s_bytes[23] == b'-'
+                && s_bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, b)| matches!(idx, 8 | 13 | 18 | 23) || b.is_ascii_hexdigit());
+            if looks_uuid
+                && slice != "00000000-0000-0000-0000-00000000-0000"
+                && slice != "00000000-0000-0000-0000-000000000000"
+            {
+                out.push_str(REDACTED_SECRET);
+                i += 36;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
     out
 }
 
@@ -282,7 +367,7 @@ pub fn proxy_node_dedup_key(node: &ProxyNodeConfig) -> String {
 /// Parse standard proxy share URIs (`ss://`, `vless://`, `anytls://`, `trojan://`, `socks5://`, `http-proxy://`)
 /// into a validated `ProxyNodeConfig`.
 pub fn parse_proxy_uri(raw: &str) -> Result<ProxyNodeConfig> {
-    let trimmed = raw.trim();
+    let trimmed = trim_bom_and_controls(raw);
     if trimmed.is_empty() {
         return Err(ProxyError::Config("proxy URI cannot be empty".into()));
     }
@@ -337,7 +422,7 @@ pub fn parse_proxy_uri(raw: &str) -> Result<ProxyNodeConfig> {
 }
 
 pub fn is_proxy_uri_token(token: &str) -> bool {
-    let t = token.trim();
+    let t = trim_bom_and_controls(token);
     let Some((scheme, rest)) = t.split_once("://") else {
         return false;
     };
@@ -363,7 +448,7 @@ pub fn is_proxy_uri_token(token: &str) -> bool {
 
 fn contains_uri_scheme_line(text: &str) -> bool {
     text.lines().any(|l| {
-        let t = l.trim();
+        let t = trim_bom_and_controls(l);
         !t.is_empty()
             && !t.starts_with('#')
             && ((t.matches("://").count() == 1 && is_proxy_uri_token(t))
@@ -375,21 +460,22 @@ fn contains_uri_scheme_line(text: &str) -> bool {
 /// valid Base64 (standard or URL-safe, padded or unpadded, single-line or MIME multi-line)
 /// whose decoded UTF-8 payload contains share URI lines.
 pub fn try_decode_base64_uri_list(input: &str) -> Option<String> {
-    let trimmed = input.trim();
+    let trimmed = trim_bom_and_controls(input);
     if trimmed.is_empty() || contains_uri_scheme_line(trimmed) {
         return None;
     }
     let bytes = decode_b64_flexible(trimmed)?;
     let decoded = String::from_utf8(bytes).ok()?;
-    if contains_uri_scheme_line(&decoded) {
-        Some(decoded)
+    let clean_decoded = trim_bom_and_controls(&decoded);
+    if contains_uri_scheme_line(clean_decoded) {
+        Some(clean_decoded.to_string())
     } else {
         None
     }
 }
 
 fn extract_uri_tokens(input: &str) -> Result<Vec<String>> {
-    let trimmed = input.trim();
+    let trimmed = trim_bom_and_controls(input);
     if trimmed.is_empty() {
         return Err(ProxyError::Config(
             "no proxy share links found in empty input".into(),
@@ -411,7 +497,7 @@ fn extract_uri_tokens(input: &str) -> Result<Vec<String>> {
 
     let mut tokens = Vec::new();
     for line in candidate.lines() {
-        let line = line.trim();
+        let line = trim_bom_and_controls(line);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -510,6 +596,19 @@ pub fn parse_subscription_uris_best_effort(
     Ok((nodes, skipped))
 }
 
+fn format_uri_host_port(server: &str, port: u16) -> String {
+    let clean = server
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if clean.contains(':') {
+        format!("[{clean}]:{port}")
+    } else {
+        format!("{clean}:{port}")
+    }
+}
+
 pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
     match node {
         ProxyNodeConfig::Ss {
@@ -521,8 +620,9 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
             ..
         } => {
             let userinfo = URL_SAFE_NO_PAD.encode(format!("{cipher}:{password}"));
+            let host_port = format_uri_host_port(server, *port);
             format!(
-                "ss://{userinfo}@{server}:{port}#{}",
+                "ss://{userinfo}@{host_port}#{}",
                 percent_encode_fragment(name)
             )
         }
@@ -574,8 +674,9 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
             if *skip_cert_verify {
                 params.push("allowInsecure=1".to_string());
             }
+            let host_port = format_uri_host_port(server, *port);
             format!(
-                "vless://{uuid}@{server}:{port}?{}#{}",
+                "vless://{uuid}@{host_port}?{}#{}",
                 params.join("&"),
                 percent_encode_fragment(name)
             )
@@ -608,8 +709,9 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
             } else {
                 format!("?{}", params.join("&"))
             };
+            let host_port = format_uri_host_port(server, *port);
             format!(
-                "anytls://{}@{server}:{port}{query}#{}",
+                "anytls://{}@{host_port}{query}#{}",
                 percent_encode_component(password),
                 percent_encode_fragment(name)
             )
@@ -661,8 +763,9 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
             } else {
                 format!("?{}", params.join("&"))
             };
+            let host_port = format_uri_host_port(server, *port);
             format!(
-                "trojan://{}@{server}:{port}{query}#{}",
+                "trojan://{}@{host_port}{query}#{}",
                 percent_encode_component(password),
                 percent_encode_fragment(name)
             )
@@ -702,8 +805,9 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
             } else {
                 format!("?{}", params.join("&"))
             };
+            let host_port = format_uri_host_port(server, *port);
             format!(
-                "{scheme}://{auth}{server}:{port}{query}#{}",
+                "{scheme}://{auth}{host_port}{query}#{}",
                 percent_encode_fragment(name)
             )
         }
@@ -739,8 +843,9 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
             } else {
                 format!("?{}", params.join("&"))
             };
+            let host_port = format_uri_host_port(server, *port);
             format!(
-                "{scheme}://{auth}{server}:{port}{query}#{}",
+                "{scheme}://{auth}{host_port}{query}#{}",
                 percent_encode_fragment(name)
             )
         }
@@ -748,7 +853,10 @@ pub fn export_proxy_uri(node: &ProxyNodeConfig) -> String {
 }
 
 pub(crate) fn decode_b64_flexible(s: &str) -> Option<Vec<u8>> {
-    let compact: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let compact: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{feff}' && *c != '\0')
+        .collect();
     if compact.is_empty() {
         return None;
     }
@@ -798,9 +906,38 @@ fn percent_encode_component(s: &str) -> String {
     out
 }
 
+fn apply_ss_query_params(query: &str, udp: &mut bool) -> Result<()> {
+    if query.is_empty() {
+        return Ok(());
+    }
+    for pair in query.split('&') {
+        if pair.trim().is_empty() {
+            continue;
+        }
+        let (k_raw, v_raw) = pair.split_once('=').unwrap_or((pair, ""));
+        let k = percent_decode_str(k_raw).trim().to_ascii_lowercase();
+        let v = percent_decode_str(v_raw);
+        match k.as_str() {
+            "plugin" | "v2ray-plugin" | "obfs" if !v.trim().is_empty() => {
+                return Err(ProxyError::Config(
+                    "Shadowsocks SIP003 plugin is not supported (only native AEAD and SS-2022 TCP/UDP are supported)"
+                        .into(),
+                ));
+            }
+            "udp" | "uot" => {
+                if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false") {
+                    *udp = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn parse_ss_uri(raw: &str) -> Result<ProxyNodeConfig> {
     let without_scheme = raw.strip_prefix("ss://").unwrap_or(raw);
-    let (main_part, fragment) = match without_scheme.split_once('#') {
+    let (main_part, mut fragment) = match without_scheme.split_once('#') {
         Some((m, f)) => (m, Some(percent_decode_str(f))),
         None => (without_scheme, None),
     };
@@ -808,30 +945,7 @@ fn parse_ss_uri(raw: &str) -> Result<ProxyNodeConfig> {
     let main_part = main_part.trim_end_matches('/');
 
     let mut udp = true;
-    if !query.is_empty() {
-        for pair in query.split('&') {
-            if pair.trim().is_empty() {
-                continue;
-            }
-            let (k_raw, v_raw) = pair.split_once('=').unwrap_or((pair, ""));
-            let k = percent_decode_str(k_raw).trim().to_ascii_lowercase();
-            let v = percent_decode_str(v_raw);
-            match k.as_str() {
-                "plugin" | "v2ray-plugin" | "obfs" if !v.trim().is_empty() => {
-                    return Err(ProxyError::Config(
-                        "Shadowsocks SIP003 plugin is not supported (only native AEAD and SS-2022 TCP/UDP are supported)"
-                            .into(),
-                    ));
-                }
-                "udp" | "uot" => {
-                    if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false") {
-                        udp = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    apply_ss_query_params(query, &mut udp)?;
 
     let (cipher, password, server, port) = if let Some((userinfo, hostport)) =
         main_part.rsplit_once('@')
@@ -854,7 +968,17 @@ fn parse_ss_uri(raw: &str) -> Result<ProxyNodeConfig> {
             .ok_or_else(|| ProxyError::Config("invalid legacy Base64 ss:// URI".into()))?;
         let full = String::from_utf8(bytes)
             .map_err(|_| ProxyError::Config("invalid UTF-8 in legacy ss:// URI".into()))?;
-        let (userinfo, hostport) = full
+        let (inner_main, inner_frag) = match full.split_once('#') {
+            Some((m, f)) => (m, Some(percent_decode_str(f))),
+            None => (full.as_str(), None),
+        };
+        if fragment.is_none() {
+            fragment = inner_frag;
+        }
+        let (inner_main, inner_query) = inner_main.split_once('?').unwrap_or((inner_main, ""));
+        apply_ss_query_params(inner_query, &mut udp)?;
+        let inner_main = inner_main.trim_end_matches('/');
+        let (userinfo, hostport) = inner_main
             .rsplit_once('@')
             .ok_or_else(|| ProxyError::Config("missing '@' in decoded legacy ss:// URI".into()))?;
         let (method, pass) = userinfo
@@ -983,6 +1107,16 @@ fn parse_vless_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     }
                 }
             }
+            "tls" => {
+                if matches!(
+                    val_trimmed.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "tls"
+                ) {
+                    tls = true;
+                } else if matches!(val_trimmed.to_ascii_lowercase().as_str(), "0" | "false") {
+                    tls = false;
+                }
+            }
             "flow" => {
                 if !val_trimmed.is_empty() && !val_trimmed.eq_ignore_ascii_case("none") {
                     return Err(ProxyError::Config(format!(
@@ -1026,7 +1160,7 @@ fn parse_vless_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     ws_ed_hdr = Some(val_trimmed.to_string());
                 }
             }
-            "servicename" | "mode" | "seed" | "quicsecurity" | "key" | "extra" => {
+            "servicename" | "seed" | "quicsecurity" | "extra" => {
                 if !val_trimmed.is_empty() {
                     return Err(ProxyError::Config(format!(
                         "VLESS transport parameter '{}' is not supported (gRPC/HTTPUpgrade/QUIC transports are not supported)",
@@ -1051,16 +1185,18 @@ fn parse_vless_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     servername = Some(val_trimmed.to_string());
                 }
             }
-            "allowinsecure" | "insecure" => match val_trimmed.to_ascii_lowercase().as_str() {
-                "1" | "true" => skip_cert_verify = true,
-                "0" | "false" | "" => skip_cert_verify = false,
-                other => {
-                    return Err(ProxyError::Config(format!(
-                        "invalid VLESS allowInsecure value '{}' (expected 0, 1, true, or false)",
-                        safe_token_preview(other)
-                    )));
+            "allowinsecure" | "insecure" | "skip-cert-verify" => {
+                match val_trimmed.to_ascii_lowercase().as_str() {
+                    "1" | "true" => skip_cert_verify = true,
+                    "0" | "false" | "" => skip_cert_verify = false,
+                    other => {
+                        return Err(ProxyError::Config(format!(
+                            "invalid VLESS allowInsecure value '{}' (expected 0, 1, true, or false)",
+                            safe_token_preview(other)
+                        )));
+                    }
                 }
-            },
+            }
             "alpn" => {
                 alpn = val_trimmed
                     .split(',')
@@ -1073,21 +1209,11 @@ fn parse_vless_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     udp = false;
                 }
             }
-            "fp" | "fingerprint" | "tfo" | "sni_policy" => {
-                // Benign client hints emitted by standard subscription panels
-            }
-            "remark" | "remarks" => {
-                if !val_trimmed.is_empty() {
-                    remark_fallback = Some(val_trimmed.to_string());
-                }
+            "remark" | "remarks" if !val_trimmed.is_empty() => {
+                remark_fallback = Some(val_trimmed.to_string());
             }
             _ => {
-                if !val_trimmed.is_empty() {
-                    return Err(ProxyError::Config(format!(
-                        "unsupported VLESS query parameter '{}'",
-                        safe_token_preview(&k)
-                    )));
-                }
+                // Ignore benign vendor/panel client hints (e.g. fp, tfo, mux, v, client-fingerprint)
             }
         }
     }
@@ -1143,15 +1269,42 @@ fn parse_vless_uri(raw: &str) -> Result<ProxyNodeConfig> {
     })
 }
 
-fn parse_trojan_uri(raw: &str) -> Result<ProxyNodeConfig> {
-    let parsed =
-        Url::parse(raw).map_err(|_| ProxyError::Config("invalid trojan:// URI syntax".into()))?;
-    if parsed.password().is_some_and(|p| !p.is_empty()) {
-        return Err(ProxyError::Config(
-            "invalid trojan:// URI userinfo (percent-encode ':' in password if present)".into(),
-        ));
+/// Normalize single-credential share URIs (`trojan://password@host:port`, `anytls://password@host:port`)
+/// where real-world panels emit raw unencoded `@` or `:` characters inside `password`.
+fn normalize_single_password_uri(raw: &str, scheme_prefix: &str) -> String {
+    let Some(rest) = raw.strip_prefix(scheme_prefix) else {
+        return raw.to_string();
+    };
+    let tail_idx = rest.find(['?', '#']).unwrap_or(rest.len());
+    let (authority_and_path, suffix) = rest.split_at(tail_idx);
+    let (authority, path_part) = match authority_and_path.find('/') {
+        Some(slash_idx) => authority_and_path.split_at(slash_idx),
+        None => (authority_and_path, ""),
+    };
+    let Some((raw_pass, hostport)) = authority.rsplit_once('@') else {
+        return raw.to_string();
+    };
+    let decoded_pass = percent_decode_str(raw_pass);
+    let encoded_pass = percent_encode_component(&decoded_pass);
+    format!("{scheme_prefix}{encoded_pass}@{hostport}{path_part}{suffix}")
+}
+
+fn extract_single_password_userinfo(parsed: &Url) -> String {
+    match parsed.password() {
+        Some(p) => format!(
+            "{}:{}",
+            percent_decode_str(parsed.username()),
+            percent_decode_str(p)
+        ),
+        None => percent_decode_str(parsed.username()),
     }
-    let password = percent_decode_str(parsed.username());
+}
+
+fn parse_trojan_uri(raw: &str) -> Result<ProxyNodeConfig> {
+    let normalized = normalize_single_password_uri(raw, "trojan://");
+    let parsed = Url::parse(&normalized)
+        .map_err(|_| ProxyError::Config("invalid trojan:// URI syntax".into()))?;
+    let password = extract_single_password_userinfo(&parsed);
     if password.trim().is_empty() {
         return Err(ProxyError::Config(
             "missing password in trojan:// URI".into(),
@@ -1265,7 +1418,6 @@ fn parse_trojan_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     )));
                 }
             }
-            "fp" | "fingerprint" | "tfo" | "headertype" => {}
             "remark" | "remarks" if !val_trimmed.is_empty() => {
                 remark_fallback = Some(val_trimmed.to_string());
             }
@@ -1498,9 +1650,10 @@ fn parse_http_proxy_uri(without_scheme: &str, tls: bool) -> Result<ProxyNodeConf
 }
 
 fn parse_anytls_uri(raw: &str) -> Result<ProxyNodeConfig> {
-    let parsed =
-        Url::parse(raw).map_err(|_| ProxyError::Config("invalid anytls:// URI syntax".into()))?;
-    let password = percent_decode_str(parsed.username());
+    let normalized = normalize_single_password_uri(raw, "anytls://");
+    let parsed = Url::parse(&normalized)
+        .map_err(|_| ProxyError::Config("invalid anytls:// URI syntax".into()))?;
+    let password = extract_single_password_userinfo(&parsed);
     if password.is_empty() {
         return Err(ProxyError::Config(
             "missing password in anytls:// URI".into(),
@@ -1529,6 +1682,7 @@ fn parse_anytls_uri(raw: &str) -> Result<ProxyNodeConfig> {
     let mut skip_cert_verify = false;
     let mut alpn = Vec::new();
     let mut udp = true;
+    let mut remark_fallback = None;
 
     for (k, v) in parsed.query_pairs() {
         let key_lower = k.trim().to_ascii_lowercase();
@@ -1539,7 +1693,7 @@ fn parse_anytls_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     sni = Some(val_trimmed.to_string());
                 }
             }
-            "insecure" | "allowinsecure" => {
+            "insecure" | "allowinsecure" | "skip-cert-verify" => {
                 skip_cert_verify =
                     matches!(val_trimmed.to_ascii_lowercase().as_str(), "1" | "true");
             }
@@ -1564,15 +1718,18 @@ fn parse_anytls_uri(raw: &str) -> Result<ProxyNodeConfig> {
                     )));
                 }
             }
-            "fp" | "fingerprint" | "tfo" => {}
-            _ => {
+            "pbk" | "publickey" | "sid" | "shortid" | "spx" | "servicename" => {
                 if !val_trimmed.is_empty() {
                     return Err(ProxyError::Config(format!(
-                        "unsupported AnyTLS query parameter '{}'",
+                        "AnyTLS parameter '{}' is not supported",
                         safe_token_preview(&k)
                     )));
                 }
             }
+            "remark" | "remarks" if !val_trimmed.is_empty() => {
+                remark_fallback = Some(val_trimmed.to_string());
+            }
+            _ => {}
         }
     }
     let name = parsed
@@ -1580,6 +1737,7 @@ fn parse_anytls_uri(raw: &str) -> Result<ProxyNodeConfig> {
         .map(percent_decode_str)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or(remark_fallback)
         .unwrap_or_else(|| format!("AnyTLS-{server}:{port}"));
 
     Ok(ProxyNodeConfig::Anytls {

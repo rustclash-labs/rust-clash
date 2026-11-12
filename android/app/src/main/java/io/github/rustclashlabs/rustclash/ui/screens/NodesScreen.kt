@@ -14,11 +14,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -76,17 +78,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.ProxyGroupItem
 import io.github.rustclashlabs.rustclash.ui.model.ProxyNodeItem
@@ -369,10 +375,12 @@ fun NodesScreen(
                     FilterChip(
                         selected = selected,
                         onClick = { onSelectGroupTab(group.name) },
+                        modifier = Modifier.widthIn(max = 220.dp),
                         label = {
                             Text(
                                 text = "${group.name} (${group.now.ifBlank { group.type }})",
                                 maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         },
                     )
@@ -383,10 +391,13 @@ fun NodesScreen(
         Spacer(modifier = Modifier.height(12.dp))
 
         if (state.nodes.isEmpty() && !state.demoMode) {
+            val stackActionButtons = LocalConfiguration.current.screenWidthDp < 360 ||
+                LocalDensity.current.fontScale >= 1.2f
             // Empty State
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(top = 8.dp),
                 shape = RoundedCornerShape(18.dp),
                 color = extColors.cardSurface,
@@ -408,25 +419,49 @@ fun NodesScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(modifier = Modifier.height(16.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Button(
-                            onClick = onImportClipboardDirect,
-                            modifier = Modifier.weight(1f),
+                    if (stackActionButtons) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Icon(Icons.Rounded.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("粘贴导入", maxLines = 1)
+                            Button(
+                                onClick = onImportClipboardDirect,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Rounded.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("粘贴导入", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            OutlinedButton(
+                                onClick = onOpenImportSheet,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("链接 / 订阅", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
                         }
-                        OutlinedButton(
-                            onClick = onOpenImportSheet,
-                            modifier = Modifier.weight(1f),
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("链接 / 订阅", maxLines = 1)
+                            Button(
+                                onClick = onImportClipboardDirect,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Icon(Icons.Rounded.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("粘贴导入", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            OutlinedButton(
+                                onClick = onOpenImportSheet,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("链接 / 订阅", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
                         }
                     }
                     Spacer(modifier = Modifier.height(6.dp))
@@ -434,6 +469,38 @@ fun NodesScreen(
                         Icon(Icons.Rounded.QrCodeScanner, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("扫码导入节点")
+                    }
+                }
+            }
+        } else if (state.nodes.isEmpty() && state.demoMode) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                shape = RoundedCornerShape(18.dp),
+                color = extColors.cardSurface,
+                border = BorderStroke(1.dp, extColors.hairline),
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = "沙盒演示模式已启用",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "当前未保存外部真实节点，启动 VPN 时将使用内置本地多协议测试沙盒；导入真实节点后会自动切换为真实代理模式。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    OutlinedButton(onClick = onOpenImportSheet) {
+                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("导入真实节点 / 订阅")
                     }
                 }
             }
@@ -481,7 +548,31 @@ fun NodesScreen(
                 else -> filteredConcreteNodes
             }
 
-            if (topCategoryTab == 1 && displayNodes.isEmpty()) {
+            if (displayNodes.isEmpty() && state.nodeSearchQuery.isNotBlank()) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = extColors.cardSurface,
+                    border = BorderStroke(1.dp, extColors.hairline),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(18.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "未找到匹配「${state.nodeSearchQuery}」的节点",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        TextButton(onClick = { onSearchQueryChange("") }) {
+                            Text("清除搜索条件")
+                        }
+                    }
+                }
+            } else if (topCategoryTab == 1 && displayNodes.isEmpty()) {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
@@ -751,16 +842,21 @@ fun ImportPayloadBottomSheet(
     onOpenManualForm: () -> Unit,
     onSubmitImport: (payload: String, deduplicate: Boolean, autoSelect: Boolean) -> Unit,
 ) {
+    val extColors = LocalRustClashColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scrollState = rememberScrollState()
     val focusManager = LocalFocusManager.current
     var payloadText by remember { mutableStateOf("") }
     var deduplicate by remember { mutableStateOf(true) }
     var autoSelect by remember { mutableStateOf(true) }
+    var clipboardHint by remember { mutableStateOf<String?>(null) }
+
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.85f).coerceAtLeast(320f).dp
 
     LaunchedEffect(errorMessage) {
         if (!errorMessage.isNullOrBlank()) {
-            scrollState.animateScrollTo(scrollState.maxValue)
+            withFrameNanos { }
+            scrollState.scrollTo(scrollState.maxValue)
         }
     }
 
@@ -772,6 +868,7 @@ fun ImportPayloadBottomSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .heightIn(max = maxSheetHeight)
                 .navigationBarsPadding()
                 .imePadding()
                 .verticalScroll(scrollState)
@@ -788,7 +885,7 @@ fun ImportPayloadBottomSheet(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             // Quick Action Row
             Row(
@@ -798,11 +895,15 @@ fun ImportPayloadBottomSheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 OutlinedButton(
+                    enabled = !isImporting,
                     onClick = {
                         val clip = onReadClipboard()
                         if (!clip.isNullOrBlank()) {
                             payloadText = clip
+                            clipboardHint = null
                             if (!errorMessage.isNullOrBlank()) onClearError()
+                        } else {
+                            clipboardHint = "当前剪贴板为空，请在下方输入框直接粘贴节点链接或订阅地址"
                         }
                     },
                 ) {
@@ -811,6 +912,7 @@ fun ImportPayloadBottomSheet(
                     Text("读取剪贴板")
                 }
                 OutlinedButton(
+                    enabled = !isImporting,
                     onClick = {
                         onDismiss()
                         onLaunchCameraQr()
@@ -821,6 +923,7 @@ fun ImportPayloadBottomSheet(
                     Text("相机扫码")
                 }
                 OutlinedButton(
+                    enabled = !isImporting,
                     onClick = {
                         onDismiss()
                         onLaunchGalleryQr()
@@ -831,6 +934,7 @@ fun ImportPayloadBottomSheet(
                     Text("相册二维码")
                 }
                 OutlinedButton(
+                    enabled = !isImporting,
                     onClick = {
                         onDismiss()
                         onOpenManualForm()
@@ -842,17 +946,19 @@ fun ImportPayloadBottomSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             OutlinedTextField(
                 value = payloadText,
                 onValueChange = {
                     payloadText = it
+                    clipboardHint = null
                     if (!errorMessage.isNullOrBlank()) onClearError()
                 },
+                enabled = !isImporting,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(150.dp),
+                    .heightIn(min = 104.dp, max = 140.dp),
                 shape = RoundedCornerShape(14.dp),
                 placeholder = {
                     Text(
@@ -862,7 +968,23 @@ fun ImportPayloadBottomSheet(
                 },
             )
 
-            Spacer(modifier = Modifier.height(10.dp))
+            if (!clipboardHint.isNullOrBlank() && errorMessage.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = extColors.amberContainer,
+                ) {
+                    Text(
+                        text = clipboardHint!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = extColors.onAmberContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -873,7 +995,11 @@ fun ImportPayloadBottomSheet(
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.weight(1f),
                 )
-                Switch(checked = deduplicate, onCheckedChange = { deduplicate = it })
+                Switch(
+                    checked = deduplicate,
+                    enabled = !isImporting,
+                    onCheckedChange = { deduplicate = it },
+                )
             }
 
             Row(
@@ -885,18 +1011,22 @@ fun ImportPayloadBottomSheet(
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.weight(1f),
                 )
-                Switch(checked = autoSelect, onCheckedChange = { autoSelect = it })
+                Switch(
+                    checked = autoSelect,
+                    enabled = !isImporting,
+                    onCheckedChange = { autoSelect = it },
+                )
             }
 
             if (!errorMessage.isNullOrBlank()) {
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 ModalInlineErrorBanner(
                     message = errorMessage,
                     onDismiss = onClearError,
                 )
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             Button(
                 onClick = {
@@ -928,6 +1058,7 @@ fun ImportPayloadBottomSheet(
 @Composable
 fun NodeEditorDialog(
     existingNode: ProxyNodeItem?,
+    isSaving: Boolean = false,
     backendError: String? = null,
     onClearBackendError: () -> Unit = {},
     onDismiss: () -> Unit,
@@ -943,64 +1074,82 @@ fun NodeEditorDialog(
         "socks5" to "SOCKS5",
         "http" to "HTTP",
     )
-    var selectedProto by remember {
-        val rawProto = existingNode?.type?.lowercase()?.let { if (it == "socks") "socks5" else it }
+    val existingProto = existingNode?.type?.lowercase()?.let { if (it == "socks") "socks5" else it }
+    var selectedProto by remember(existingNode) {
         mutableStateOf(
-            rawProto?.takeIf { p -> protocols.any { it.first == p } } ?: "ss",
+            existingProto?.takeIf { p -> protocols.any { it.first == p } } ?: "ss",
         )
     }
-    var name by remember { mutableStateOf(existingNode?.name ?: "") }
-    var server by remember { mutableStateOf(existingNode?.server ?: "") }
-    var portText by remember { mutableStateOf((existingNode?.port ?: 443).toString()) }
-    var username by remember { mutableStateOf(existingNode?.username ?: "") }
-    var secret by remember { mutableStateOf("") }
-    var cipherOrEnc by remember {
+    var name by remember(existingNode) { mutableStateOf(existingNode?.name ?: "") }
+    var server by remember(existingNode) { mutableStateOf(existingNode?.server ?: "") }
+    var portText by remember(existingNode) { mutableStateOf((existingNode?.port ?: 443).toString()) }
+    var username by remember(existingNode) { mutableStateOf(existingNode?.username ?: "") }
+    var secret by remember(existingNode) { mutableStateOf("") }
+    var cipherOrEnc by remember(existingNode) {
         mutableStateOf(
-            when (existingNode?.type?.lowercase()) {
-                "ss" -> existingNode.cipher.ifBlank { "2022-blake3-aes-256-gcm" }
-                "vless" -> existingNode.encryption.takeIf { it != "***REDACTED***" } ?: ""
-                else -> "2022-blake3-aes-256-gcm"
+            when (existingProto) {
+                "ss" -> existingNode.cipher.ifBlank { "aes-256-gcm" }
+                "vless" -> existingNode.encryption.takeIf { it != "***REDACTED***" } ?: "none"
+                else -> "aes-256-gcm"
             },
         )
     }
-    var transportNet by remember {
+    var transportNet by remember(existingNode) {
         mutableStateOf(
             existingNode?.network?.lowercase()?.takeIf { it == "ws" || it == "tcp" } ?: "tcp",
         )
     }
-    var wsPath by remember { mutableStateOf(existingNode?.wsPath?.ifBlank { "/ws" } ?: "/ws") }
-    var wsHost by remember { mutableStateOf(existingNode?.wsHost ?: "") }
-    var maxEarlyDataText by remember {
+    var wsPath by remember(existingNode) { mutableStateOf(existingNode?.wsPath?.ifBlank { "/ws" } ?: "/ws") }
+    var wsHost by remember(existingNode) { mutableStateOf(existingNode?.wsHost ?: "") }
+    var maxEarlyDataText by remember(existingNode) {
         mutableStateOf(if ((existingNode?.maxEarlyData ?: 0) > 0) existingNode!!.maxEarlyData.toString() else "0")
     }
-    var sni by remember { mutableStateOf(existingNode?.sni ?: "") }
-    var tlsEnabled by remember {
+    var sni by remember(existingNode) { mutableStateOf(existingNode?.sni ?: "") }
+    var tlsEnabled by remember(existingNode) {
         mutableStateOf(
             existingNode?.tls ?: (selectedProto in setOf("vless", "trojan", "anytls")),
         )
     }
-    var skipCertVerify by remember { mutableStateOf(existingNode?.skipCertVerify ?: false) }
-    var autoSelect by remember { mutableStateOf(!isEditing) }
-    var validationError by remember { mutableStateOf<String?>(null) }
+    var skipCertVerify by remember(existingNode) { mutableStateOf(existingNode?.skipCertVerify ?: false) }
+    var autoSelect by remember(existingNode) { mutableStateOf(!isEditing) }
+    var validationError by remember(existingNode) { mutableStateOf<String?>(null) }
+
+    val clearErrors = {
+        if (validationError != null) validationError = null
+        if (!backendError.isNullOrBlank()) onClearBackendError()
+    }
+
+    val maxDialogBodyHeight = (LocalConfiguration.current.screenHeightDp * 0.56f).coerceAtLeast(200f).dp
 
     LaunchedEffect(validationError, backendError) {
         if (!validationError.isNullOrBlank() || !backendError.isNullOrBlank()) {
-            dialogScrollState.animateScrollTo(dialogScrollState.maxValue)
+            withFrameNanos { }
+            dialogScrollState.scrollTo(dialogScrollState.maxValue)
         }
     }
 
     val supportsWs = selectedProto == "vless" || selectedProto == "trojan"
     val isAuthOptional = selectedProto == "socks5" || selectedProto == "http"
+    val protoSwitchedOnEdit = isEditing && selectedProto != existingProto
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSaving) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(0.92f)
+            .widthIn(max = 520.dp),
         title = {
-            Text(if (isEditing) "编辑节点：${existingNode?.name}" else "手动添加节点")
+            Text(
+                text = if (isEditing) "编辑节点：${existingNode?.name}" else "手动添加节点",
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         },
         text = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(max = maxDialogBodyHeight)
                     .verticalScroll(dialogScrollState),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
@@ -1013,10 +1162,30 @@ fun NodeEditorDialog(
                     protocols.forEach { (protoKey, protoLabel) ->
                         FilterChip(
                             selected = selectedProto == protoKey,
+                            enabled = !isSaving,
                             onClick = {
-                                selectedProto = protoKey
-                                if (protoKey in setOf("trojan", "anytls")) {
-                                    tlsEnabled = true
+                                if (selectedProto != protoKey) {
+                                    selectedProto = protoKey
+                                    clearErrors()
+                                    when (protoKey) {
+                                        "ss" -> {
+                                            if (cipherOrEnc.isBlank() || cipherOrEnc == "none") {
+                                                cipherOrEnc = "aes-256-gcm"
+                                            }
+                                        }
+                                        "vless" -> {
+                                            if (cipherOrEnc == "aes-256-gcm" ||
+                                                cipherOrEnc.startsWith("2022-") ||
+                                                cipherOrEnc == "chacha20-ietf-poly1305"
+                                            ) {
+                                                cipherOrEnc = "none"
+                                            }
+                                            tlsEnabled = true
+                                        }
+                                        "trojan", "anytls" -> {
+                                            tlsEnabled = true
+                                        }
+                                    }
                                 }
                             },
                             label = { Text(protoLabel, style = MaterialTheme.typography.labelSmall) },
@@ -1026,21 +1195,33 @@ fun NodeEditorDialog(
 
                 OutlinedTextField(
                     value = name,
-                    onValueChange = { name = it },
+                    onValueChange = {
+                        name = it
+                        clearErrors()
+                    },
+                    enabled = !isSaving,
                     label = { Text("节点名称") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
                     value = server,
-                    onValueChange = { server = it },
+                    onValueChange = {
+                        server = it
+                        clearErrors()
+                    },
+                    enabled = !isSaving,
                     label = { Text("服务器地址 (域名或 IP)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
                     value = portText,
-                    onValueChange = { portText = it },
+                    onValueChange = {
+                        portText = it
+                        clearErrors()
+                    },
+                    enabled = !isSaving,
                     label = { Text("端口 (1 - 65535)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -1050,7 +1231,11 @@ fun NodeEditorDialog(
                 if (isAuthOptional) {
                     OutlinedTextField(
                         value = username,
-                        onValueChange = { username = it },
+                        onValueChange = {
+                            username = it
+                            clearErrors()
+                        },
+                        enabled = !isSaving,
                         label = { Text("用户名 (可选)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
@@ -1059,10 +1244,15 @@ fun NodeEditorDialog(
 
                 OutlinedTextField(
                     value = secret,
-                    onValueChange = { secret = it },
+                    onValueChange = {
+                        secret = it
+                        clearErrors()
+                    },
+                    enabled = !isSaving,
                     label = {
                         Text(
                             when {
+                                protoSwitchedOnEdit && !isAuthOptional -> "密码 / UUID（切换协议需重新填写）"
                                 isEditing -> "密码 / UUID（留空保留原密钥）"
                                 selectedProto == "vless" -> "VLESS UUID"
                                 isAuthOptional -> "连接密码 (无鉴权可留空)"
@@ -1078,11 +1268,15 @@ fun NodeEditorDialog(
                 if (selectedProto == "ss" || selectedProto == "vless") {
                     OutlinedTextField(
                         value = cipherOrEnc,
-                        onValueChange = { cipherOrEnc = it },
+                        onValueChange = {
+                            cipherOrEnc = it
+                            clearErrors()
+                        },
+                        enabled = !isSaving,
                         label = {
                             Text(
                                 if (selectedProto == "ss") {
-                                    "加密算法 (如 aes-256-gcm / 2022-blake3-aes-256-gcm)"
+                                    "加密算法 (默认 aes-256-gcm / 支持 2022-blake3-*)"
                                 } else {
                                     "VLESS Encryption (默认 none)"
                                 },
@@ -1102,34 +1296,54 @@ fun NodeEditorDialog(
                         Text("传输层：", style = MaterialTheme.typography.bodySmall)
                         FilterChip(
                             selected = transportNet == "tcp",
-                            onClick = { transportNet = "tcp" },
+                            enabled = !isSaving,
+                            onClick = {
+                                transportNet = "tcp"
+                                clearErrors()
+                            },
                             label = { Text("TCP", style = MaterialTheme.typography.labelSmall) },
                         )
                         FilterChip(
                             selected = transportNet == "ws",
-                            onClick = { transportNet = "ws" },
+                            enabled = !isSaving,
+                            onClick = {
+                                transportNet = "ws"
+                                clearErrors()
+                            },
                             label = { Text("WebSocket (WS)", style = MaterialTheme.typography.labelSmall) },
                         )
                     }
                     if (transportNet == "ws") {
                         OutlinedTextField(
                             value = wsPath,
-                            onValueChange = { wsPath = it },
+                            onValueChange = {
+                                wsPath = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
                             label = { Text("WS Path (如 /ws)") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         OutlinedTextField(
                             value = wsHost,
-                            onValueChange = { wsHost = it },
+                            onValueChange = {
+                                wsHost = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
                             label = { Text("WS Host Header (可选)") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         OutlinedTextField(
                             value = maxEarlyDataText,
-                            onValueChange = { maxEarlyDataText = it },
-                            label = { Text("0-RTT Early Data 字节数 (默认 0)") },
+                            onValueChange = {
+                                maxEarlyDataText = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = { Text("0-RTT Early Data 字节数 (0 - 65535)") },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             modifier = Modifier.fillMaxWidth(),
@@ -1140,7 +1354,11 @@ fun NodeEditorDialog(
                 if (selectedProto in setOf("vless", "trojan", "anytls", "socks5", "http")) {
                     OutlinedTextField(
                         value = sni,
-                        onValueChange = { sni = it },
+                        onValueChange = {
+                            sni = it
+                            clearErrors()
+                        },
+                        enabled = !isSaving,
                         label = { Text("TLS SNI (可选)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
@@ -1149,18 +1367,36 @@ fun NodeEditorDialog(
 
                 if (selectedProto in setOf("vless", "socks5", "http")) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = tlsEnabled, onCheckedChange = { tlsEnabled = it })
+                        Checkbox(
+                            checked = tlsEnabled,
+                            enabled = !isSaving,
+                            onCheckedChange = {
+                                tlsEnabled = it
+                                clearErrors()
+                            },
+                        )
                         Text("启用 TLS 传输加密", style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 if (selectedProto in setOf("vless", "trojan", "anytls", "socks5", "http")) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = skipCertVerify, onCheckedChange = { skipCertVerify = it })
+                        Checkbox(
+                            checked = skipCertVerify,
+                            enabled = !isSaving,
+                            onCheckedChange = {
+                                skipCertVerify = it
+                                clearErrors()
+                            },
+                        )
                         Text("跳过证书校验 (仅测试环境)", style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = autoSelect, onCheckedChange = { autoSelect = it })
+                    Checkbox(
+                        checked = autoSelect,
+                        enabled = !isSaving,
+                        onCheckedChange = { autoSelect = it },
+                    )
                     Text("保存后立即设为当前节点", style = MaterialTheme.typography.bodySmall)
                 }
 
@@ -1178,6 +1414,7 @@ fun NodeEditorDialog(
         },
         confirmButton = {
             Button(
+                enabled = !isSaving,
                 onClick = {
                     val cleanName = name.trim()
                     val cleanHost = server.trim()
@@ -1187,9 +1424,23 @@ fun NodeEditorDialog(
                         validationError = "请填写合法的节点名称、服务器地址与端口 (1-65535)"
                         return@Button
                     }
-                    if (!isEditing && !isAuthOptional && cleanSec.isEmpty()) {
-                        validationError = "新建该协议节点必须填写密码或 VLESS UUID"
+                    if ((!isEditing || protoSwitchedOnEdit) && !isAuthOptional && cleanSec.isEmpty()) {
+                        validationError = if (protoSwitchedOnEdit) {
+                            "切换节点协议后必须重新填写密码或 VLESS UUID"
+                        } else {
+                            "新建该协议节点必须填写密码或 VLESS UUID"
+                        }
                         return@Button
+                    }
+                    val parsedEarlyData = if (supportsWs && transportNet == "ws") {
+                        val rawEarly = maxEarlyDataText.trim().ifEmpty { "0" }.toIntOrNull()
+                        if (rawEarly == null || rawEarly !in 0..65535) {
+                            validationError = "0-RTT Early Data 字节数需为 0 - 65535 之间的整数"
+                            return@Button
+                        }
+                        rawEarly
+                    } else {
+                        0
                     }
                     validationError = null
 
@@ -1208,9 +1459,8 @@ fun NodeEditorDialog(
                                 if (wsHost.trim().isNotEmpty()) {
                                     wsObj.put("headers", JSONObject().put("Host", wsHost.trim()))
                                 }
-                                val early = maxEarlyDataText.trim().toIntOrNull() ?: 0
-                                if (early > 0) {
-                                    wsObj.put("max-early-data", early)
+                                if (parsedEarlyData > 0) {
+                                    wsObj.put("max-early-data", parsedEarlyData)
                                     wsObj.put("early-data-header-name", "Sec-WebSocket-Protocol")
                                 }
                                 put("ws-opts", wsObj)
@@ -1220,7 +1470,7 @@ fun NodeEditorDialog(
                         }
                         when (selectedProto) {
                             "ss" -> {
-                                put("cipher", cipherOrEnc.trim().ifEmpty { "2022-blake3-aes-256-gcm" })
+                                put("cipher", cipherOrEnc.trim().ifEmpty { "aes-256-gcm" })
                                 put("password", cleanSec.ifEmpty { "***REDACTED***" })
                             }
                             "vless" -> {
@@ -1255,7 +1505,7 @@ fun NodeEditorDialog(
                                 }
                                 if (cleanSec.isNotEmpty()) {
                                     put("password", cleanSec)
-                                } else if (isEditing && username.trim().isNotEmpty()) {
+                                } else if (isEditing && !protoSwitchedOnEdit && username.trim().isNotEmpty()) {
                                     put("password", "***REDACTED***")
                                 }
                                 put("tls", tlsEnabled)
@@ -1267,11 +1517,19 @@ fun NodeEditorDialog(
                     onSave(existingNode?.name, json, autoSelect)
                 },
             ) {
-                Text("保存")
+                if (isSaving) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
+                Text(if (isSaving) "保存中…" else "保存")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(enabled = !isSaving, onClick = onDismiss) {
                 Text("取消")
             }
         },
@@ -1304,20 +1562,33 @@ private fun NodeQrInfoDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(node.name) },
+        title = {
+            Text(
+                text = node.name,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
         text = {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+            ) {
                 if (qrBitmap != null) {
                     Image(
                         bitmap = qrBitmap.asImageBitmap(),
                         contentDescription = "节点二维码",
-                        modifier = Modifier.size(210.dp),
+                        modifier = Modifier.size(200.dp),
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                 }
                 Text(
                     text = "${node.protocolDisplay} · ${node.server}:${node.port}",
                     style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(

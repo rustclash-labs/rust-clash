@@ -305,7 +305,7 @@ mod desktop_ipc {
         state
             .engine
             .select_group_and_persist(&group, &proxy)
-            .map_err(|e| e.to_string())
+            .map_err(|e| proxy_core::config::uri::redact_sensitive_text(&e.to_string()))
     }
 
     #[tauri::command]
@@ -320,7 +320,7 @@ mod desktop_ipc {
             .router()
             .test_delay(&name, &target_url, Duration::from_secs(5))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| proxy_core::config::uri::redact_sensitive_text(&e.to_string()))
     }
 
     #[tauri::command]
@@ -344,7 +344,7 @@ mod desktop_ipc {
             .engine
             .reload_yaml(&yaml)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| proxy_core::config::uri::redact_sensitive_text(&e.to_string()))
     }
 
     #[tauri::command]
@@ -355,9 +355,11 @@ mod desktop_ipc {
         let state_dir = state.engine.state_dir();
         if enable {
             let port = state.engine.mixed_addr().port();
-            enable_system_proxy("127.0.0.1", port, &[], &state_dir).map_err(|e| e.to_string())
+            enable_system_proxy("127.0.0.1", port, &[], &state_dir)
+                .map_err(|e| proxy_core::config::uri::redact_sensitive_text(&e.to_string()))
         } else {
-            disable_system_proxy(&state_dir).map_err(|e| e.to_string())
+            disable_system_proxy(&state_dir)
+                .map_err(|e| proxy_core::config::uri::redact_sensitive_text(&e.to_string()))
         }
     }
 
@@ -384,7 +386,8 @@ mod desktop_ipc {
         context: &str,
         err: impl std::fmt::Display,
     ) {
-        let msg = format!("{context}: {err}");
+        let safe_err = proxy_core::config::uri::redact_sensitive_text(&err.to_string());
+        let msg = format!("{context}: {safe_err}");
         tracing::warn!("{msg}");
         engine.hub().push_log("error", msg.clone());
         let _ = app.emit("rust-clash://desktop-error", msg);

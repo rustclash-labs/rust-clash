@@ -53,6 +53,10 @@ tracing-subscriber.workspace = true
 url.workspace = true
 rust-embed = { workspace = true, optional = true }
 socket2.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

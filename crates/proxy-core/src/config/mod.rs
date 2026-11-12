@@ -192,6 +192,100 @@ pub struct SkippedProxyEntry {
     pub reason: String,
 }
 
+pub(crate) fn parse_yaml_value_with_merges(yaml: &str) -> Result<serde_yml::Value> {
+    let trimmed = uri::trim_bom_and_controls(yaml);
+    let cleaned: std::borrow::Cow<'_, str> = if trimmed.contains('\0') {
+        std::borrow::Cow::Owned(trimmed.replace('\0', ""))
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+
+    let mut first_mapping: Option<serde_yml::Value> = None;
+    let mut first_non_null: Option<serde_yml::Value> = None;
+    for doc in serde_yml::Deserializer::from_str(&cleaned) {
+        let val = serde_yml::Value::deserialize(doc).map_err(|e| {
+            ProxyError::Config(format!(
+                "YAML parse error: {}",
+                uri::redact_sensitive_text(&e.to_string())
+            ))
+        })?;
+        if val.is_null() {
+            continue;
+        }
+        if val.is_mapping() {
+            first_mapping = Some(val);
+            break;
+        }
+        if first_non_null.is_none() {
+            first_non_null = Some(val);
+        }
+    }
+
+    let mut root = first_mapping
+        .or(first_non_null)
+        .unwrap_or(serde_yml::Value::Null);
+    let mut budget = 100_000usize;
+    resolve_yaml_merge_keys(&mut root, 0, &mut budget)?;
+    Ok(root)
+}
+
+fn resolve_yaml_merge_keys(
+    val: &mut serde_yml::Value,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<()> {
+    if depth > 64 {
+        return Err(ProxyError::Config(
+            "YAML nesting depth exceeds safety limit (64)".into(),
+        ));
+    }
+    *budget = budget.saturating_sub(1);
+    if *budget == 0 {
+        return Err(ProxyError::Config(
+            "YAML anchor/merge complexity exceeds safety limit".into(),
+        ));
+    }
+
+    match val {
+        serde_yml::Value::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                resolve_yaml_merge_keys(item, depth + 1, budget)?;
+            }
+        }
+        serde_yml::Value::Mapping(map) => {
+            for (_, v) in map.iter_mut() {
+                resolve_yaml_merge_keys(v, depth + 1, budget)?;
+            }
+            let merge_key = serde_yml::Value::String("<<".to_string());
+            if let Some(merge_val) = map.remove(&merge_key) {
+                match merge_val {
+                    serde_yml::Value::Mapping(src_map) => {
+                        for (k, v) in src_map {
+                            if !map.contains_key(&k) {
+                                map.insert(k, v);
+                            }
+                        }
+                    }
+                    serde_yml::Value::Sequence(seq) => {
+                        for elem in seq {
+                            if let serde_yml::Value::Mapping(src_map) = elem {
+                                for (k, v) in src_map {
+                                    if !map.contains_key(&k) {
+                                        map.insert(k, v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl ClashConfig {
     pub fn from_yaml_str(yaml: &str) -> Result<Self> {
         let cfg = Self::from_yaml_str_unchecked(yaml)?;
@@ -200,12 +294,7 @@ impl ClashConfig {
     }
 
     pub fn from_yaml_str_unchecked(yaml: &str) -> Result<Self> {
-        let mut root: serde_yml::Value = serde_yml::from_str(yaml).map_err(|e| {
-            ProxyError::Config(format!(
-                "YAML parse error: {}",
-                uri::redact_sensitive_text(&e.to_string())
-            ))
-        })?;
+        let mut root = parse_yaml_value_with_merges(yaml)?;
         let serde_yml::Value::Mapping(ref mut map) = root else {
             return Err(ProxyError::Config(
                 "YAML configuration root must be a key-value mapping".into(),
@@ -213,7 +302,7 @@ impl ClashConfig {
         };
         normalize_clash_yaml_root_mapping(map, false);
         validate_raw_yaml_proxies(map)?;
-        expand_proxy_groups_yaml(map);
+        expand_proxy_groups_yaml(map, false);
         serde_path_to_error::deserialize(root).map_err(|e| {
             let path = e.path().to_string();
             let detail = uri::redact_sensitive_text(&e.inner().to_string());
@@ -236,12 +325,7 @@ impl ClashConfig {
     ///   unsupported rule types, `:53` / `:9090` listeners) are normalized into valid `ClashConfig` structures.
     /// - If `skipped` is non-empty and `0` valid proxy nodes remain, fails closed with the redacted error!
     pub fn from_yaml_str_sanitized(yaml: &str) -> Result<(Self, Vec<SkippedProxyEntry>)> {
-        let mut root: serde_yml::Value = serde_yml::from_str(yaml).map_err(|e| {
-            ProxyError::Config(format!(
-                "YAML parse error: {}",
-                uri::redact_sensitive_text(&e.to_string())
-            ))
-        })?;
+        let mut root = parse_yaml_value_with_merges(yaml)?;
         let serde_yml::Value::Mapping(ref mut map) = root else {
             return Err(ProxyError::Config(
                 "YAML configuration root must be a key-value mapping".into(),
@@ -276,6 +360,13 @@ impl ClashConfig {
                     }
                 }
             }
+            for kept_item in &kept_seq {
+                if let Some(pmap) = kept_item.as_mapping()
+                    && let Some(kept_name) = yaml_str_field(pmap, "name")
+                {
+                    skipped_names.remove(kept_name.trim());
+                }
+            }
             if !skipped.is_empty() && kept_seq.is_empty() {
                 if skipped.len() == 1 {
                     return Err(first_err.unwrap_or_else(|| {
@@ -305,7 +396,7 @@ impl ClashConfig {
             map.insert(proxies_key, serde_yml::Value::Sequence(kept_seq));
         }
 
-        expand_proxy_groups_yaml(map);
+        expand_proxy_groups_yaml(map, true);
 
         let mut cfg: Self = serde_path_to_error::deserialize(root).map_err(|e| {
             let path = e.path().to_string();
@@ -482,6 +573,16 @@ rules:
             return Err(ProxyError::Config(format!(
                 "invalid bind-address '{}': expected IP address or '*'",
                 self.bind_address
+            )));
+        }
+
+        if self.mixed_port > 0
+            && let Ok(ec_addr) = self.external_controller.trim().parse::<SocketAddr>()
+            && ec_addr.port() == self.mixed_port
+        {
+            return Err(ProxyError::Config(format!(
+                "mixed-port ({}) cannot be the same as external-controller port ({})",
+                self.mixed_port, self.mixed_port
             )));
         }
 
@@ -728,7 +829,12 @@ fn strip_null_entries(map: &mut serde_yml::Mapping) {
 fn coerce_yaml_u64(val: &mut serde_yml::Value) {
     match val {
         serde_yml::Value::String(s) => {
-            if let Ok(n) = s.trim().parse::<u64>() {
+            let trimmed = s.trim();
+            if let Ok(n) = trimmed.parse::<u64>() {
+                *val = serde_yml::Value::Number(n.into());
+            } else if let Some(num_part) = trimmed.strip_suffix('s')
+                && let Ok(n) = num_part.trim().parse::<u64>()
+            {
                 *val = serde_yml::Value::Number(n.into());
             }
         }
@@ -844,10 +950,13 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
         "encryption",
         "servername",
         "sni",
+        "peer",
         "flow",
         "network",
         "transport",
         "username",
+        "security",
+        "ws-path",
     ] {
         if let Some(v) = pmap.get_mut(str_k) {
             coerce_yaml_string(v);
@@ -856,8 +965,17 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
     if let Some(serde_yml::Value::String(u)) = pmap.get_mut("uuid") {
         *u = u.trim().to_string();
     }
+    if let Some(serde_yml::Value::String(srv)) = pmap.get_mut("server") {
+        let clean = srv
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim();
+        *srv = clean.to_string();
+    }
 
     let mut force_tls_default = false;
+    let mut proto_lc = String::new();
     if let Some(serde_yml::Value::String(t)) = pmap.get_mut("type") {
         let low = t.trim().to_ascii_lowercase();
         let mapped = match low.as_str() {
@@ -869,10 +987,73 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
             }
             other => other,
         };
+        proto_lc = mapped.to_string();
         *t = mapped.to_string();
+    }
+    if proto_lc == "vless"
+        && !pmap.contains_key("tls")
+        && yaml_str_field(pmap, "security").is_some_and(|s| s.trim().eq_ignore_ascii_case("tls"))
+    {
+        force_tls_default = true;
     }
     if force_tls_default && !pmap.contains_key("tls") {
         pmap.insert(yaml_key("tls"), serde_yml::Value::Bool(true));
+    }
+
+    // Map legacy `peer` into SNI if neither `sni` nor `servername` is set
+    if let Some(peer_val) = pmap.remove("peer")
+        && !pmap.contains_key("sni")
+        && !pmap.contains_key("servername")
+        && peer_val.as_str().is_some_and(|s| !s.trim().is_empty())
+    {
+        pmap.insert(yaml_key("sni"), peer_val);
+    }
+
+    // Canonicalize alias pairs so serde never fails with `duplicate field` when both exist
+    if pmap.contains_key("network") && pmap.contains_key("transport") {
+        let transport_val = pmap.remove("transport");
+        let net_empty = yaml_str_field(pmap, "network").is_none_or(|s| s.trim().is_empty());
+        if net_empty && let Some(tv) = transport_val {
+            pmap.insert(yaml_key("network"), tv);
+        }
+    }
+    if proto_lc == "vless" {
+        if pmap.contains_key("servername") && pmap.contains_key("sni") {
+            let sni_val = pmap.remove("sni");
+            let srv_empty = yaml_str_field(pmap, "servername").is_none_or(|s| s.trim().is_empty());
+            if srv_empty && let Some(sv) = sni_val {
+                pmap.insert(yaml_key("servername"), sv);
+            }
+        }
+    } else if pmap.contains_key("sni") && pmap.contains_key("servername") {
+        let srv_val = pmap.remove("servername");
+        let sni_empty = yaml_str_field(pmap, "sni").is_none_or(|s| s.trim().is_empty());
+        if sni_empty && let Some(sv) = srv_val {
+            pmap.insert(yaml_key("sni"), sv);
+        }
+    }
+
+    // Map legacy `allow-insecure` / `allowInsecure` / `insecure` -> `skip-cert-verify`
+    for insecure_alias in ["allow-insecure", "allowInsecure", "insecure"] {
+        if let Some(alias_val) = pmap.remove(insecure_alias)
+            && !pmap.contains_key("skip-cert-verify")
+        {
+            pmap.insert(yaml_key("skip-cert-verify"), alias_val);
+        }
+    }
+
+    // Map legacy top-level `ws-path` / `ws-headers` into `ws-opts`
+    let legacy_ws_path = pmap.remove("ws-path");
+    let legacy_ws_headers = pmap.remove("ws-headers");
+    if !pmap.contains_key("ws-opts") && (legacy_ws_path.is_some() || legacy_ws_headers.is_some()) {
+        let mut wmap = serde_yml::Mapping::new();
+        if let Some(p) = legacy_ws_path {
+            wmap.insert(yaml_key("path"), p);
+        }
+        if let Some(h) = legacy_ws_headers {
+            wmap.insert(yaml_key("headers"), h);
+        }
+        pmap.insert(yaml_key("ws-opts"), serde_yml::Value::Mapping(wmap));
     }
 
     for num_k in [
@@ -953,17 +1134,24 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
     }
 }
 
-fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
-    let concrete_names: Vec<String> = map
+fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: bool) {
+    let concrete_nodes: Vec<(String, String)> = map
         .get("proxies")
         .and_then(serde_yml::Value::as_sequence)
         .map(|seq| {
             seq.iter()
                 .filter_map(|v| v.as_mapping())
-                .filter_map(|m| yaml_str_field(m, "name"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned)
+                .filter_map(|m| {
+                    let name = yaml_str_field(m, "name")?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let proto = yaml_str_field(m, "type")
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    Some((name.to_owned(), proto))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -985,17 +1173,48 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
             "strategy",
             "filter",
             "exclude-filter",
+            "exclude-type",
         ] {
             if let Some(v) = gmap.get_mut(str_k) {
                 coerce_yaml_string(v);
             }
         }
+        if lenient_subscription {
+            let valid_gtype = yaml_str_field(gmap, "type").is_some_and(|raw| {
+                let norm: String = raw
+                    .trim()
+                    .chars()
+                    .filter(|c| *c != '-' && *c != '_')
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect();
+                matches!(
+                    norm.as_str(),
+                    "select"
+                        | "selector"
+                        | "relay"
+                        | "urltest"
+                        | "smart"
+                        | "fallback"
+                        | "loadbalance"
+                )
+            });
+            if !valid_gtype {
+                gmap.insert(yaml_key("type"), serde_yml::Value::String("select".into()));
+            }
+        }
         for num_k in ["interval", "tolerance"] {
             if let Some(v) = gmap.get_mut(num_k) {
                 coerce_yaml_u64(v);
+                if lenient_subscription && v.as_u64().is_none() {
+                    gmap.remove(num_k);
+                }
             }
         }
-        for inc_k in ["include-all", "include-all-proxies"] {
+        for inc_k in [
+            "include-all",
+            "include-all-proxies",
+            "include-all-providers",
+        ] {
             if let Some(v) = gmap.get_mut(inc_k) {
                 coerce_yaml_bool(v);
             }
@@ -1007,6 +1226,10 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
             || gmap
                 .get("include-all-proxies")
                 .and_then(serde_yml::Value::as_bool)
+                .unwrap_or(false)
+            || gmap
+                .get("include-all-providers")
+                .and_then(serde_yml::Value::as_bool)
                 .unwrap_or(false);
 
         let filter_re = yaml_str_field(gmap, "filter")
@@ -1017,6 +1240,14 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .and_then(|pat| regex::Regex::new(pat).ok());
+        let exclude_types: HashSet<String> = yaml_str_field(gmap, "exclude-type")
+            .map(|s| {
+                s.split('|')
+                    .map(|p| p.trim().to_ascii_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if let Some(p_val) = gmap.get_mut("proxies") {
             sanitize_yaml_string_seq(p_val);
@@ -1037,7 +1268,23 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
             }
         }
 
-        if include_all {
+        let has_explicit_proxies = gmap
+            .get("proxies")
+            .and_then(serde_yml::Value::as_sequence)
+            .is_some_and(|s| !s.is_empty());
+        let has_use = gmap
+            .get("use")
+            .and_then(serde_yml::Value::as_sequence)
+            .is_some_and(|s| !s.is_empty());
+        let should_expand = include_all
+            || (lenient_subscription
+                && !has_explicit_proxies
+                && (filter_re.is_some()
+                    || exclude_re.is_some()
+                    || !exclude_types.is_empty()
+                    || has_use));
+
+        if should_expand {
             let mut list = match gmap.remove("proxies") {
                 Some(serde_yml::Value::Sequence(seq)) => seq,
                 _ => Vec::new(),
@@ -1047,7 +1294,10 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
                 .filter_map(serde_yml::Value::as_str)
                 .map(ToOwned::to_owned)
                 .collect();
-            for cname in &concrete_names {
+            for (cname, cproto) in &concrete_nodes {
+                if !exclude_types.is_empty() && exclude_types.contains(cproto) {
+                    continue;
+                }
                 if let Some(ref re) = filter_re
                     && !re.is_match(cname)
                 {
@@ -1070,7 +1320,21 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping) {
 fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subscription: bool) {
     strip_null_entries(map);
 
-    for num_k in ["mixed-port", "port"] {
+    // Alias legacy Clash root keys (`Proxy`, `Proxy Group`, `Rule`, `Rule Provider`)
+    for (legacy_key, modern_key) in [
+        ("Proxy", "proxies"),
+        ("Proxy Group", "proxy-groups"),
+        ("Rule", "rules"),
+        ("Rule Provider", "rule-providers"),
+    ] {
+        if let Some(legacy_val) = map.remove(legacy_key)
+            && !map.contains_key(modern_key)
+        {
+            map.insert(yaml_key(modern_key), legacy_val);
+        }
+    }
+
+    for num_k in ["mixed-port", "port", "socks-port"] {
         if let Some(v) = map.get_mut(num_k) {
             coerce_yaml_u64(v);
         }
@@ -1080,10 +1344,16 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         Some(serde_yml::Value::Number(n)) => n.as_u64() == Some(0),
         _ => false,
     };
-    if mixed_missing_or_zero
-        && let Some(p) = map.get("port").and_then(serde_yml::Value::as_u64)
-        && (1..=65535).contains(&p)
-    {
+    let fallback_port = map
+        .get("port")
+        .and_then(serde_yml::Value::as_u64)
+        .filter(|p| (1..=65535).contains(p))
+        .or_else(|| {
+            map.get("socks-port")
+                .and_then(serde_yml::Value::as_u64)
+                .filter(|p| (1..=65535).contains(p))
+        });
+    if mixed_missing_or_zero && let Some(p) = fallback_port {
         map.insert(yaml_key("mixed-port"), serde_yml::Value::Number(p.into()));
     } else if lenient_subscription
         && let Some(mp) = map.get("mixed-port")
@@ -1101,16 +1371,36 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         }
     }
 
-    for str_k in ["bind-address", "log-level", "secret", "mmdb-path"] {
+    for str_k in ["bind-address", "log-level", "secret", "mmdb-path", "mode"] {
         if let Some(v) = map.get_mut(str_k) {
             coerce_yaml_string(v);
         }
     }
-
-    if let Some(serde_yml::Value::String(b)) = map.get_mut("bind-address")
-        && b.trim().is_empty()
+    if lenient_subscription
+        && let Some(mval) = map.get("mode")
+        && mval.as_str().is_none_or(|s| {
+            !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "" | "rule" | "script" | "global" | "direct"
+            )
+        })
     {
-        *b = "*".to_string();
+        map.insert(yaml_key("mode"), serde_yml::Value::String("rule".into()));
+    }
+
+    if let Some(serde_yml::Value::String(b)) = map.get_mut("bind-address") {
+        let bt = b.trim();
+        if bt.is_empty() {
+            *b = "*".to_string();
+        } else if bt == "[::]" {
+            *b = "::".to_string();
+        } else if bt.eq_ignore_ascii_case("localhost")
+            || (lenient_subscription && bt != "*" && bt.parse::<IpAddr>().is_err())
+        {
+            *b = "127.0.0.1".to_string();
+        }
+    } else if lenient_subscription && map.contains_key("bind-address") {
+        map.remove("bind-address");
     }
     match map.get_mut("external-controller") {
         Some(serde_yml::Value::Bool(false)) => {
@@ -1129,7 +1419,12 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
             }
         }
         Some(serde_yml::Value::String(ec)) => {
-            *ec = normalize_go_host_port(ec, "127.0.0.1:9090");
+            let normalized = normalize_go_host_port(ec, "127.0.0.1:9090");
+            if lenient_subscription && normalized.parse::<SocketAddr>().is_err() {
+                *ec = "127.0.0.1:9090".to_string();
+            } else {
+                *ec = normalized;
+            }
         }
         Some(_) if lenient_subscription => {
             map.remove("external-controller");
@@ -1214,27 +1509,32 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                 }
             }
         }
-        if let Some(fir_val) = dmap.get_mut("fake-ip-range") {
-            if let serde_yml::Value::Sequence(seq) = fir_val {
-                let first = seq
-                    .iter()
-                    .find_map(serde_yml::Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToOwned::to_owned);
-                if let Some(first_cidr) = first {
-                    *fir_val = serde_yml::Value::String(first_cidr);
-                } else {
-                    dmap.remove("fake-ip-range");
-                }
-            } else if let serde_yml::Value::String(s) = fir_val {
-                let trimmed = s.trim();
-                if trimmed.is_empty()
-                    || (lenient_subscription && trimmed.parse::<Ipv4Net>().is_err())
-                {
-                    *s = default_fake_ip_range();
-                }
+        if let Some(serde_yml::Value::Sequence(seq)) = dmap.get("fake-ip-range").cloned() {
+            let preferred_v4 = seq
+                .iter()
+                .filter_map(serde_yml::Value::as_str)
+                .map(str::trim)
+                .find(|s| s.parse::<Ipv4Net>().is_ok())
+                .map(ToOwned::to_owned);
+            let first_any = seq
+                .iter()
+                .filter_map(serde_yml::Value::as_str)
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(chosen) = preferred_v4.or(first_any) {
+                dmap.insert(yaml_key("fake-ip-range"), serde_yml::Value::String(chosen));
+            } else {
+                dmap.remove("fake-ip-range");
             }
+        }
+        if let Some(serde_yml::Value::String(s)) = dmap.get_mut("fake-ip-range") {
+            let trimmed = s.trim();
+            if trimmed.is_empty() || (lenient_subscription && trimmed.parse::<Ipv4Net>().is_err()) {
+                *s = default_fake_ip_range();
+            }
+        } else if lenient_subscription && dmap.contains_key("fake-ip-range") {
+            dmap.remove("fake-ip-range");
         }
         for seq_k in [
             "fake-ip-filter",
@@ -1417,6 +1717,55 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
     }
 }
 
+fn break_subscription_group_cycles(groups: &mut [ProxyGroupConfig], remaining_concrete: &[String]) {
+    let idx_by_name: HashMap<String, usize> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.name.clone(), i))
+        .collect();
+    let mut color: Vec<u8> = vec![0; groups.len()];
+
+    fn dfs_prune(
+        u: usize,
+        groups: &mut [ProxyGroupConfig],
+        idx_by_name: &HashMap<String, usize>,
+        color: &mut [u8],
+    ) {
+        color[u] = 1;
+        let mut i = 0usize;
+        while i < groups[u].proxies.len() {
+            let member = groups[u].proxies[i].clone();
+            if let Some(&v) = idx_by_name.get(&member) {
+                if color[v] == 1 {
+                    // Back-edge creating a cycle: prune this edge
+                    groups[u].proxies.remove(i);
+                    continue;
+                } else if color[v] == 0 {
+                    dfs_prune(v, groups, idx_by_name, color);
+                }
+            }
+            i += 1;
+        }
+        color[u] = 2;
+    }
+
+    for start in 0..groups.len() {
+        if color[start] == 0 {
+            dfs_prune(start, groups, &idx_by_name, &mut color);
+        }
+    }
+
+    for g in groups.iter_mut() {
+        if g.proxies.is_empty() {
+            if !remaining_concrete.is_empty() {
+                g.proxies = remaining_concrete.to_vec();
+            } else {
+                g.proxies.push("DIRECT".to_string());
+            }
+        }
+    }
+}
+
 fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: &HashSet<String>) {
     if !(576..=65535).contains(&cfg.tun.mtu) {
         cfg.tun.mtu = 1500;
@@ -1427,6 +1776,16 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
         .is_some_and(|p| !Path::new(p).is_file())
     {
         cfg.mmdb_path = None;
+    }
+    if let Ok(ec_sa) = cfg.external_controller.trim().parse::<SocketAddr>()
+        && cfg.mixed_port > 0
+        && ec_sa.port() == cfg.mixed_port
+    {
+        cfg.external_controller = if cfg.mixed_port == 9090 {
+            "127.0.0.1:9091".to_string()
+        } else {
+            "127.0.0.1:9090".to_string()
+        };
     }
 
     // 0. Uniquify duplicate or reserved node names in `proxies` and deduplicate colliding `proxy-groups`
@@ -1502,18 +1861,36 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
         true
     });
 
-    // 1. Prune unsupported rule-provider types/behaviors/formats (e.g. binary `mrs`)
+    // 1. Prune unsupported or broken rule-provider types/behaviors/formats (e.g. binary `mrs`, missing local `file`)
     cfg.rule_providers.retain(|pname, pcfg| {
-        !pname.trim().is_empty()
-            && matches!(
-                pcfg.provider_type.trim().to_ascii_lowercase().as_str(),
-                "inline" | "file" | "http"
-            )
-            && matches!(
-                pcfg.behavior.trim().to_ascii_lowercase().as_str(),
-                "domain" | "ipcidr" | "classical"
-            )
-            && !pcfg.format.trim().eq_ignore_ascii_case("mrs")
+        if pname.trim().is_empty() {
+            return false;
+        }
+        let pt = pcfg.provider_type.trim().to_ascii_lowercase();
+        let beh = pcfg.behavior.trim().to_ascii_lowercase();
+        let fmt = pcfg.format.trim().to_ascii_lowercase();
+        if !matches!(pt.as_str(), "inline" | "file" | "http")
+            || !matches!(beh.as_str(), "domain" | "ipcidr" | "classical")
+            || fmt == "mrs"
+        {
+            return false;
+        }
+        match pt.as_str() {
+            "file" => pcfg.path.as_deref().is_some_and(|p| Path::new(p).is_file()),
+            "http" => {
+                let valid_url = pcfg.url.as_deref().is_some_and(|u| {
+                    let ul = u.trim().to_ascii_lowercase();
+                    (ul.starts_with("https://") || ul.starts_with("http://"))
+                        && url::Url::parse(u.trim()).is_ok()
+                });
+                valid_url || !pcfg.payload.is_empty()
+            }
+            "inline" => {
+                crate::router::ruleset::RuleSetMatcher::compile(pname, &beh, &pcfg.payload, None)
+                    .is_ok()
+            }
+            _ => false,
+        }
     });
 
     let remaining_concrete: Vec<String> =
@@ -1522,10 +1899,12 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
         cfg.proxy_groups.iter().map(|g| g.name.clone()).collect();
     let known_concrete_set: HashSet<String> = remaining_concrete.iter().cloned().collect();
 
-    // 2. Prune skipped or dangling proxy-provider references from proxy-groups and heal empty groups
+    // 2. Prune skipped or dangling proxy-provider references from proxy-groups and heal empty/cyclic groups
     for g in &mut cfg.proxy_groups {
+        let self_name = g.name.clone();
         g.proxies.retain(|m| {
-            !skipped_names.contains(m)
+            m != &self_name
+                && !skipped_names.contains(m)
                 && (m == "DIRECT"
                     || m == "REJECT"
                     || known_concrete_set.contains(m)
@@ -1539,6 +1918,7 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
             }
         }
     }
+    break_subscription_group_cycles(&mut cfg.proxy_groups, &remaining_concrete);
 
     let fallback_target = cfg
         .proxy_groups

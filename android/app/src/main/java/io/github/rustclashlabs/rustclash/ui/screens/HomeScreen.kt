@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.MoreVert
@@ -62,16 +63,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
+import io.github.rustclashlabs.rustclash.ui.theme.LatencyPill
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.TrafficWaveformGraph
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
@@ -86,6 +85,7 @@ fun HomeScreen(
     onNavigateToNodes: () -> Unit,
     onNavigateToRules: (initialTab: Int) -> Unit,
     onTestActiveLatency: () -> Unit,
+    onDismissError: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var showRoutingSheet by remember { mutableStateOf(false) }
@@ -185,7 +185,12 @@ fun HomeScreen(
                 color = if (isHardError) extColors.dangerContainer else extColors.amberContainer,
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(
+                        start = 14.dp,
+                        top = 10.dp,
+                        bottom = 10.dp,
+                        end = if (isHardError) 8.dp else 14.dp,
+                    ),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
@@ -201,6 +206,23 @@ fun HomeScreen(
                         color = if (isHardError) extColors.onDangerContainer else extColors.onAmberContainer,
                         modifier = Modifier.weight(1f),
                     )
+                    if (isHardError) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .clickable(onClick = onDismissError),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Clear,
+                                contentDescription = "关闭错误提示",
+                                tint = extColors.onDangerContainer.copy(alpha = 0.85f),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -271,19 +293,21 @@ fun HomeScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 22.dp, end = 22.dp, top = 16.dp, bottom = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                        .padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     SpeedColumnItem(
                         arrow = "↓",
                         label = "下载",
                         rateText = UiJsonParsers.formatRate(if (isConnected) state.telemetry.downRate else 0L),
+                        modifier = Modifier.weight(1f),
                     )
                     SpeedColumnItem(
                         arrow = "↑",
                         label = "上传",
                         rateText = UiJsonParsers.formatRate(if (isConnected) state.telemetry.upRate else 0L),
+                        modifier = Modifier.weight(1f),
                     )
                 }
 
@@ -349,6 +373,9 @@ fun HomeScreen(
                 // Row 2: 当前节点
                 val delayMs = state.effectiveNodeDelayMs
                 val isProbing = state.isTestingAllDelays || state.testingNodeName == state.effectiveOutbound
+                val canTestActiveNode = !(state.nodes.isEmpty() && !state.demoMode) &&
+                    state.effectiveOutbound != "DIRECT" &&
+                    state.effectiveOutbound != "REJECT"
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -379,25 +406,8 @@ fun HomeScreen(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         } else {
-                            val latencyColor = when {
-                                delayMs == null || delayMs <= 0L -> MaterialTheme.colorScheme.onSurfaceVariant
-                                delayMs <= 180L -> extColors.emerald
-                                delayMs <= 420L -> extColors.amber
-                                else -> extColors.danger
-                            }
-                            val annotated = buildAnnotatedString {
-                                append("${state.effectiveOutbound} · ${state.effectiveProtocolDisplay}")
-                                if (delayMs != null && delayMs > 0L) {
-                                    append(" · ")
-                                    withStyle(SpanStyle(color = latencyColor, fontWeight = FontWeight.SemiBold)) {
-                                        append("$delayMs ms")
-                                    }
-                                } else if (!isProbing && state.effectiveOutbound != "DIRECT") {
-                                    append(" · 点击测速")
-                                }
-                            }
                             Text(
-                                text = annotated,
+                                text = "${state.effectiveOutbound} · ${state.effectiveProtocolDisplay}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -406,7 +416,16 @@ fun HomeScreen(
                         }
                     }
 
-                    if (isProbing) {
+                    if (canTestActiveNode) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        LatencyPill(
+                            delayMs = delayMs,
+                            isProbing = isProbing,
+                            isSelected = true,
+                            onClick = onTestActiveLatency,
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                    } else if (isProbing) {
                         CircularProgressIndicator(
                             modifier = Modifier
                                 .padding(end = 6.dp)
@@ -686,12 +705,15 @@ private fun SpeedColumnItem(
     arrow: String,
     label: String,
     rateText: String,
+    modifier: Modifier = Modifier,
 ) {
-    Column {
+    Column(modifier = modifier) {
         Text(
             text = "$arrow $label",
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
@@ -700,6 +722,7 @@ private fun SpeedColumnItem(
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }

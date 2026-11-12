@@ -652,4 +652,52 @@ class VpnConfigAndLifecycleTest {
         assertEquals("导入失败：$cleaned", withErr.modalError)
         assertNull(withErr.copy(modalError = null).modalError)
     }
+
+    @Test
+    fun vpnStateTrackerUnderlyingLostTransitionsRunningToReconnectingAndRecoversCleanly() {
+        val tracker = VpnStateTracker()
+        // Losing underlying network when DISCONNECTED is a no-op
+        tracker.onUnderlyingLost()
+        assertEquals(VpnLifecycleState.DISCONNECTED, tracker.state)
+
+        tracker.onStartRequested()
+        tracker.onRunning()
+        assertEquals(VpnLifecycleState.RUNNING, tracker.state)
+
+        tracker.onUnderlyingLost()
+        assertEquals(VpnLifecycleState.RECONNECTING, tracker.state)
+
+        tracker.onNetworkHandoff()
+        assertEquals(VpnLifecycleState.RUNNING, tracker.state)
+
+        tracker.onError("VPN 连接授权已被取消")
+        assertEquals(VpnLifecycleState.ERROR, tracker.state)
+        assertEquals("VPN 连接授权已被取消", tracker.lastError)
+
+        tracker.clearError()
+        assertEquals(VpnLifecycleState.DISCONNECTED, tracker.state)
+        assertNull(tracker.lastError)
+    }
+
+    @Test
+    fun expandedSecretRedactionScrubsVmessHysteria2TuicWireguardStandaloneUuidsAndTokens() {
+        val raw =
+            "Rejected nodes: vmess://eyJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsImlkIjoiYTFiMmMzZDQtZTVmNi00Nzg5LWFiY2QtZWYwMTIzNDU2Nzg5In0= " +
+                "and hy2://HY2_SUPER_PASS_999@hy2.example.com:443?sni=hy2.example.com#HY2 " +
+                "and tuic://12345678-1234-4321-abcd-9876543210ff:TUIC_PASS_777@tuic.example.com:443#TUIC " +
+                "and wg://WG_PRIV_KEY_555@wg.example.com:51820 " +
+                "with standalone uuid f47ac10b-58cc-4372-a567-0e02b2c3d479 and access_token=PANEL_TOKEN_333"
+        val scrubbed = NodeImportSupport.redactSecretsForUi(raw)
+        assertFalse(scrubbed.contains("eyJhZGQiOi"))
+        assertFalse(scrubbed.contains("HY2_SUPER_PASS_999"))
+        assertFalse(scrubbed.contains("TUIC_PASS_777"))
+        assertFalse(scrubbed.contains("WG_PRIV_KEY_555"))
+        assertFalse(scrubbed.contains("f47ac10b-58cc-4372-a567-0e02b2c3d479"))
+        assertFalse(scrubbed.contains("PANEL_TOKEN_333"))
+        assertTrue(scrubbed.contains("vmess://***REDACTED***"))
+        assertTrue(scrubbed.contains("hy2://***REDACTED***"))
+        assertTrue(scrubbed.contains("tuic://***REDACTED***"))
+        assertTrue(scrubbed.contains("wg://***REDACTED***"))
+        assertTrue(scrubbed.contains("access_token=***REDACTED***"))
+    }
 }

@@ -554,24 +554,29 @@ fun ModalInlineErrorBanner(
                     .size(18.dp),
             )
             Spacer(modifier = Modifier.width(8.dp))
-            SelectionContainer(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = message,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
-                    color = extColors.onDangerContainer,
-                )
+            Box(modifier = Modifier.weight(1f)) {
+                SelectionContainer {
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        color = extColors.onDangerContainer,
+                    )
+                }
             }
             if (onDismiss != null) {
                 Spacer(modifier = Modifier.width(4.dp))
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.size(26.dp),
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Clear,
                         contentDescription = "关闭错误提示",
-                        tint = extColors.onDangerContainer.copy(alpha = 0.8f),
+                        tint = extColors.onDangerContainer.copy(alpha = 0.85f),
                         modifier = Modifier.size(16.dp),
                     )
                 }

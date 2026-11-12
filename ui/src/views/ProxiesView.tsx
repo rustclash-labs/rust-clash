@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { androidBridge, clashApi, readClipboardText } from "../api";
 import type {
   ConfigSnapshot,
@@ -12,6 +12,7 @@ import {
   nodeProtocolBadge,
   protocolBadgeVariant,
 } from "../utils/format";
+import { renderInlineCode } from "../utils/inlineCode";
 
 interface ProxiesViewProps {
   config: ConfigSnapshot | null;
@@ -25,12 +26,12 @@ const REDACTED_SECRET = "***REDACTED***";
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
 const SS_CIPHERS = [
-  "2022-blake3-aes-256-gcm",
-  "2022-blake3-aes-128-gcm",
-  "2022-blake3-chacha20-poly1305",
   "aes-256-gcm",
   "aes-128-gcm",
   "chacha20-ietf-poly1305",
+  "2022-blake3-aes-256-gcm",
+  "2022-blake3-aes-128-gcm",
+  "2022-blake3-chacha20-poly1305",
 ];
 
 type ModalMode = "paste" | "manual";
@@ -43,6 +44,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   openAddModalSignal = 0,
 }) => {
   const [testingMap, setTestingMap] = useState<Record<string, boolean>>({});
+  const [probingAll, setProbingAll] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [okBanner, setOkBanner] = useState<string | null>(null);
@@ -57,7 +59,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [editingOriginalName, setEditingOriginalName] = useState<string | null>(
     null,
   );
+  const [editingOriginalProto, setEditingOriginalProto] =
+    useState<NodeProto | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
+  const modalErrorRef = useRef<HTMLDivElement | null>(null);
 
   // Paste tab state
   const [pasteInput, setPasteInput] = useState("");
@@ -73,7 +78,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [autoSelectManual, setAutoSelectManual] = useState(true);
 
   // SS fields
-  const [ssCipher, setSsCipher] = useState("2022-blake3-aes-256-gcm");
+  const [ssCipher, setSsCipher] = useState("aes-256-gcm");
   const [ssPassword, setSsPassword] = useState("");
 
   // VLESS fields
@@ -111,6 +116,34 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [proxyTls, setProxyTls] = useState(false);
   const [proxySni, setProxySni] = useState("");
   const [proxySkipVerify, setProxySkipVerify] = useState(false);
+
+  const modalInflight =
+    busyAction === "import" || busyAction === "save-node";
+
+  const requestCloseModal = useCallback(() => {
+    if (busyAction === "import" || busyAction === "save-node") return;
+    setModalError(null);
+    setModalOpen(false);
+  }, [busyAction]);
+
+  useEffect(() => {
+    if (!modalOpen || !modalError) return;
+    modalErrorRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+  }, [modalOpen, modalError]);
+
+  useEffect(() => {
+    if (!modalOpen) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        requestCloseModal();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [modalOpen, requestCloseModal]);
 
   const loadActiveNodes = useCallback(async () => {
     try {
@@ -163,13 +196,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
   const resetManualForm = () => {
     setEditingOriginalName(null);
+    setEditingOriginalProto(null);
     setProto("ss");
     setNodeName("");
     setServerHost("");
     setServerPort("443");
     setUdpEnabled(true);
     setAutoSelectManual(true);
-    setSsCipher("2022-blake3-aes-256-gcm");
+    setSsCipher("aes-256-gcm");
     setSsPassword("");
     setVlessUuid("");
     setVlessEncryption("none");
@@ -210,6 +244,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     resetManualForm();
     setModalError(null);
     setEditingOriginalName(node.name);
+    setEditingOriginalProto(node.type);
     setModalMode("manual");
     setProto(node.type);
     setNodeName(node.name);
@@ -361,7 +396,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     } else {
       openCreateModal("paste");
       setModalError(
-        "Clipboard access requires browser permission — press Ctrl+V / Cmd+V (or long-press Paste) below to import immediately.",
+        "Clipboard is empty or requires browser permission — press Ctrl+V / Cmd+V (or long-press Paste) below to import immediately.",
       );
     }
   };
@@ -375,7 +410,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       );
     } else {
       setModalError(
-        "Could not read clipboard directly; please paste into the text box.",
+        "Clipboard is empty or blocked by browser permissions — please paste directly into the text box.",
       );
     }
   };
@@ -388,13 +423,27 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     if (wsHost.trim()) {
       headers.Host = wsHost.trim();
     }
-    const earlyNum = Number.parseInt(wsMaxEarlyData.trim(), 10);
+    const trimmedEarly = wsMaxEarlyData.trim();
+    let earlyNum = 0;
+    if (trimmedEarly.length > 0) {
+      if (!/^\d+$/.test(trimmedEarly)) {
+        throw new Error(
+          "WebSocket 0-RTT max-early-data must be an integer between 0 and 65535.",
+        );
+      }
+      earlyNum = Number.parseInt(trimmedEarly, 10);
+      if (!Number.isFinite(earlyNum) || earlyNum < 0 || earlyNum > 65535) {
+        throw new Error(
+          "WebSocket 0-RTT max-early-data must be between 0 and 65535.",
+        );
+      }
+    }
     return {
       network: "ws",
       wsOpts: {
         path: wsPath.trim() || "/",
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
-        ...(Number.isFinite(earlyNum) && earlyNum > 0
+        ...(earlyNum > 0
           ? {
               "max-early-data": earlyNum,
               "early-data-header-name": "Sec-WebSocket-Protocol",
@@ -418,11 +467,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       throw new Error("Port must be between 1 and 65535.");
     }
     const isEditing = Boolean(editingOriginalName);
+    const sameProtoAsExisting =
+      isEditing && editingOriginalProto === proto;
 
     if (proto === "ss") {
       const pass = ssPassword.trim();
-      if (!isEditing && !pass) {
-        throw new Error("Shadowsocks password / PSK is required.");
+      if (!sameProtoAsExisting && !pass) {
+        throw new Error(
+          isEditing
+            ? "Switching node protocol to Shadowsocks requires entering a new password / PSK."
+            : "Shadowsocks password / PSK is required.",
+        );
       }
       return {
         type: "ss",
@@ -437,12 +492,16 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
     if (proto === "vless") {
       const rawUuid = vlessUuid.trim();
-      if (!isEditing && !rawUuid) {
-        throw new Error("VLESS UUID is required.");
+      if (!sameProtoAsExisting && !rawUuid) {
+        throw new Error(
+          isEditing
+            ? "Switching node protocol to VLESS requires entering a valid UUID."
+            : "VLESS UUID is required.",
+        );
       }
       const encTrimmed = vlessEncryption.trim();
       const effectiveEnc =
-        isEditing && !encTrimmed && vlessHadRedactedEnc
+        sameProtoAsExisting && !encTrimmed && vlessHadRedactedEnc
           ? REDACTED_SECRET
           : encTrimmed || "none";
       const alpnList = vlessAlpn
@@ -469,8 +528,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
     if (proto === "trojan") {
       const pass = trojanPassword.trim();
-      if (!isEditing && !pass) {
-        throw new Error("Trojan password is required.");
+      if (!sameProtoAsExisting && !pass) {
+        throw new Error(
+          isEditing
+            ? "Switching node protocol to Trojan requires entering a Trojan password."
+            : "Trojan password is required.",
+        );
       }
       const alpnList = trojanAlpn
         .split(",")
@@ -497,7 +560,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       const passTrimmed = authPassword.trim();
       const resolvedPass = passTrimmed
         ? passTrimmed
-        : isEditing && authHadSavedPassword
+        : sameProtoAsExisting && authHadSavedPassword
           ? REDACTED_SECRET
           : null;
       return {
@@ -518,7 +581,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       const passTrimmed = authPassword.trim();
       const resolvedPass = passTrimmed
         ? passTrimmed
-        : isEditing && authHadSavedPassword
+        : sameProtoAsExisting && authHadSavedPassword
           ? REDACTED_SECRET
           : null;
       return {
@@ -535,8 +598,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     }
 
     const pass = anytlsPassword.trim();
-    if (!isEditing && !pass) {
-      throw new Error("AnyTLS password is required.");
+    if (!sameProtoAsExisting && !pass) {
+      throw new Error(
+        isEditing
+          ? "Switching node protocol to AnyTLS requires entering an AnyTLS password."
+          : "AnyTLS password is required.",
+      );
     }
     const alpnList = anytlsAlpn
       .split(",")
@@ -699,8 +766,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   };
 
   const handleProbeAllGroups = async () => {
-    for (const grp of groups) {
-      await handleProbeGroup(grp);
+    if (probingAll) return;
+    setProbingAll(true);
+    try {
+      for (const grp of groups) {
+        await handleProbeGroup(grp);
+      }
+    } finally {
+      setProbingAll(false);
     }
   };
 
@@ -864,7 +937,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             {effectiveChains.length > 1 && (
               <div
                 className="mono"
-                style={{ fontSize: 11.5, color: "var(--text-muted)" }}
+                style={{
+                  fontSize: 11.5,
+                  color: "var(--text-muted)",
+                  overflowWrap: "anywhere",
+                }}
               >
                 Chain: {[...effectiveChains].reverse().join(" → ")}
               </div>
@@ -909,15 +986,151 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               {busyAction === "dedup" ? "Deduplicating..." : "Deduplicate"}
             </button>
             <button
+              id="proxies-probe-all-btn"
               type="button"
               className="btn"
+              disabled={concreteProxyNames.length === 0 || probingAll}
               onClick={() => void handleProbeAllGroups()}
             >
-              Probe All
+              {probingAll ? "Probing..." : "Probe All"}
             </button>
           </div>
         </div>
       </section>
+
+      {errorBanner && (
+        <div id="proxies-error-banner" className="banner banner-err">
+          <span>{renderInlineCode(errorBanner)}</span>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setErrorBanner(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {okBanner && (
+        <div id="proxies-ok-banner" className="banner banner-ok">
+          <span>{renderInlineCode(okBanner)}</span>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setOkBanner(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {isDirectWarning && activeNodes[0] && (
+        <div className="banner banner-warn">
+          <span>
+            <strong>Notice:</strong> Current effective outbound is{" "}
+            <strong>DIRECT</strong> while {activeNodes.length} proxy node(s) are
+            available. Select a node below to route traffic through your proxy.
+          </span>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            onClick={() =>
+              void handleSelectConcreteNodeQuick(activeNodes[0].name)
+            }
+          >
+            Use {activeNodes[0].name}
+          </button>
+        </div>
+      )}
+
+      {/* Inline Quick Import Card when Blank / Zero Saved Nodes */}
+      {activeNodes.length === 0 && !config?.demo.enabled && (
+        <section className="onboarding-card" style={{ alignItems: "stretch" }}>
+          <div style={{ width: "100%", minWidth: 0 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+                marginBottom: 8,
+              }}
+            >
+              <div>
+                <div style={{ fontSize: 14.5, fontWeight: 700 }}>
+                  Quick Node Import — Paste &amp; Connect Immediately
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                  Paste single or multiple{" "}
+                  <code className="mono">ss://</code>,{" "}
+                  <code className="mono">vless://</code>,{" "}
+                  <code className="mono">trojan://</code>,{" "}
+                  <code className="mono">anytls://</code>,{" "}
+                  <code className="mono">socks5://</code>, or{" "}
+                  <code className="mono">http-proxy://</code> links, a Base64
+                  subscription, Clash YAML, or an{" "}
+                  <code className="mono">https://</code> subscription URL.
+                  Saved automatically across restarts.
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => openCreateModal("manual")}
+              >
+                Manual Node Form
+              </button>
+            </div>
+
+            <textarea
+              id="quick-paste-uris-input"
+              className="code-editor"
+              rows={3}
+              placeholder={"ss://2022-blake3-aes-256-gcm:...@example.com:8388#HK-Node\nvless://uuid@example.com:443?type=ws&path=%2Fws&security=tls&sni=example.com#JP-WS\ntrojan://password@example.com:443?sni=example.com#SG-Trojan"}
+              value={quickPasteText}
+              onChange={(ev) => {
+                if (errorBanner) setErrorBanner(null);
+                setQuickPasteText(ev.target.value);
+              }}
+            />
+
+            <div
+              style={{
+                marginTop: 10,
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                id="quick-import-submit-btn"
+                type="button"
+                className="btn btn-primary"
+                disabled={busyAction === "import"}
+                onClick={() =>
+                  void executeImportText(quickPasteText, {
+                    deduplicate: true,
+                    autoSelect: true,
+                  })
+                }
+              >
+                {busyAction === "import"
+                  ? "Importing..."
+                  : "Save & Select Node"}
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busyAction === "import"}
+                onClick={() => void handlePasteFromClipboardAndImport()}
+              >
+                Paste from Clipboard
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* Deep Per-Stage Timing Waterfall & AI / Dev Endpoint Readiness Matrix */}
       <section className="card">
@@ -927,9 +1140,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               Deep Timing Waterfall &amp; AI / Dev Endpoint Readiness Matrix
             </h2>
             <div className="card-subtitle">
-              Decompose TCP latency into `DNS → Tunnel → TLS → HTTP TTFB`
-              (isolated from parallel UDP checks), and distinguish HTTP `401`
-              auth-required, `429` rate-limits, and `403` Geo/WAF blocks
+              Decompose TCP latency into{" "}
+              <code className="mono">DNS → Tunnel → TLS → HTTP TTFB</code>{" "}
+              (isolated from parallel UDP checks), and distinguish HTTP{" "}
+              <code className="mono">401</code> auth-required,{" "}
+              <code className="mono">429</code> rate-limits, and{" "}
+              <code className="mono">403</code> Geo/WAF blocks
             </div>
           </div>
           {waterfallRes?.udp_probe && (
@@ -957,12 +1173,19 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             display: "flex",
             gap: 8,
             flexWrap: "wrap",
+            minWidth: 0,
             marginBottom: deepProbeErr || waterfallRes || matrixRes ? 12 : 0,
           }}
         >
           <select
             id="waterfall-proxy-select"
             className="select"
+            style={{
+              flex: "1 1 180px",
+              width: 0,
+              minWidth: 150,
+              maxWidth: "100%",
+            }}
             value={effectiveProbeProxy}
             onChange={(ev) => setSelectedProbeTarget(ev.target.value)}
           >
@@ -1317,137 +1540,6 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         )}
       </section>
 
-      {errorBanner && (
-        <div className="banner banner-err">
-          <span>{errorBanner}</span>
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={() => setErrorBanner(null)}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {okBanner && (
-        <div className="banner banner-ok">
-          <span>{okBanner}</span>
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={() => setOkBanner(null)}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {isDirectWarning && activeNodes[0] && (
-        <div className="banner banner-warn">
-          <span>
-            <strong>Notice:</strong> Current effective outbound is{" "}
-            <strong>DIRECT</strong> while {activeNodes.length} proxy node(s) are
-            available. Select a node below to route traffic through your proxy.
-          </span>
-          <button
-            type="button"
-            className="btn btn-primary btn-sm"
-            onClick={() =>
-              void handleSelectConcreteNodeQuick(activeNodes[0].name)
-            }
-          >
-            Use {activeNodes[0].name}
-          </button>
-        </div>
-      )}
-
-      {/* Inline Quick Import Card when Blank / Zero Saved Nodes */}
-      {activeNodes.length === 0 && !config?.demo.enabled && (
-        <section className="onboarding-card" style={{ alignItems: "stretch" }}>
-          <div style={{ width: "100%" }}>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 10,
-                flexWrap: "wrap",
-                marginBottom: 8,
-              }}
-            >
-              <div>
-                <div style={{ fontSize: 14.5, fontWeight: 700 }}>
-                  Quick Node Import — Paste &amp; Connect Immediately
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                  Paste single or multiple{" "}
-                  <code className="mono">ss://</code>,{" "}
-                  <code className="mono">vless://</code>,{" "}
-                  <code className="mono">trojan://</code>,{" "}
-                  <code className="mono">anytls://</code>,{" "}
-                  <code className="mono">socks5://</code>, or{" "}
-                  <code className="mono">http-proxy://</code> links, a Base64
-                  subscription, Clash YAML, or an{" "}
-                  <code className="mono">https://</code> subscription URL.
-                  Saved automatically across restarts.
-                </div>
-              </div>
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => openCreateModal("manual")}
-              >
-                Manual Node Form
-              </button>
-            </div>
-
-            <textarea
-              id="quick-paste-uris-input"
-              className="code-editor"
-              rows={3}
-              placeholder={"ss://2022-blake3-aes-256-gcm:...@example.com:8388#HK-Node\nvless://uuid@example.com:443?type=ws&path=%2Fws&security=tls&sni=example.com#JP-WS\ntrojan://password@example.com:443?sni=example.com#SG-Trojan"}
-              value={quickPasteText}
-              onChange={(ev) => setQuickPasteText(ev.target.value)}
-            />
-
-            <div
-              style={{
-                marginTop: 10,
-                display: "flex",
-                gap: 8,
-                flexWrap: "wrap",
-              }}
-            >
-              <button
-                id="quick-import-submit-btn"
-                type="button"
-                className="btn btn-primary"
-                disabled={busyAction === "import"}
-                onClick={() =>
-                  void executeImportText(quickPasteText, {
-                    deduplicate: true,
-                    autoSelect: true,
-                  })
-                }
-              >
-                {busyAction === "import"
-                  ? "Importing..."
-                  : "Save & Select Node"}
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={busyAction === "import"}
-                onClick={() => void handlePasteFromClipboardAndImport()}
-              >
-                Paste from Clipboard
-              </button>
-            </div>
-          </div>
-        </section>
-      )}
-
       {/* Saved Proxy Nodes Management Card */}
       {activeNodes.length > 0 && !config?.demo.enabled && (
         <section className="card">
@@ -1461,7 +1553,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 10,
+                gap: 8,
                 flexWrap: "wrap",
               }}
             >
@@ -1522,7 +1614,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     }}
                   >
                     <div className="node-tile-top">
-                      <div>
+                      <div style={{ minWidth: 0 }}>
                         <div className="node-name">{node.name}</div>
                         <div
                           className="mono"
@@ -1530,6 +1622,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                             fontSize: 11,
                             color: "var(--text-muted)",
                             marginTop: 2,
+                            overflowWrap: "anywhere",
                           }}
                         >
                           {node.server}:{node.port}
@@ -1755,7 +1848,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       {modalOpen && (
         <div
           className="modal-backdrop"
-          onClick={() => setModalOpen(false)}
+          onClick={() => requestCloseModal()}
           role="presentation"
         >
           <div
@@ -1777,7 +1870,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 gap: 12,
               }}
             >
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <h2 className="card-title" style={{ fontSize: 16 }}>
                   {editingOriginalName
                     ? `Edit / Rename Node: ${editingOriginalName}`
@@ -1792,7 +1885,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => setModalOpen(false)}
+                disabled={modalInflight}
+                onClick={() => requestCloseModal()}
               >
                 Close
               </button>
@@ -1803,6 +1897,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 <button
                   type="button"
                   className={`seg-btn ${modalMode === "paste" ? "active" : ""}`}
+                  disabled={modalInflight}
                   onClick={() => {
                     setModalError(null);
                     setModalMode("paste");
@@ -1813,6 +1908,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 <button
                   type="button"
                   className={`seg-btn ${modalMode === "manual" ? "active" : ""}`}
+                  disabled={modalInflight}
                   onClick={() => {
                     setModalError(null);
                     setModalMode("manual");
@@ -1824,8 +1920,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             )}
 
             {modalError && (
-              <div className="banner banner-err">
-                <span>{modalError}</span>
+              <div
+                ref={modalErrorRef}
+                id="modal-inline-error-banner"
+                className="banner banner-err"
+              >
+                <span>{renderInlineCode(modalError)}</span>
               </div>
             )}
 
@@ -1835,6 +1935,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   <button
                     type="button"
                     className="btn btn-sm"
+                    disabled={modalInflight}
                     onClick={() => void handleFillModalFromClipboard()}
                   >
                     Read Clipboard
@@ -1843,8 +1944,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     <button
                       type="button"
                       className="btn btn-sm"
+                      disabled={modalInflight}
                       onClick={() => {
-                        setModalOpen(false);
+                        requestCloseModal();
                         androidBridge.requestQrScan();
                       }}
                     >
@@ -1859,7 +1961,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   rows={6}
                   placeholder={"Paste one or multiple share links (one per line), Base64 subscription, Clash YAML, or HTTPS subscription URL:\nss://...\nvless://...\ntrojan://...\nanytls://...\nsocks5://...\nhttp-proxy://..."}
                   value={pasteInput}
-                  onChange={(e) => setPasteInput(e.target.value)}
+                  onChange={(e) => {
+                    if (modalError) setModalError(null);
+                    setPasteInput(e.target.value);
+                  }}
                 />
 
                 <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
@@ -1907,7 +2012,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   <button
                     type="button"
                     className="btn"
-                    onClick={() => setModalOpen(false)}
+                    disabled={modalInflight}
+                    onClick={() => requestCloseModal()}
                   >
                     Cancel
                   </button>
@@ -1939,9 +2045,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   <div className="form-field">
                     <label className="form-label">Protocol</label>
                     <select
+                      id="manual-node-proto-select"
                       className="select"
                       value={proto}
-                      onChange={(e) => setProto(e.target.value as NodeProto)}
+                      onChange={(e) => {
+                        if (modalError) setModalError(null);
+                        setProto(e.target.value as NodeProto);
+                      }}
                     >
                       <option value="ss">Shadowsocks / SS-2022</option>
                       <option value="vless">VLESS / VLESS+PQ (TCP / WS)</option>
@@ -1959,7 +2069,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       type="text"
                       placeholder="e.g. HK-IEPL-01"
                       value={nodeName}
-                      onChange={(e) => setNodeName(e.target.value)}
+                      onChange={(e) => {
+                        if (modalError) setModalError(null);
+                        setNodeName(e.target.value);
+                      }}
                       required
                     />
                   </div>
@@ -1971,7 +2084,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       type="text"
                       placeholder="edge.example.com"
                       value={serverHost}
-                      onChange={(e) => setServerHost(e.target.value)}
+                      onChange={(e) => {
+                        if (modalError) setModalError(null);
+                        setServerHost(e.target.value);
+                      }}
                       required
                     />
                   </div>
@@ -1984,7 +2100,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       min={1}
                       max={65535}
                       value={serverPort}
-                      onChange={(e) => setServerPort(e.target.value)}
+                      onChange={(e) => {
+                        if (modalError) setModalError(null);
+                        setServerPort(e.target.value);
+                      }}
                       required
                     />
                   </div>
@@ -2015,12 +2134,15 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           type="password"
                           autoComplete="off"
                           placeholder={
-                            editingOriginalName
+                            editingOriginalName && editingOriginalProto === "ss"
                               ? "Leave blank to keep saved password"
                               : "Password or Base64 PSK"
                           }
                           value={ssPassword}
-                          onChange={(e) => setSsPassword(e.target.value)}
+                          onChange={(e) => {
+                            if (modalError) setModalError(null);
+                            setSsPassword(e.target.value);
+                          }}
                         />
                       </div>
                     </>
@@ -2035,18 +2157,24 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           type="password"
                           autoComplete="off"
                           placeholder={
-                            editingOriginalName
+                            editingOriginalName &&
+                            editingOriginalProto === "vless"
                               ? "Leave blank to keep saved UUID"
                               : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
                           }
                           value={vlessUuid}
-                          onChange={(e) => setVlessUuid(e.target.value)}
+                          onChange={(e) => {
+                            if (modalError) setModalError(null);
+                            setVlessUuid(e.target.value);
+                          }}
                         />
                       </div>
 
                       <div className="form-field full">
                         <label className="form-label">
-                          Client Encryption (`none` or `mlkem768x25519plus...`)
+                          Client Encryption (<code className="mono">none</code>{" "}
+                          or{" "}
+                          <code className="mono">mlkem768x25519plus...</code>)
                         </label>
                         <input
                           className="input mono"
@@ -2096,12 +2224,16 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           type="password"
                           autoComplete="off"
                           placeholder={
-                            editingOriginalName
+                            editingOriginalName &&
+                            editingOriginalProto === "trojan"
                               ? "Leave blank to keep saved password"
                               : "Trojan password"
                           }
                           value={trojanPassword}
-                          onChange={(e) => setTrojanPassword(e.target.value)}
+                          onChange={(e) => {
+                            if (modalError) setModalError(null);
+                            setTrojanPassword(e.target.value);
+                          }}
                         />
                       </div>
 
@@ -2181,10 +2313,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                               className="input tabular"
                               type="number"
                               min={0}
-                              max={8192}
+                              max={65535}
                               placeholder="0 (or 2048 for 0-RTT)"
                               value={wsMaxEarlyData}
-                              onChange={(e) => setWsMaxEarlyData(e.target.value)}
+                              onChange={(e) => {
+                                if (modalError) setModalError(null);
+                                setWsMaxEarlyData(e.target.value);
+                              }}
                             />
                           </div>
                         </>
@@ -2201,12 +2336,16 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           type="password"
                           autoComplete="off"
                           placeholder={
-                            editingOriginalName
+                            editingOriginalName &&
+                            editingOriginalProto === "anytls"
                               ? "Leave blank to keep saved password"
                               : "AnyTLS password"
                           }
                           value={anytlsPassword}
-                          onChange={(e) => setAnytlsPassword(e.target.value)}
+                          onChange={(e) => {
+                            if (modalError) setModalError(null);
+                            setAnytlsPassword(e.target.value);
+                          }}
                         />
                       </div>
 
@@ -2471,7 +2610,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   <button
                     type="button"
                     className="btn"
-                    onClick={() => setModalOpen(false)}
+                    disabled={modalInflight}
+                    onClick={() => requestCloseModal()}
                   >
                     Cancel
                   </button>

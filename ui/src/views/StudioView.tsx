@@ -8,6 +8,7 @@ import type {
   VlessKeypairResponse,
 } from "../types";
 import { formatBytes } from "../utils/format";
+import { renderInlineCode } from "../utils/inlineCode";
 
 interface StudioViewProps {
   profilesSnapshot: ProfilesSnapshot | null;
@@ -61,6 +62,19 @@ export const StudioView: React.FC<StudioViewProps> = ({
   const [zeroRtt, setZeroRtt] = useState(true);
   const [includePq, setIncludePq] = useState(true);
   const [keypair, setKeypair] = useState<VlessKeypairResponse | null>(null);
+  const [keygenBusy, setKeygenBusy] = useState(false);
+
+  // Section-local feedback so errors/confirmations are always visible right next to the editor
+  const [importBusy, setImportBusy] = useState(false);
+  const [importMsg, setImportMsg] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+  const [yamlBusy, setYamlBusy] = useState<"audit" | "reload" | null>(null);
+  const [yamlMsg, setYamlMsg] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   const loadYamlAndUris = async () => {
     try {
@@ -80,6 +94,23 @@ export const StudioView: React.FC<StudioViewProps> = ({
     e.preventDefault();
     if (!profileName.trim()) {
       setStatusMsg({ ok: false, text: "Profile name is required." });
+      return;
+    }
+    if (sourceMode === "subscription" && !subUrl.trim()) {
+      setStatusMsg({
+        ok: false,
+        text: "Subscription HTTPS URL is required.",
+      });
+      return;
+    }
+    if (sourceMode !== "subscription" && !profilePayload.trim()) {
+      setStatusMsg({
+        ok: false,
+        text:
+          sourceMode === "uris"
+            ? "Please paste one or more share links (or Base64 subscription payload)."
+            : "Please paste a Clash / Mihomo YAML configuration.",
+      });
       return;
     }
     setProfileBusyId("create");
@@ -207,6 +238,8 @@ export const StudioView: React.FC<StudioViewProps> = ({
   };
 
   const handleGenerateKeys = async () => {
+    if (keygenBusy) return;
+    setKeygenBusy(true);
     setStatusMsg(null);
     try {
       const generated = await clashApi.generateVlessKeys({
@@ -220,17 +253,30 @@ export const StudioView: React.FC<StudioViewProps> = ({
         ok: false,
         text: e instanceof Error ? e.message : String(e),
       });
+    } finally {
+      setKeygenBusy(false);
     }
   };
 
   const handleImportUris = async () => {
-    if (!uriInput.trim()) return;
+    if (!uriInput.trim()) {
+      setImportMsg({
+        ok: false,
+        text: "Please paste one or more share URIs, a Base64 bundle, Clash YAML, or an HTTPS subscription URL.",
+      });
+      return;
+    }
+    setImportBusy(true);
+    setImportMsg(null);
     setStatusMsg(null);
     try {
       const res = await clashApi.importUris(uriInput, true);
       setUriInput("");
       await loadYamlAndUris();
       await onReloaded();
+      const dupCount = res["skipped-duplicates"] ?? 0;
+      const dupNote =
+        dupCount > 0 ? ` (${dupCount} duplicate skipped)` : "";
       const skipped = res["skipped-unsupported"] ?? [];
       const skippedProtos = Array.from(
         new Set(skipped.map((s) => s.protocol)),
@@ -239,34 +285,37 @@ export const StudioView: React.FC<StudioViewProps> = ({
         skipped.length > 0
           ? ` [${skipped.length} unsupported skipped: ${skippedProtos}]`
           : "";
-      setStatusMsg({
-        ok: true,
-        text: `Imported and activated ${res.count} proxy node(s) into live router${skippedNote}.`,
-      });
+      const msg = `Imported and activated ${res.count} proxy node(s) into live router${dupNote}${skippedNote}.`;
+      setImportMsg({ ok: true, text: msg });
+      setStatusMsg({ ok: true, text: msg });
     } catch (e) {
-      setStatusMsg({
-        ok: false,
-        text: e instanceof Error ? e.message : String(e),
-      });
+      const text = e instanceof Error ? e.message : String(e);
+      setImportMsg({ ok: false, text });
+    } finally {
+      setImportBusy(false);
     }
   };
 
   const handleAuditDraftYaml = async () => {
+    if (!yamlText.trim()) {
+      setYamlMsg({ ok: false, text: "YAML editor cannot be empty." });
+      return;
+    }
+    setYamlBusy("audit");
+    setYamlMsg(null);
     setStatusMsg(null);
     try {
       const res = await clashApi.postConfigAudit(yamlText, true);
       setDraftAudit(res.audit);
       setLatestDiff(res.diff ?? null);
       setDiffSourceLabel("Draft YAML vs Active Engine");
-      setStatusMsg({
-        ok: true,
-        text: `Draft YAML audited: Grade ${res.audit.grade} (${res.audit.score}/100) — ${res.audit.findings.length} finding(s).`,
-      });
+      const text = `Draft YAML audited: Grade ${res.audit.grade} (${res.audit.score}/100) — ${res.audit.findings.length} finding(s).`;
+      setYamlMsg({ ok: true, text });
     } catch (e) {
-      setStatusMsg({
-        ok: false,
-        text: e instanceof Error ? e.message : String(e),
-      });
+      const text = e instanceof Error ? e.message : String(e);
+      setYamlMsg({ ok: false, text });
+    } finally {
+      setYamlBusy(null);
     }
   };
 
@@ -281,20 +330,26 @@ export const StudioView: React.FC<StudioViewProps> = ({
   };
 
   const handleSaveYaml = async () => {
+    if (!yamlText.trim()) {
+      setYamlMsg({ ok: false, text: "YAML configuration cannot be empty." });
+      return;
+    }
+    setYamlBusy("reload");
+    setYamlMsg(null);
     setStatusMsg(null);
     try {
       await clashApi.reloadYaml(yamlText);
       await loadYamlAndUris();
       await onReloaded();
-      setStatusMsg({
-        ok: true,
-        text: "Validated and hot-reloaded Clash YAML configuration with zero downtime.",
-      });
+      const text =
+        "Validated and hot-reloaded Clash YAML configuration with zero downtime.";
+      setYamlMsg({ ok: true, text });
+      setStatusMsg({ ok: true, text });
     } catch (e) {
-      setStatusMsg({
-        ok: false,
-        text: e instanceof Error ? e.message : String(e),
-      });
+      const text = e instanceof Error ? e.message : String(e);
+      setYamlMsg({ ok: false, text });
+    } finally {
+      setYamlBusy(null);
     }
   };
 
@@ -458,7 +513,7 @@ export const StudioView: React.FC<StudioViewProps> = ({
                         disabled={profileBusyId === p.id}
                         onClick={() => void handleRefreshSubscription(p)}
                       >
-                        Refresh
+                        {profileBusyId === p.id ? "Refreshing..." : "Refresh"}
                       </button>
                     )}
                     {!isActive && p.kind !== "starter" && (
@@ -500,21 +555,30 @@ export const StudioView: React.FC<StudioViewProps> = ({
               <button
                 type="button"
                 className={`seg-btn ${sourceMode === "subscription" ? "active" : ""}`}
-                onClick={() => setSourceMode("subscription")}
+                onClick={() => {
+                  setSourceMode("subscription");
+                  setStatusMsg(null);
+                }}
               >
                 HTTPS Subscription
               </button>
               <button
                 type="button"
                 className={`seg-btn ${sourceMode === "uris" ? "active" : ""}`}
-                onClick={() => setSourceMode("uris")}
+                onClick={() => {
+                  setSourceMode("uris");
+                  setStatusMsg(null);
+                }}
               >
                 Share URIs
               </button>
               <button
                 type="button"
                 className={`seg-btn ${sourceMode === "yaml" ? "active" : ""}`}
-                onClick={() => setSourceMode("yaml")}
+                onClick={() => {
+                  setSourceMode("yaml");
+                  setStatusMsg(null);
+                }}
               >
                 Local YAML
               </button>
@@ -550,7 +614,7 @@ export const StudioView: React.FC<StudioViewProps> = ({
                 id="new-profile-sub-url-input"
                 className="input mono"
                 style={{ flex: "1 1 260px" }}
-                placeholder="https://provider.example/sub?token=... (TLS 1.3 verified, stored in Keystore)"
+                placeholder="https://provider.example.com/sub?token=... (TLS 1.3 verified, stored in Keystore)"
                 value={subUrl}
                 onChange={(e) => setSubUrl(e.target.value)}
               />
@@ -584,7 +648,9 @@ export const StudioView: React.FC<StudioViewProps> = ({
                   className="btn btn-primary"
                   disabled={profileBusyId === "create"}
                 >
-                  Save &amp; Activate Profile
+                  {profileBusyId === "create"
+                    ? "Saving..."
+                    : "Save & Activate Profile"}
                 </button>
               </div>
             </>
@@ -597,11 +663,13 @@ export const StudioView: React.FC<StudioViewProps> = ({
           <div className="card-header">
             <div>
               <h2 className="card-title">
-                Post-Quantum VLESS Keypair Studio (`mlkem768x25519plus`)
+                Post-Quantum VLESS Keypair Studio (
+                <code className="mono">mlkem768x25519plus</code>)
               </h2>
               <div className="card-subtitle">
-                100% wire-compatible with Xray-core `vlessenc` hybrid X25519 +
-                FIPS-203 ML-KEM-768
+                100% wire-compatible with Xray-core{" "}
+                <code className="mono">vlessenc</code> hybrid X25519 + FIPS-203
+                ML-KEM-768
               </div>
             </div>
           </div>
@@ -664,9 +732,10 @@ export const StudioView: React.FC<StudioViewProps> = ({
               id="keygen-generate-btn"
               type="button"
               className="btn btn-primary"
+              disabled={keygenBusy}
               onClick={handleGenerateKeys}
             >
-              Generate PQ Keypair
+              {keygenBusy ? "Generating..." : "Generate PQ Keypair"}
             </button>
           </div>
 
@@ -680,7 +749,7 @@ export const StudioView: React.FC<StudioViewProps> = ({
                     marginBottom: 3,
                   }}
                 >
-                  Client `encryption` (
+                  Client <code className="mono">encryption</code> (
                   {keypair.mlkem768_encapsulation_key_bytes} B ML-KEM-768 EK)
                 </div>
                 <div className="kv-box mono">{keypair.encryption}</div>
@@ -693,8 +762,8 @@ export const StudioView: React.FC<StudioViewProps> = ({
                     marginBottom: 3,
                   }}
                 >
-                  Server `decryption` (64 B deterministic seed + X25519 clamped
-                  key)
+                  Server <code className="mono">decryption</code> (64 B
+                  deterministic seed + X25519 clamped key)
                 </div>
                 <div className="kv-box mono">{keypair.decryption}</div>
               </div>
@@ -731,11 +800,31 @@ export const StudioView: React.FC<StudioViewProps> = ({
                 Quick Live Node Importer &amp; URI Exporter
               </h2>
               <div className="card-subtitle">
-                Supports `ss://` (SIP002/2022), `vless://`, `trojan://`,
-                `anytls://`, `socks5://`, `http-proxy://`, and Base64 bundles
+                Supports <code className="mono">ss://</code> (SIP002/2022),{" "}
+                <code className="mono">vless://</code>,{" "}
+                <code className="mono">trojan://</code>,{" "}
+                <code className="mono">anytls://</code>,{" "}
+                <code className="mono">socks5://</code>,{" "}
+                <code className="mono">http-proxy://</code>, and Base64 bundles
               </div>
             </div>
           </div>
+
+          {importMsg && (
+            <div
+              className={`banner ${importMsg.ok ? "banner-ok" : "banner-err"}`}
+              style={{ marginBottom: 10 }}
+            >
+              <span>{importMsg.text}</span>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setImportMsg(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           <textarea
             id="uri-import-textarea"
@@ -743,7 +832,10 @@ export const StudioView: React.FC<StudioViewProps> = ({
             rows={4}
             placeholder="Paste ss://, vless://, trojan://, anytls://, socks5://, or http-proxy:// share links (one per line or Base64)..."
             value={uriInput}
-            onChange={(e) => setUriInput(e.target.value)}
+            onChange={(e) => {
+              setUriInput(e.target.value);
+              if (importMsg && !importMsg.ok) setImportMsg(null);
+            }}
           />
           <div
             style={{
@@ -757,9 +849,10 @@ export const StudioView: React.FC<StudioViewProps> = ({
               id="uri-import-btn"
               type="button"
               className="btn btn-primary"
+              disabled={importBusy}
               onClick={handleImportUris}
             >
-              Import &amp; Activate Nodes
+              {importBusy ? "Importing..." : "Import & Activate Nodes"}
             </button>
           </div>
 
@@ -773,20 +866,28 @@ export const StudioView: React.FC<StudioViewProps> = ({
             Active Engine Node Share URIs ({exportedUris.length})
           </div>
           <div
+            id="exported-uris-box"
             className="kv-box mono"
             style={{ maxHeight: 150, overflowY: "auto", fontSize: 11.5 }}
           >
-            {exportedUris.map((u, idx) => (
-              <div
-                key={idx}
-                style={{
-                  padding: "3px 0",
-                  borderBottom: "1px solid var(--border-subtle)",
-                }}
-              >
-                {u}
+            {exportedUris.length === 0 ? (
+              <div style={{ color: "var(--text-muted)" }}>
+                No shareable proxy nodes in active profile yet — import share
+                URIs or a subscription above.
               </div>
-            ))}
+            ) : (
+              exportedUris.map((u, idx) => (
+                <div
+                  key={idx}
+                  style={{
+                    padding: "3px 0",
+                    borderBottom: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  {u}
+                </div>
+              ))
+            )}
           </div>
         </section>
       </div>
@@ -859,7 +960,8 @@ export const StudioView: React.FC<StudioViewProps> = ({
                 <div className="banner banner-err">
                   <span>
                     <strong>MITM / Downgrade Warning:</strong> Subscription or
-                    draft introduced insecure TLS (`skip-cert-verify: true` or
+                    draft introduced insecure TLS (
+                    <code className="mono">skip-cert-verify: true</code> or
                     plaintext transport) on:{" "}
                     <code className="mono">
                       {latestDiff.newly_insecure_nodes.join(", ")}
@@ -895,9 +997,9 @@ export const StudioView: React.FC<StudioViewProps> = ({
                   style={{ fontSize: 12 }}
                 >
                   <strong className="mono">[{f.code}]</strong> ({f.location}) —{" "}
-                  {f.title} ·{" "}
+                  {renderInlineCode(f.title)} ·{" "}
                   <span style={{ color: "var(--accent-emerald)" }}>
-                    Fix: {f.remediation}
+                    Fix: {renderInlineCode(f.remediation)}
                   </span>
                 </div>
               ))}
@@ -913,15 +1015,20 @@ export const StudioView: React.FC<StudioViewProps> = ({
               Live Clash Meta (Mihomo) YAML Configuration
             </h2>
             <div className="card-subtitle">
-              Credentials &amp; UUIDs are redacted (`***REDACTED***` / nil UUID)
-              for API safety and preserved automatically on hot-reload
+              Credentials &amp; UUIDs are redacted (
+              <code className="mono">***REDACTED***</code> / nil UUID) for API
+              safety and preserved automatically on hot-reload
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
               type="button"
               className="btn btn-sm"
-              onClick={() => void loadYamlAndUris()}
+              disabled={yamlBusy !== null}
+              onClick={() => {
+                setYamlMsg(null);
+                void loadYamlAndUris();
+              }}
             >
               Reset from Engine
             </button>
@@ -929,26 +1036,51 @@ export const StudioView: React.FC<StudioViewProps> = ({
               id="yaml-audit-diff-btn"
               type="button"
               className="btn btn-sm"
+              disabled={yamlBusy !== null}
               onClick={() => void handleAuditDraftYaml()}
             >
-              Audit &amp; Diff Draft
+              {yamlBusy === "audit" ? "Auditing..." : "Audit & Diff Draft"}
             </button>
             <button
               id="yaml-reload-btn"
               type="button"
               className="btn btn-primary"
+              disabled={yamlBusy !== null}
               onClick={handleSaveYaml}
             >
-              Validate &amp; Hot-Reload YAML
+              {yamlBusy === "reload"
+                ? "Validating..."
+                : "Validate & Hot-Reload YAML"}
             </button>
           </div>
         </div>
+
+        {yamlMsg && (
+          <div
+            id="yaml-editor-status-banner"
+            className={`banner ${yamlMsg.ok ? "banner-ok" : "banner-err"}`}
+            style={{ marginBottom: 12 }}
+          >
+            <span>{renderInlineCode(yamlMsg.text)}</span>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setYamlMsg(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         <textarea
           id="yaml-editor-textarea"
           className="code-editor"
           rows={18}
           value={yamlText}
-          onChange={(e) => setYamlText(e.target.value)}
+          onChange={(e) => {
+            setYamlText(e.target.value);
+            if (yamlMsg && !yamlMsg.ok) setYamlMsg(null);
+          }}
         />
       </section>
 
@@ -956,14 +1088,17 @@ export const StudioView: React.FC<StudioViewProps> = ({
         <div className="card-header">
           <div>
             <h2 className="card-title">
-              AI-Native Credential-Redacted MCP Server (`rust-clash mcp`)
+              AI-Native Credential-Redacted MCP Server (
+              <code className="mono">rust-clash mcp</code>)
             </h2>
             <div className="card-subtitle">
               Let Claude Code, Gemini CLI, or Cursor diagnose routing rules,
-              Split-DNS risks, TLS/WAF `403` vs `429` status, and UDP readiness
-              over JSON-RPC 2.0 `stdio` — credentials &amp; server endpoints
-              redacted by default (`--include-network-metadata` /
-              `--allow-mutations` opt-in)
+              Split-DNS risks, TLS/WAF <code className="mono">403</code> vs{" "}
+              <code className="mono">429</code> status, and UDP readiness over
+              JSON-RPC 2.0 <code className="mono">stdio</code> — credentials
+              &amp; server endpoints redacted by default (
+              <code className="mono">--include-network-metadata</code> /{" "}
+              <code className="mono">--allow-mutations</code> opt-in)
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
