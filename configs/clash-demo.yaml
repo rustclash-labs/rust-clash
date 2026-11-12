@@ -1,0 +1,99 @@
+# ==============================================================================
+# SYNTHETIC EXAMPLE CONFIGURATION ONLY — CONTAINS ZERO REAL SERVERS OR SECRETS
+# ==============================================================================
+# All hostnames (`*.example.com`, RFC 2606), UUIDs (`00000000-0000-4000-...`),
+# base64 keys (`0x42` repeated), VLESS `encryption` test vectors (generated via
+# `rust-clash keygen-vless` with the private decryption key discarded), and
+# passwords below are non-functional placeholders for schema validation (`check`).
+#
+# NEVER commit real subscription URLs, server IPs, or credentials to Git.
+# Copy this file to `configs/my.local.yaml` (gitignored) for local testing.
+# ==============================================================================
+
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.0/15
+  fake-ip-filter:
+    - localhost
+    - "*.lan"
+    - "+.msftconnecttest.com"
+  default-nameserver:
+    - 1.1.1.1:53
+    - 223.5.5.5:53
+  nameserver:
+    - https://cloudflare-dns.com/dns-query
+    - https://dns.alidns.com/dns-query
+
+tun:
+  enable: false
+  stack: smoltcp
+  device: utun-clash0
+  auto-route: false
+  mtu: 1500
+
+proxies:
+  - name: TYO-VLESS-PQ-0RTT
+    type: vless
+    server: tyo.example.com
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    # Synthetic public encapsulation key vector (`rust-clash keygen-vless`); no server exists.
+    encryption: mlkem768x25519plus.xorpub.0rtt.8jlZeWcuwEC5rnZWXVODU4nTIjQAIyXc1RXpgUfueEw.yqs25RwEX0GBK-tQ4saYPNUUq0UA4pi4BpmiWLIJxXM75zbLtGqwYAHQtkeLIrMkixck8RecOwWenccz3WMs-nQ0xvqA5uk7sut4X4MJoShb1OsFbKOQKndmxoqWHlSBi8yxkGKaylZ4lVptXPyAneaPMjQPNmwGwDWar7eiv9RtudALvdIsX0JzqKiP_kqfs_akq2KGqgkyzOqngGhClgbNZJlU5Xo4GJNqKDQQWACKYbCqUvpgCTRKuegs-UE7HyCCq3AQ_9PNciEmwuAyM6oGsOVf9xgbArGq82eIJMGgimc0g5GeeVxS01iU18JdeioYaTvKQMqoQkkj60hTqWSMhhA9ADw9W4vLZqy8IYJEL0BVrdxracx6ULlEFyK_gidgBWksfAWAYjdqtHZyEnIuG0eM7Uypalg0artydUHHFKiziWW4uekdIsrM8-EepycyF4egylzLo3JZdowPa-qdcqY3pfQTcnF_fyU9s1gbR-hoR3ARPyIlZcZe5RJZxIUWanNB_ccMQXyLDkRKwTennRapnja-qmCFaAwQsuSb-CwViIlrgXakdbM9ddOQdgsyzoN3gbZJINApJEyWp-ARqkkTmXG5vyG0VGAo-SCMiMhaUsQ38GE09lSUexh-qKhumoSth3BdKMYdVUo5SYStTzlGiUZ9mwtbYiU8BfbNycwnpmKfQbchDxNfaiY4FdJWmBaZUqEzrRcOHBt35nxHQ5J0kUSwfNgq-rCABUaTNYscHsWYeCoxzah9CIu_kNqd1bmdkvAi0xGSNfEH16dJxMW1sEMrDlhc7Gyl3LNHjPlKcfYMUnQjxYe67fun0wV5heMVzEFoJ0a3Qec7wQXBvPIXrZpW5OidLnB0KXrCgttH2mKU91YQUNkqUaEzOGNLSCxEvFWJm4oR9PTNbdFY4mOem7eOkDUdhMwxPdkB5Lk1ojRwEYu4fxwMZpaS4odp3-HKPaXMgdhGiyyPz0Nyi4EwQSemaDQ_AfE_78xCTISp_fZbR7BYfPaTXLJPjdA3zpUMn2IEB2dW0AnHnnyux9ZfuaylQ6rLegMmQyF7g3dMA0iATCfK58QBSJEvMAyfQdwdQYeP_uO6SYKKKUyEoMhBIJwRjwCAxSVpCFtrQ-ErQMc3neYFljtzzDNyC9qxzJRrm5uW8wevVayJWtciYNUi6kCBZPOAvcmoAOxPgQqxFgGCHXFHhKRdwDATaDGLRhRWNIhzf6bOUzsmfQAI5lQv3sxVcRgSCKpQagNdBYBG01OESCSqVAd5Ohksl5SMEslsDsgtIcu5nwW051lQRNMuvusjWIZm94Ke5lwIS2M7bFJRsycZRQNV4VBVaOmUo6KwB_eKZhyNomF2dVYOceZnM4A-W_Fn4oq_MMJL3GlHvbW88ZvL-XuGWDqdeyR7FSJKoaqB7YotF1Z7kZKJm8OumtCT0hdGl7p6d1ldMIdYWRRksmwR49SRm9W-4egAYpeMapBn24xH5eYLGTqmJ9xTOhUUgBB4J9JCfRJaJ1My0wpFBNIHMkmCYBYRic6MAURvmDR2l1OKYzbYHznfDYUy61LtRSvVdffz3cw
+    udp: true
+
+  - name: HK-SS2022-AES256
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: 2022-blake3-aes-256-gcm
+    # Base64 of 32 repeated 0x42 ('B') placeholder bytes
+    password: QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=
+    udp: true
+
+  - name: LAX-AnyTLS-v2
+    type: anytls
+    server: lax.example.com
+    port: 443
+    password: replace-with-anytls-password
+    sni: lax.example.com
+    idle-session-check-interval: 30
+    idle-session-timeout: 60
+    min-idle-session: 1
+
+proxy-groups:
+  - name: 🚀 Proxy
+    type: select
+    proxies:
+      - ⚡ Auto-Best
+      - TYO-VLESS-PQ-0RTT
+      - HK-SS2022-AES256
+      - LAX-AnyTLS-v2
+      - DIRECT
+
+  - name: ⚡ Auto-Best
+    type: url-test
+    proxies:
+      - TYO-VLESS-PQ-0RTT
+      - HK-SS2022-AES256
+      - LAX-AnyTLS-v2
+    url: http://www.gstatic.com/generate_204
+    interval: 120
+    tolerance: 30
+
+rules:
+  - DOMAIN-SUFFIX,anthropic.com,🚀 Proxy
+  - DOMAIN-SUFFIX,github.com,🚀 Proxy
+  - DOMAIN-KEYWORD,google,⚡ Auto-Best
+  - GEOSITE,cn,DIRECT
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,🚀 Proxy

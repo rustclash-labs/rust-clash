@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="12" y1="8" x2="96" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10B981" />
+      <stop offset="52%" stop-color="#059669" />
+      <stop offset="100%" stop-color="#064E3B" />
+    </linearGradient>
+    <linearGradient id="routeGrad" x1="28" y1="55" x2="80" y2="55" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6EE7B7" />
+      <stop offset="100%" stop-color="#A7F3D0" />
+    </linearGradient>
+    <clipPath id="squircleClip">
+      <rect x="6" y="6" width="96" height="96" rx="24" ry="24" />
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircleClip)">
+    <!-- Emerald Gradient Background -->
+    <rect x="0" y="0" width="108" height="108" fill="url(#bgGrad)" />
+    <!-- Subtle Geometric Routing Arcs -->
+    <path d="M -6,42 C 22,14 62,6 102,22 L 108,0 L 0,0 Z" fill="#FFFFFF" fill-opacity="0.08" />
+    <path d="M 16,108 C 44,78 78,68 114,74 L 114,114 L 16,114 Z" fill="#022C22" fill-opacity="0.22" />
+
+    <!-- Upper Geometric Slanted 'R' -->
+    <path fill="#FFFFFF" fill-rule="evenodd"
+      d="M 36.2,50.5 L 40.1,30.0 L 61.5,30.0 C 70.2,30.0 74.8,34.4 73.4,41.2 C 72.1,47.3 67.0,50.5 59.2,50.5 L 36.2,50.5 Z
+         M 47.2,37.0 L 59.0,37.0 C 62.6,37.0 64.4,38.6 63.8,41.2 C 63.2,43.8 60.9,44.9 57.4,44.9 L 45.7,44.9 Z" />
+
+    <!-- Lower Stem & Diagonal Leg of 'R' -->
+    <path fill="#FFFFFF"
+      d="M 34.5,59.5 L 44.1,59.5 L 41.2,74.5 L 31.6,74.5 Z
+         M 52.5,59.5 L 62.8,59.5 L 71.4,74.5 L 60.6,74.5 Z" />
+
+    <!-- Integrated Forward Split-Routing Stream Arrow -->
+    <path fill="url(#routeGrad)"
+      d="M 28.0,57.3 L 29.2,52.7 L 66.8,52.7 L 65.4,48.8 L 79.6,55.0 L 65.4,61.2 L 66.8,57.3 Z" />
+  </g>
+</svg>

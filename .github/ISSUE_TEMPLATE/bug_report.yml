@@ -1,0 +1,69 @@
+name: Bug Report / 缺陷反馈
+description: Report a reproducible non-security bug (with all proxy credentials & subscription URLs redacted)
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **SECURITY & PRIVACY WARNING / 安全与隐私警告**
+        > - **Do NOT post real subscription URLs (`?token=...`), proxy server IPs/domains, `uuid`s, Shadowsocks keys, VLESS `encryption` strings, API `secret`s, or raw `.pcap` captures.** Public GitHub Issues are indexed permanently.
+        > - **严禁在公开 Issue 中粘贴真实机场订阅链接、节点 IP/域名、密码、`UUID`、私钥或抓包文件！** 如需附带诊断信息，请使用内置脱敏导出（`Settings -> Export Redacted Diagnostics` 或 `GET /diagnostics/export`）并二次人工检查。
+        > - For security vulnerabilities, stop and submit a [Private Security Advisory](https://github.com/rustclash-labs/rust-clash/security/advisories/new) or email `rustclash.labs@proton.me` instead (`SECURITY.md`).
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform & Component / 平台与组件
+      options:
+        - Linux CLI / Daemon (`proxy-cli`)
+        - Linux Desktop (`tauri-app`)
+        - Windows CLI / Desktop (`wintun.dll` / `tauri-app`)
+        - macOS CLI / Desktop (`utun` / `tauri-app`)
+        - Android Client (`android/` + `proxy-ffi`)
+        - Embedded Web Console (`ui/`)
+        - Core Library (`proxy-core`)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / 版本号
+      description: Output of `rust-clash --version` or release tag / commit SHA
+      placeholder: "v0.3.2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Reproduction Steps & Expected vs. Actual Behavior / 复现步骤与现象
+      description: Describe how to reproduce the issue using `127.0.0.1` or `*.example.com` synthetic placeholders.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized Logs or Minimal Config / 已脱敏日志或最小复现配置
+      render: yaml
+      placeholder: |
+        # Replace all real servers with *.example.com and all credentials with dummy placeholders!
+        proxies:
+          - name: Demo-Node
+            type: ss
+            server: hk.example.com
+            port: 8388
+            cipher: 2022-blake3-aes-256-gcm
+            password: QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=
+
+  - type: checkboxes
+    id: sanitization
+    attributes:
+      label: Mandatory Sanitization Check / 脱敏确认（必选）
+      options:
+        - label: I have verified that this report contains NO real subscription URLs, tokens, server IPs/domains, UUIDs, passwords, or private keys. / 我已确认本 Issue 不包含任何真实订阅链接、Token、节点地址、UUID、密码或私钥。
+          required: true
+        - label: This is NOT an undisclosed security vulnerability (security issues must use Private Vulnerability Reporting per `SECURITY.md`). / 本问题不属于未公开的安全漏洞。
+          required: true

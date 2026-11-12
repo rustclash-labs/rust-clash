@@ -1,0 +1,33 @@
+name: Feature Request / 功能建议
+description: Propose an enhancement, platform improvement, or documentation update
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Privacy Note**: Do not include real proxy subscription links, server addresses, or credentials in feature proposals.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement / 背景与痛点
+      description: What problem or use case are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution / 建议方案
+      description: Describe the desired behavior, CLI/API surface, or specification reference (RFC / public wire spec).
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation / 确认
+      options:
+        - label: This proposal contains no real proxy credentials or subscription tokens, and does not copy code from GPL/AGPL projects.
+          required: true

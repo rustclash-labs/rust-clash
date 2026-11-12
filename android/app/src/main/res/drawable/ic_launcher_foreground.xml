@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Upper geometric slanted 'R' bowl -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M36.2,50.5L40.1,30.0L61.5,30.0C70.2,30.0 74.8,34.4 73.4,41.2C72.1,47.3 67.0,50.5 59.2,50.5L36.2,50.5ZM47.2,37.0L59.0,37.0C62.6,37.0 64.4,38.6 63.8,41.2C63.2,43.8 60.9,44.9 57.4,44.9L45.7,44.9Z" />
+
+    <!-- Lower stem & diagonal leg of 'R' -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M34.5,59.5L44.1,59.5L41.2,74.5L31.6,74.5ZM52.5,59.5L62.8,59.5L71.4,74.5L60.6,74.5Z" />
+
+    <!-- Integrated forward split-routing stream arrow -->
+    <path android:pathData="M28.0,57.3L29.2,52.7L66.8,52.7L65.4,48.8L79.6,55.0L65.4,61.2L66.8,57.3Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="28"
+                android:startY="55"
+                android:endX="80"
+                android:endY="55"
+                android:type="linear">
+                <item
+                    android:color="#FF6EE7B7"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FFA7F3D0"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

@@ -1,0 +1,42 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Frontend artifacts (ui/dist is built before release/embed; node_modules excluded)
+/ui/node_modules/
+/ui/.vite/
+
+# Local runtime state & logs
+*.log
+*.pid
+.DS_Store
+.env
+.env.*
+
+# Android Gradle & cross-compiled JNI outputs
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/app/src/main/assets/licenses/
+/android/local.properties
+/crates/tauri-app/wintun-bundle/
+
+# Private signing keystores & keys (never commit to version control)
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+
+# Local user proxy configs, GeoIP databases & packet captures (prevent accidental leaks)
+/config.yaml
+/config.yml
+configs/config.yaml
+configs/config.yml
+configs/*.local.yaml
+configs/*.local.yml
+!configs/clash-demo.yaml
+*.mmdb
+*.pcap
+*.pcapng

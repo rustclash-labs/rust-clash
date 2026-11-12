@@ -1,0 +1,557 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.3.2)"
+        required: true
+        type: string
+        default: "v0.3.2"
+      target_platforms:
+        description: "Platforms to build & publish (saves private-repo Actions minutes)"
+        required: false
+        type: choice
+        default: "all"
+        options:
+          - "all"
+          - "android"
+          - "linux+android"
+          - "desktop"
+      run_android_tests:
+        description: "Re-run Android JUnit/Robolectric + Lint during Release packaging"
+        required: false
+        type: boolean
+        default: false
+      allow_ephemeral_debug_signing:
+        description: "Allow ephemeral debug APK signing when ANDROID_KEYSTORE_* secrets are absent (WARNING: breaks future Android in-place upgrades)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "true"
+
+jobs:
+  prepare:
+    name: Validate Tag, Versions, Signing Key & Build Web UI
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+      android_signing_mode: ${{ steps.validate.outputs.android_signing_mode }}
+      build_android: ${{ steps.validate.outputs.build_android }}
+      build_linux: ${{ steps.validate.outputs.build_linux }}
+      build_windows: ${{ steps.validate.outputs.build_windows }}
+      build_macos: ${{ steps.validate.outputs.build_macos }}
+      expected_min_assets: ${{ steps.validate.outputs.expected_min_assets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate Release Tag, Version Alignment, Target Platforms & Android Keystore
+        id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PLATFORMS: ${{ inputs.target_platforms }}
+          REF_NAME: ${{ github.ref_name }}
+          ALLOW_EPHEMERAL: ${{ inputs.allow_ephemeral_debug_signing }}
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="${INPUT_TAG}"
+            PLATFORMS="${INPUT_PLATFORMS:-all}"
+          else
+            TAG="${REF_NAME}"
+            PLATFORMS="all"
+          fi
+          TAG="$(echo -n "$TAG" | xargs)"
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag '$TAG'. Expected format like 'v0.3.2'." >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          BASE_VERSION="${VERSION%%-*}"
+
+          python3 - "$BASE_VERSION" <<'PY'
+          import json, pathlib, re, sys, tomllib
+
+          expected = sys.argv[1]
+          cargo_ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+          tauri_ver = json.loads(pathlib.Path("crates/tauri-app/tauri.conf.json").read_text())["version"]
+          ui_ver = json.loads(pathlib.Path("ui/package.json").read_text())["version"]
+          gradle_txt = pathlib.Path("android/app/build.gradle.kts").read_text()
+          m_name = re.search(r'versionName\s*=\s*"([^"]+)"', gradle_txt)
+          m_code = re.search(r'versionCode\s*=\s*(\d+)', gradle_txt)
+          android_ver = m_name.group(1) if m_name else ""
+          android_code = int(m_code.group(1)) if m_code else 0
+
+          mismatches = []
+          for label, actual in [
+              ("Cargo.toml", cargo_ver),
+              ("crates/tauri-app/tauri.conf.json", tauri_ver),
+              ("ui/package.json", ui_ver),
+              ("android/app/build.gradle.kts (versionName)", android_ver),
+          ]:
+              if actual != expected:
+                  mismatches.append(f"{label}={actual} (expected {expected})")
+
+          if mismatches:
+              raise SystemExit("Version mismatch against release tag: " + ", ".join(mismatches))
+          if android_code < 3:
+              raise SystemExit(f"Android versionCode ({android_code}) must be >= 3 for upgrade compatibility")
+
+          print(f"Verified version alignment: {expected} (Android versionCode={android_code})")
+          PY
+
+          case "$PLATFORMS" in
+            android)
+              BUILD_ANDROID="true"
+              BUILD_LINUX="false"
+              BUILD_WINDOWS="false"
+              BUILD_MACOS="false"
+              EXPECTED_ASSETS="4"
+              ;;
+            linux+android)
+              BUILD_ANDROID="true"
+              BUILD_LINUX="true"
+              BUILD_WINDOWS="false"
+              BUILD_MACOS="false"
+              EXPECTED_ASSETS="7"
+              ;;
+            desktop)
+              BUILD_ANDROID="false"
+              BUILD_LINUX="true"
+              BUILD_WINDOWS="true"
+              BUILD_MACOS="true"
+              EXPECTED_ASSETS="10"
+              ;;
+            all|*)
+              BUILD_ANDROID="true"
+              BUILD_LINUX="true"
+              BUILD_WINDOWS="true"
+              BUILD_MACOS="true"
+              EXPECTED_ASSETS="14"
+              ;;
+          esac
+
+          SIGNING_MODE="skipped"
+          if [[ "$BUILD_ANDROID" == "true" ]]; then
+            if [[ -n "$KS_B64" && -n "$KS_PASS" && -n "$KS_ALIAS" ]]; then
+              TMP_KS="$(mktemp "${RUNNER_TEMP:-/tmp}/verify-ks-XXXXXX.keystore")"
+              trap 'rm -f "$TMP_KS"' EXIT
+              chmod 600 "$TMP_KS"
+              python3 - "$TMP_KS" <<'PY'
+          import base64, os, pathlib, sys
+          raw = "".join(os.environ["KS_B64"].split())
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(raw))
+          PY
+              CERT_FP="$(keytool -list -v -keystore "$TMP_KS" -storepass "$KS_PASS" -alias "$KS_ALIAS" | grep -i 'SHA256:' | head -n 1 | sed 's/^[[:space:]]*//')"
+              if [[ -z "$CERT_FP" ]]; then
+                echo "::error::Failed reading signing certificate for alias '$KS_ALIAS' from ANDROID_KEYSTORE_BASE64." >&2
+                exit 1
+              fi
+              rm -f "$TMP_KS"
+              SIGNING_MODE="release"
+              {
+                printf '### Release Preflight (`%s`, platforms: `%s`)\n' "$TAG" "$PLATFORMS"
+                printf '%s\n' '- **Android Signing**: Persistent Release Keystore (`envRelease`, v1+v2+v3)'
+                printf -- '- **Certificate Fingerprint**: `%s`\n' "$CERT_FP"
+              } >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$ALLOW_EPHEMERAL" == "true" ]]; then
+              echo "::warning::ANDROID_KEYSTORE_* secrets are not configured; proceeding with ephemeral debug signing because allow_ephemeral_debug_signing=true."
+              SIGNING_MODE="debug"
+              {
+                printf '### Release Preflight (`%s`, platforms: `%s`)\n' "$TAG" "$PLATFORMS"
+                printf '%s\n' '- **Android Signing**: WARNING — Ephemeral Debug Keystore (`allow_ephemeral_debug_signing=true`)'
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::Missing persistent Android signing secrets (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS)!" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "android_signing_mode=$SIGNING_MODE"
+            echo "build_android=$BUILD_ANDROID"
+            echo "build_linux=$BUILD_LINUX"
+            echo "build_windows=$BUILD_WINDOWS"
+            echo "build_macos=$BUILD_MACOS"
+            echo "expected_min_assets=$EXPECTED_ASSETS"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build Production Embedded Web Console Once
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-ui-dist
+          path: ui/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  build-linux:
+    name: Desktop & CLI Release (linux-x86_64)
+    needs: prepare
+    if: needs.prepare.outputs.build_linux == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-ui-dist
+          path: ui/dist
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install Linux Tauri & Packaging Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm
+      - name: Build Standalone CLI & Tauri Linux Packages (deb + rpm)
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          cargo build --locked --release -p proxy-cli --target x86_64-unknown-linux-gnu
+          cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md target/x86_64-unknown-linux-gnu/release/
+          tar -C target/x86_64-unknown-linux-gnu/release -czf release-out/rust-clash-cli-linux-x86_64.tar.gz \
+            rust-clash LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md
+          (cd crates/tauri-app && npx --yes --package=@tauri-apps/cli@2.12.4 tauri build --target x86_64-unknown-linux-gnu --bundles deb,rpm --features desktop)
+          cp target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb release-out/
+          cp target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm release-out/
+          ls -lh release-out/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-pkg-linux-x86_64
+          path: release-out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  build-windows:
+    name: Desktop & CLI Release (windows-x86_64)
+    needs: prepare
+    if: needs.prepare.outputs.build_windows == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-ui-dist
+          path: ui/dist
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install NASM on Windows (required by aws-lc-sys)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --no-progress -y
+          }
+          if (Test-Path "C:\Program Files\NASM") {
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      - name: Fetch & SHA-256 Verify Official Signed Wintun Driver
+        shell: pwsh
+        run: |
+          python scripts/fetch_wintun.py --self-test
+          python scripts/fetch_wintun.py --arch amd64 --out-dir target/x86_64-pc-windows-msvc/release
+          python scripts/fetch_wintun.py --arch amd64 --out-dir crates/tauri-app/wintun-bundle
+      - name: Build CLI + Tauri Windows Installers (NSIS + MSI)
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p proxy-cli --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path release-out | Out-Null
+          Compress-Archive -Path `
+            target/x86_64-pc-windows-msvc/release/rust-clash.exe, `
+            target/x86_64-pc-windows-msvc/release/wintun.dll, `
+            target/x86_64-pc-windows-msvc/release/wintun-LICENSE.txt, `
+            LICENSE-MIT, `
+            LICENSE-APACHE, `
+            THIRD_PARTY_NOTICES.md `
+            -DestinationPath release-out/rust-clash-cli-windows-x86_64.zip
+          Push-Location crates/tauri-app
+          $extraCfg = '{"bundle":{"resources":{"../../LICENSE-MIT":"LICENSE-MIT","../../LICENSE-APACHE":"LICENSE-APACHE","../../THIRD_PARTY_NOTICES.md":"THIRD_PARTY_NOTICES.md","wintun-bundle/wintun.dll":"wintun.dll","wintun-bundle/wintun-LICENSE.txt":"wintun-LICENSE.txt"}}}'
+          npx --yes --package=@tauri-apps/cli@2.12.4 tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi --features desktop --config $extraCfg
+          Pop-Location
+          Copy-Item target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe -Destination release-out/
+          Copy-Item target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi -Destination release-out/
+          Get-ChildItem release-out/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-pkg-windows-x86_64
+          path: release-out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  build-macos:
+    name: Desktop & CLI Release (macOS arm64 + x86_64 Unified Runner)
+    needs: prepare
+    if: needs.prepare.outputs.build_macos == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-ui-dist
+          path: ui/dist
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build Both arm64 & x86_64 CLI + DMG Installers on Single Runner
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          npm install -g @tauri-apps/cli@2.12.4
+
+          for entry in "aarch64-apple-darwin:rust-clash-cli-macos-arm64.tar.gz" "x86_64-apple-darwin:rust-clash-cli-macos-x86_64.tar.gz"; do
+            target="${entry%%:*}"
+            archive="${entry##*:}"
+            cargo build --locked --release -p proxy-cli --target "$target"
+            cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "target/${target}/release/"
+            tar -C "target/${target}/release" -czf "release-out/${archive}" \
+              rust-clash LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md
+            (cd crates/tauri-app && tauri build --target "$target" --bundles dmg --features desktop)
+            cp "target/${target}/release/bundle/dmg/"*.dmg release-out/
+          done
+          ls -lh release-out/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-pkg-macos
+          path: release-out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  build-android:
+    name: Android Release (Signed Split APKs + Universal APK + Play Store AAB)
+    needs: prepare
+    if: needs.prepare.outputs.build_android == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-ui-dist
+          path: ui/dist
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Cache Gradle Wrapper & Dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Configure JDK 17 & Android SDK/NDK 27.2.12479018
+        run: |
+          set -euo pipefail
+          if [[ -n "${JAVA_HOME_17_X64:-}" ]] && [[ -d "${JAVA_HOME_17_X64}" ]]; then
+            echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> "$GITHUB_ENV"
+            echo "${JAVA_HOME_17_X64}/bin" >> "$GITHUB_PATH"
+          fi
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          if [[ ! -d "${SDK_ROOT}/platforms/android-35" || ! -d "${SDK_ROOT}/build-tools/35.0.0" || ! -d "${SDK_ROOT}/ndk/27.2.12479018" ]]; then
+            SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+            if [[ ! -x "$SDKMANAGER" ]]; then
+              SDKMANAGER="$(find "$SDK_ROOT" -name sdkmanager -type f | head -n 1)"
+            fi
+            (yes || true) | "$SDKMANAGER" --licenses >/dev/null || true
+            "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          fi
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Build & Verify Signed Android Split APKs, Universal APK & AAB Packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_MODE: ${{ needs.prepare.outputs.android_signing_mode }}
+          RUN_ANDROID_TESTS: ${{ inputs.run_android_tests }}
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          if [[ "${RUN_ANDROID_TESTS:-false}" == "true" ]]; then
+            export ANDROID_SKIP_CHECKS="0"
+          else
+            export ANDROID_SKIP_CHECKS="1"
+          fi
+
+          if [[ "$SIGNING_MODE" == "release" ]]; then
+            KS_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/android-release-XXXXXX.keystore")"
+            trap 'rm -f "$KS_FILE"' EXIT
+            chmod 600 "$KS_FILE"
+            python3 - "$KS_FILE" <<'PY'
+          import base64, os, pathlib, sys
+          raw = "".join(os.environ["KS_B64"].split())
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(raw))
+          PY
+            ANDROID_BUILD_VARIANT=release \
+              ANDROID_KEYSTORE_PATH="$KS_FILE" \
+              ./scripts/build_android.sh
+            cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk release-out/rust-clash-android-arm64-v8a.apk
+            cp android/app/build/outputs/apk/release/app-x86_64-release.apk release-out/rust-clash-android-x86_64.apk
+            cp android/app/build/outputs/apk/release/app-universal-release.apk release-out/rust-clash-android-universal.apk
+            cp android/app/build/outputs/bundle/release/app-release.aab release-out/rust-clash-android-bundle.aab
+            rm -f "$KS_FILE"
+          else
+            ANDROID_BUILD_VARIANT=debug ./scripts/build_android.sh
+            cp android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk release-out/rust-clash-android-arm64-v8a.apk
+            cp android/app/build/outputs/apk/debug/app-x86_64-debug.apk release-out/rust-clash-android-x86_64.apk
+            cp android/app/build/outputs/apk/debug/app-universal-debug.apk release-out/rust-clash-android-universal.apk
+            cp android/app/build/outputs/bundle/debug/app-debug.aab release-out/rust-clash-android-bundle.aab
+          fi
+
+          APKSIGNER_BIN="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
+          for apk_pkg in \
+            release-out/rust-clash-android-arm64-v8a.apk \
+            release-out/rust-clash-android-x86_64.apk \
+            release-out/rust-clash-android-universal.apk
+          do
+            "$APKSIGNER_BIN" verify --min-sdk-version 26 --print-certs "$apk_pkg" >/dev/null
+          done
+          CERT_INFO="$("$APKSIGNER_BIN" verify --min-sdk-version 26 --print-certs release-out/rust-clash-android-arm64-v8a.apk)"
+          echo "$CERT_INFO"
+          {
+            echo "### Android APK Signature Verification"
+            echo '```'
+            echo "$CERT_INFO"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ls -lh release-out/
+
+      - name: Prune Transient Gradle Locks Before Cache Save
+        if: always()
+        run: rm -rf ~/.gradle/caches/modules-2/modules-2.lock ~/.gradle/caches/*/plugin-resolution/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-pkg-android
+          path: release-out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Atomic GitHub Release (${{ needs.prepare.outputs.tag }})
+    needs: [prepare, build-linux, build-windows, build-macos, build-android]
+    permissions:
+      contents: write
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.build-linux.result == 'success' || needs.build-linux.result == 'skipped') &&
+      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') &&
+      (needs.build-android.result == 'success' || needs.build-android.result == 'skipped') &&
+      (needs.build-linux.result == 'success' || needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-android.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-pkg-*
+          path: release-dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS & Verify Deliverable Completeness
+        env:
+          MIN_ASSETS: ${{ needs.prepare.outputs.expected_min_assets }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd release-dist
+          COUNT="$(ls -1 | wc -l | xargs)"
+          echo "Collected $COUNT platform packages (expected >= ${MIN_ASSETS}):"
+          ls -lh
+          if [[ "$COUNT" -lt "${MIN_ASSETS}" ]]; then
+            echo "::error::Expected at least ${MIN_ASSETS} release packages, found $COUNT" >&2
+            exit 1
+          fi
+          sha256sum * | sort -k2 > SHA256SUMS.txt
+          {
+            printf '### Release Artifacts & SHA-256 Checksums (`%s`)\n' "${RELEASE_TAG}"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "RustClash ${{ needs.prepare.outputs.tag }}"
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-dist/*

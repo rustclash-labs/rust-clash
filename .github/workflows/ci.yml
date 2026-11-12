@@ -1,0 +1,323 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".gitignore"
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: "Run full cross-platform matrix (macOS 10x + Windows 2x + Android)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    name: Unified Linux Check (UI + Kernel + Tauri + TUN + Interop)
+    runs-on: ubuntu-latest
+    outputs:
+      run_macos: ${{ steps.changes.outputs.run_macos }}
+      run_windows: ${{ steps.changes.outputs.run_windows }}
+      run_android: ${{ steps.changes.outputs.run_android }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Detect Platform-Specific Changes (Quota-Aware Routing)
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          FULL_MATRIX: ${{ inputs.full_matrix }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$FULL_MATRIX" == "true" ]]; then
+            echo "run_macos=true" >> "$GITHUB_OUTPUT"
+            echo "run_windows=true" >> "$GITHUB_OUTPUT"
+            echo "run_android=true" >> "$GITHUB_OUTPUT"
+            echo "any_extra=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_REF" ]]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF" || true
+            CHANGED="$(git diff --name-only FETCH_HEAD...HEAD || true)"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
+          else
+            CHANGED=""
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          RUN_MACOS="false"
+          RUN_WINDOWS="false"
+          RUN_ANDROID="false"
+
+          if echo "$CHANGED" | grep -Eq '^(platforms/macos-ne/|crates/proxy-core/src/platform/tun/macos\.rs|crates/proxy-core/src/platform/sysproxy/|crates/proxy-ffi/src/ios_macos\.rs)'; then
+            RUN_MACOS="true"
+          fi
+          if echo "$CHANGED" | grep -Eq '^(crates/proxy-core/src/platform/tun/windows\.rs|scripts/fetch_wintun\.py)'; then
+            RUN_WINDOWS="true"
+          fi
+          if echo "$CHANGED" | grep -Eq '^(android/|crates/proxy-ffi/|scripts/build_android\.sh)'; then
+            RUN_ANDROID="true"
+          fi
+
+          ANY_EXTRA="false"
+          if [[ "$RUN_MACOS" == "true" || "$RUN_WINDOWS" == "true" || "$RUN_ANDROID" == "true" ]]; then
+            ANY_EXTRA="true"
+          fi
+
+          echo "run_macos=$RUN_MACOS" >> "$GITHUB_OUTPUT"
+          echo "run_windows=$RUN_WINDOWS" >> "$GITHUB_OUTPUT"
+          echo "run_android=$RUN_ANDROID" >> "$GITHUB_OUTPUT"
+          echo "any_extra=$ANY_EXTRA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install & Build Production SPA
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.changes.outputs.any_extra == 'true'
+        with:
+          name: ui-dist
+          path: ui/dist
+          retention-days: 1
+
+      - name: Install Tauri 2 System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Cache External Reference Binaries
+        id: interop-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/interop-bins
+          key: interop-bins-linux-ss1.25.0-xray26.10.31-anytls0.0.13
+
+      - name: Download & Verify Official Reference Binaries (SHA-256 Pinned)
+        if: steps.interop-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/interop-bins/xray /tmp/interop-bins/anytls /tmp/interop-dl
+
+          fetch_release_asset() {
+            local repo="$1" tag="$2" asset="$3" dest="$4"
+            rm -f "$dest"
+            for attempt in 1 2 3; do
+              if gh release download "$tag" -R "$repo" -p "$asset" -O "$dest" --clobber && [[ -s "$dest" ]]; then
+                return 0
+              fi
+              rm -f "$dest"
+              sleep $((attempt * 3))
+            done
+            curl -fsSL --retry 8 --retry-delay 4 --retry-all-errors --connect-timeout 30 \
+              -o "$dest" "https://github.com/${repo}/releases/download/${tag}/${asset}"
+          }
+
+          fetch_release_asset shadowsocks/shadowsocks-rust v1.25.0 \
+            shadowsocks-v1.25.0.x86_64-unknown-linux-musl.tar.xz /tmp/interop-dl/ss.tar.xz
+          fetch_release_asset XTLS/Xray-core v26.10.31 \
+            Xray-linux-64.zip /tmp/interop-dl/xray.zip
+          fetch_release_asset anytls/anytls-go v0.0.13 \
+            anytls_0.0.13_linux_amd64.zip /tmp/interop-dl/anytls.zip
+
+          cat <<'EOF' | sha256sum -c -
+          8439bf43c324b0fc273e663d0b1f8926fd8f666cbd1e0fd59b35096f0e778e92  /tmp/interop-dl/ss.tar.xz
+          e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214  /tmp/interop-dl/xray.zip
+          7e80fc099ea54a71110d256dd60648c47c63c70a3c499eb1f6d7aaa4edb7016f  /tmp/interop-dl/anytls.zip
+          EOF
+
+          tar -xJf /tmp/interop-dl/ss.tar.xz -C /tmp/interop-bins
+          unzip -q /tmp/interop-dl/xray.zip -d /tmp/interop-bins/xray
+          unzip -q /tmp/interop-dl/anytls.zip -d /tmp/interop-bins/anytls
+          chmod +x /tmp/interop-bins/ssserver /tmp/interop-bins/sslocal \
+                   /tmp/interop-bins/xray/xray \
+                   /tmp/interop-bins/anytls/anytls-server /tmp/interop-bins/anytls/anytls-client
+          rm -rf /tmp/interop-dl
+
+      - name: Check Rust Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy Strict Lint Audit (Workspace + Tauri Desktop)
+        run: cargo clippy --locked --workspace --all-targets --features tauri-app/desktop -- -D warnings
+
+      - name: Unit, E2E, Tauri Desktop & External Interop Suite
+        env:
+          RUST_CLASH_INTEROP_BIN_DIR: /tmp/interop-bins
+          RUST_CLASH_REQUIRE_EXTERNAL_INTEROP: "1"
+        run: cargo test --locked --workspace --features tauri-app/desktop -- --nocapture
+
+      - name: Isolated Linux Kernel /dev/net/tun + Policy Routing E2E (ip netns)
+        run: ./scripts/ci_linux_netns_tun_test.sh
+
+  android:
+    name: Android Native VPN Check (On Android/FFI Change)
+    needs: linux
+    if: needs.linux.outputs.run_android == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Cache Gradle Wrapper & Dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+      - name: Configure JDK 17 & Android SDK/NDK 27.2.12479018
+        run: |
+          set -euo pipefail
+          if [[ -n "${JAVA_HOME_17_X64:-}" ]] && [[ -d "${JAVA_HOME_17_X64}" ]]; then
+            echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> "$GITHUB_ENV"
+            echo "${JAVA_HOME_17_X64}/bin" >> "$GITHUB_PATH"
+          fi
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          if [[ ! -d "${SDK_ROOT}/platforms/android-35" || ! -d "${SDK_ROOT}/build-tools/35.0.0" || ! -d "${SDK_ROOT}/ndk/27.2.12479018" ]]; then
+            SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+            if [[ ! -x "$SDKMANAGER" ]]; then
+              SDKMANAGER="$(find "$SDK_ROOT" -name sdkmanager -type f | head -n 1)"
+            fi
+            (yes || true) | "$SDKMANAGER" --licenses >/dev/null || true
+            "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          fi
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Cross-Compile Rust JNI Core, Run JUnit + Lint & Build Debug APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_BUILD_VARIANT: debug
+          ANDROID_SKIP_BUNDLE: "1"
+        run: ./scripts/build_android.sh
+      - name: Prune Transient Gradle Locks Before Cache Save
+        if: always()
+        run: rm -rf ~/.gradle/caches/modules-2/modules-2.lock ~/.gradle/caches/*/plugin-resolution/
+
+  windows:
+    name: Windows Kernel & Wintun Check (On Windows Change)
+    needs: linux
+    if: needs.linux.outputs.run_windows == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install NASM on Windows (required by aws-lc-sys)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --no-progress -y
+          }
+          if (Test-Path "C:\Program Files\NASM") {
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      - name: Fetch & Verify Official Signed Wintun Driver
+        shell: pwsh
+        run: |
+          python scripts/fetch_wintun.py --self-test
+          python scripts/fetch_wintun.py --out-dir target/debug
+      - name: Clippy & Integration Suite
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace -- --nocapture
+
+  macos:
+    name: macOS Kernel & NetworkExtension Check (On macOS Change)
+    needs: linux
+    if: needs.linux.outputs.run_macos == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Typecheck Native macOS NetworkExtension (PacketTunnelProvider.swift)
+        run: |
+          xcrun --sdk macosx swiftc -typecheck \
+            platforms/macos-ne/PacketTunnelProvider.swift \
+            -import-objc-header platforms/macos-ne/RustClashNEBridge.h \
+            -target arm64-apple-macos13.0
+      - name: Clippy & Integration Suite
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace -- --nocapture
