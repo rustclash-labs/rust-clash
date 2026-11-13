@@ -345,6 +345,7 @@ async fn real_linux_kernel_netns_tun_tcp_udp_dns_and_teardown_e2e() {
         secret: None,
         geodata_mode: false,
         mmdb_path: None,
+        hosts: std::collections::HashMap::new(),
         dns: DnsConfig {
             enable: true,
             listen: "127.0.0.1:0".into(),
@@ -356,6 +357,7 @@ async fn real_linux_kernel_netns_tun_tcp_udp_dns_and_teardown_e2e() {
             direct_nameserver: vec![format!("{ss_server_ip}:{trusted_dns_port}")],
             nameserver: vec![format!("{ss_server_ip}:{trusted_dns_port}")],
             fallback: Vec::new(),
+            ..Default::default()
         },
         tun: TunConfig {
             enable: true,

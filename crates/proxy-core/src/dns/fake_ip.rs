@@ -204,9 +204,189 @@ impl PoolInner {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CompiledHostsRule {
+    pattern: String,
+    ips: Vec<IpAddr>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledPolicyRule {
+    pattern: String,
+    upstreams: Vec<DnsUpstream>,
+}
+
+fn label_glob_matches(text: &str, pat: &str) -> bool {
+    if pat == "*" {
+        return !text.is_empty();
+    }
+    if !pat.contains('*') {
+        return text == pat;
+    }
+    let tb = text.as_bytes();
+    let pb = pat.as_bytes();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut match_ti = 0usize;
+
+    while ti < tb.len() {
+        if pi < pb.len() && pb[pi] == tb[ti] {
+            ti += 1;
+            pi += 1;
+        } else if pi < pb.len() && pb[pi] == b'*' {
+            star_pi = Some(pi);
+            match_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            match_ti += 1;
+            ti = match_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pb.len() && pb[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pb.len()
+}
+
+fn labels_match_glob_slice(domain_labels: &[&str], pat_labels: &[&str]) -> bool {
+    if domain_labels.len() != pat_labels.len() {
+        return false;
+    }
+    domain_labels
+        .iter()
+        .zip(pat_labels.iter())
+        .all(|(d, p)| label_glob_matches(d, p))
+}
+
+/// Split a Clash/Mihomo pattern key (which may be comma-separated, such as
+/// `"+.internal.corp,+.edge.corp"` or `"geosite:cn,private"`), preserving the `"geosite:"`
+/// prefix for bare subsequent category tokens.
+pub(crate) fn split_clash_pattern_list(raw_key: &str) -> Vec<String> {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if !trimmed.contains(',') {
+        return vec![trimmed.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut inherit_geosite = false;
+    for (idx, part) in trimmed.split(',').enumerate() {
+        let tok = part.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if idx == 0
+            && tok.len() > 8
+            && tok.is_char_boundary(8)
+            && tok[..8].eq_ignore_ascii_case("geosite:")
+        {
+            inherit_geosite = true;
+            out.push(tok.to_string());
+        } else if inherit_geosite
+            && !tok.contains(':')
+            && !tok.contains('.')
+            && !tok.contains('*')
+            && !tok.contains('+')
+        {
+            out.push(format!("geosite:{tok}"));
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Match `domain` against a single Clash/Mihomo domain pattern, returning a specificity score
+/// (`Exact > Multi-label Wildcard > Suffix (+./.) > GeoSite > Catch-All`) when matched.
+pub fn domain_matches_clash_pattern(domain: &str, raw_pat: &str) -> Option<u32> {
+    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() {
+        return None;
+    }
+    let p = raw_pat.trim().trim_end_matches('.').to_ascii_lowercase();
+    if p.is_empty() {
+        return None;
+    }
+    if p == "*" || p == "+" || p == "+.*" {
+        return Some(100);
+    }
+    if let Some(rest) = p.strip_prefix("geosite:") {
+        let cat = rest.trim();
+        if cat.is_empty() {
+            return None;
+        }
+        if let Some(builtin) = crate::router::geosite_data::lookup_builtin_geosite(cat)
+            && crate::router::geodata::matches_geosite_dynamic(cat, builtin, &d)
+        {
+            return Some(1000 + (cat.len().min(128) as u32));
+        }
+        return None;
+    }
+    if let Some(suffix) = p.strip_prefix("+.") {
+        if suffix.is_empty() {
+            return None;
+        }
+        if !suffix.contains('*') {
+            if d == suffix || d.ends_with(&format!(".{suffix}")) {
+                let labels = suffix.bytes().filter(|&b| b == b'.').count() as u32 + 1;
+                return Some(2000 + labels * 64 + (suffix.len().min(255) as u32));
+            }
+            return None;
+        }
+        let d_labels: Vec<&str> = d.split('.').collect();
+        let s_labels: Vec<&str> = suffix.split('.').collect();
+        if d_labels.len() >= s_labels.len()
+            && labels_match_glob_slice(&d_labels[d_labels.len() - s_labels.len()..], &s_labels)
+        {
+            let lit_labels = s_labels.iter().filter(|&&l| !l.contains('*')).count() as u32;
+            return Some(2000 + lit_labels * 64 + (suffix.len().min(255) as u32));
+        }
+        return None;
+    }
+    if let Some(suffix) = p.strip_prefix('.') {
+        if suffix.is_empty() {
+            return None;
+        }
+        let d_labels: Vec<&str> = d.split('.').collect();
+        let s_labels: Vec<&str> = suffix.split('.').collect();
+        if d_labels.len() > s_labels.len()
+            && labels_match_glob_slice(&d_labels[d_labels.len() - s_labels.len()..], &s_labels)
+        {
+            let lit_labels = s_labels.iter().filter(|&&l| !l.contains('*')).count() as u32;
+            return Some(2000 + lit_labels * 64 + (suffix.len().min(255) as u32));
+        }
+        return None;
+    }
+    if p.contains('*') {
+        let d_labels: Vec<&str> = d.split('.').collect();
+        let p_labels: Vec<&str> = p.split('.').collect();
+        if labels_match_glob_slice(&d_labels, &p_labels) {
+            let lit_labels = p_labels.iter().filter(|&&l| !l.contains('*')).count() as u32;
+            return Some(3000 + lit_labels * 64 + (p.len().min(255) as u32));
+        }
+        return None;
+    }
+    if d == p {
+        return Some(4000 + (p.len().min(255) as u32));
+    }
+    None
+}
+
+/// Check whether `domain` matches any pattern in a (possibly comma-separated) Clash pattern string.
+pub fn domain_matches_any_clash_pattern(domain: &str, raw_key: &str) -> bool {
+    split_clash_pattern_list(raw_key)
+        .iter()
+        .any(|pat| domain_matches_clash_pattern(domain, pat).is_some())
+}
+
 /// Production Multi-Transport DNS Engine supporting:
 /// - `fake-ip` (`198.18.0.0/15`) and `redir-host` / `normal` (Real-IP) modes
-/// - `udp://` (with RFC 1035 `TC=1` -> TCP fallback), `tcp://`, `tls://` (DoT), and `https://` (DoH RFC 8484)
+/// - `udp://` (with RFC 1035 `TC=1` -> TCP fallback), `tcp://`, `tls://` (DoT), and `https://` (DoH RFC 8484 HTTP/1.1 + HTTP/2)
+/// - Clash Meta / Mihomo `nameserver-policy`, `proxy-server-nameserver`, `proxy-server-nameserver-policy`, and static `hosts`
 /// - Strict literal-IP `default-nameserver` bootstrap separation (preventing OS resolver leaks)
 /// - Configurable `dns.ipv6` policy
 /// - TTL-aware positive & negative (`NXDOMAIN` / `NODATA`) caching + explicit `flush_cache()` invalidation
@@ -215,22 +395,30 @@ pub struct FakeIpDnsEngine {
     enabled: bool,
     fake_ip_mode: bool,
     ipv6: bool,
+    use_hosts: bool,
+    direct_nameserver_follow_policy: bool,
     enhanced_mode: String,
     net: Ipv4Net,
     filters: Vec<String>,
+    hosts_rules: Vec<CompiledHostsRule>,
     bootstrap_servers: Vec<BootstrapDnsServer>,
+    proxy_upstreams: Vec<DnsUpstream>,
+    proxy_policy_rules: Vec<CompiledPolicyRule>,
     direct_upstreams: Vec<DnsUpstream>,
     upstreams: Vec<DnsUpstream>,
     fallbacks: Vec<DnsUpstream>,
+    policy_rules: Vec<CompiledPolicyRule>,
     literal_nameservers: Vec<SocketAddr>,
     extra_ca_der: Vec<CertificateDer<'static>>,
     pool: Mutex<PoolInner>,
     real_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
     direct_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
+    proxy_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
     packet_cache: Mutex<LruCache<(String, u16), CachedWirePacket>>,
     bootstrap_cache: Mutex<LruCache<String, (Instant, Vec<IpAddr>)>>,
     inflight_real: DashMap<String, watch::Sender<bool>>,
     inflight_direct: DashMap<String, watch::Sender<bool>>,
+    inflight_proxy: DashMap<String, watch::Sender<bool>>,
 }
 
 impl FakeIpDnsEngine {
@@ -243,14 +431,53 @@ impl FakeIpDnsEngine {
         extra_ca_der: &[CertificateDer<'static>],
     ) -> Result<Self> {
         let net = cfg.parsed_fake_ip_net()?;
-        let mode_lc = cfg.enhanced_mode.trim().to_ascii_lowercase();
-        if !matches!(mode_lc.as_str(), "fake-ip" | "redir-host" | "normal" | "") {
-            return Err(ProxyError::Config(format!(
-                "unsupported dns.enhanced-mode '{}' (expected 'fake-ip', 'redir-host', or 'normal')",
-                cfg.enhanced_mode
-            )));
-        }
+        let raw_mode = cfg.enhanced_mode.trim().to_ascii_lowercase();
+        let mode_lc = match raw_mode.as_str() {
+            "mapping" => "fake-ip".to_string(),
+            "passthrough" | "hosts" | "" => "normal".to_string(),
+            "fake-ip" | "redir-host" | "normal" => raw_mode,
+            _ => {
+                return Err(ProxyError::Config(format!(
+                    "unsupported dns.enhanced-mode '{}' (expected 'fake-ip', 'redir-host', or 'normal')",
+                    cfg.enhanced_mode
+                )));
+            }
+        };
         let fake_ip_mode = mode_lc == "fake-ip";
+
+        let mut hosts_rules = Vec::new();
+        let mut sorted_hosts_keys: Vec<&String> = cfg.hosts.keys().collect();
+        sorted_hosts_keys.sort();
+        for raw_key in sorted_hosts_keys {
+            let Some(ip_strs) = cfg.hosts.get(raw_key) else {
+                continue;
+            };
+            let mut ips = Vec::new();
+            for s in ip_strs {
+                if s.trim().is_empty() {
+                    continue;
+                }
+                let ip = crate::config::parse_hosts_ip_entry(s).ok_or_else(|| {
+                    ProxyError::Config(format!("invalid IP address '{s}' in hosts for '{raw_key}'"))
+                })?;
+                if !net.contains(&match ip {
+                    IpAddr::V4(v4) => v4,
+                    IpAddr::V6(v6) => v6.to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED),
+                }) && !ips.contains(&ip)
+                {
+                    ips.push(ip);
+                }
+            }
+            if ips.is_empty() {
+                continue;
+            }
+            for pat in split_clash_pattern_list(raw_key) {
+                hosts_rules.push(CompiledHostsRule {
+                    pattern: pat,
+                    ips: ips.clone(),
+                });
+            }
+        }
 
         let mut bootstrap_servers = Vec::new();
         for b in &cfg.default_nameserver {
@@ -259,18 +486,32 @@ impl FakeIpDnsEngine {
             }
         }
 
-        let mut direct_upstreams = Vec::new();
         let mut literal_nameservers = Vec::new();
+        let mut record_literal_ns = |up: &DnsUpstream| {
+            if let Some(sa) = up.literal_socket_addr()
+                && !literal_nameservers.contains(&sa)
+            {
+                literal_nameservers.push(sa);
+            }
+        };
+
+        let mut proxy_upstreams = Vec::new();
+        for ns in &cfg.proxy_server_nameserver {
+            if ns.trim().is_empty() {
+                continue;
+            }
+            let parsed = DnsUpstream::parse(ns)?;
+            record_literal_ns(&parsed);
+            proxy_upstreams.push(parsed);
+        }
+
+        let mut direct_upstreams = Vec::new();
         for dns_str in &cfg.direct_nameserver {
             if dns_str.trim().is_empty() {
                 continue;
             }
             let parsed = DnsUpstream::parse(dns_str)?;
-            if let Some(sa) = parsed.literal_socket_addr()
-                && !literal_nameservers.contains(&sa)
-            {
-                literal_nameservers.push(sa);
-            }
+            record_literal_ns(&parsed);
             direct_upstreams.push(parsed);
         }
 
@@ -280,11 +521,7 @@ impl FakeIpDnsEngine {
                 continue;
             }
             let parsed = DnsUpstream::parse(ns)?;
-            if let Some(sa) = parsed.literal_socket_addr()
-                && !literal_nameservers.contains(&sa)
-            {
-                literal_nameservers.push(sa);
-            }
+            record_literal_ns(&parsed);
             upstreams.push(parsed);
         }
 
@@ -294,21 +531,81 @@ impl FakeIpDnsEngine {
                 continue;
             }
             let parsed = DnsUpstream::parse(fb)?;
-            if let Some(sa) = parsed.literal_socket_addr()
-                && !literal_nameservers.contains(&sa)
-            {
-                literal_nameservers.push(sa);
-            }
+            record_literal_ns(&parsed);
             fallbacks.push(parsed);
         }
 
-        // Enforce strict bootstrap separation: if any DoT/DoH upstream uses a domain hostname,
-        // `default-nameserver` MUST contain at least one literal-IP bootstrap server!
-        if (direct_upstreams.iter().any(DnsUpstream::requires_bootstrap)
-            || upstreams.iter().any(DnsUpstream::requires_bootstrap)
-            || fallbacks.iter().any(DnsUpstream::requires_bootstrap))
-            && bootstrap_servers.is_empty()
-        {
+        let compile_policy_map = |policy_map: &HashMap<String, Vec<String>>,
+                                  record_ns: &mut dyn FnMut(&DnsUpstream)|
+         -> Result<Vec<CompiledPolicyRule>> {
+            let mut keys: Vec<&String> = policy_map.keys().collect();
+            keys.sort();
+            let mut compiled = Vec::new();
+            for raw_key in keys {
+                let Some(ns_list) = policy_map.get(raw_key) else {
+                    continue;
+                };
+                let mut ups = Vec::new();
+                for ns in ns_list {
+                    if ns.trim().is_empty() {
+                        continue;
+                    }
+                    let parsed = DnsUpstream::parse(ns)?;
+                    record_ns(&parsed);
+                    ups.push(parsed);
+                }
+                if ups.is_empty() {
+                    continue;
+                }
+                for pat in split_clash_pattern_list(raw_key) {
+                    compiled.push(CompiledPolicyRule {
+                        pattern: pat,
+                        upstreams: ups.clone(),
+                    });
+                }
+            }
+            Ok(compiled)
+        };
+
+        let policy_rules = compile_policy_map(&cfg.nameserver_policy, &mut record_literal_ns)?;
+        let proxy_policy_rules =
+            compile_policy_map(&cfg.proxy_server_nameserver_policy, &mut record_literal_ns)?;
+
+        let host_covered_by_static_hosts = |domain: &str| -> bool {
+            cfg.use_hosts
+                && hosts_rules
+                    .iter()
+                    .any(|r| domain_matches_clash_pattern(domain, &r.pattern).is_some())
+        };
+
+        let upstream_needs_bootstrap = |u: &DnsUpstream| -> bool {
+            if !u.requires_bootstrap() {
+                return false;
+            }
+            match u.endpoint_host() {
+                DnsEndpointHost::Ip(_) => false,
+                DnsEndpointHost::Domain(ref d) => {
+                    d != "localhost" && !host_covered_by_static_hosts(d)
+                }
+            }
+        };
+
+        // Enforce strict bootstrap separation: if any DoT/DoH upstream uses a domain hostname
+        // not statically resolved via `hosts`, `default-nameserver` MUST contain at least one literal-IP bootstrap server!
+        let any_needs_bootstrap = proxy_upstreams.iter().any(&upstream_needs_bootstrap)
+            || direct_upstreams.iter().any(&upstream_needs_bootstrap)
+            || upstreams.iter().any(&upstream_needs_bootstrap)
+            || fallbacks.iter().any(&upstream_needs_bootstrap)
+            || policy_rules
+                .iter()
+                .flat_map(|r| r.upstreams.iter())
+                .any(&upstream_needs_bootstrap)
+            || proxy_policy_rules
+                .iter()
+                .flat_map(|r| r.upstreams.iter())
+                .any(&upstream_needs_bootstrap);
+
+        if any_needs_bootstrap && bootstrap_servers.is_empty() {
             return Err(ProxyError::Config(
                 "DoH/DoT hostname in dns.nameserver/fallback requires at least one literal-IP dns.default-nameserver".into(),
             ));
@@ -318,17 +615,19 @@ impl FakeIpDnsEngine {
             enabled: cfg.enable,
             fake_ip_mode,
             ipv6: cfg.ipv6,
-            enhanced_mode: if mode_lc.is_empty() {
-                "normal".to_string()
-            } else {
-                mode_lc
-            },
+            use_hosts: cfg.use_hosts,
+            direct_nameserver_follow_policy: cfg.direct_nameserver_follow_policy,
+            enhanced_mode: mode_lc,
             net,
             filters: cfg.fake_ip_filter.clone(),
+            hosts_rules,
             bootstrap_servers,
+            proxy_upstreams,
+            proxy_policy_rules,
             direct_upstreams,
             upstreams,
             fallbacks,
+            policy_rules,
             literal_nameservers,
             extra_ca_der: extra_ca_der.to_vec(),
             pool: Mutex::new(PoolInner::new(net, 16_384)),
@@ -338,6 +637,9 @@ impl FakeIpDnsEngine {
             direct_ip_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(4096).expect("non-zero cache size"),
             )),
+            proxy_ip_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(1024).expect("non-zero cache size"),
+            )),
             packet_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(4096).expect("non-zero cache size"),
             )),
@@ -346,6 +648,7 @@ impl FakeIpDnsEngine {
             )),
             inflight_real: DashMap::new(),
             inflight_direct: DashMap::new(),
+            inflight_proxy: DashMap::new(),
         })
     }
 
@@ -369,6 +672,7 @@ impl FakeIpDnsEngine {
     pub fn flush_cache(&self) {
         self.real_ip_cache.lock().clear();
         self.direct_ip_cache.lock().clear();
+        self.proxy_ip_cache.lock().clear();
         self.packet_cache.lock().clear();
         self.bootstrap_cache.lock().clear();
         clear_dns_upstream_pools();
@@ -377,6 +681,7 @@ impl FakeIpDnsEngine {
     pub fn cached_record_count(&self) -> usize {
         self.real_ip_cache.lock().len()
             + self.direct_ip_cache.lock().len()
+            + self.proxy_ip_cache.lock().len()
             + self.packet_cache.lock().len()
     }
 
@@ -436,27 +741,94 @@ impl FakeIpDnsEngine {
         if d.is_empty() || d.parse::<IpAddr>().is_ok() {
             return true;
         }
-        for pat in &self.filters {
-            let p = pat.trim().trim_end_matches('.').to_ascii_lowercase();
-            if p.is_empty() {
-                continue;
-            }
-            if let Some(suffix) = p.strip_prefix("+.") {
-                if d == suffix || d.ends_with(&format!(".{suffix}")) {
-                    return true;
+        if self.use_hosts && self.lookup_static_hosts_raw(&d).is_some() {
+            return true;
+        }
+        self.filters
+            .iter()
+            .any(|pat| domain_matches_any_clash_pattern(&d, pat))
+    }
+
+    fn lookup_static_hosts_raw(&self, normalized: &str) -> Option<&[IpAddr]> {
+        if !self.use_hosts || self.hosts_rules.is_empty() {
+            return None;
+        }
+        let mut best: Option<(u32, &str, &[IpAddr])> = None;
+        for rule in &self.hosts_rules {
+            if let Some(score) = domain_matches_clash_pattern(normalized, &rule.pattern) {
+                let replace = match best {
+                    None => true,
+                    Some((best_score, best_pat, _)) => {
+                        score > best_score
+                            || (score == best_score && rule.pattern.as_str() < best_pat)
+                    }
+                };
+                if replace {
+                    best = Some((score, rule.pattern.as_str(), rule.ips.as_slice()));
                 }
-            } else if let Some(suffix) = p.strip_prefix("*.") {
-                if let Some((prefix, rest)) = d.split_once('.')
-                    && !prefix.is_empty()
-                    && rest == suffix
-                {
-                    return true;
-                }
-            } else if d == p {
-                return true;
             }
         }
-        false
+        best.map(|(_, _, ips)| ips)
+    }
+
+    fn lookup_static_hosts_filtered(&self, normalized: &str) -> Option<Vec<IpAddr>> {
+        let raw = self.lookup_static_hosts_raw(normalized)?;
+        let filtered: Vec<IpAddr> = raw
+            .iter()
+            .copied()
+            .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+            .collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    }
+
+    fn lookup_static_hosts_for_endpoint(&self, normalized: &str) -> Option<Vec<IpAddr>> {
+        let raw = self.lookup_static_hosts_raw(normalized)?;
+        let mut preferred: Vec<IpAddr> = raw
+            .iter()
+            .copied()
+            .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+            .collect();
+        if preferred.is_empty() {
+            preferred = raw
+                .iter()
+                .copied()
+                .filter(|ip| !self.is_fake_ip(*ip))
+                .collect();
+        }
+        if preferred.is_empty() {
+            None
+        } else {
+            Some(preferred)
+        }
+    }
+
+    fn matching_policy_upstreams<'a>(
+        rules: &'a [CompiledPolicyRule],
+        normalized: &str,
+    ) -> Option<&'a [DnsUpstream]> {
+        if rules.is_empty() {
+            return None;
+        }
+        let mut best: Option<(u32, &'a str, &'a [DnsUpstream])> = None;
+        for rule in rules {
+            if let Some(score) = domain_matches_clash_pattern(normalized, &rule.pattern) {
+                let replace = match best {
+                    None => true,
+                    Some((best_score, best_pat, _)) => {
+                        score > best_score
+                            || (score == best_score && rule.pattern.as_str() < best_pat)
+                    }
+                };
+                if replace {
+                    best = Some((score, rule.pattern.as_str(), rule.upstreams.as_slice()));
+                }
+            }
+        }
+        best.map(|(_, _, ups)| ups)
     }
 
     pub fn assign_fake_ip(&self, domain: &str) -> Ipv4Addr {
@@ -536,7 +908,7 @@ impl FakeIpDnsEngine {
             if self.is_fake_ip(bs.ip()) {
                 continue;
             }
-            if let Ok(resp) = bs.exchange(&query).await
+            if let Ok(resp) = bs.exchange_with_ca(&query, &self.extra_ca_der).await
                 && let Ok(meta) = extract_dns_response_meta(&resp)
                 && meta.rcode == 0
             {
@@ -567,8 +939,8 @@ impl FakeIpDnsEngine {
         None
     }
 
-    /// Resolve a DoT/DoH server's hostname strictly using literal-IP `default-nameserver`s
-    /// (never touching OS `getaddrinfo`, preventing DNS leaks and recursive TUN loops).
+    /// Resolve a DoT/DoH server's hostname strictly using static `hosts` (when `use-hosts: true`)
+    /// or literal-IP `default-nameserver`s (never touching OS `getaddrinfo`, preventing DNS leaks and recursive TUN loops).
     async fn resolve_bootstrap_host(&self, host: &DnsEndpointHost) -> Result<Vec<IpAddr>> {
         match host {
             DnsEndpointHost::Ip(ip) => {
@@ -580,10 +952,14 @@ impl FakeIpDnsEngine {
                 Ok(vec![*ip])
             }
             DnsEndpointHost::Domain(domain) => {
-                if domain == "localhost" {
+                let norm = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+                if norm == "localhost" {
                     return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
                 }
-                if let Some((expires_at, ips)) = self.bootstrap_cache.lock().get(domain).cloned()
+                if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&norm) {
+                    return Ok(static_ips);
+                }
+                if let Some((expires_at, ips)) = self.bootstrap_cache.lock().get(&norm).cloned()
                     && Instant::now() < expires_at
                 {
                     return Ok(ips);
@@ -591,11 +967,11 @@ impl FakeIpDnsEngine {
 
                 let (res_a, res_aaaa) = if self.ipv6 {
                     tokio::join!(
-                        self.query_bootstrap_qtype(domain, QTYPE_A),
-                        self.query_bootstrap_qtype(domain, QTYPE_AAAA)
+                        self.query_bootstrap_qtype(&norm, QTYPE_A),
+                        self.query_bootstrap_qtype(&norm, QTYPE_AAAA)
                     )
                 } else {
-                    (self.query_bootstrap_qtype(domain, QTYPE_A).await, None)
+                    (self.query_bootstrap_qtype(&norm, QTYPE_A).await, None)
                 };
 
                 let mut ips = Vec::new();
@@ -616,7 +992,7 @@ impl FakeIpDnsEngine {
                 }
 
                 self.bootstrap_cache.lock().put(
-                    domain.clone(),
+                    norm,
                     (Instant::now() + Duration::from_secs(min_ttl), ips.clone()),
                 );
                 Ok(ips)
@@ -624,10 +1000,13 @@ impl FakeIpDnsEngine {
         }
     }
 
-    async fn exchange_with_upstreams(&self, raw_query: &[u8]) -> Result<Vec<u8>> {
+    async fn exchange_with_upstream_slice(
+        &self,
+        slice: &[DnsUpstream],
+        raw_query: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut last_err = ProxyError::Dns("no DNS upstreams configured".into());
-
-        for upstream in &self.upstreams {
+        for upstream in slice {
             let ips = match self.resolve_bootstrap_host(&upstream.endpoint_host()).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -640,22 +1019,38 @@ impl FakeIpDnsEngine {
                 Err(e) => last_err = e,
             }
         }
+        Err(last_err)
+    }
 
-        for fb in &self.fallbacks {
-            let ips = match self.resolve_bootstrap_host(&fb.endpoint_host()).await {
-                Ok(v) => v,
-                Err(e) => {
-                    last_err = e;
-                    continue;
+    async fn exchange_with_upstreams(&self, raw_query: &[u8]) -> Result<Vec<u8>> {
+        match self
+            .exchange_with_upstream_slice(&self.upstreams, raw_query)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(primary_err) => {
+                if self.fallbacks.is_empty() {
+                    Err(primary_err)
+                } else {
+                    self.exchange_with_upstream_slice(&self.fallbacks, raw_query)
+                        .await
                 }
-            };
-            match fb.exchange(&ips, raw_query, &self.extra_ca_der).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) => last_err = e,
             }
         }
+    }
 
-        Err(last_err)
+    async fn query_slice_qtype(
+        &self,
+        slice: &[DnsUpstream],
+        normalized: &str,
+        qtype: u16,
+    ) -> Option<crate::dns::wire::DnsResponseMeta> {
+        let query = build_dns_query(rand::random(), normalized, qtype);
+        let resp = self
+            .exchange_with_upstream_slice(slice, &query)
+            .await
+            .ok()?;
+        extract_dns_response_meta(&resp).ok()
     }
 
     async fn query_upstream_qtype(
@@ -668,8 +1063,78 @@ impl FakeIpDnsEngine {
         extract_dns_response_meta(&resp).ok()
     }
 
-    /// Resolve a domain name to real IPv4 (and IPv6 if `dns.ipv6: true`) addresses via configured
-    /// `nameserver` / `fallback` upstreams with TTL-aware positive and negative caching and singleflight coalescing.
+    fn collect_ips_from_metas(
+        &self,
+        metas: [Option<crate::dns::wire::DnsResponseMeta>; 2],
+    ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
+        let mut resolved = Vec::new();
+        let mut saw_nxdomain = false;
+        let mut saw_nodata = false;
+        let mut min_pos_ttl: Option<u64> = None;
+        let mut min_neg_ttl: Option<u64> = None;
+
+        for meta in metas.into_iter().flatten() {
+            if meta.rcode == 3 {
+                saw_nxdomain = true;
+                let neg_t = u64::from(meta.min_ttl.unwrap_or(30))
+                    .clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS);
+                min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
+            } else if meta.rcode == 0 {
+                if meta.answers.is_empty() {
+                    saw_nodata = true;
+                    let neg_t = u64::from(meta.min_ttl.unwrap_or(15))
+                        .clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS);
+                    min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
+                } else {
+                    let pos_t = u64::from(meta.min_ttl.unwrap_or(60))
+                        .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
+                    min_pos_ttl = Some(min_pos_ttl.map_or(pos_t, |c| c.min(pos_t)));
+                    for ans in meta.answers {
+                        match ans {
+                            DnsAnswerData::A(v4) => {
+                                let ip = IpAddr::V4(v4);
+                                if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
+                                    resolved.push(ip);
+                                }
+                            }
+                            DnsAnswerData::Aaaa(v6) if self.ipv6 => {
+                                let ip = IpAddr::V6(v6);
+                                if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
+                                    resolved.push(ip);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        (resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata)
+    }
+
+    async fn query_slice_ips(
+        &self,
+        slice: &[DnsUpstream],
+        normalized: &str,
+    ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
+        let metas = if self.ipv6 {
+            let (m_a, m_aaaa) = tokio::join!(
+                self.query_slice_qtype(slice, normalized, QTYPE_A),
+                self.query_slice_qtype(slice, normalized, QTYPE_AAAA)
+            );
+            [m_a, m_aaaa]
+        } else {
+            [
+                self.query_slice_qtype(slice, normalized, QTYPE_A).await,
+                None,
+            ]
+        };
+        self.collect_ips_from_metas(metas)
+    }
+
+    /// Resolve a domain name to real IPv4 (and IPv6 if `dns.ipv6: true`) addresses via static `hosts`,
+    /// `nameserver-policy`, or configured `nameserver` / `fallback` upstreams with TTL-aware positive
+    /// and negative caching and singleflight coalescing.
     /// Never falls back to OS `lookup_host` when `nameserver`s are configured.
     pub async fn resolve_real_ips(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -693,6 +1158,9 @@ impl FakeIpDnsEngine {
             } else {
                 Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
             };
+        }
+        if let Some(static_ips) = self.lookup_static_hosts_filtered(&normalized) {
+            return Ok(static_ips);
         }
 
         if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized) {
@@ -730,60 +1198,32 @@ impl FakeIpDnsEngine {
             return cached;
         }
 
-        let mut resolved = Vec::new();
-        let mut saw_nxdomain = false;
-        let mut saw_nodata = false;
-        let mut min_pos_ttl: Option<u64> = None;
-        let mut min_neg_ttl: Option<u64> = None;
-
-        if !self.upstreams.is_empty() || !self.fallbacks.is_empty() {
-            let metas = if self.ipv6 {
-                let (m_a, m_aaaa) = tokio::join!(
-                    self.query_upstream_qtype(&normalized, QTYPE_A),
-                    self.query_upstream_qtype(&normalized, QTYPE_AAAA)
-                );
-                [m_a, m_aaaa]
+        let (mut resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata) =
+            if let Some(policy_ups) =
+                Self::matching_policy_upstreams(&self.policy_rules, &normalized)
+            {
+                self.query_slice_ips(policy_ups, &normalized).await
+            } else if !self.upstreams.is_empty() || !self.fallbacks.is_empty() {
+                let metas = if self.ipv6 {
+                    let (m_a, m_aaaa) = tokio::join!(
+                        self.query_upstream_qtype(&normalized, QTYPE_A),
+                        self.query_upstream_qtype(&normalized, QTYPE_AAAA)
+                    );
+                    [m_a, m_aaaa]
+                } else {
+                    [self.query_upstream_qtype(&normalized, QTYPE_A).await, None]
+                };
+                self.collect_ips_from_metas(metas)
             } else {
-                [self.query_upstream_qtype(&normalized, QTYPE_A).await, None]
+                (Vec::new(), None, None, false, false)
             };
 
-            for meta in metas.into_iter().flatten() {
-                if meta.rcode == 3 {
-                    saw_nxdomain = true;
-                    let neg_t = u64::from(meta.min_ttl.unwrap_or(30))
-                        .clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS);
-                    min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
-                } else if meta.rcode == 0 {
-                    if meta.answers.is_empty() {
-                        saw_nodata = true;
-                        let neg_t = u64::from(meta.min_ttl.unwrap_or(15))
-                            .clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS);
-                        min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
-                    } else {
-                        let pos_t = u64::from(meta.min_ttl.unwrap_or(60))
-                            .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
-                        min_pos_ttl = Some(min_pos_ttl.map_or(pos_t, |c| c.min(pos_t)));
-                        for ans in meta.answers {
-                            match ans {
-                                DnsAnswerData::A(v4) => {
-                                    let ip = IpAddr::V4(v4);
-                                    if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
-                                        resolved.push(ip);
-                                    }
-                                }
-                                DnsAnswerData::Aaaa(v6) if self.ipv6 => {
-                                    let ip = IpAddr::V6(v6);
-                                    if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
-                                        resolved.push(ip);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        } else if !self.enabled {
+        if resolved.is_empty()
+            && !self.enabled
+            && self.upstreams.is_empty()
+            && self.fallbacks.is_empty()
+            && Self::matching_policy_upstreams(&self.policy_rules, &normalized).is_none()
+        {
             // Only when the DNS engine itself is explicitly disabled (`dns.enable: false`) and no
             // upstreams were provided, allow system lookup while still filtering Fake-IPs.
             if let Ok(Ok(iter)) = tokio::time::timeout(
@@ -834,42 +1274,10 @@ impl FakeIpDnsEngine {
         Ok(resolved)
     }
 
-    async fn exchange_with_direct_upstreams(&self, raw_query: &[u8]) -> Result<Vec<u8>> {
-        let mut last_err = ProxyError::Dns("no direct-nameserver upstreams configured".into());
-        for upstream in &self.direct_upstreams {
-            let ips = match self.resolve_bootstrap_host(&upstream.endpoint_host()).await {
-                Ok(v) => v,
-                Err(e) => {
-                    last_err = e;
-                    continue;
-                }
-            };
-            match upstream.exchange(&ips, raw_query, &self.extra_ca_der).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) => last_err = e,
-            }
-        }
-        Err(last_err)
-    }
-
-    async fn query_direct_qtype(
-        &self,
-        normalized: &str,
-        qtype: u16,
-    ) -> Option<crate::dns::wire::DnsResponseMeta> {
-        let query = build_dns_query(rand::random(), normalized, qtype);
-        let resp = self.exchange_with_direct_upstreams(&query).await.ok()?;
-        extract_dns_response_meta(&resp).ok()
-    }
-
     /// Resolve a domain name for `DIRECT` outbound dialing and `GEOIP,CN` rule matching.
-    /// Prefers `dns.direct-nameserver` (e.g. `223.5.5.5:53`, `119.29.29.29:53`) when configured
-    /// so Mainland China domains get fast, accurate domestic CDN answers, falling back cleanly
-    /// to `resolve_real_ips` when `direct-nameserver` is empty or unreachable.
+    /// Honors static `hosts` and (when `direct-nameserver-follow-policy: true`, the default)
+    /// `nameserver-policy` before `dns.direct-nameserver`, falling back cleanly to `resolve_real_ips`.
     pub async fn resolve_direct_ips(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        if self.direct_upstreams.is_empty() {
-            return self.resolve_real_ips(domain).await;
-        }
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized.is_empty() {
             return Err(ProxyError::Dns("cannot resolve empty domain".into()));
@@ -891,6 +1299,15 @@ impl FakeIpDnsEngine {
             } else {
                 Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
             };
+        }
+        if let Some(static_ips) = self.lookup_static_hosts_filtered(&normalized) {
+            return Ok(static_ips);
+        }
+        if self.direct_upstreams.is_empty()
+            || (self.direct_nameserver_follow_policy
+                && Self::matching_policy_upstreams(&self.policy_rules, &normalized).is_some())
+        {
+            return self.resolve_real_ips(domain).await;
         }
 
         if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized) {
@@ -929,42 +1346,9 @@ impl FakeIpDnsEngine {
             return cached;
         }
 
-        let mut resolved = Vec::new();
-        let mut min_pos_ttl: Option<u64> = None;
-        let metas = if self.ipv6 {
-            let (m_a, m_aaaa) = tokio::join!(
-                self.query_direct_qtype(&normalized, QTYPE_A),
-                self.query_direct_qtype(&normalized, QTYPE_AAAA)
-            );
-            [m_a, m_aaaa]
-        } else {
-            [self.query_direct_qtype(&normalized, QTYPE_A).await, None]
-        };
-
-        for meta in metas.into_iter().flatten() {
-            if meta.rcode == 0 && !meta.answers.is_empty() {
-                let pos_t = u64::from(meta.min_ttl.unwrap_or(60))
-                    .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
-                min_pos_ttl = Some(min_pos_ttl.map_or(pos_t, |c| c.min(pos_t)));
-                for ans in meta.answers {
-                    match ans {
-                        DnsAnswerData::A(v4) => {
-                            let ip = IpAddr::V4(v4);
-                            if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
-                                resolved.push(ip);
-                            }
-                        }
-                        DnsAnswerData::Aaaa(v6) if self.ipv6 => {
-                            let ip = IpAddr::V6(v6);
-                            if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
-                                resolved.push(ip);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        let (resolved, min_pos_ttl, _, _, _) = self
+            .query_slice_ips(&self.direct_upstreams, &normalized)
+            .await;
 
         if !resolved.is_empty() {
             let ttl = min_pos_ttl.unwrap_or(60);
@@ -983,8 +1367,13 @@ impl FakeIpDnsEngine {
     }
 
     /// Resolve a domain-based proxy node server hostname (`server: hk01.example.com`)
-    /// strictly over protected bootstrap / direct / configured upstreams while rejecting Fake-IPs
-    /// (`198.18.0.0/15`), preventing recursive self-loops when Android `VpnService` is active.
+    /// honoring Clash Meta / Mihomo split-horizon DNS hierarchy:
+    /// 1. Static `hosts` (when `use-hosts: true`)
+    /// 2. `proxy-server-nameserver-policy`
+    /// 3. `proxy-server-nameserver`
+    /// 4. `nameserver-policy`
+    /// 5. `nameserver` / `fallback` & `direct-nameserver`
+    /// 6. `default-nameserver` -> OS fallback (while strictly rejecting Fake-IPs)
     pub async fn resolve_proxy_server_ips(&self, host: &str) -> Result<Vec<IpAddr>> {
         let clean = host
             .trim()
@@ -1007,19 +1396,139 @@ impl FakeIpDnsEngine {
         if clean == "localhost" {
             return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         }
+        if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&clean) {
+            return Ok(static_ips);
+        }
 
+        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+            return cached;
+        }
+
+        let _inflight_guard = {
+            let waiter = match self.inflight_proxy.entry(clean.clone()) {
+                Entry::Occupied(occ) => Err(occ.get().subscribe()),
+                Entry::Vacant(vac) => {
+                    let (tx, _rx) = watch::channel(false);
+                    vac.insert(tx.clone());
+                    Ok(InflightLookupGuard {
+                        map: &self.inflight_proxy,
+                        key: clean.clone(),
+                        tx,
+                    })
+                }
+            };
+            match waiter {
+                Ok(guard) => Some(guard),
+                Err(mut rx) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
+                        .await;
+                    if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+                        return cached;
+                    }
+                    None
+                }
+            }
+        };
+
+        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+            return cached;
+        }
+
+        let cache_and_return = |ips: Vec<IpAddr>, ttl_opt: Option<u64>| -> Result<Vec<IpAddr>> {
+            let ttl = ttl_opt.unwrap_or(60);
+            self.proxy_ip_cache.lock().put(
+                clean.clone(),
+                CachedIpResolution::Positive {
+                    expires_at: Instant::now() + Duration::from_secs(ttl),
+                    ips: ips.clone(),
+                },
+            );
+            Ok(ips)
+        };
+
+        // 1. Dedicated `proxy-server-nameserver-policy`
+        if let Some(ps_pol) = Self::matching_policy_upstreams(&self.proxy_policy_rules, &clean) {
+            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
+                self.query_slice_ips(ps_pol, &clean).await;
+            if !ips.is_empty() {
+                return cache_and_return(ips, pos_ttl);
+            }
+            if saw_nx || saw_nodata {
+                self.proxy_ip_cache.lock().put(
+                    clean.clone(),
+                    CachedIpResolution::Negative {
+                        expires_at: Instant::now() + Duration::from_secs(neg_ttl.unwrap_or(15)),
+                        nxdomain: saw_nx,
+                    },
+                );
+            }
+            return Err(ProxyError::Dns(format!(
+                "proxy-server-nameserver-policy DNS resolution failed for '{clean}'"
+            )));
+        }
+
+        // 2. Dedicated `proxy-server-nameserver`
+        if !self.proxy_upstreams.is_empty() {
+            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
+                self.query_slice_ips(&self.proxy_upstreams, &clean).await;
+            if !ips.is_empty() {
+                return cache_and_return(ips, pos_ttl);
+            }
+            if saw_nx || saw_nodata {
+                self.proxy_ip_cache.lock().put(
+                    clean.clone(),
+                    CachedIpResolution::Negative {
+                        expires_at: Instant::now() + Duration::from_secs(neg_ttl.unwrap_or(15)),
+                        nxdomain: saw_nx,
+                    },
+                );
+            }
+            return Err(ProxyError::Dns(format!(
+                "proxy-server-nameserver DNS resolution failed for '{clean}'"
+            )));
+        }
+
+        // 3. Domain-scoped `nameserver-policy` (used by subscriptions with self-hosted DoH/DoT!)
+        if let Some(pol) = Self::matching_policy_upstreams(&self.policy_rules, &clean) {
+            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
+                self.query_slice_ips(pol, &clean).await;
+            if !ips.is_empty() {
+                return cache_and_return(ips, pos_ttl);
+            }
+            if saw_nx || saw_nodata {
+                self.proxy_ip_cache.lock().put(
+                    clean.clone(),
+                    CachedIpResolution::Negative {
+                        expires_at: Instant::now() + Duration::from_secs(neg_ttl.unwrap_or(15)),
+                        nxdomain: saw_nx,
+                    },
+                );
+            }
+            return Err(ProxyError::Dns(format!(
+                "nameserver-policy DNS resolution failed for proxy server '{clean}'"
+            )));
+        }
+
+        // 4. Configured `nameserver` / `fallback` & `direct-nameserver`
+        if let Ok(ips) = self.resolve_real_ips(&clean).await
+            && !ips.is_empty()
+        {
+            return cache_and_return(ips, Some(60));
+        }
+        if !self.direct_upstreams.is_empty()
+            && let Ok(ips) = self.resolve_direct_ips(&clean).await
+            && !ips.is_empty()
+        {
+            return cache_and_return(ips, Some(60));
+        }
+
+        // 5. Literal-IP `default-nameserver` bootstrap & OS fallback bypassing Fake-IP
         if let Ok(ips) = self
             .resolve_bootstrap_host(&DnsEndpointHost::Domain(clean.clone()))
             .await
             && !ips.is_empty()
         {
-            return Ok(ips);
-        }
-
-        if let Ok(ips) = self.resolve_direct_ips(&clean).await
-            && !ips.is_empty()
-        {
-            return Ok(ips);
+            return cache_and_return(ips, Some(60));
         }
 
         let addrs = crate::router::geodata::resolve_host_bypassing_fake_ip(&clean, 0).await?;
@@ -1033,7 +1542,7 @@ impl FakeIpDnsEngine {
                 "unable to resolve real IP for proxy server '{clean}'"
             )));
         }
-        Ok(ips)
+        cache_and_return(ips, Some(60))
     }
 
     pub fn entries_snapshot(&self) -> Vec<FakeIpEntry> {
@@ -1074,6 +1583,35 @@ impl FakeIpDnsEngine {
             return Ok(query.build_response(raw_query, 0, 5, &[]));
         }
 
+        // Static `hosts` lookup takes precedence before Fake-IP allocation (matching Clash Meta / Mihomo)
+        if let Some(static_ips) = self.lookup_static_hosts_raw(&normalized) {
+            return match query.question.qtype {
+                QTYPE_A => {
+                    let answers: Vec<DnsAnswerData> = static_ips
+                        .iter()
+                        .filter_map(|ip| match ip {
+                            IpAddr::V4(v4) if !self.is_fake_ip(*ip) => Some(DnsAnswerData::A(*v4)),
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(query.build_response(raw_query, 0, 60, &answers))
+                }
+                QTYPE_AAAA => {
+                    let answers: Vec<DnsAnswerData> = static_ips
+                        .iter()
+                        .filter_map(|ip| match ip {
+                            IpAddr::V6(v6) if self.ipv6 && !self.is_fake_ip(*ip) => {
+                                Some(DnsAnswerData::Aaaa(*v6))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    Ok(query.build_response(raw_query, 0, 60, &answers))
+                }
+                _ => Ok(query.build_response(raw_query, 0, 60, &[])),
+            };
+        }
+
         if self.enabled && self.fake_ip_mode && !self.should_bypass_fake_ip(&normalized) {
             return match query.question.qtype {
                 QTYPE_A => {
@@ -1104,7 +1642,15 @@ impl FakeIpDnsEngine {
             return Ok(hit);
         }
 
-        if let Ok(resp) = self.exchange_with_upstreams(raw_query).await {
+        let upstream_res = if let Some(pol_ups) =
+            Self::matching_policy_upstreams(&self.policy_rules, &normalized)
+        {
+            self.exchange_with_upstream_slice(pol_ups, raw_query).await
+        } else {
+            self.exchange_with_upstreams(raw_query).await
+        };
+
+        if let Ok(resp) = upstream_res {
             if let Ok(meta) = extract_dns_response_meta(&resp) {
                 if meta.rcode == 0 && !meta.answers.is_empty() {
                     let ttl = u64::from(meta.min_ttl.unwrap_or(60))

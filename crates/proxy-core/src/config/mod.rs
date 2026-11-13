@@ -129,6 +129,13 @@ pub struct ClashConfig {
     #[serde(default)]
     pub dns: DnsConfig,
 
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_string_or_vec_map"
+    )]
+    pub hosts: HashMap<String, Vec<String>>,
+
     #[serde(default)]
     pub tun: TunConfig,
 
@@ -176,6 +183,7 @@ impl Default for ClashConfig {
             geodata_mode: false,
             mmdb_path: None,
             dns: DnsConfig::default(),
+            hosts: HashMap::new(),
             tun: TunConfig::default(),
             proxies: Vec::new(),
             proxy_groups: Vec::new(),
@@ -303,7 +311,7 @@ impl ClashConfig {
         normalize_clash_yaml_root_mapping(map, false);
         validate_raw_yaml_proxies(map)?;
         expand_proxy_groups_yaml(map, false);
-        serde_path_to_error::deserialize(root).map_err(|e| {
+        let mut cfg: Self = serde_path_to_error::deserialize(root).map_err(|e| {
             let path = e.path().to_string();
             let detail = uri::redact_sensitive_text(&e.inner().to_string());
             if path.is_empty() || path == "." {
@@ -314,7 +322,26 @@ impl ClashConfig {
                     uri::redact_sensitive_text(&path)
                 ))
             }
-        })
+        })?;
+        cfg.sync_root_hosts_into_dns();
+        Ok(cfg)
+    }
+
+    pub fn sync_root_hosts_into_dns(&mut self) {
+        for (k, v) in &self.hosts {
+            self.dns.hosts.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    pub fn dns_with_merged_hosts(&self) -> DnsConfig {
+        if self.hosts.is_empty() {
+            return self.dns.clone();
+        }
+        let mut merged = self.dns.clone();
+        for (k, v) in &self.hosts {
+            merged.hosts.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        merged
     }
 
     /// Parse a Clash YAML profile with best-effort sanitization for mixed multi-protocol subscriptions:
@@ -411,6 +438,7 @@ impl ClashConfig {
             }
         })?;
 
+        cfg.sync_root_hosts_into_dns();
         sanitize_subscription_groups_and_rules(&mut cfg, &skipped_names);
 
         cfg.validate()?;
@@ -617,7 +645,7 @@ rules:
             })?;
         }
 
-        self.dns.validate()?;
+        self.dns.validate_with_extra_hosts(&self.hosts)?;
 
         let has_mmdb = if let Some(ref p) = self.mmdb_path {
             if !Path::new(p).is_file() {
@@ -1459,6 +1487,10 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         }
     }
 
+    normalize_yaml_string_list_map(map, "hosts", lenient_subscription, |s| {
+        parse_hosts_ip_entry(s).is_some()
+    });
+
     if let Some(serde_yml::Value::Mapping(dmap)) = map.get_mut("dns") {
         strip_null_entries(dmap);
         match dmap.get("listen").cloned() {
@@ -1480,7 +1512,12 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
             }
             _ => {}
         }
-        for bool_k in ["enable", "ipv6"] {
+        for bool_k in [
+            "enable",
+            "ipv6",
+            "use-hosts",
+            "direct-nameserver-follow-policy",
+        ] {
             if let Some(v) = dmap.get_mut(bool_k) {
                 coerce_yaml_bool(v);
                 if lenient_subscription && !v.is_bool() {
@@ -1540,6 +1577,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
             "fake-ip-filter",
             "default-nameserver",
             "direct-nameserver",
+            "proxy-server-nameserver",
             "nameserver",
             "fallback",
         ] {
@@ -1547,6 +1585,18 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                 sanitize_yaml_string_seq(v);
             }
         }
+        normalize_yaml_string_list_map(dmap, "hosts", lenient_subscription, |s| {
+            parse_hosts_ip_entry(s).is_some()
+        });
+        normalize_yaml_string_list_map(dmap, "nameserver-policy", lenient_subscription, |s| {
+            DnsUpstream::parse(s).is_ok()
+        });
+        normalize_yaml_string_list_map(
+            dmap,
+            "proxy-server-nameserver-policy",
+            lenient_subscription,
+            |s| DnsUpstream::parse(s).is_ok(),
+        );
         if lenient_subscription {
             if let Some(serde_yml::Value::Sequence(seq)) = dmap.get_mut("default-nameserver") {
                 seq.retain(|v| {
@@ -1556,7 +1606,12 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                         .is_some_and(|s| BootstrapDnsServer::parse(s).is_ok())
                 });
             }
-            for ns_k in ["nameserver", "direct-nameserver", "fallback"] {
+            for ns_k in [
+                "nameserver",
+                "direct-nameserver",
+                "proxy-server-nameserver",
+                "fallback",
+            ] {
                 if let Some(serde_yml::Value::Sequence(seq)) = dmap.get_mut(ns_k) {
                     seq.retain(|v| {
                         v.as_str()
@@ -1575,12 +1630,26 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                     serde_yml::Value::String("1.1.1.1:53".to_string()),
                 ];
             }
-            let needs_bootstrap = ["nameserver", "direct-nameserver", "fallback"]
+            let seq_needs_bootstrap = [
+                "nameserver",
+                "direct-nameserver",
+                "proxy-server-nameserver",
+                "fallback",
+            ]
+            .iter()
+            .filter_map(|&k| dmap.get(k).and_then(serde_yml::Value::as_sequence))
+            .flatten()
+            .filter_map(serde_yml::Value::as_str)
+            .any(|s| DnsUpstream::parse(s).is_ok_and(|u| u.requires_bootstrap()));
+            let policy_needs_bootstrap = ["nameserver-policy", "proxy-server-nameserver-policy"]
                 .iter()
-                .filter_map(|&k| dmap.get(k).and_then(serde_yml::Value::as_sequence))
+                .filter_map(|&k| dmap.get(k).and_then(serde_yml::Value::as_mapping))
+                .flat_map(|m| m.values())
+                .filter_map(serde_yml::Value::as_sequence)
                 .flatten()
                 .filter_map(serde_yml::Value::as_str)
                 .any(|s| DnsUpstream::parse(s).is_ok_and(|u| u.requires_bootstrap()));
+            let needs_bootstrap = seq_needs_bootstrap || policy_needs_bootstrap;
             let has_bootstrap = match dmap.get("default-nameserver") {
                 None => true, // serde default provides 1.1.1.1:53, 8.8.8.8:53
                 Some(serde_yml::Value::Sequence(seq)) => !seq.is_empty(),
@@ -2398,6 +2467,123 @@ fn dfs_check_group_cycle<'a>(
     Ok(())
 }
 
+pub(crate) fn parse_hosts_ip_entry(raw: &str) -> Option<IpAddr> {
+    let clean = raw
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if clean.is_empty() {
+        return None;
+    }
+    clean.parse::<IpAddr>().ok()
+}
+
+fn normalize_yaml_string_list_map(
+    parent: &mut serde_yml::Mapping,
+    key: &str,
+    lenient_subscription: bool,
+    filter_fn: impl Fn(&str) -> bool,
+) {
+    let Some(raw_val) = parent.remove(key) else {
+        return;
+    };
+    match raw_val {
+        serde_yml::Value::Null => {}
+        serde_yml::Value::Mapping(mut m) => {
+            strip_null_entries(&mut m);
+            let mut cleaned = serde_yml::Mapping::new();
+            for (k, mut v) in m {
+                let mut k_coerced = k;
+                coerce_yaml_string(&mut k_coerced);
+                let Some(k_str) = k_coerced.as_str().map(str::trim) else {
+                    if !lenient_subscription {
+                        cleaned.insert(k_coerced, v);
+                    }
+                    continue;
+                };
+                if k_str.is_empty() {
+                    continue;
+                }
+                sanitize_yaml_string_seq(&mut v);
+                if let serde_yml::Value::Sequence(ref mut seq) = v {
+                    for item in seq.iter_mut() {
+                        if let serde_yml::Value::String(s) = item {
+                            *s = s.trim().to_string();
+                        }
+                    }
+                    seq.retain(|item| item.as_str().is_some_and(|s| !s.is_empty()));
+                    if lenient_subscription {
+                        seq.retain(|item| item.as_str().is_some_and(&filter_fn));
+                    }
+                    if !seq.is_empty() {
+                        cleaned.insert(yaml_key(k_str), v);
+                    }
+                } else if !lenient_subscription {
+                    cleaned.insert(yaml_key(k_str), v);
+                }
+            }
+            if !cleaned.is_empty() {
+                parent.insert(yaml_key(key), serde_yml::Value::Mapping(cleaned));
+            }
+        }
+        other if !lenient_subscription => {
+            parent.insert(yaml_key(key), other);
+        }
+        _ => {}
+    }
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn deserialize_string_or_vec_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Null,
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let raw: Option<HashMap<String, OneOrMany>> = Option::deserialize(deserializer)?;
+    let mut out = HashMap::new();
+    if let Some(map) = raw {
+        for (k, v) in map {
+            let key = k.trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            let list: Vec<String> = match v {
+                OneOrMany::Null => Vec::new(),
+                OneOrMany::One(s) => {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![t.to_string()]
+                    }
+                }
+                OneOrMany::Many(seq) => seq
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            };
+            if !list.is_empty() {
+                out.insert(key, list);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DnsConfig {
@@ -2409,6 +2595,12 @@ pub struct DnsConfig {
 
     #[serde(default)]
     pub ipv6: bool,
+
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_hosts: bool,
+
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub direct_nameserver_follow_policy: bool,
 
     #[serde(default = "default_enhanced_mode")]
     pub enhanced_mode: String,
@@ -2425,11 +2617,35 @@ pub struct DnsConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_nameserver: Vec<String>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_server_nameserver: Vec<String>,
+
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_string_or_vec_map"
+    )]
+    pub proxy_server_nameserver_policy: HashMap<String, Vec<String>>,
+
     #[serde(default = "default_nameservers")]
     pub nameserver: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<String>,
+
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_string_or_vec_map"
+    )]
+    pub nameserver_policy: HashMap<String, Vec<String>>,
+
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_string_or_vec_map"
+    )]
+    pub hosts: HashMap<String, Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -2472,28 +2688,44 @@ impl Default for DnsConfig {
             enable: true,
             listen: default_dns_listen(),
             ipv6: false,
+            use_hosts: true,
+            direct_nameserver_follow_policy: true,
             enhanced_mode: default_enhanced_mode(),
             fake_ip_range: default_fake_ip_range(),
             fake_ip_filter: default_fake_ip_filter(),
             default_nameserver: default_bootstrap_nameservers(),
             direct_nameserver: Vec::new(),
+            proxy_server_nameserver: Vec::new(),
+            proxy_server_nameserver_policy: HashMap::new(),
             nameserver: default_nameservers(),
             fallback: Vec::new(),
+            nameserver_policy: HashMap::new(),
+            hosts: HashMap::new(),
         }
     }
 }
 
 impl DnsConfig {
     pub fn parsed_fake_ip_net(&self) -> Result<Ipv4Net> {
-        self.fake_ip_range.parse::<Ipv4Net>().map_err(|e| {
-            ProxyError::Config(format!(
-                "invalid fake-ip-range '{}': {e}",
-                self.fake_ip_range
-            ))
-        })
+        self.fake_ip_range
+            .parse::<Ipv4Net>()
+            .map(|net| net.trunc())
+            .map_err(|e| {
+                ProxyError::Config(format!(
+                    "invalid fake-ip-range '{}': {e}",
+                    self.fake_ip_range
+                ))
+            })
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_extra_hosts(&HashMap::new())
+    }
+
+    pub fn validate_with_extra_hosts(
+        &self,
+        extra_hosts: &HashMap<String, Vec<String>>,
+    ) -> Result<()> {
         let _ = self.parsed_fake_ip_net()?;
         if self.enable && self.listen.trim().parse::<SocketAddr>().is_err() {
             return Err(ProxyError::Config(format!(
@@ -2512,23 +2744,62 @@ impl DnsConfig {
             )));
         }
 
+        for (pat, ips) in self.hosts.iter().chain(extra_hosts.iter()) {
+            if pat.trim().is_empty() {
+                return Err(ProxyError::Config(
+                    "hosts domain pattern cannot be empty".into(),
+                ));
+            }
+            for ip_str in ips {
+                if !ip_str.trim().is_empty() && parse_hosts_ip_entry(ip_str).is_none() {
+                    return Err(ProxyError::Config(format!(
+                        "invalid IP address '{ip_str}' in hosts for '{pat}'"
+                    )));
+                }
+            }
+        }
+
         let mut bootstraps = Vec::new();
         for b in &self.default_nameserver {
             if !b.trim().is_empty() {
                 bootstraps.push(BootstrapDnsServer::parse(b)?);
             }
         }
+
+        let host_covered_by_static_hosts = |domain: &str| -> bool {
+            if !self.use_hosts {
+                return false;
+            }
+            self.hosts
+                .iter()
+                .chain(extra_hosts.iter())
+                .filter(|(_, ips)| ips.iter().any(|s| parse_hosts_ip_entry(s).is_some()))
+                .any(|(pat, _)| crate::dns::fake_ip::domain_matches_any_clash_pattern(domain, pat))
+        };
+
         let mut needs_bootstrap = false;
-        for ns in self
+        let all_upstreams = self
             .nameserver
             .iter()
             .chain(self.direct_nameserver.iter())
+            .chain(self.proxy_server_nameserver.iter())
             .chain(self.fallback.iter())
-        {
+            .chain(self.nameserver_policy.values().flatten())
+            .chain(self.proxy_server_nameserver_policy.values().flatten());
+
+        for ns in all_upstreams {
             if !ns.trim().is_empty() {
                 let up = DnsUpstream::parse(ns)?;
                 if up.requires_bootstrap() {
-                    needs_bootstrap = true;
+                    let covered = match up.endpoint_host() {
+                        crate::dns::upstream::DnsEndpointHost::Domain(ref d) => {
+                            d == "localhost" || host_covered_by_static_hosts(d)
+                        }
+                        crate::dns::upstream::DnsEndpointHost::Ip(_) => true,
+                    };
+                    if !covered {
+                        needs_bootstrap = true;
+                    }
                 }
             }
         }

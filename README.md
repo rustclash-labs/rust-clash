@@ -21,7 +21,7 @@
 `rust-clash` combines a pure-Rust proxy kernel (`crates/proxy-core`), CLI daemon (`crates/proxy-cli`), Tauri 2 desktop client (`crates/tauri-app`), JNI/C-ABI bridge (`crates/proxy-ffi`), Jetpack Compose Android `VpnService` app (`android/`), and embedded React 19 Web Console (`ui/`) — supporting **VLESS (`mlkem768x25519plus` Post-Quantum 0-RTT/1-RTT)**, **Trojan**, **AnyTLS v2**, **Shadowsocks-2022 (`SIP022`)**, **SOCKS5 / HTTP(S)**, **Multi-Transport Fake-IP DNS**, and **event-driven `smoltcp` Userspace TUN** without Go (`mihomo`/`sing-box`/`xray-core`) or C/C++ proxy sidecars.
 
 > [!IMPORTANT]
-> **Experimental & AI-Authored Prototype (`v0.3.4`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
+> **Experimental & AI-Authored Prototype (`v0.3.5`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
 
 ---
 
@@ -96,15 +96,15 @@ Instead of competing purely on legacy protocol sprawl, `rust-clash` targets thre
 
 ## Download & Quick Start
 
-### Prebuilt Releases ([`v0.3.4` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
+### Prebuilt Releases ([`v0.3.5` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
 
 Every release publishes [`SHA256SUMS.txt`](https://github.com/rustclash-labs/rust-clash/releases/latest) across all 14 desktop, CLI, and mobile artifacts:
 
 | Platform | Desktop / Mobile App | Headless CLI (`rust-clash`) | Notes |
 |---|---|---|---|
-| **Linux (`x86_64`)** | `RustClash_0.3.4_amd64.deb`<br/>`RustClash-0.3.4-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
-| **Windows 10/11 (`x86_64`)** | `RustClash_0.3.4_x64-setup.exe`<br/>`RustClash_0.3.4_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
-| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.3.4_aarch64.dmg`<br/>`RustClash_0.3.4_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
+| **Linux (`x86_64`)** | `RustClash_0.3.5_amd64.deb`<br/>`RustClash-0.3.5-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
+| **Windows 10/11 (`x86_64`)** | `RustClash_0.3.5_x64-setup.exe`<br/>`RustClash_0.3.5_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
+| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.3.5_aarch64.dmg`<br/>`RustClash_0.3.5_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
 | **Android 8.0+ (`API 26+`)** | `rust-clash-android-arm64-v8a.apk`<br/>`rust-clash-android-universal.apk` | — *(JNI `libproxy_ffi.so` bundled)* | Signed with project release keystore (`x86_64` APK & `.aab` also attached) |
 
 ### 60-Second Demo Sandbox & CLI Quick Start
@@ -195,7 +195,7 @@ rust-clash keygen-vless --mode xorpub
   - `VMess`, `Hysteria2`, `TUIC`, `WireGuard` outbound, VLESS `REALITY` / XTLS `flow` (`xtls-rprx-vision`), and `gRPC` / `HTTPUpgrade` transports are **not** implemented. Mixed V2Board/Mihomo subscriptions containing unsupported node types automatically skip those entries and prune group references (`SkippedProxyEntry`) when at least one supported node is present.
 
 ### 3. Multi-Transport DNS, Routing Engine & Profile Management
-- **Multi-Transport DNS Engine**: `UDP`, `TCP`, **DNS-over-TLS (`tls://`)**, and **DNS-over-HTTPS (`https://` RFC 8484)** with pooled connections, `singleflight` query deduplication, literal-IP `default-nameserver` bootstrap separation, `fake-ip` (`198.18.0.0/15`) & `redir-host`/`normal` modes, negative caching, and TTL clamping.
+- **Multi-Transport & Split-Horizon DNS Engine**: `UDP`, `TCP`, **DNS-over-TLS (`tls://`)**, and **DNS-over-HTTPS (`https://` RFC 8484 over both `HTTP/2` `h2` & pooled `HTTP/1.1`)** with `nameserver-policy`, `proxy-server-nameserver`, `proxy-server-nameserver-policy`, `direct-nameserver-follow-policy`, root/`dns` static `hosts` (`use-hosts`), multi-wildcard `fake-ip-filter`, `singleflight` query deduplication, literal-IP `default-nameserver` bootstrap separation, `fake-ip` (`198.18.0.0/15`) & `redir-host`/`normal` modes, negative caching, and TTL clamping.
 - **RFC 8305 Happy Eyeballs & TLS Resumption**: Interleaved IPv6/IPv4 connection racing (`250 ms` stagger) integrated with engine DNS + `SocketProtector` and `rustls` `ClientSessionMemoryCache(256)`.
 - **Routing Engine**: Hash/radix domain matching, binary-search interval tables for `IP-CIDR` / `IP-CIDR6` / `SRC-IP-CIDR` / `RULE-SET` (`rule-providers`), built-in fallback + optional `.mmdb` / remote rule-list `GEOIP` & `GEOSITE`, `PROCESS-NAME` matching, and `/rules/explain` diagnostics.
 - **Profiles & Credential Hygiene**: Persistent HTTPS subscription manager (`Subscription-Userinfo`, V2Board/Mihomo YAML normalization, atomic `.bak` rollback), OS `SecretVault` integration (Windows DPAPI, macOS Keychain, Linux Secret Service, Android Keystore, with `0600` local AES-256-GCM fallback in headless environments), `RecoveryJournal` crash rollback, and automatic credential redaction in `GET /configs` and `GET /diagnostics/export`.

@@ -663,7 +663,10 @@ pub fn validate_profile_config(
     extra_ca_der: &[CertificateDer<'static>],
 ) -> Result<(usize, usize)> {
     cfg.validate()?;
-    let dns = Arc::new(FakeIpDnsEngine::with_extra_ca(&cfg.dns, extra_ca_der)?);
+    let dns = Arc::new(FakeIpDnsEngine::with_extra_ca(
+        &cfg.dns_with_merged_hosts(),
+        extra_ca_der,
+    )?);
     let outbounds = build_outbounds(&cfg.proxies, extra_ca_der)?;
     let router = Router::with_providers_and_mmdb(
         cfg.mode,

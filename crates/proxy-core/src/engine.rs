@@ -471,6 +471,7 @@ impl DemoCluster {
             secret: None,
             geodata_mode: false,
             mmdb_path: None,
+            hosts: HashMap::new(),
             dns: DnsConfig {
                 enable: true,
                 listen: "127.0.0.1:1053".to_string(),
@@ -486,6 +487,7 @@ impl DemoCluster {
                 direct_nameserver: vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()],
                 nameserver: vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()],
                 fallback: Vec::new(),
+                ..Default::default()
             },
             // Default `tun.enable` to `false` with `auto_route: true` so we NEVER falsely report
             // system TUN as active unless an OS TUN interface is genuinely attached!
@@ -1146,7 +1148,10 @@ impl ProxyEngine {
         let state_dir = default_state_dir();
         let extra_ca_der: Vec<CertificateDer<'static>> = Vec::new();
         let geodata_mgr = crate::router::geodata::GeoDataManager::new(&state_dir, Vec::new());
-        let dns_engine = Arc::new(FakeIpDnsEngine::with_extra_ca(&cfg.dns, &extra_ca_der)?);
+        let dns_engine = Arc::new(FakeIpDnsEngine::with_extra_ca(
+            &cfg.dns_with_merged_hosts(),
+            &extra_ca_der,
+        )?);
         let outbounds =
             build_outbounds_with_dns(&cfg.proxies, &extra_ca_der, Some(Arc::clone(&dns_engine)))?;
         let mmdb = match load_optional_mmdb(cfg)? {
@@ -1190,7 +1195,10 @@ impl ProxyEngine {
         )?;
         let mixed_policy = Arc::new(RwLock::new(policy));
 
-        let dns_engine = Arc::new(FakeIpDnsEngine::with_extra_ca(&cfg.dns, &extra_ca_der)?);
+        let dns_engine = Arc::new(FakeIpDnsEngine::with_extra_ca(
+            &cfg.dns_with_merged_hosts(),
+            &extra_ca_der,
+        )?);
         let outbounds =
             build_outbounds_with_dns(&cfg.proxies, &extra_ca_der, Some(Arc::clone(&dns_engine)))?;
         let mmdb = match load_optional_mmdb(&cfg)? {
@@ -2224,7 +2232,10 @@ impl ProxyEngine {
             &new_cfg.authentication,
             &new_cfg.lan_allowed_ips,
         )?;
-        let new_dns = Arc::new(FakeIpDnsEngine::with_extra_ca(&new_cfg.dns, &extra_ca)?);
+        let new_dns = Arc::new(FakeIpDnsEngine::with_extra_ca(
+            &new_cfg.dns_with_merged_hosts(),
+            &extra_ca,
+        )?);
         new_dns.import_entries_from(prev_router.dns());
         let new_outbounds =
             build_outbounds_with_dns(&new_cfg.proxies, &extra_ca, Some(Arc::clone(&new_dns)))?;

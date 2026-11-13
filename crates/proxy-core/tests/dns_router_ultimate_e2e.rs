@@ -288,6 +288,7 @@ async fn dns_doh_dot_tcp_truncation_bootstrap_and_caching_e2e() {
         direct_nameserver: vec![],
         nameserver: vec![format!("https://doh-ns.internal:{doh_port}/dns-query")],
         fallback: vec![],
+        ..Default::default()
     };
     let doh_dns =
         Arc::new(FakeIpDnsEngine::with_extra_ca(&doh_cfg, std::slice::from_ref(&ca_der)).unwrap());
@@ -374,6 +375,7 @@ async fn dns_doh_dot_tcp_truncation_bootstrap_and_caching_e2e() {
         direct_nameserver: vec![],
         nameserver: vec![format!("tls://dot-ns.internal:{dot_port}")],
         fallback: vec![format!("https://doh-ns.internal:{doh_port}/dns-query")],
+        ..Default::default()
     };
     let dot_dns = Arc::new(FakeIpDnsEngine::with_extra_ca(&ipv6_dot_cfg, &[ca_der]).unwrap());
     let dot_ips = dot_dns
@@ -420,6 +422,7 @@ async fn dns_doh_dot_tcp_truncation_bootstrap_and_caching_e2e() {
         direct_nameserver: vec![],
         nameserver: vec![format!("udp://{trunc_addr}")],
         fallback: vec![],
+        ..Default::default()
     };
     let trunc_dns = FakeIpDnsEngine::new(&trunc_cfg).unwrap();
     let trunc_ips = trunc_dns

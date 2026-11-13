@@ -254,7 +254,8 @@ fn build_offline_router(
         (None, GeoDataManager::builtin_status())
     };
     let dns = Arc::new(
-        FakeIpDnsEngine::new(&cfg.dns).map_err(|e| redact_sensitive_text(&e.to_string()))?,
+        FakeIpDnsEngine::new(&cfg.dns_with_merged_hosts())
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?,
     );
     let outbounds = build_outbounds_with_dns(&cfg.proxies, &[], Some(Arc::clone(&dns)))
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
