@@ -493,7 +493,10 @@ fn audit_config_inner(
         .dns
         .nameserver
         .iter()
+        .chain(cfg.dns.proxy_server_nameserver.iter())
         .chain(cfg.dns.fallback.iter())
+        .chain(cfg.dns.nameserver_policy.values().flatten())
+        .chain(cfg.dns.proxy_server_nameserver_policy.values().flatten())
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| DnsUpstream::parse(s).ok())
         .collect();
@@ -1239,6 +1242,26 @@ pub fn diff_configs(prev: &ClashConfig, next: &ClashConfig) -> ConfigDiffSummary
         dns_changes.push(format!(
             "dns.fallback: {:?} -> {:?}",
             prev.dns.fallback, next.dns.fallback
+        ));
+    }
+    if prev.dns.proxy_server_nameserver != next.dns.proxy_server_nameserver {
+        dns_changes.push(format!(
+            "dns.proxy-server-nameserver: {:?} -> {:?}",
+            prev.dns.proxy_server_nameserver, next.dns.proxy_server_nameserver
+        ));
+    }
+    if prev.dns.nameserver_policy != next.dns.nameserver_policy {
+        dns_changes.push(format!(
+            "dns.nameserver-policy: {} rule(s) -> {} rule(s)",
+            prev.dns.nameserver_policy.len(),
+            next.dns.nameserver_policy.len()
+        ));
+    }
+    if prev.dns_with_merged_hosts().hosts != next.dns_with_merged_hosts().hosts {
+        dns_changes.push(format!(
+            "hosts: {} entry(s) -> {} entry(s)",
+            prev.dns_with_merged_hosts().hosts.len(),
+            next.dns_with_merged_hosts().hosts.len()
         ));
     }
 

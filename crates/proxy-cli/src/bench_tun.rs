@@ -291,6 +291,7 @@ pub async fn run_tun_benchmark(args: BenchTunArgs) -> Result<()> {
         secret: None,
         geodata_mode: false,
         mmdb_path: None,
+        hosts: std::collections::HashMap::new(),
         dns: DnsConfig {
             enable: true,
             listen: "127.0.0.1:0".into(),
@@ -302,6 +303,7 @@ pub async fn run_tun_benchmark(args: BenchTunArgs) -> Result<()> {
             direct_nameserver: vec![format!("127.0.0.1:{}", args.dns_origin_port)],
             nameserver: vec![format!("127.0.0.1:{}", args.dns_origin_port)],
             fallback: Vec::new(),
+            ..Default::default()
         },
         tun: TunConfig {
             enable: true,

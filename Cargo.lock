@@ -3020,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-cli"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3087,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-ffi"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "base64 0.22.1",
  "jni",
@@ -4166,7 +4166,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "parking_lot",

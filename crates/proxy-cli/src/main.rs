@@ -398,7 +398,9 @@ async fn main() -> Result<()> {
 
         Commands::Check { config } => {
             let cfg = ClashConfig::from_file(&config)?;
-            let dns = Arc::new(proxy_core::dns::FakeIpDnsEngine::new(&cfg.dns)?);
+            let dns = Arc::new(proxy_core::dns::FakeIpDnsEngine::new(
+                &cfg.dns_with_merged_hosts(),
+            )?);
             let outbounds = proxy_core::engine::build_outbounds_with_dns(
                 &cfg.proxies,
                 &[],
