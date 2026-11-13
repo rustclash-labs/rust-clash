@@ -940,3 +940,225 @@ fn android_jni_split_tunneling_presets_offline_explain_and_diagnostics_e2e() {
     }
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn android_offline_router_cache_and_positive_dns_seed_transfer_to_vpn() {
+    use std::{
+        net::Ipv4Addr,
+        os::fd::{FromRawFd, OwnedFd},
+        sync::atomic::AtomicUsize,
+    };
+
+    use proxy_core::dns::wire::{DnsAnswerData, DnsQueryPacket, QTYPE_A};
+    use proxy_ffi::{
+        android_jni::{
+            android_flush_dns_core, android_import_unified_core, android_test_latency_core,
+            start_android_vpn_with_state_dir, stop_android_vpn_core,
+        },
+        fd_bridge::CallbackSocketProtector,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+        sync::watch,
+    };
+    use uuid::Uuid;
+
+    let _serial = SERIAL_ANDROID_FFI_LOCK.blocking_lock();
+    let _ = stop_android_vpn_core();
+    let _ = android_flush_dns_core();
+
+    let bg_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let dns_queries = Arc::new(AtomicUsize::new(0));
+    let dns_queries_bg = Arc::clone(&dns_queries);
+
+    let (dns_addr, ss_addr, http_addr) = bg_rt.block_on(async {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let d_addr = udp.local_addr().unwrap();
+        let mut d_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    _ = d_stop.changed() => break,
+                    recv = udp.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = recv else { break };
+                        let pkt = &buf[..n];
+                        let Ok(q) = DnsQueryPacket::parse(pkt) else { continue };
+                        dns_queries_bg.fetch_add(1, Ordering::SeqCst);
+                        let resp = if q.question.name == "gw.seed-test.example" && q.question.qtype == QTYPE_A {
+                            q.build_response(pkt, 0, 180, &[DnsAnswerData::A(Ipv4Addr::LOCALHOST)])
+                        } else {
+                            q.build_response(pkt, 0, 180, &[])
+                        };
+                        let _ = udp.send_to(&resp, peer).await;
+                    }
+                }
+            }
+        });
+
+        let (s_addr, _s_task) = proxy_core::outbound::ss::spawn_ss_server(
+            "127.0.0.1:0",
+            "chacha20-ietf-poly1305",
+            "android-seed-secret",
+            stop_rx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let h_addr = http_listener.local_addr().unwrap();
+        let mut h_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = h_stop.changed() => break,
+                    acc = http_listener.accept() => {
+                        let Ok((mut sock, _)) = acc else { break };
+                        tokio::spawn(async move {
+                            let mut buf = Vec::with_capacity(512);
+                            let mut tmp = [0u8; 256];
+                            loop {
+                                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    let Ok(n) = sock.read(&mut tmp).await else { return };
+                                    if n == 0 {
+                                        return;
+                                    }
+                                    buf.extend_from_slice(&tmp[..n]);
+                                }
+                                let hdr_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                                buf.drain(..hdr_end);
+                                let resp = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+                                if sock.write_all(resp).await.is_err() || sock.flush().await.is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        (d_addr, s_addr, h_addr)
+    });
+
+    let state_dir = std::env::temp_dir().join(format!("rc-android-seed-e2e-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let yaml = format!(
+        r#"mixed-port: 0
+mode: rule
+unified-delay: true
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver:
+    - "{dns_addr}"
+  proxy-server-nameserver:
+    - "{dns_addr}"
+proxies:
+  - name: "SS-SEED"
+    type: ss
+    server: gw.seed-test.example
+    port: {ss_port}
+    cipher: chacha20-ietf-poly1305
+    password: "android-seed-secret"
+    udp: true
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "SS-SEED"
+rules:
+  - MATCH,PROXY
+"#,
+        ss_port = ss_addr.port(),
+    );
+
+    let imp = android_import_unified_core(&state_dir, &yaml, true, true)
+        .expect("import custom DNS profile offline");
+    assert_eq!(imp["ok"], true);
+    assert_eq!(imp["effectiveOutbound"], "SS-SEED");
+
+    let probe_url = format!("http://{http_addr}/generate_204");
+
+    // 1. Offline latency probe #1 -> resolves `gw.seed-test.example` once (`dns_queries == 1`)
+    let p1 = android_test_latency_core(&state_dir, None, Some(&probe_url), 3000)
+        .expect("offline latency probe #1");
+    assert_eq!(p1["ok"], true);
+    assert_eq!(p1["tested"], 1);
+    assert!(p1["delays"]["SS-SEED"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        dns_queries.load(Ordering::SeqCst),
+        1,
+        "first offline latency probe must resolve proxy server hostname once"
+    );
+
+    // 2. Offline latency probe #2 -> reuses `OFFLINE_ROUTER_CACHE` (`dns_queries` stays `1`!)
+    let p2 = android_test_latency_core(&state_dir, None, Some(&probe_url), 3000)
+        .expect("offline latency probe #2");
+    assert_eq!(p2["ok"], true);
+    assert!(p2["delays"]["SS-SEED"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        dns_queries.load(Ordering::SeqCst),
+        1,
+        "repeated offline probe must reuse cached offline Router + proxy_ip_cache without extra DNS lookups"
+    );
+
+    // 3. Start Android VPN -> harvests `PositiveDnsCacheSeed` into live `ProxyEngine` (`PreconnectPolicy::Mobile`)!
+    //    Neither startup preconnect nor live latency probe #3 needs an extra DNS lookup (`dns_queries` stays `1`!)
+    let (fd1, peer1, ino1) = create_tun_like_socketpair();
+    let protector = Arc::new(CallbackSocketProtector::new_unix(
+        "android-seed-live",
+        true,
+        |_fd| Ok(()),
+    ));
+    let started = start_android_vpn_with_state_dir(
+        Some(unsafe { OwnedFd::from_raw_fd(fd1) }),
+        Some(&state_dir),
+        "",
+        false,
+        protector,
+    )
+    .expect("start Android VPN with seeded DNS cache");
+    assert_eq!(started["ok"], true);
+    assert_eq!(started["effectiveOutbound"], "SS-SEED");
+
+    let p3 = android_test_latency_core(&state_dir, None, Some(&probe_url), 3000)
+        .expect("live latency probe #3");
+    assert_eq!(p3["ok"], true);
+    assert!(p3["delays"]["SS-SEED"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        dns_queries.load(Ordering::SeqCst),
+        1,
+        "PositiveDnsCacheSeed transferred from offline probe must eliminate redundant DNS query on VPN start"
+    );
+
+    // 4. Explicit `android_flush_dns_core()` flushes live cache -> next probe re-queries (`dns_queries == 2`)!
+    assert!(android_flush_dns_core());
+    let p4 = android_test_latency_core(&state_dir, None, Some(&probe_url), 3000)
+        .expect("live latency probe after flush");
+    assert_eq!(p4["ok"], true);
+    assert!(p4["delays"]["SS-SEED"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(
+        dns_queries.load(Ordering::SeqCst),
+        2,
+        "flushing DNS cache must trigger a fresh proxy server resolution on next probe"
+    );
+
+    assert!(stop_android_vpn_core());
+    assert_tun_fd_fully_closed_in_kernel(fd1, ino1, peer1);
+    unsafe {
+        libc::close(peer1);
+    }
+    let _ = stop_tx.send(true);
+    bg_rt.shutdown_timeout(Duration::from_millis(200));
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

@@ -58,6 +58,7 @@ pub struct AnyTlsOutbound {
     tls_connector: TlsConnector,
     padding_scheme: Arc<RwLock<PaddingScheme>>,
     pool: Arc<AnyTlsSessionPool>,
+    preconnect_lock: tokio::sync::Mutex<()>,
     dns: Option<Arc<crate::dns::FakeIpDnsEngine>>,
 }
 
@@ -78,6 +79,7 @@ impl AnyTlsOutbound {
             tls_connector: TlsConnector::from(client_cfg),
             padding_scheme: Arc::new(RwLock::new(PaddingScheme::default())),
             pool,
+            preconnect_lock: tokio::sync::Mutex::new(()),
             dns: None,
         })
     }
@@ -158,6 +160,42 @@ impl OutboundHandler for AnyTlsOutbound {
 
     fn on_network_change(&self) -> usize {
         self.pool.on_network_change()
+    }
+
+    fn set_low_power_mode(&self, enabled: bool) {
+        self.pool.set_low_power_mode(enabled);
+    }
+
+    async fn preconnect(&self, target_sessions: usize) -> io::Result<()> {
+        if target_sessions == 0 {
+            return Ok(());
+        }
+        if let Some(dns) = &self.dns {
+            dns.prewarm_proxy_server_ips(&self.cfg.server)
+                .await
+                .map_err(|e| e.into_io())?;
+        }
+        let goal = target_sessions.min(4);
+        if goal > 1 {
+            self.pool.set_dynamic_min_idle(goal);
+        }
+        let _guard = self.preconnect_lock.lock().await;
+        while self.pool.idle_count() < goal && self.pool.healthy_session_count() < goal + 4 {
+            let seq = self.pool.next_seq();
+            AnyTlsClientSession::preconnect_idle(
+                seq,
+                &self.cfg.server,
+                self.cfg.port,
+                &self.cfg.sni,
+                &self.cfg.password,
+                &self.tls_connector,
+                Arc::clone(&self.padding_scheme),
+                self.pool.pool_context(),
+                self.dns.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {

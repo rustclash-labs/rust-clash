@@ -72,6 +72,7 @@ export interface ConfigSnapshot {
   "secret-configured"?: boolean;
   "bind-address": string;
   mode: RunMode;
+  "unified-delay"?: boolean;
   "effective-outbound"?: EffectiveOutboundSummary;
   "selected-groups"?: Record<string, string>;
   "log-level": string;

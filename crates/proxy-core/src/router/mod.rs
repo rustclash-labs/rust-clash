@@ -131,6 +131,7 @@ impl FastRuleIndex {
 
 pub struct Router {
     mode: RwLock<RunMode>,
+    unified_delay: std::sync::atomic::AtomicBool,
     outbounds: HashMap<String, DynOutbound>,
     groups: HashMap<String, Arc<ProxyGroup>>,
     group_order: Vec<String>,
@@ -261,6 +262,7 @@ impl Router {
 
         Ok(Self {
             mode: RwLock::new(initial_mode),
+            unified_delay: std::sync::atomic::AtomicBool::new(true),
             outbounds,
             groups,
             group_order,
@@ -277,6 +279,46 @@ impl Router {
 
     pub fn set_mode(&self, mode: RunMode) {
         *self.mode.write() = mode;
+    }
+
+    pub fn unified_delay(&self) -> bool {
+        self.unified_delay
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_unified_delay(&self, enabled: bool) {
+        self.unified_delay
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_low_power_mode(&self, enabled: bool) {
+        for ob in self.outbounds.values() {
+            ob.set_low_power_mode(enabled);
+        }
+    }
+
+    /// Pre-warm DNS and/or idle multiplexed sessions for the current effective primary outbound.
+    /// Returns `Ok(true)` if a concrete `"PROXY"` outbound was pre-warmed, or `Ok(false)` when
+    /// running in `Direct` mode or when the effective primary outbound is `DIRECT`/`REJECT`/`ERROR`.
+    pub async fn preconnect_primary(&self, target_sessions: usize) -> Result<bool> {
+        if target_sessions == 0 || self.mode() == RunMode::Direct {
+            return Ok(false);
+        }
+        let eff = self.effective_primary_outbound();
+        let Some(ob) = self.outbounds.get(&eff.effective_outbound).cloned() else {
+            return Ok(false);
+        };
+        if ob.exit_category() != "PROXY" {
+            return Ok(false);
+        }
+        ob.preconnect(target_sessions)
+            .await
+            .map_err(ProxyError::Io)?;
+        Ok(true)
+    }
+
+    pub fn outbound(&self, name: &str) -> Option<Arc<dyn crate::outbound::OutboundHandler>> {
+        self.outbounds.get(name).cloned()
     }
 
     pub fn dns(&self) -> &Arc<FakeIpDnsEngine> {
@@ -840,8 +882,9 @@ impl Router {
     }
 
     pub async fn test_delay(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
+        let unified = self.unified_delay();
         if let Some(outbound) = self.outbounds.get(name) {
-            match outbound.latency_test(url, timeout).await {
+            match outbound.latency_test_with_mode(url, timeout, unified).await {
                 Ok(ms) => {
                     self.delays.record(name, ms);
                     return Ok(ms);
@@ -854,7 +897,13 @@ impl Router {
         }
         if let Some(group) = self.groups.get(name) {
             let map = group
-                .evaluate_health(&self.outbounds, &self.delays, Some(url), timeout)
+                .evaluate_health_with_mode(
+                    &self.outbounds,
+                    &self.delays,
+                    Some(url),
+                    timeout,
+                    unified,
+                )
                 .await;
             let chosen = group.current();
             if let Some(Some(ms)) = map.get(&chosen) {
@@ -906,6 +955,7 @@ impl Router {
             return;
         }
 
+        let unified = self.unified_delay();
         let sem = Arc::new(Semaphore::new(16));
         let delays = &self.delays;
         let futs = unique_probes.into_iter().map(|(member, url)| {
@@ -916,7 +966,10 @@ impl Router {
                     return ((member, url), None);
                 };
                 let _permit = sem_clone.acquire().await.ok();
-                match outbound.latency_test(&url, timeout).await {
+                match outbound
+                    .latency_test_with_mode(&url, timeout, unified)
+                    .await
+                {
                     Ok(ms) => {
                         delays.record(&member, ms);
                         ((member, url), Some(ms))

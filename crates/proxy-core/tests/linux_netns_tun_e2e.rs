@@ -343,6 +343,7 @@ async fn real_linux_kernel_netns_tun_tcp_udp_dns_and_teardown_e2e() {
         log_level: "info".into(),
         external_controller: "127.0.0.1:0".into(),
         secret: None,
+        unified_delay: true,
         geodata_mode: false,
         mmdb_path: None,
         hosts: std::collections::HashMap::new(),
