@@ -308,10 +308,12 @@ class DebugLogManagerTest {
             assertFalse(bundleText.contains("LEAKED_SUB_TOKEN_777"))
             assertFalse(bundleText.contains("12345678-1234-4321-abcd-9876543210ff"))
 
-            // Interval normalization check
+            // Interval normalization & slice timestamp formatting check
             assertEquals(900L, DebugLogManager.normalizeSliceIntervalSecs(600L))
             assertEquals(1800L, DebugLogManager.normalizeSliceIntervalSecs(1800L))
             assertEquals(3600L, DebugLogManager.normalizeSliceIntervalSecs(7200L))
+            assertEquals("-", io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.formatEpochTime(0L))
+            assertTrue(io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.formatEpochTime(t1).contains(":"))
         } finally {
             sliceDir.deleteRecursively()
             exportDir.deleteRecursively()

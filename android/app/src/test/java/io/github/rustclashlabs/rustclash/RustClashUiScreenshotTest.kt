@@ -1171,13 +1171,13 @@ class RustClashUiScreenshotTest {
         composeRule.onNodeWithText("调试与诊断 (Debug)").performClick()
 
         composeRule.onNodeWithText("开启 Debug 诊断采集").assertIsDisplayed()
-        composeRule.onNodeWithText("15 分钟").performClick()
+        composeRule.onNodeWithText("15 分钟").performScrollTo().performClick()
         assertTrue(selectedInterval == 900L)
 
-        composeRule.onNodeWithText("立即生成切片").performClick()
+        composeRule.onNodeWithText("立即生成切片").performScrollTo().performClick()
         assertTrue(manualSliceClicked)
 
-        composeRule.onNodeWithText("一键分享诊断报告").performClick()
+        composeRule.onNodeWithText("一键分享诊断报告").performScrollTo().performClick()
         assertTrue(shareClicked)
         assertTrue(toggledEnabled == null)
     }

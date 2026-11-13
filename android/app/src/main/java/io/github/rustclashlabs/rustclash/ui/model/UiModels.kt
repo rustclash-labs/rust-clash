@@ -830,6 +830,13 @@ object UiJsonParsers {
         }.getOrDefault("-")
     }
 
+    fun formatEpochTime(epochMs: Long): String {
+        if (epochMs <= 0L) return "-"
+        return runCatching {
+            SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(epochMs))
+        }.getOrDefault("-")
+    }
+
     fun formatCleanBackendError(raw: String?, fallback: String): String {
         var cleaned = NodeImportSupport.redactSecretsForUi((raw ?: "").trim())
         val prefix = "Configuration error:"
