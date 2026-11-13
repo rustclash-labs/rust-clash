@@ -24,11 +24,15 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.SaveAlt
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -69,6 +73,7 @@ import io.github.rustclashlabs.rustclash.ui.theme.SegmentedSelectorRow
 import io.github.rustclashlabs.rustclash.ui.theme.SettingsGroupContainer
 import io.github.rustclashlabs.rustclash.ui.theme.SettingsGroupDivider
 import io.github.rustclashlabs.rustclash.ui.theme.SettingsRowItem
+import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
 import io.github.rustclashlabs.rustclash.vpn.PerAppMode
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 
@@ -85,6 +90,13 @@ fun SettingsScreen(
     onSetShowSystemApps: (Boolean) -> Unit = {},
     onSetDefaultSubAutoUpdateSecs: (Long) -> Unit = {},
     onClearSettingsNotice: () -> Unit = {},
+    onSetDebugLogEnabled: (Boolean) -> Unit = {},
+    onSetDebugSliceIntervalSecs: (Long) -> Unit = {},
+    onCaptureDebugSliceNow: () -> Unit = {},
+    onShareDebugReport: () -> Unit = {},
+    onSaveDebugReportToFile: () -> Unit = {},
+    onClearDebugLogs: () -> Unit = {},
+    onRefreshDebugSummary: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var showAppearanceSheet by remember { mutableStateOf(false) }
@@ -92,6 +104,7 @@ fun SettingsScreen(
     var showNetworkSheet by remember { mutableStateOf(false) }
     var showPerformanceSheet by remember { mutableStateOf(false) }
     var showGeneralSheet by remember { mutableStateOf(false) }
+    var showDebugSheet by remember { mutableStateOf(false) }
     var showAboutSheet by remember { mutableStateOf(false) }
 
     Column(
@@ -188,7 +201,26 @@ fun SettingsScreen(
             )
             SettingsGroupDivider()
 
-            // 6. About RustClash
+            // 6. Debug & Diagnostics
+            val debugBadge = when {
+                state.debugLog.enabled && state.debugLog.sliceCount > 0 -> "采集中 · ${state.debugLog.sliceCount} 份"
+                state.debugLog.enabled -> "采集中"
+                state.debugLog.sliceCount > 0 -> "已存 ${state.debugLog.sliceCount} 份"
+                else -> null
+            }
+            SettingsRowItem(
+                icon = Icons.Rounded.BugReport,
+                title = "调试与诊断 (Debug)",
+                subtitle = "周期采集运行切片 · 一键导出脱敏报告",
+                trailingBadge = debugBadge,
+                onClick = {
+                    onRefreshDebugSummary()
+                    showDebugSheet = true
+                },
+            )
+            SettingsGroupDivider()
+
+            // 7. About RustClash
             SettingsRowItem(
                 icon = Icons.Rounded.Info,
                 title = "关于 RustClash",
@@ -264,6 +296,19 @@ fun SettingsScreen(
             state = state,
             onSetDefaultSubAutoUpdateSecs = onSetDefaultSubAutoUpdateSecs,
             onDismiss = { showGeneralSheet = false },
+        )
+    }
+
+    if (showDebugSheet) {
+        DebugDiagnosticsBottomSheet(
+            state = state,
+            onSetDebugLogEnabled = onSetDebugLogEnabled,
+            onSetDebugSliceIntervalSecs = onSetDebugSliceIntervalSecs,
+            onCaptureDebugSliceNow = onCaptureDebugSliceNow,
+            onShareDebugReport = onShareDebugReport,
+            onSaveDebugReportToFile = onSaveDebugReportToFile,
+            onClearDebugLogs = onClearDebugLogs,
+            onDismiss = { showDebugSheet = false },
         )
     }
 
@@ -581,6 +626,233 @@ private fun GeneralSettingsBottomSheet(
             InfoKeyValueRow("配置与节点持久化", "SharedPreferences + 敏感凭据加密存储")
 
             Spacer(modifier = Modifier.height(20.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DebugDiagnosticsBottomSheet(
+    state: AppUiState,
+    onSetDebugLogEnabled: (Boolean) -> Unit,
+    onSetDebugSliceIntervalSecs: (Long) -> Unit,
+    onCaptureDebugSliceNow: () -> Unit,
+    onShareDebugReport: () -> Unit,
+    onSaveDebugReportToFile: () -> Unit,
+    onClearDebugLogs: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val extColors = LocalRustClashColors.current
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val intervalChoices = DebugLogManager.SLICE_INTERVAL_CHOICES
+    val selectedInterval = DebugLogManager.normalizeSliceIntervalSecs(state.debugLog.sliceIntervalSecs)
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 10.dp),
+        ) {
+            Text(
+                text = "调试与诊断 (Debug)",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "开启后在使用期间自动采集网络切换、DNS 命中、节点握手耗时与访问分流明细，供性能与耗电分析。密码、UUID 与订阅链接均自动脱敏。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "开启 Debug 诊断采集",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "后台按周期切片并在断开 VPN 时自动归档一份快照",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Switch(
+                    checked = state.debugLog.enabled,
+                    onCheckedChange = onSetDebugLogEnabled,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "自动生成切片周期",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "息屏休眠期间自动免唤醒节电，亮屏恢复或断开连接时立即归档；最多保留最近 12 份（上限 8 MB 自动滚动覆盖）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            SegmentedSelectorRow(
+                items = intervalChoices,
+                selectedItem = selectedInterval,
+                labelOf = { secs ->
+                    when (secs) {
+                        900L -> "15 分钟"
+                        1800L -> "30 分钟"
+                        else -> "60 分钟"
+                    }
+                },
+                onSelect = onSetDebugSliceIntervalSecs,
+            )
+
+            HorizontalDivider(color = extColors.hairline, modifier = Modifier.padding(vertical = 12.dp))
+
+            InfoKeyValueRow(
+                "已归档诊断切片",
+                "${state.debugLog.sliceCount} / ${DebugLogManager.MAX_SLICE_FILES} 份（${UiJsonParsers.formatBytes(state.debugLog.totalBytes)}）",
+            )
+            InfoKeyValueRow(
+                "最近切片时间",
+                if (state.debugLog.latestSliceTimeMs > 0L) {
+                    UiJsonParsers.formatEpochTime(state.debugLog.latestSliceTimeMs)
+                } else {
+                    "尚未生成（导出时会自动采集当前状态）"
+                },
+            )
+            if (state.debugLog.hasCrashBreadcrumb) {
+                InfoKeyValueRow("异常崩溃记录", "已捕获上次异常堆栈（导出自动附带）")
+            }
+
+            if (state.debugLog.recentSlices.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        state.debugLog.recentSlices.take(4).forEach { slice ->
+                            val triggerLabel = when (slice.trigger) {
+                                "periodic" -> "周期归档"
+                                "disconnect" -> "断开归档"
+                                "revoked" -> "系统抢占"
+                                "screen-on" -> "亮屏补齐"
+                                "debug-on" -> "开启基线"
+                                "export" -> "导出快照"
+                                "manual" -> "手动快照"
+                                else -> slice.trigger
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "${UiJsonParsers.formatEpochTime(slice.createdAtMs)} · $triggerLabel",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    text = UiJsonParsers.formatBytes(slice.sizeBytes),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Button(
+                onClick = onShareDebugReport,
+                enabled = !state.isExportingDebugLog,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = extColors.emerald,
+                    contentColor = Color.White,
+                ),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Share,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(if (state.isExportingDebugLog) "正在汇总诊断报告…" else "一键分享诊断报告")
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onSaveDebugReportToFile,
+                    enabled = !state.isExportingDebugLog,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.SaveAlt,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("保存到手机", maxLines = 1)
+                }
+                OutlinedButton(
+                    onClick = onCaptureDebugSliceNow,
+                    enabled = !state.isExportingDebugLog,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("立即生成切片", maxLines = 1)
+                }
+            }
+
+            if (state.debugLog.sliceCount > 0 || state.debugLog.hasCrashBreadcrumb) {
+                Spacer(modifier = Modifier.height(4.dp))
+                TextButton(
+                    onClick = onClearDebugLogs,
+                    enabled = !state.isExportingDebugLog,
+                    modifier = Modifier.align(Alignment.CenterHorizontally),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.DeleteOutline,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("清空历史诊断日志")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }

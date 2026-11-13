@@ -105,6 +105,8 @@ struct AndroidVpnRuntime {
 }
 
 static ANDROID_RUNTIME: Mutex<Option<AndroidVpnRuntime>> = Mutex::new(None);
+/// Persists Android debug diagnostic mode across VPN start/restart cycles within the process.
+static ANDROID_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 /// Serializes offline `ProfileManager::open_or_init` mutations so concurrent JNI calls never race on `profiles_index.json`.
 static OFFLINE_PROFILE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -721,6 +723,9 @@ fn start_android_vpn_with_state_dir_and_jvm(
     };
 
     seed_delays_into_router(&engine.router());
+    if ANDROID_DEBUG_LOGGING.load(Ordering::Acquire) {
+        engine.hub().set_debug_mode(true);
+    }
 
     // 2. Attach Android's established `VpnService` `OwnedFd` to `VirtualTunHandle`
     #[cfg(unix)]
@@ -2691,6 +2696,527 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             name_opt,
             interval_opt,
         )
+    })();
+    let out = match res {
+        Ok(v) => v.to_string(),
+        Err(e) => {
+            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
+        }
+    };
+    rust_to_jstring(&mut env, &out)
+}
+
+/// Enable or disable Android debug diagnostic mode offline or live.
+pub fn android_set_debug_logging_core(enabled: bool) -> bool {
+    let prev = ANDROID_DEBUG_LOGGING.swap(enabled, Ordering::AcqRel);
+    if let Some((_, engine)) = live_handle_and_engine() {
+        engine.hub().set_debug_mode(enabled);
+        if prev != enabled {
+            engine.hub().push_log(
+                "info",
+                if enabled {
+                    "[DEBUG] Android diagnostic capture mode enabled"
+                } else {
+                    "[DEBUG] Android diagnostic capture mode disabled"
+                },
+            );
+        }
+    }
+    true
+}
+
+pub fn android_is_debug_logging_core() -> bool {
+    ANDROID_DEBUG_LOGGING.load(Ordering::Acquire)
+}
+
+fn percentile_u64(sorted: &[u64], pct: usize) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((sorted.len() - 1) * pct) / 100;
+    sorted.get(idx).copied()
+}
+
+fn build_redacted_active_profile_summary(
+    mgr: &ProfileManager,
+) -> (Option<String>, Option<serde_json::Value>) {
+    let routing_preset = mgr
+        .routing_snapshot()
+        .ok()
+        .map(|r| r.active_choice.as_str().to_string());
+    let snap = mgr.snapshot();
+    let active_profile = snap
+        .profiles
+        .into_iter()
+        .find(|p| p.id == snap.active_profile_id)
+        .map(|meta| {
+            serde_json::json!({
+                "name": redact_sensitive_text(&meta.name),
+                "kind": meta.kind,
+                "proxyCount": meta.proxy_count,
+                "manualProxyCount": meta.manual_proxy_count,
+                "groupCount": meta.group_count,
+                "ruleCount": meta.rule_count,
+                "autoUpdateIntervalSecs": meta.auto_update_interval_secs,
+                "lastUpdatedMs": meta.last_updated_ms,
+                "subscriptionHost": meta.subscription_url_redacted,
+                "lastError": meta.last_error.as_deref().map(redact_sensitive_text),
+            })
+        });
+    (routing_preset, active_profile)
+}
+
+/// Collect a credential-redacted mobile diagnostic slice (`[since_epoch_ms, now]`) preserving
+/// visited domains, Fake-IP restorations, matched routing rules, and node names/protocols/latencies.
+pub fn android_collect_debug_snapshot_core(
+    state_dir: &Path,
+    since_epoch_ms: u64,
+) -> Result<serde_json::Value, String> {
+    let captured_at_ms = proxy_core::tracker::TelemetryHub::now_ms();
+    let debug_mode = ANDROID_DEBUG_LOGGING.load(Ordering::Acquire);
+
+    let live_ctx = {
+        let guard = ANDROID_RUNTIME.lock();
+        guard.as_ref().map(|rt| {
+            #[cfg(unix)]
+            let tun_stats = rt
+                .fd_bridge
+                .as_ref()
+                .map(|b| {
+                    (
+                        b.rx_packets(),
+                        b.tx_packets(),
+                        b.rx_bytes(),
+                        b.tx_bytes(),
+                        b.tx_write_drops(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0));
+            #[cfg(not(unix))]
+            let tun_stats = (0u64, 0u64, 0u64, 0u64, 0u64);
+            (
+                Arc::clone(&rt.engine),
+                tun_stats,
+                rt.protector.tcp_count(),
+                rt.protector.udp_count(),
+                rt.protector.fail_count(),
+                rt.network_transitions.load(Ordering::Relaxed),
+                rt.is_wifi.load(Ordering::Acquire),
+                rt.last_network_handle.load(Ordering::Acquire),
+            )
+        })
+    };
+
+    if let Some((
+        engine,
+        (rx_pkts, tx_pkts, rx_bytes, tx_bytes, tx_write_drops),
+        prot_tcp,
+        prot_udp,
+        prot_fail,
+        network_transitions,
+        is_wifi,
+        last_network_handle,
+    )) = live_ctx
+    {
+        let hub = engine.hub();
+        let router = engine.router();
+        sync_delays_from_router(&router);
+        let delays_map = collect_delays_map_from_router(&router);
+        let eff = router.effective_primary_outbound();
+        let active_delay = router.delays().latest_delay(&eff.effective_outbound);
+
+        let (routing_preset, active_profile) = if let Ok(mgr) = engine.ensure_profile_manager() {
+            build_redacted_active_profile_summary(&mgr)
+        } else if !state_dir.as_os_str().is_empty()
+            && let Ok(mgr) = ProfileManager::open_or_init(state_dir)
+        {
+            build_redacted_active_profile_summary(&mgr)
+        } else {
+            (None, None)
+        };
+
+        let (up_rate, down_rate) = hub
+            .traffic_history()
+            .last()
+            .map(|p| (p.up, p.down))
+            .unwrap_or((0, 0));
+        let (up_total, down_total) = hub.totals();
+        let dns_snap = router.dns().telemetry_snapshot();
+        let geodata = engine.geodata_status();
+
+        let conns = hub.diagnostics_since(since_epoch_ms, 1_500);
+        let mut window_tcp = 0usize;
+        let mut window_udp = 0usize;
+        let mut window_failed = 0usize;
+        let mut window_zero_rx = 0usize;
+        let mut window_fake_ip_restored = 0usize;
+
+        #[derive(Default)]
+        struct OutboundAgg {
+            protocol: String,
+            exit_type: String,
+            connections: usize,
+            failures: usize,
+            zero_rx_count: usize,
+            upload_bytes: u64,
+            download_bytes: u64,
+            handshakes: Vec<u64>,
+        }
+
+        #[derive(Default)]
+        struct DomainAgg {
+            connections: usize,
+            failures: usize,
+            upload_bytes: u64,
+            download_bytes: u64,
+            primary_rule: String,
+            primary_outbound: String,
+        }
+
+        let mut by_outbound: HashMap<String, OutboundAgg> = HashMap::new();
+        let mut by_domain: HashMap<String, DomainAgg> = HashMap::new();
+
+        for c in &conns {
+            if c.metadata.network.eq_ignore_ascii_case("udp") {
+                window_udp += 1;
+            } else {
+                window_tcp += 1;
+            }
+            if c.status == "failed" {
+                window_failed += 1;
+            }
+            let is_zero_rx = c.status == "closed" && c.download == 0 && c.upload > 0;
+            if is_zero_rx {
+                window_zero_rx += 1;
+            }
+            if c.metadata.fake_ip.is_some() {
+                window_fake_ip_restored += 1;
+            }
+
+            let ob_entry = by_outbound.entry(c.effective_outbound.clone()).or_default();
+            if ob_entry.protocol.is_empty() {
+                ob_entry.protocol.clone_from(&c.effective_protocol);
+                ob_entry.exit_type.clone_from(&c.exit_type);
+            }
+            ob_entry.connections += 1;
+            if c.status == "failed" {
+                ob_entry.failures += 1;
+            }
+            if is_zero_rx {
+                ob_entry.zero_rx_count += 1;
+            }
+            ob_entry.upload_bytes = ob_entry.upload_bytes.saturating_add(c.upload);
+            ob_entry.download_bytes = ob_entry.download_bytes.saturating_add(c.download);
+            if let Some(ms) = c.connect_duration_ms {
+                ob_entry.handshakes.push(ms);
+            }
+
+            let safe_host = redact_sensitive_text(&c.metadata.host);
+            let dom_entry = by_domain.entry(safe_host).or_default();
+            dom_entry.connections += 1;
+            if c.status == "failed" {
+                dom_entry.failures += 1;
+            }
+            dom_entry.upload_bytes = dom_entry.upload_bytes.saturating_add(c.upload);
+            dom_entry.download_bytes = dom_entry.download_bytes.saturating_add(c.download);
+            if dom_entry.primary_rule.is_empty() {
+                dom_entry.primary_rule = if c.rule_payload.is_empty() {
+                    c.rule.clone()
+                } else {
+                    format!("{},{}", c.rule, redact_sensitive_text(&c.rule_payload))
+                };
+                dom_entry.primary_outbound.clone_from(&c.effective_outbound);
+            }
+        }
+
+        let mut outbound_stats: Vec<(usize, serde_json::Value)> = by_outbound
+            .into_iter()
+            .map(|(outbound_name, mut agg)| {
+                agg.handshakes.sort_unstable();
+                let p50 = percentile_u64(&agg.handshakes, 50);
+                let p95 = percentile_u64(&agg.handshakes, 95);
+                let max_hs = agg.handshakes.last().copied();
+                let probe_delay = delays_map.get(&outbound_name).copied();
+                let safe_name = redact_sensitive_text(&outbound_name);
+                (
+                    agg.connections,
+                    serde_json::json!({
+                        "outbound": safe_name,
+                        "protocol": agg.protocol,
+                        "exitType": agg.exit_type,
+                        "latestProbeDelayMs": probe_delay,
+                        "connections": agg.connections,
+                        "failures": agg.failures,
+                        "zeroRxCount": agg.zero_rx_count,
+                        "handshakeSamples": agg.handshakes.len(),
+                        "handshakeP50Ms": p50,
+                        "handshakeP95Ms": p95,
+                        "handshakeMaxMs": max_hs,
+                        "uploadBytes": agg.upload_bytes,
+                        "downloadBytes": agg.download_bytes,
+                    }),
+                )
+            })
+            .collect();
+        outbound_stats.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
+        let outbound_stats_json: Vec<serde_json::Value> =
+            outbound_stats.into_iter().map(|(_, v)| v).collect();
+
+        let mut top_domains: Vec<(usize, serde_json::Value)> = by_domain
+            .into_iter()
+            .map(|(host, agg)| {
+                (
+                    agg.connections,
+                    serde_json::json!({
+                        "host": host,
+                        "connections": agg.connections,
+                        "failures": agg.failures,
+                        "uploadBytes": agg.upload_bytes,
+                        "downloadBytes": agg.download_bytes,
+                        "primaryRule": agg.primary_rule,
+                        "primaryOutbound": redact_sensitive_text(&agg.primary_outbound),
+                    }),
+                )
+            })
+            .collect();
+        top_domains.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
+        let top_domains_json: Vec<serde_json::Value> =
+            top_domains.into_iter().take(25).map(|(_, v)| v).collect();
+
+        let mut rules_with_hits: Vec<_> = router
+            .rules_snapshot()
+            .into_iter()
+            .filter(|r| r.hits > 0)
+            .collect();
+        rules_with_hits.sort_by_key(|r| std::cmp::Reverse(r.hits));
+        let top_rules_json: Vec<serde_json::Value> = rules_with_hits
+            .into_iter()
+            .take(25)
+            .map(|r| {
+                serde_json::json!({
+                    "type": r.rule_type,
+                    "payload": redact_sensitive_text(&r.payload),
+                    "proxy": redact_sensitive_text(&r.proxy),
+                    "hits": r.hits,
+                })
+            })
+            .collect();
+
+        let failed_connections_json: Vec<serde_json::Value> = conns
+            .iter()
+            .filter(|c| c.status == "failed")
+            .take(80)
+            .map(|c| {
+                serde_json::json!({
+                    "host": redact_sensitive_text(&c.metadata.host),
+                    "destinationPort": c.metadata.destination_port,
+                    "network": c.metadata.network,
+                    "fakeIp": c.metadata.fake_ip,
+                    "rule": c.rule,
+                    "rulePayload": redact_sensitive_text(&c.rule_payload),
+                    "chains": c.chains.iter().map(|ch| redact_sensitive_text(ch)).collect::<Vec<_>>(),
+                    "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                    "effectiveProtocol": c.effective_protocol,
+                    "exitType": c.exit_type,
+                    "error": c.error.as_deref().map(redact_sensitive_text),
+                    "startEpochMs": c.start_epoch_ms,
+                })
+            })
+            .collect();
+
+        let mut slow_candidates: Vec<_> = conns
+            .iter()
+            .filter(|c| c.connect_duration_ms.is_some())
+            .collect();
+        slow_candidates.sort_by_key(|c| std::cmp::Reverse(c.connect_duration_ms.unwrap_or(0)));
+        let slow_connections_json: Vec<serde_json::Value> = slow_candidates
+            .into_iter()
+            .take(40)
+            .map(|c| {
+                serde_json::json!({
+                    "host": redact_sensitive_text(&c.metadata.host),
+                    "destinationPort": c.metadata.destination_port,
+                    "network": c.metadata.network,
+                    "rule": c.rule,
+                    "rulePayload": redact_sensitive_text(&c.rule_payload),
+                    "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                    "effectiveProtocol": c.effective_protocol,
+                    "connectDurationMs": c.connect_duration_ms,
+                    "upload": c.upload,
+                    "download": c.download,
+                    "status": c.status,
+                    "startEpochMs": c.start_epoch_ms,
+                })
+            })
+            .collect();
+
+        let recent_connections_json: Vec<serde_json::Value> = conns
+            .iter()
+            .take(80)
+            .map(|c| {
+                serde_json::json!({
+                    "host": redact_sensitive_text(&c.metadata.host),
+                    "destinationPort": c.metadata.destination_port,
+                    "network": c.metadata.network,
+                    "fakeIp": c.metadata.fake_ip,
+                    "rule": c.rule,
+                    "rulePayload": redact_sensitive_text(&c.rule_payload),
+                    "chains": c.chains.iter().map(|ch| redact_sensitive_text(ch)).collect::<Vec<_>>(),
+                    "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                    "effectiveProtocol": c.effective_protocol,
+                    "exitType": c.exit_type,
+                    "connectDurationMs": c.connect_duration_ms,
+                    "upload": c.upload,
+                    "download": c.download,
+                    "status": c.status,
+                    "error": c.error.as_deref().map(redact_sensitive_text),
+                    "startEpochMs": c.start_epoch_ms,
+                })
+            })
+            .collect();
+
+        let engine_logs_json: Vec<serde_json::Value> = hub
+            .logs_since(since_epoch_ms, 250)
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "timestampMs": e.timestamp_ms,
+                    "level": e.level,
+                    "payload": redact_sensitive_text(&e.payload),
+                })
+            })
+            .collect();
+
+        return Ok(serde_json::json!({
+            "ok": true,
+            "vpnRunning": true,
+            "debugMode": debug_mode,
+            "demoActive": engine.demo_info().enabled,
+            "capturedAtMs": captured_at_ms,
+            "sinceEpochMs": since_epoch_ms,
+            "startedAtMs": hub.started_at_ms(),
+            "uptimeSecs": hub.uptime_secs(),
+            "telemetryParked": hub.is_telemetry_parked(),
+            "rssBytes": read_process_rss_bytes(),
+            "mode": router.mode().as_str(),
+            "routingPreset": routing_preset,
+            "effectiveOutbound": redact_sensitive_text(&eff.effective_outbound),
+            "effectiveProtocol": eff.effective_protocol,
+            "effectiveDelayMs": active_delay,
+            "networkTransitions": network_transitions,
+            "isWifi": is_wifi,
+            "lastNetworkHandle": last_network_handle,
+            "activeProfile": active_profile,
+            "geodata": geodata,
+            "traffic": {
+                "upRate": up_rate,
+                "downRate": down_rate,
+                "upTotal": up_total,
+                "downTotal": down_total,
+                "activeConnections": hub.active_connection_count(),
+                "totalConnections": hub.total_connections(),
+                "establishedConnections": hub.established_connections_total(),
+                "failedConnections": hub.failed_connections_total(),
+                "zeroRxClosedConnections": hub.zero_rx_closed_total(),
+            },
+            "windowSummary": {
+                "connections": conns.len(),
+                "tcpConnections": window_tcp,
+                "udpConnections": window_udp,
+                "failedConnections": window_failed,
+                "zeroRxClosedConnections": window_zero_rx,
+                "fakeIpRestoredConnections": window_fake_ip_restored,
+            },
+            "tun": {
+                "rxPackets": rx_pkts,
+                "txPackets": tx_pkts,
+                "rxBytes": rx_bytes,
+                "txBytes": tx_bytes,
+                "txWriteDrops": tx_write_drops,
+                "protectedTcpSockets": prot_tcp,
+                "protectedUdpSockets": prot_udp,
+                "protectFailures": prot_fail,
+            },
+            "dns": dns_snap,
+            "outboundStats": outbound_stats_json,
+            "topDomains": top_domains_json,
+            "topRules": top_rules_json,
+            "failedConnections": failed_connections_json,
+            "slowConnections": slow_connections_json,
+            "recentConnections": recent_connections_json,
+            "engineLogs": engine_logs_json,
+        }));
+    }
+
+    let (mode_str, routing_preset, active_profile, geodata) = if !state_dir.as_os_str().is_empty() {
+        let gm = GeoDataManager::new(state_dir, Vec::new());
+        if let Ok(mgr) = ProfileManager::open_or_init(state_dir) {
+            let mode = mgr
+                .load_active_config()
+                .map(|(cfg, _)| cfg.mode.as_str().to_string())
+                .unwrap_or_else(|_| "rule".to_string());
+            let (rp, ap) = build_redacted_active_profile_summary(&mgr);
+            (mode, rp, ap, Some(gm.status()))
+        } else {
+            ("rule".to_string(), None, None, Some(gm.status()))
+        }
+    } else {
+        ("rule".to_string(), None, None, None)
+    };
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "vpnRunning": false,
+        "debugMode": debug_mode,
+        "demoActive": false,
+        "capturedAtMs": captured_at_ms,
+        "sinceEpochMs": since_epoch_ms,
+        "rssBytes": read_process_rss_bytes(),
+        "mode": mode_str,
+        "routingPreset": routing_preset,
+        "activeProfile": active_profile,
+        "geodata": geodata,
+        "outboundStats": [],
+        "topDomains": [],
+        "topRules": [],
+        "failedConnections": [],
+        "slowConnections": [],
+        "recentConnections": [],
+        "engineLogs": [],
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSetDebugLogging(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    enable: jboolean,
+) -> jboolean {
+    if android_set_debug_logging_core(enable == JNI_TRUE) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeCollectDebugSnapshotJson<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    state_dir_jstr: JString<'local>,
+    since_epoch_ms: jlong,
+) -> jstring {
+    ensure_tracing_initialized();
+    let res = (|| -> Result<serde_json::Value, String> {
+        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+        let since_u64 = if since_epoch_ms <= 0 {
+            0u64
+        } else {
+            since_epoch_ms as u64
+        };
+        android_collect_debug_snapshot_core(Path::new(dir.trim()), since_u64)
     })();
     let out = match res {
         Ok(v) => v.to_string(),

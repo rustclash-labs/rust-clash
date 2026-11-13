@@ -62,6 +62,18 @@ pub struct FakeIpEntry {
     pub domain: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DnsTelemetrySnapshot {
+    pub total_queries: u64,
+    pub fake_ip_hits: u64,
+    pub cache_hits: u64,
+    pub upstream_queries: u64,
+    pub upstream_errors: u64,
+    pub upstream_avg_ms: u64,
+    pub upstream_max_ms: u64,
+    pub active_fake_ip_entries: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PositiveDnsCacheSeed {
     pub(crate) proxy_entries: Vec<(String, Instant, Vec<IpAddr>)>,
@@ -436,6 +448,12 @@ pub struct FakeIpDnsEngine {
     inflight_proxy: DashMap<String, watch::Sender<bool>>,
     inflight_bootstrap: DashMap<String, watch::Sender<bool>>,
     total_queries: AtomicU64,
+    fake_ip_hits: AtomicU64,
+    cache_hits: AtomicU64,
+    upstream_queries: AtomicU64,
+    upstream_errors: AtomicU64,
+    upstream_total_ms: AtomicU64,
+    upstream_max_ms: AtomicU64,
 }
 
 impl FakeIpDnsEngine {
@@ -668,6 +686,12 @@ impl FakeIpDnsEngine {
             inflight_proxy: DashMap::new(),
             inflight_bootstrap: DashMap::new(),
             total_queries: AtomicU64::new(0),
+            fake_ip_hits: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            upstream_queries: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            upstream_total_ms: AtomicU64::new(0),
+            upstream_max_ms: AtomicU64::new(0),
         })
     }
 
@@ -675,6 +699,26 @@ impl FakeIpDnsEngine {
     pub fn import_entries_from(&self, prev: &FakeIpDnsEngine) {
         self.total_queries
             .store(prev.total_queries(), Ordering::Relaxed);
+        self.fake_ip_hits
+            .store(prev.fake_ip_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.cache_hits
+            .store(prev.cache_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.upstream_queries.store(
+            prev.upstream_queries.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.upstream_errors.store(
+            prev.upstream_errors.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.upstream_total_ms.store(
+            prev.upstream_total_ms.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.upstream_max_ms.store(
+            prev.upstream_max_ms.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         if prev.net != self.net {
             return;
         }
@@ -1197,6 +1241,8 @@ impl FakeIpDnsEngine {
         slice: &[DnsUpstream],
         raw_query: &[u8],
     ) -> Result<Vec<u8>> {
+        self.upstream_queries.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let mut last_err = ProxyError::Dns("no DNS upstreams configured".into());
         for upstream in slice {
             let ips = match self.resolve_bootstrap_host(&upstream.endpoint_host()).await {
@@ -1207,10 +1253,16 @@ impl FakeIpDnsEngine {
                 }
             };
             match upstream.exchange(&ips, raw_query, &self.extra_ca_der).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    let ms = started.elapsed().as_millis() as u64;
+                    self.upstream_total_ms.fetch_add(ms, Ordering::Relaxed);
+                    self.upstream_max_ms.fetch_max(ms, Ordering::Relaxed);
+                    return Ok(resp);
+                }
                 Err(e) => last_err = e,
             }
         }
+        self.upstream_errors.fetch_add(1, Ordering::Relaxed);
         Err(last_err)
     }
 
@@ -1356,6 +1408,7 @@ impl FakeIpDnsEngine {
         }
 
         if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
 
@@ -1503,6 +1556,7 @@ impl FakeIpDnsEngine {
         }
 
         if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
 
@@ -1593,6 +1647,7 @@ impl FakeIpDnsEngine {
         }
 
         if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
 
@@ -1749,6 +1804,24 @@ impl FakeIpDnsEngine {
         self.total_queries.load(Ordering::Relaxed)
     }
 
+    pub fn telemetry_snapshot(&self) -> DnsTelemetrySnapshot {
+        let up_q = self.upstream_queries.load(Ordering::Relaxed);
+        let up_err = self.upstream_errors.load(Ordering::Relaxed);
+        let up_ok = up_q.saturating_sub(up_err);
+        let total_ms = self.upstream_total_ms.load(Ordering::Relaxed);
+        let avg_ms = total_ms.checked_div(up_ok).unwrap_or(0);
+        DnsTelemetrySnapshot {
+            total_queries: self.total_queries.load(Ordering::Relaxed),
+            fake_ip_hits: self.fake_ip_hits.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            upstream_queries: up_q,
+            upstream_errors: up_err,
+            upstream_avg_ms: avg_ms,
+            upstream_max_ms: self.upstream_max_ms.load(Ordering::Relaxed),
+            active_fake_ip_entries: self.entry_count(),
+        }
+    }
+
     /// Process a raw RFC 1035 DNS request packet, returning the encoded DNS response packet.
     pub async fn handle_dns_packet(&self, raw_query: &[u8]) -> Result<Vec<u8>> {
         self.total_queries.fetch_add(1, Ordering::Relaxed);
@@ -1810,6 +1883,7 @@ impl FakeIpDnsEngine {
         }
 
         if self.enabled && self.fake_ip_mode && !self.should_bypass_fake_ip(&normalized) {
+            self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
             return match query.question.qtype {
                 QTYPE_A => {
                     let fake_ip = self.assign_fake_ip(&normalized);
@@ -1833,6 +1907,7 @@ impl FakeIpDnsEngine {
             && Instant::now() < cached.expires_at
             && cached.wire.len() >= 12
         {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             let mut hit = cached.wire;
             hit[0] = raw_query[0];
             hit[1] = raw_query[1];

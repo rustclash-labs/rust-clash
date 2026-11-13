@@ -149,4 +149,11 @@ object NativeBridge {
         name: String,
         intervalSecs: Long,
     ): String
+
+    external fun nativeSetDebugLogging(enable: Boolean): Boolean
+
+    external fun nativeCollectDebugSnapshotJson(
+        stateDir: String,
+        sinceEpochMs: Long,
+    ): String
 }

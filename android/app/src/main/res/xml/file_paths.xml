@@ -3,4 +3,10 @@
     <cache-path
         name="qr_captures"
         path="qr_captures/" />
+    <cache-path
+        name="debug_exports"
+        path="debug_exports/" />
+    <files-path
+        name="debug_logs"
+        path="debug_logs/" />
 </paths>

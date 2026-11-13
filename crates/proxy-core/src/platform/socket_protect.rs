@@ -51,6 +51,7 @@ pub struct CallbackSocketProtector {
     protect_loopback: bool,
     protected_tcp_count: AtomicU64,
     protected_udp_count: AtomicU64,
+    protect_fail_count: AtomicU64,
     #[cfg(unix)]
     fd_hook: Arc<dyn Fn(i32) -> io::Result<()> + Send + Sync>,
     #[cfg(not(unix))]
@@ -68,6 +69,7 @@ impl CallbackSocketProtector {
             protect_loopback,
             protected_tcp_count: AtomicU64::new(0),
             protected_udp_count: AtomicU64::new(0),
+            protect_fail_count: AtomicU64::new(0),
             fd_hook: Arc::new(hook),
         }
     }
@@ -79,6 +81,7 @@ impl CallbackSocketProtector {
             protect_loopback,
             protected_tcp_count: AtomicU64::new(0),
             protected_udp_count: AtomicU64::new(0),
+            protect_fail_count: AtomicU64::new(0),
             fd_hook: Arc::new(|_| Ok(())),
         }
     }
@@ -91,22 +94,32 @@ impl CallbackSocketProtector {
         self.protected_udp_count.load(Ordering::Relaxed)
     }
 
+    pub fn fail_count(&self) -> u64 {
+        self.protect_fail_count.load(Ordering::Relaxed)
+    }
+
     fn invoke(&self, sock: &Socket) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            (self.fd_hook)(sock.as_raw_fd())
+        let res = {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                (self.fd_hook)(sock.as_raw_fd())
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawSocket;
+                (self.fd_hook)(sock.as_raw_socket())
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = sock;
+                (self.fd_hook)(0)
+            }
+        };
+        if res.is_err() {
+            self.protect_fail_count.fetch_add(1, Ordering::Relaxed);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            (self.fd_hook)(sock.as_raw_socket())
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = sock;
-            (self.fd_hook)(0)
-        }
+        res
     }
 }
 
@@ -131,10 +144,11 @@ impl SocketProtector for CallbackSocketProtector {
 
     fn description(&self) -> String {
         format!(
-            "{}(tcp={},udp={})",
+            "{}(tcp={},udp={},fail={})",
             self.label,
             self.tcp_count(),
-            self.udp_count()
+            self.udp_count(),
+            self.fail_count()
         )
     }
 }

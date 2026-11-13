@@ -1252,3 +1252,471 @@ fn android_update_profile_settings_and_manual_overlay_ffi_e2e() {
 
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn android_debug_diagnostic_snapshot_live_offline_and_redaction_e2e() {
+    use std::{
+        net::Ipv4Addr,
+        os::fd::{FromRawFd, OwnedFd},
+    };
+
+    use proxy_core::dns::wire::{DnsAnswerData, DnsQueryPacket, QTYPE_A};
+    use proxy_ffi::{
+        android_jni::{
+            android_collect_debug_snapshot_core, android_flush_dns_core,
+            android_import_unified_core, android_is_debug_logging_core,
+            android_set_debug_logging_core, start_android_vpn_with_state_dir,
+            stop_android_vpn_core,
+        },
+        fd_bridge::CallbackSocketProtector,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+        sync::watch,
+    };
+    use uuid::Uuid;
+
+    let _serial = SERIAL_ANDROID_FFI_LOCK.blocking_lock();
+    let _ = stop_android_vpn_core();
+    let _ = android_flush_dns_core();
+    android_set_debug_logging_core(false);
+    assert!(!android_is_debug_logging_core());
+
+    let bg_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    let sub_secret_token = "SUPER_SECRET_SUB_TOKEN_9999";
+    let socks_secret_pass = "SOCKS_DEBUG_SECRET_PASS_8888";
+    let vless_secret_uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+
+    let (dns_addr, socks_addr, http_origin_addr, dead_port, sub_addr) = bg_rt.block_on(async {
+        // 1. Mock authoritative DNS server resolving `api.bilibili.com` -> 127.0.0.1
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let d_addr = udp.local_addr().unwrap();
+        let mut d_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    _ = d_stop.changed() => break,
+                    recv = udp.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = recv else { break };
+                        let pkt = &buf[..n];
+                        let Ok(q) = DnsQueryPacket::parse(pkt) else { continue };
+                        let resp = if q.question.qtype == QTYPE_A {
+                            q.build_response(pkt, 0, 180, &[DnsAnswerData::A(Ipv4Addr::LOCALHOST)])
+                        } else {
+                            q.build_response(pkt, 0, 180, &[])
+                        };
+                        let _ = udp.send_to(&resp, peer).await;
+                    }
+                }
+            }
+        });
+
+        // 2. Mock authenticated SOCKS5 proxy server (`HK-Node-01`) accepting any domain target
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s_addr = socks_listener.local_addr().unwrap();
+        let mut s_stop = stop_rx.clone();
+        let expected_pass = socks_secret_pass.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = s_stop.changed() => break,
+                    acc = socks_listener.accept() => {
+                        let Ok((mut sock, _)) = acc else { break };
+                        let pass_copy = expected_pass.clone();
+                        tokio::spawn(async move {
+                            let mut hdr = [0u8; 2];
+                            if sock.read_exact(&mut hdr).await.is_err() || hdr[0] != 0x05 {
+                                return;
+                            }
+                            let mut methods = vec![0u8; usize::from(hdr[1])];
+                            if sock.read_exact(&mut methods).await.is_err() {
+                                return;
+                            }
+                            if methods.contains(&0x02) {
+                                if sock.write_all(&[0x05, 0x02]).await.is_err() {
+                                    return;
+                                }
+                                let mut auth_hdr = [0u8; 2];
+                                if sock.read_exact(&mut auth_hdr).await.is_err() {
+                                    return;
+                                }
+                                let mut uname = vec![0u8; usize::from(auth_hdr[1])];
+                                if sock.read_exact(&mut uname).await.is_err() {
+                                    return;
+                                }
+                                let mut plen = [0u8; 1];
+                                if sock.read_exact(&mut plen).await.is_err() {
+                                    return;
+                                }
+                                let mut pw = vec![0u8; usize::from(plen[0])];
+                                if sock.read_exact(&mut pw).await.is_err() {
+                                    return;
+                                }
+                                if pw != pass_copy.as_bytes() {
+                                    let _ = sock.write_all(&[0x01, 0x01]).await;
+                                    return;
+                                }
+                                if sock.write_all(&[0x01, 0x00]).await.is_err() {
+                                    return;
+                                }
+                            } else if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                                return;
+                            }
+
+                            let mut req = [0u8; 4];
+                            if sock.read_exact(&mut req).await.is_err() {
+                                return;
+                            }
+                            match req[3] {
+                                0x01 => {
+                                    let mut skip = [0u8; 6];
+                                    let _ = sock.read_exact(&mut skip).await;
+                                }
+                                0x03 => {
+                                    let mut dlen = [0u8; 1];
+                                    if sock.read_exact(&mut dlen).await.is_err() {
+                                        return;
+                                    }
+                                    let mut skip = vec![0u8; usize::from(dlen[0]) + 2];
+                                    let _ = sock.read_exact(&mut skip).await;
+                                }
+                                0x04 => {
+                                    let mut skip = [0u8; 18];
+                                    let _ = sock.read_exact(&mut skip).await;
+                                }
+                                _ => return,
+                            }
+                            if sock
+                                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let mut http_buf = [0u8; 512];
+                            let _ = sock.read(&mut http_buf).await;
+                            let _ = sock
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy")
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+
+        // 3. Direct HTTP origin server for `api.bilibili.com` (`DIRECT` rule)
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let h_addr = http_listener.local_addr().unwrap();
+        let mut h_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = h_stop.changed() => break,
+                    acc = http_listener.accept() => {
+                        let Ok((mut sock, _)) = acc else { break };
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 512];
+                            let _ = sock.read(&mut buf).await;
+                            let _ = sock
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect")
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+
+        // 4. Reserve a closed port so `Dead-VLESS-Node` deterministically fails TCP connect
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = dead_listener.local_addr().unwrap().port();
+        drop(dead_listener);
+
+        // 5. Subscription HTTP server hosting the YAML profile
+        let sub_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sub_srv_addr = sub_listener.local_addr().unwrap();
+        let sub_yaml = format!(
+            r#"mixed-port: 0
+mode: rule
+unified-delay: true
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver:
+    - "{d_addr}"
+proxies:
+  - name: "HK-Node-01"
+    type: socks5
+    server: 127.0.0.1
+    port: {socks_port}
+    username: "debuguser"
+    password: "{socks_secret_pass}"
+    udp: true
+  - name: "Dead-VLESS-Node"
+    type: vless
+    server: 127.0.0.1
+    port: {closed_port}
+    uuid: "{vless_secret_uuid}"
+    tls: true
+    servername: dead.example.com
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "HK-Node-01"
+      - "Dead-VLESS-Node"
+rules:
+  - DOMAIN-SUFFIX,bilibili.com,DIRECT
+  - DOMAIN-SUFFIX,broken.example,Dead-VLESS-Node
+  - DOMAIN-SUFFIX,google.com,HK-Node-01
+  - MATCH,PROXY
+"#,
+            socks_port = s_addr.port(),
+        );
+        let mut sub_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sub_stop.changed() => break,
+                    acc = sub_listener.accept() => {
+                        let Ok((mut sock, _)) = acc else { break };
+                        let body = sub_yaml.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 1024];
+                            let _ = sock.read(&mut buf).await;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        (d_addr, s_addr, h_addr, closed_port, sub_srv_addr)
+    });
+    let _ = (dns_addr, socks_addr, dead_port);
+
+    let state_dir = std::env::temp_dir().join(format!("rc-android-debug-e2e-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // Import subscription URL containing secret query token
+    let raw_sub_url = format!("http://{sub_addr}/api/v1/client/subscribe?token={sub_secret_token}");
+    let imp = android_import_unified_core(&state_dir, &raw_sub_url, true, true)
+        .expect("import subscription profile offline");
+    assert_eq!(imp["ok"], true);
+
+    // Enable debug mode BEFORE starting VPN and verify offline snapshot
+    assert!(android_set_debug_logging_core(true));
+    assert!(android_is_debug_logging_core());
+
+    let offline_snap =
+        android_collect_debug_snapshot_core(&state_dir, 0).expect("collect offline debug snapshot");
+    assert_eq!(offline_snap["ok"], true);
+    assert_eq!(offline_snap["vpnRunning"], false);
+    assert_eq!(offline_snap["debugMode"], true);
+    assert_eq!(offline_snap["activeProfile"]["proxyCount"], 2);
+    let offline_raw_str = offline_snap.to_string();
+    assert!(!offline_raw_str.contains(sub_secret_token));
+    assert!(!offline_raw_str.contains(socks_secret_pass));
+    assert!(!offline_raw_str.contains(vless_secret_uuid));
+
+    // Start Android VPN -> debugMode propagates automatically onto live TelemetryHub
+    let since_ms = proxy_core::tracker::TelemetryHub::now_ms().saturating_sub(50);
+    let (fd1, peer1, ino1) = create_tun_like_socketpair();
+    let protector = Arc::new(CallbackSocketProtector::new_unix(
+        "android-debug-live",
+        true,
+        |_fd| Ok(()),
+    ));
+    let started = start_android_vpn_with_state_dir(
+        Some(unsafe { OwnedFd::from_raw_fd(fd1) }),
+        Some(&state_dir),
+        "",
+        false,
+        protector,
+    )
+    .expect("start Android VPN with debug logging enabled");
+    assert_eq!(started["ok"], true);
+    let live_api_secret = started["apiSecret"].as_str().unwrap().to_string();
+    let mixed_port = started["mixedPort"].as_u64().unwrap() as u16;
+    assert!(mixed_port > 0);
+
+    // Pump a Fake-IP L3 DNS query through the attached Android TUN fd (`peer1`) to exercise TUN + Fake-IP counters
+    let dns_q = build_dns_query(0x7171, "tun-probe.google.com", QTYPE_A);
+    let raw_l3 = build_raw_ipv4_udp_packet([198, 18, 0, 9], [198, 18, 0, 1], 53111, 53, &dns_q);
+    let wrote = unsafe { libc::write(peer1, raw_l3.as_ptr().cast(), raw_l3.len()) };
+    assert_eq!(wrote as usize, raw_l3.len());
+    let mut reply_buf = [0u8; 512];
+    for _ in 0..30 {
+        let mut pfd = libc::pollfd {
+            fd: peer1,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&raw mut pfd, 1, 50) } > 0 {
+            let _ = unsafe { libc::read(peer1, reply_buf.as_mut_ptr().cast(), reply_buf.len()) };
+            break;
+        }
+    }
+
+    // Drive 3 HTTP proxy requests through `mixed_port`:
+    //   (a) `www.google.com` -> `HK-Node-01` (PROXY, succeeds)
+    //   (b) `api.bilibili.com` -> `DIRECT` (DIRECT, succeeds)
+    //   (c) `fail.broken.example` -> `Dead-VLESS-Node` (fails TCP connect)
+    bg_rt.block_on(async {
+        // (a) Proxy hit via HK-Node-01
+        let mut c1 = tokio::net::TcpStream::connect(("127.0.0.1", mixed_port))
+            .await
+            .unwrap();
+        c1.write_all(b"GET http://www.google.com/generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut r1 = Vec::new();
+        let _ = c1.read_to_end(&mut r1).await;
+        assert!(String::from_utf8_lossy(&r1).contains("200 OK"));
+
+        // (b) Direct hit via DIRECT
+        let mut c2 = tokio::net::TcpStream::connect(("127.0.0.1", mixed_port))
+            .await
+            .unwrap();
+        let req2 = format!(
+            "GET http://api.bilibili.com:{}/feed HTTP/1.1\r\nHost: api.bilibili.com:{}\r\nConnection: close\r\n\r\n",
+            http_origin_addr.port(),
+            http_origin_addr.port()
+        );
+        c2.write_all(req2.as_bytes()).await.unwrap();
+        let mut r2 = Vec::new();
+        let _ = c2.read_to_end(&mut r2).await;
+        assert!(String::from_utf8_lossy(&r2).contains("200 OK"));
+
+        // (c) Failed outbound hit via Dead-VLESS-Node
+        let mut c3 = tokio::net::TcpStream::connect(("127.0.0.1", mixed_port))
+            .await
+            .unwrap();
+        let _ = c3
+            .write_all(b"GET http://fail.broken.example/test HTTP/1.1\r\nHost: fail.broken.example\r\nConnection: close\r\n\r\n")
+            .await;
+        let mut r3 = Vec::new();
+        let _ = c3.read_to_end(&mut r3).await;
+    });
+
+    // Give async connection close telemetry a brief moment to settle
+    std::thread::sleep(Duration::from_millis(60));
+
+    let live_snap = android_collect_debug_snapshot_core(&state_dir, since_ms)
+        .expect("collect live debug snapshot");
+    let live_str = live_snap.to_string();
+
+    assert_eq!(live_snap["ok"], true);
+    assert_eq!(live_snap["vpnRunning"], true);
+    assert_eq!(live_snap["debugMode"], true);
+    assert!(live_snap["tun"]["rxPackets"].as_u64().unwrap_or(0) >= 1);
+    assert!(live_snap["tun"]["rxBytes"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        live_snap["tun"]["protectedTcpSockets"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    );
+    assert_eq!(
+        live_snap["tun"]["protectFailures"].as_u64().unwrap_or(99),
+        0
+    );
+    assert!(live_snap["dns"]["total_queries"].as_u64().unwrap_or(0) >= 1);
+    assert!(live_snap["dns"]["fake_ip_hits"].as_u64().unwrap_or(0) >= 1);
+    assert!(
+        live_snap["traffic"]["establishedConnections"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    );
+    assert!(
+        live_snap["traffic"]["failedConnections"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+
+    // Visited domains, matched rules, and node names MUST be preserved for mobile optimization analysis
+    assert!(
+        live_str.contains("www.google.com"),
+        "visited domain www.google.com must be preserved"
+    );
+    assert!(
+        live_str.contains("api.bilibili.com"),
+        "visited domain api.bilibili.com must be preserved"
+    );
+    assert!(
+        live_str.contains("fail.broken.example"),
+        "failed domain fail.broken.example must be preserved"
+    );
+    assert!(
+        live_str.contains("HK-Node-01"),
+        "node name HK-Node-01 must be preserved"
+    );
+    assert!(
+        live_str.contains("Dead-VLESS-Node"),
+        "failed node name Dead-VLESS-Node must be preserved"
+    );
+
+    let hk_stat = live_snap["outboundStats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["outbound"] == "HK-Node-01")
+        .expect("HK-Node-01 outbound stats present");
+    assert!(hk_stat["handshakeSamples"].as_u64().unwrap_or(0) >= 1);
+    assert!(!hk_stat["handshakeP50Ms"].is_null());
+    assert!(hk_stat["downloadBytes"].as_u64().unwrap_or(0) > 0);
+
+    let failed_arr = live_snap["failedConnections"].as_array().unwrap();
+    assert!(
+        failed_arr
+            .iter()
+            .any(|c| c["host"] == "fail.broken.example"
+                && c["effectiveOutbound"] == "Dead-VLESS-Node"),
+        "failedConnections must capture fail.broken.example -> Dead-VLESS-Node"
+    );
+
+    // Secrets, UUIDs, passwords, subscription tokens, and ephemeral apiSecret MUST be 100% absent
+    assert!(
+        !live_str.contains(sub_secret_token),
+        "subscription token must be redacted"
+    );
+    assert!(
+        !live_str.contains(socks_secret_pass),
+        "proxy password must be redacted"
+    );
+    assert!(
+        !live_str.contains(vless_secret_uuid),
+        "VLESS UUID must be redacted"
+    );
+    assert!(
+        !live_str.contains(&live_api_secret),
+        "ephemeral apiSecret must never appear in debug snapshot"
+    );
+
+    android_set_debug_logging_core(false);
+    assert!(!android_is_debug_logging_core());
+    assert!(stop_android_vpn_core());
+    assert_tun_fd_fully_closed_in_kernel(fd1, ino1, peer1);
+    unsafe {
+        libc::close(peer1);
+    }
+    let _ = stop_tx.send(true);
+    bg_rt.shutdown_timeout(Duration::from_millis(200));
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

@@ -13,6 +13,7 @@ import io.github.rustclashlabs.rustclash.ui.model.MainDestination
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.ThemePreference
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
+import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
 import io.github.rustclashlabs.rustclash.vpn.NativeBridge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.PerAppMode
@@ -33,6 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 
 class RustClashViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext: Context = application.applicationContext
@@ -54,6 +56,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     private var previousVpnRunning: Boolean = false
 
     init {
+        DebugLogManager.installCrashBreadcrumbHook(appContext)
+        DebugLogManager.syncNativeDebugFlag(appContext)
         refreshAll()
     }
 
@@ -93,6 +97,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             defaultSubAutoUpdateSecs = defaultSubSecs,
             enableIpv6 = ipv6,
             demoMode = demo,
+            debugLog = DebugLogManager.getStorageSummary(appContext),
         )
     }
 
@@ -150,6 +155,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             viewModelScope.launch {
                 pollLiveStatusAndDiagnostics(includeDiagnostics = true)
             }
+        } else if (dest == MainDestination.SETTINGS) {
+            refreshDebugLogSummary()
         }
     }
 
@@ -164,6 +171,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 pollLiveStatusAndDiagnostics(includeDiagnostics = includeDiag)
                 if (tickCount > 0 && tickCount % 5 == 0 && previousVpnRunning) {
                     syncSnapshotQuietly()
+                }
+                if (dest == MainDestination.SETTINGS && tickCount % 10 == 0) {
+                    refreshDebugLogSummaryQuietly()
                 }
                 tickCount++
                 delay(1_000L)
@@ -188,12 +198,13 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun refreshAll() {
         if (!NativeBridge.ensureLoaded()) {
-            _uiState.update { it.copy(nativeLoaded = false) }
+            _uiState.update { it.copy(nativeLoaded = false, debugLog = DebugLogManager.getStorageSummary(appContext)) }
             return
         }
         viewModelScope.launch {
             syncSnapshotQuietly()
             refreshProfilesQuietly()
+            refreshDebugLogSummaryQuietly()
             pollLiveStatusAndDiagnostics(includeDiagnostics = true)
         }
     }
@@ -992,6 +1003,107 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 val err = runCatching { JSONObject(raw).optString("error") }.getOrNull()
                 emitMessage(err ?: "更新订阅自动刷新频率失败")
             }
+        }
+    }
+
+    fun refreshDebugLogSummary() {
+        viewModelScope.launch {
+            refreshDebugLogSummaryQuietly()
+        }
+    }
+
+    private suspend fun refreshDebugLogSummaryQuietly() {
+        val summary = withContext(Dispatchers.IO) {
+            DebugLogManager.getStorageSummary(appContext)
+        }
+        _uiState.update { it.copy(debugLog = summary) }
+    }
+
+    fun setDebugLogEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            val summary = withContext(Dispatchers.IO) {
+                DebugLogManager.setEnabled(appContext, enabled)
+                if (enabled) {
+                    // Capture an initial baseline slice immediately when enabled while running
+                    if (RustClashVpnService.stateTracker.state == VpnLifecycleState.RUNNING) {
+                        DebugLogManager.captureSlice(appContext, stateDir, trigger = "debug-on")
+                    }
+                }
+                DebugLogManager.getStorageSummary(appContext)
+            }
+            _uiState.update { it.copy(debugLog = summary) }
+            emitMessage(
+                if (enabled) {
+                    "已开启 Debug 诊断采集（后台按周期与断开时自动生成脱敏日志切片）"
+                } else {
+                    "已关闭 Debug 诊断采集（历史切片仍可随时导出或清空）"
+                },
+            )
+        }
+    }
+
+    fun setDebugSliceIntervalSecs(intervalSecs: Long) {
+        viewModelScope.launch {
+            val summary = withContext(Dispatchers.IO) {
+                DebugLogManager.setSliceIntervalSecs(appContext, intervalSecs)
+                DebugLogManager.getStorageSummary(appContext)
+            }
+            _uiState.update { it.copy(debugLog = summary) }
+            val mins = summary.sliceIntervalSecs / 60L
+            emitMessage("Debug 自动切片周期已设为：每 $mins 分钟")
+        }
+    }
+
+    fun captureDebugSliceNow() {
+        if (_uiState.value.isExportingDebugLog) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isExportingDebugLog = true) }
+            try {
+                val (createdFile, summary) = withContext(Dispatchers.IO) {
+                    val file = DebugLogManager.captureSlice(appContext, stateDir, trigger = "manual")
+                    file to DebugLogManager.getStorageSummary(appContext)
+                }
+                _uiState.update { it.copy(debugLog = summary) }
+                if (createdFile != null) {
+                    emitMessage("已生成当前诊断切片（共 ${summary.sliceCount} 份）")
+                } else {
+                    emitMessage("生成诊断切片失败")
+                }
+            } finally {
+                _uiState.update { it.copy(isExportingDebugLog = false) }
+            }
+        }
+    }
+
+    fun prepareDebugReportForExport(onReady: (File) -> Unit) {
+        if (_uiState.value.isExportingDebugLog) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isExportingDebugLog = true) }
+            try {
+                val (reportFile, summary) = withContext(Dispatchers.IO) {
+                    val f = DebugLogManager.buildCombinedReportFile(appContext, stateDir)
+                    f to DebugLogManager.getStorageSummary(appContext)
+                }
+                _uiState.update { it.copy(debugLog = summary) }
+                if (reportFile != null && reportFile.isFile) {
+                    onReady(reportFile)
+                } else {
+                    emitMessage("生成诊断报告失败，请重试")
+                }
+            } finally {
+                _uiState.update { it.copy(isExportingDebugLog = false) }
+            }
+        }
+    }
+
+    fun clearAllDebugLogs() {
+        viewModelScope.launch {
+            val summary = withContext(Dispatchers.IO) {
+                DebugLogManager.clearAllLogs(appContext)
+                DebugLogManager.getStorageSummary(appContext)
+            }
+            _uiState.update { it.copy(debugLog = summary, diagnostics = emptyList()) }
+            emitMessage("已清空所有历史 Debug 诊断日志")
         }
     }
 }

@@ -22,6 +22,9 @@ use tokio::{
 use crate::{addr::TargetAddr, config::uri::redact_sensitive_text, outbound::OutboundHandler};
 
 const MAX_RECENT_DIAGNOSTICS: usize = 200;
+const MAX_DEBUG_DIAGNOSTICS: usize = 1_500;
+const MAX_RECENT_LOGS: usize = 300;
+const MAX_DEBUG_LOGS: usize = 1_500;
 
 fn log_level_severity(level: &str) -> u8 {
     match level.trim().to_ascii_lowercase().as_str() {
@@ -84,6 +87,9 @@ pub struct ConnectionSnapshot {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_epoch_ms: Option<u64>,
+    /// Outbound TCP/TLS/protocol handshake duration in milliseconds once established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -117,13 +123,22 @@ pub struct ActiveConnection {
     pub exit_type: String,
     pub remote_endpoint: String,
     established: AtomicBool,
+    connect_duration_ms: AtomicU64,
     closed: AtomicBool,
     close_notify: Notify,
 }
 
 impl ActiveConnection {
     pub fn mark_established(&self) {
-        self.established.store(true, Ordering::Release);
+        if !self.established.swap(true, Ordering::Release) {
+            let dur = TelemetryHub::now_ms().saturating_sub(self.start_epoch_ms);
+            let _ = self.connect_duration_ms.compare_exchange(
+                u64::MAX,
+                dur,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     pub fn snapshot(&self) -> ConnectionSnapshot {
@@ -132,6 +147,8 @@ impl ActiveConnection {
         } else {
             "connecting"
         };
+        let raw_dur = self.connect_duration_ms.load(Ordering::Acquire);
+        let connect_duration_ms = (raw_dur != u64::MAX).then_some(raw_dur);
         ConnectionSnapshot {
             id: self.id.clone(),
             metadata: self.metadata.clone(),
@@ -148,6 +165,7 @@ impl ActiveConnection {
             status: status.to_string(),
             error: None,
             end_epoch_ms: None,
+            connect_duration_ms,
         }
     }
 
@@ -176,12 +194,16 @@ impl ActiveConnection {
 pub struct TelemetryHub {
     started_at_ms: u64,
     total_connections: AtomicU64,
+    established_connections_total: AtomicU64,
+    failed_connections_total: AtomicU64,
+    zero_rx_closed_total: AtomicU64,
     total_upload: AtomicU64,
     total_download: AtomicU64,
     last_sampled_up: AtomicU64,
     last_sampled_down: AtomicU64,
     sample_ticks: AtomicU64,
     telemetry_parked: AtomicBool,
+    debug_mode: AtomicBool,
     min_log_severity: AtomicU8,
     connections: DashMap<String, Arc<ActiveConnection>>,
     activity_notify: Notify,
@@ -206,19 +228,23 @@ impl TelemetryHub {
         Self {
             started_at_ms: Self::now_ms(),
             total_connections: AtomicU64::new(0),
+            established_connections_total: AtomicU64::new(0),
+            failed_connections_total: AtomicU64::new(0),
+            zero_rx_closed_total: AtomicU64::new(0),
             total_upload: AtomicU64::new(0),
             total_download: AtomicU64::new(0),
             last_sampled_up: AtomicU64::new(0),
             last_sampled_down: AtomicU64::new(0),
             sample_ticks: AtomicU64::new(0),
             telemetry_parked: AtomicBool::new(false),
+            debug_mode: AtomicBool::new(false),
             min_log_severity: AtomicU8::new(log_level_severity("info")),
             connections: DashMap::new(),
             activity_notify: Notify::new(),
             recent_diagnostics: Mutex::new(VecDeque::with_capacity(MAX_RECENT_DIAGNOSTICS)),
             session_resetters: Mutex::new(Vec::new()),
             history: Mutex::new(VecDeque::with_capacity(120)),
-            recent_logs: Mutex::new(VecDeque::with_capacity(300)),
+            recent_logs: Mutex::new(VecDeque::with_capacity(MAX_RECENT_LOGS)),
             traffic_tx,
             log_tx,
         }
@@ -234,6 +260,45 @@ impl TelemetryHub {
 
     pub fn total_connections(&self) -> u64 {
         self.total_connections.load(Ordering::Relaxed)
+    }
+
+    pub fn established_connections_total(&self) -> u64 {
+        self.established_connections_total.load(Ordering::Relaxed)
+    }
+
+    pub fn failed_connections_total(&self) -> u64 {
+        self.failed_connections_total.load(Ordering::Relaxed)
+    }
+
+    pub fn zero_rx_closed_total(&self) -> u64 {
+        self.zero_rx_closed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn is_debug_mode(&self) -> bool {
+        self.debug_mode.load(Ordering::Acquire)
+    }
+
+    pub fn set_debug_mode(&self, enabled: bool) {
+        self.debug_mode.store(enabled, Ordering::Release);
+        if enabled {
+            self.min_log_severity
+                .store(log_level_severity("debug"), Ordering::Relaxed);
+        } else {
+            self.min_log_severity
+                .store(log_level_severity("info"), Ordering::Relaxed);
+            {
+                let mut ring = self.recent_diagnostics.lock();
+                while ring.len() > MAX_RECENT_DIAGNOSTICS {
+                    ring.pop_front();
+                }
+            }
+            {
+                let mut logs = self.recent_logs.lock();
+                while logs.len() > MAX_RECENT_LOGS {
+                    logs.pop_front();
+                }
+            }
+        }
     }
 
     pub fn set_log_level(&self, level: &str) {
@@ -381,6 +446,7 @@ impl TelemetryHub {
             exit_type,
             remote_endpoint,
             established: AtomicBool::new(false),
+            connect_duration_ms: AtomicU64::new(u64::MAX),
             closed: AtomicBool::new(false),
             close_notify: Notify::new(),
         });
@@ -390,6 +456,21 @@ impl TelemetryHub {
     }
 
     fn archive_diagnostic(&self, snap: ConnectionSnapshot) {
+        if snap.status == "failed" {
+            self.failed_connections_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else if snap.connect_duration_ms.is_some() {
+            self.established_connections_total
+                .fetch_add(1, Ordering::Relaxed);
+            if snap.download == 0 && snap.upload > 0 {
+                self.zero_rx_closed_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let max_cap = if self.is_debug_mode() {
+            MAX_DEBUG_DIAGNOSTICS
+        } else {
+            MAX_RECENT_DIAGNOSTICS
+        };
         let mut ring = self.recent_diagnostics.lock();
         if snap.status == "failed"
             && let Some(back) = ring.back_mut()
@@ -404,7 +485,7 @@ impl TelemetryHub {
             back.end_epoch_ms = snap.end_epoch_ms;
             return;
         }
-        if ring.len() >= MAX_RECENT_DIAGNOSTICS {
+        while ring.len() >= max_cap {
             ring.pop_front();
         }
         ring.push_back(snap);
@@ -481,6 +562,7 @@ impl TelemetryHub {
             status: "failed".to_string(),
             error: Some(safe_reason),
             end_epoch_ms: Some(now),
+            connect_duration_ms: None,
         };
         self.archive_diagnostic(snap);
     }
@@ -630,6 +712,31 @@ impl TelemetryHub {
         combined
     }
 
+    /// Return active + archived connection snapshots overlapping `[since_epoch_ms, now]`,
+    /// sorted newest-first and capped at `MAX_DEBUG_DIAGNOSTICS`.
+    pub fn diagnostics_since(&self, since_epoch_ms: u64, limit: usize) -> Vec<ConnectionSnapshot> {
+        let cap = limit.clamp(1, MAX_DEBUG_DIAGNOSTICS);
+        let matches_window = |s: &ConnectionSnapshot| -> bool {
+            s.start_epoch_ms >= since_epoch_ms
+                || s.end_epoch_ms.is_none_or(|end| end >= since_epoch_ms)
+        };
+        let mut combined: Vec<ConnectionSnapshot> = self
+            .connections
+            .iter()
+            .map(|entry| entry.value().snapshot())
+            .filter(matches_window)
+            .collect();
+        {
+            let ring = self.recent_diagnostics.lock();
+            combined.extend(ring.iter().filter(|s| matches_window(s)).cloned());
+        }
+        combined.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
+        if combined.len() > cap {
+            combined.truncate(cap);
+        }
+        combined
+    }
+
     pub fn clear_diagnostics(&self) {
         self.recent_diagnostics.lock().clear();
     }
@@ -691,6 +798,11 @@ impl TelemetryHub {
         if log_level_severity(&level_str) < self.min_log_severity.load(Ordering::Relaxed) {
             return;
         }
+        let max_logs = if self.is_debug_mode() {
+            MAX_DEBUG_LOGS
+        } else {
+            MAX_RECENT_LOGS
+        };
         let entry = LogEntry {
             timestamp_ms: Self::now_ms(),
             level: level_str,
@@ -698,7 +810,7 @@ impl TelemetryHub {
         };
         {
             let mut logs = self.recent_logs.lock();
-            if logs.len() >= 300 {
+            while logs.len() >= max_logs {
                 logs.pop_front();
             }
             logs.push_back(entry.clone());
@@ -708,6 +820,24 @@ impl TelemetryHub {
 
     pub fn recent_logs(&self) -> Vec<LogEntry> {
         self.recent_logs.lock().iter().cloned().collect()
+    }
+
+    pub fn logs_since(&self, since_epoch_ms: u64, limit: usize) -> Vec<LogEntry> {
+        let cap = limit.clamp(1, MAX_DEBUG_LOGS);
+        let logs = self.recent_logs.lock();
+        let mut out: Vec<LogEntry> = logs
+            .iter()
+            .rev()
+            .filter(|e| e.timestamp_ms >= since_epoch_ms)
+            .take(cap)
+            .cloned()
+            .collect();
+        out.reverse();
+        out
+    }
+
+    pub fn clear_logs(&self) {
+        self.recent_logs.lock().clear();
     }
 
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogEntry> {

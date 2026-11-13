@@ -27,6 +27,9 @@ pub struct UnixPacketFdBridge {
     stopped: bool,
     rx_packets: Arc<AtomicU64>,
     tx_packets: Arc<AtomicU64>,
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
+    tx_write_drops: Arc<AtomicU64>,
     rx_thread: Option<std::thread::JoinHandle<()>>,
     tx_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -104,6 +107,9 @@ impl UnixPacketFdBridge {
         let (stop_watch_tx, mut stop_watch_rx) = tokio::sync::watch::channel(false);
         let rx_packets = Arc::new(AtomicU64::new(0));
         let tx_packets = Arc::new(AtomicU64::new(0));
+        let rx_bytes = Arc::new(AtomicU64::new(0));
+        let tx_bytes = Arc::new(AtomicU64::new(0));
+        let tx_write_drops = Arc::new(AtomicU64::new(0));
 
         let proxy_core::inbound::tun::VirtualTunHandle {
             ingress_tx,
@@ -112,6 +118,7 @@ impl UnixPacketFdBridge {
 
         let stop_rx = Arc::clone(&stop_flag);
         let rx_cnt = Arc::clone(&rx_packets);
+        let rx_byte_cnt = Arc::clone(&rx_bytes);
         let rx_thread = std::thread::Builder::new()
             .name("tun-ffi-rx".into())
             .spawn(move || {
@@ -172,6 +179,7 @@ impl UnixPacketFdBridge {
                         let first = buf[0] >> 4;
                         if first == 4 || first == 6 {
                             rx_cnt.fetch_add(1, Ordering::Release);
+                            rx_byte_cnt.fetch_add(len as u64, Ordering::Relaxed);
                             if ingress_tx.blocking_send(buf[..len].to_vec()).is_err() {
                                 return;
                             }
@@ -182,6 +190,8 @@ impl UnixPacketFdBridge {
 
         let stop_tx = Arc::clone(&stop_flag);
         let tx_cnt = Arc::clone(&tx_packets);
+        let tx_byte_cnt = Arc::clone(&tx_bytes);
+        let tx_drop_cnt = Arc::clone(&tx_write_drops);
         let tx_spawn_res = std::thread::Builder::new()
             .name("tun-ffi-tx".into())
             .spawn(move || {
@@ -203,8 +213,11 @@ impl UnixPacketFdBridge {
                                 }
                                 if write_packet_pollout_safe(tx_fd.as_raw_fd(), &pkt, &stop_tx) {
                                     tx_cnt.fetch_add(1, Ordering::Release);
+                                    tx_byte_cnt.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                                 } else if stop_tx.load(Ordering::Acquire) {
                                     break;
+                                } else {
+                                    tx_drop_cnt.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -237,6 +250,9 @@ impl UnixPacketFdBridge {
             stopped: false,
             rx_packets,
             tx_packets,
+            rx_bytes,
+            tx_bytes,
+            tx_write_drops,
             rx_thread: Some(rx_thread),
             tx_thread: Some(tx_thread),
         })
@@ -248,6 +264,18 @@ impl UnixPacketFdBridge {
 
     pub fn tx_packets(&self) -> u64 {
         self.tx_packets.load(Ordering::Acquire)
+    }
+
+    pub fn rx_bytes(&self) -> u64 {
+        self.rx_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn tx_bytes(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn tx_write_drops(&self) -> u64 {
+        self.tx_write_drops.load(Ordering::Acquire)
     }
 
     pub fn stop(&mut self) {

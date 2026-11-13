@@ -1,5 +1,6 @@
 package io.github.rustclashlabs.rustclash.ui.model
 
+import io.github.rustclashlabs.rustclash.vpn.DebugLogSummaryUi
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.PerAppMode
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
@@ -324,6 +325,8 @@ data class AppUiState(
     val profileAliases: Map<String, String> = emptyMap(),
     val defaultSubAutoUpdateSecs: Long = 86400L,
     val rateHistory: List<Long> = emptyList(),
+    val debugLog: DebugLogSummaryUi = DebugLogSummaryUi(),
+    val isExportingDebugLog: Boolean = false,
 ) {
     fun resolveProfileDisplayName(profile: ProfileUiItem): String {
         val customAlias = profileAliases[profile.id]?.trim()

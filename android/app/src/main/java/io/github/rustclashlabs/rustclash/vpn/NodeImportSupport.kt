@@ -126,25 +126,34 @@ object NodeImportSupport {
     }
 
     /**
-     * Scrubs proxy credentials, UUIDs, Reality PBKs, and subscription URL query tokens from UI strings.
+     * Scrubs proxy credentials, UUIDs, Reality PBKs, PQ keys, and subscription URL paths/query tokens from UI & debug strings.
      */
     fun redactSecretsForUi(raw: String): String {
         var out = raw
         // Redact proxy share URIs (including Trojan, SOCKS5, HTTP-Proxy, VMess, Hysteria2, TUIC, WireGuard)
-        out = Regex("""(?i)\b(ss|ssr|vless|vmess|anytls|trojan|socks5|socks5h|socks|http-proxy|https-proxy|hysteria2|hy2|hysteria|tuic|wireguard|wg|clash)://[^\s"'`<>\]})]*""")
+        out = Regex("""(?i)\b(ss|ssr|ssd|vless|vmess|anytls|trojan|socks5|socks5s|socks5h|socks|http-proxy|https-proxy|hysteria2|hy2|hysteria|tuic|wireguard|wg|snell|clash)://[^\s"'`<>\]})]*""")
             .replace(out) { m -> "${m.groupValues[1].lowercase()}://***REDACTED***" }
-        // Redact HTTP(S) query strings and userinfo
-        out = Regex("""(?i)\b(https?)://([^\s/"'`<>@]+@)?([^\s?#"'>`\])}]+)(\?[^\s"'<>`\])}]*)?""")
+        // Redact HTTP(S) subscription URLs: scrub userinfo, query/fragment tokens, and secret path segments
+        out = Regex("""(?i)\b(https?)://([^\s/"'`<>@]+@)?([^\s/?#"'>`\])}]+)(/[^\s?#"'>`\])}]*)?(\?[^\s"'<>`\])}]*)?(#[^\s"'<>`\])}]*)?""")
             .replace(out) { m ->
                 val scheme = m.groupValues[1].lowercase()
                 val hasUserInfo = m.groupValues[2].isNotEmpty()
-                val hostPath = m.groupValues[3]
-                val hasQuery = m.groupValues[4].isNotEmpty()
+                val hostPort = m.groupValues[3]
+                val safePath = sanitizeHttpUrlPath(m.groupValues[4])
+                val hasQuery = m.groupValues[5].isNotEmpty()
+                val hasFragment = m.groupValues[6].isNotEmpty()
                 val authPrefix = if (hasUserInfo) "***REDACTED***@" else ""
-                if (hasQuery) "$scheme://$authPrefix$hostPath?***REDACTED***" else "$scheme://$authPrefix$hostPath"
+                if (hasQuery || hasFragment) {
+                    "$scheme://$authPrefix$hostPort$safePath?***REDACTED***"
+                } else {
+                    "$scheme://$authPrefix$hostPort$safePath"
+                }
             }
+        // Redact Xray/VLESS post-quantum key specs
+        out = Regex("""mlkem768x25519plus\.[^\s"'`&#)\]}>]+""")
+            .replace(out, "mlkem768x25519plus.***REDACTED***")
         // Redact sensitive key=value or key: value pairs
-        out = Regex("""(?i)\b(password|passwd|uuid|secret|token|access_token|auth|pbk|public-key|private-key|encryption|decryption|sid)\s*([=:])\s*([^\s,;"'`)\]}>]+)""")
+        out = Regex("""(?i)\b(password|passwd|uuid|secret|api_key|apikey|token|access_token|auth|auth_str|auth-str|pbk|public-key|public_key|publickey|private-key|private_key|psk|encryption|decryption|sid|signature|sign)\s*([=:])\s*([^\s,;"'`)\]}>]+)""")
             .replace(out) { m -> "${m.groupValues[1]}${m.groupValues[2]}***REDACTED***" }
         // Redact standalone non-nil UUIDs
         out = Regex("""\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b""")
@@ -152,5 +161,32 @@ object NodeImportSupport {
                 if (m.value == "00000000-0000-0000-0000-000000000000") m.value else "***REDACTED***"
             }
         return out
+    }
+
+    private val SECRET_PATH_PREFIX_SEGMENTS = setOf("s", "sub", "subs", "link", "token", "raw", "d")
+
+    private fun sanitizeHttpUrlPath(path: String): String {
+        if (path.isEmpty() || path == "/") return path
+        val segments = path.removePrefix("/").split('/')
+        var prevLower = ""
+        val sanitized = segments.map { seg ->
+            if (seg.isEmpty()) {
+                prevLower = ""
+                ""
+            } else {
+                val base = seg.substringBefore('.')
+                val isBenignKnown = base.equals("generate_204", ignoreCase = true)
+                val looksLikeToken = !isBenignKnown && (
+                    (prevLower in SECRET_PATH_PREFIX_SEGMENTS && base.length >= 6) ||
+                        base.length >= 20 ||
+                        (base.length >= 16 && base.any { it.isDigit() || it.isUpperCase() }) ||
+                        seg.contains('=') ||
+                        seg.contains('@')
+                    )
+                prevLower = seg.lowercase()
+                if (looksLikeToken) "***REDACTED***" else seg
+            }
+        }
+        return "/" + sanitized.joinToString("/")
     }
 }

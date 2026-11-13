@@ -82,6 +82,7 @@ class MainActivity : AppCompatActivity() {
     private val viewModel: RustClashViewModel by viewModels()
     private var pendingCameraQrFile: File? = null
     private var pendingExportYamlContent: String? = null
+    private var pendingExportDebugFile: File? = null
 
     private val vpnPrepareLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -185,6 +186,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val safExportDebugLogLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri: Uri? ->
+        val srcFile = pendingExportDebugFile
+        pendingExportDebugFile = null
+        if (uri != null && srcFile != null && srcFile.isFile) {
+            lifecycleScope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        srcFile.inputStream().use { input ->
+                            contentResolver.openOutputStream(uri)?.use { output ->
+                                input.copyTo(output)
+                            } ?: error("null output stream")
+                        }
+                        true
+                    }.getOrDefault(false)
+                }
+                if (ok) {
+                    viewModel.emitUiMessage("已保存脱敏诊断报告")
+                } else {
+                    viewModel.emitUiMessage("保存诊断报告失败")
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
@@ -221,6 +248,17 @@ class MainActivity : AppCompatActivity() {
                         viewModel.exportActiveYamlForSaf { yaml ->
                             pendingExportYamlContent = yaml
                             runCatching { safExportYamlLauncher.launch("rustclash-config.yaml") }
+                        }
+                    },
+                    onShareDebugReport = {
+                        viewModel.prepareDebugReportForExport { reportFile ->
+                            shareDebugReportFile(reportFile)
+                        }
+                    },
+                    onSaveDebugReportToFile = {
+                        viewModel.prepareDebugReportForExport { reportFile ->
+                            pendingExportDebugFile = reportFile
+                            runCatching { safExportDebugLogLauncher.launch(reportFile.name) }
                         }
                     },
                 )
@@ -409,6 +447,29 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    private fun shareDebugReportFile(reportFile: File) {
+        runCatching {
+            val uri = FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                reportFile,
+            )
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "RustClash Android 诊断报告 (${reportFile.name})")
+                clipData = android.content.ClipData.newRawUri(reportFile.name, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(sendIntent, "分享或发送诊断报告").apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(chooser)
+        }.onFailure {
+            viewModel.emitUiMessage("无法打开系统分享面板，请使用「保存到手机」导出")
+        }
+    }
 }
 
 @Composable
@@ -422,6 +483,8 @@ internal fun RustClashAppScaffold(
     onLaunchGalleryQr: () -> Unit,
     onImportYamlFile: () -> Unit = {},
     onExportYamlFile: () -> Unit = {},
+    onShareDebugReport: () -> Unit = {},
+    onSaveDebugReportToFile: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var currentDestination by rememberSaveable { mutableStateOf(MainDestination.HOME) }
@@ -621,6 +684,13 @@ internal fun RustClashAppScaffold(
                     onSetShowSystemApps = viewModel::setShowSystemApps,
                     onSetDefaultSubAutoUpdateSecs = viewModel::setDefaultSubAutoUpdateSecs,
                     onClearSettingsNotice = viewModel::clearSettingsSheetNotice,
+                    onSetDebugLogEnabled = viewModel::setDebugLogEnabled,
+                    onSetDebugSliceIntervalSecs = viewModel::setDebugSliceIntervalSecs,
+                    onCaptureDebugSliceNow = viewModel::captureDebugSliceNow,
+                    onShareDebugReport = onShareDebugReport,
+                    onSaveDebugReportToFile = onSaveDebugReportToFile,
+                    onClearDebugLogs = viewModel::clearAllDebugLogs,
+                    onRefreshDebugSummary = viewModel::refreshDebugLogSummary,
                 )
             }
         }

@@ -1118,4 +1118,68 @@ class RustClashUiScreenshotTest {
         composeRule.onNodeWithText("暂无已保存的配置档案").assertIsDisplayed()
         composeRule.onNodeWithText("导入配置或订阅").assertIsDisplayed()
     }
+
+    @Test
+    fun settingsScreenOpensDebugDiagnosticsBottomSheetAndTriggersShareAndToggle() {
+        val fontFamily = buildCjkFontFamily()
+        var toggledEnabled: Boolean? = null
+        var selectedInterval: Long? = null
+        var shareClicked = false
+        var manualSliceClicked = false
+
+        val uiState = sampleShowcaseState(ThemePreference.DARK).copy(
+            debugLog = io.github.rustclashlabs.rustclash.vpn.DebugLogSummaryUi(
+                enabled = true,
+                sliceIntervalSecs = 1800L,
+                sliceCount = 2,
+                totalBytes = 24_576L,
+                latestSliceTimeMs = 1_763_000_000_000L,
+                hasCrashBreadcrumb = false,
+                recentSlices = listOf(
+                    io.github.rustclashlabs.rustclash.vpn.DebugSliceItemUi(
+                        fileName = "rustclash-slice-20261113-120000-000-periodic.log",
+                        trigger = "periodic",
+                        createdAtMs = 1_763_000_000_000L,
+                        sizeBytes = 12_288L,
+                    ),
+                ),
+            ),
+        )
+
+        composeRule.setContent {
+            RustClashTheme(themePreference = ThemePreference.DARK, fontFamily = fontFamily) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    SettingsScreen(
+                        state = uiState,
+                        onSetThemePreference = {},
+                        onRequestInstalledApps = {},
+                        onSavePerAppPolicy = { _, _ -> },
+                        onSetEnableIpv6 = {},
+                        onSetDemoMode = {},
+                        onFlushDns = {},
+                        onSetDebugLogEnabled = { toggledEnabled = it },
+                        onSetDebugSliceIntervalSecs = { selectedInterval = it },
+                        onCaptureDebugSliceNow = { manualSliceClicked = true },
+                        onShareDebugReport = { shareClicked = true },
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithText("调试与诊断 (Debug)").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("采集中 · 2 份").assertIsDisplayed()
+        composeRule.onNodeWithText("调试与诊断 (Debug)").performClick()
+
+        composeRule.onNodeWithText("开启 Debug 诊断采集").assertIsDisplayed()
+        composeRule.onNodeWithText("15 分钟").performClick()
+        assertTrue(selectedInterval == 900L)
+
+        composeRule.onNodeWithText("立即生成切片").performClick()
+        assertTrue(manualSliceClicked)
+
+        composeRule.onNodeWithText("一键分享诊断报告").performClick()
+        assertTrue(shareClicked)
+        assertTrue(toggledEnabled == null)
+    }
 }
+
