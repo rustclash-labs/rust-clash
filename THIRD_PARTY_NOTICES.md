@@ -52,7 +52,7 @@ Direct and transitive Rust crates compiled into `proxy-core`, `proxy-ffi`, `prox
 | Mozilla Root CA Store | `webpki-roots` | `CDLA-Permissive-2.0` |
 | Userspace TCP/IP Stack | `smoltcp` | `0BSD` |
 | Desktop Shell & Tray | `tauri`, `tauri-build`, `wry`, `tao`, `tray-icon`, `muda` | `Apache-2.0 OR MIT` |
-| Serialization, CLI & FFI | `serde`, `serde_json`, `serde_yml`, `clap`, `jni`, `uuid`, `ipnet`, `parking_lot` | `MIT OR Apache-2.0` |
+| Serialization, CLI & FFI | `serde`, `serde_json`, `serde-saphyr`, `clap`, `jni`, `uuid`, `ipnet`, `parking_lot` | `MIT OR Apache-2.0` |
 | File-Level Weak Copyleft / Multi-Licensed | `option-ext` (unmodified crate dependency), `r-efi` (elected under `MIT OR Apache-2.0`) | `MPL-2.0`, `MIT OR Apache-2.0` |
 | Linux Desktop System Libraries (Dynamic Only) | `webkit2gtk-4.1`, `gtk+-3.0`, `libsoup-3.0`, `libayatana-appindicator3` | `LGPL-2.1-or-later` (dynamically linked from host OS packages on Linux; never statically linked) |
 

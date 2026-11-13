@@ -649,3 +649,149 @@ proptest! {
         prop_assert_eq!(reparsed.name(), effective_name);
     }
 }
+
+#[test]
+fn yaml_alias_bomb_billion_laughs_is_rejected_safely_without_oom_or_secret_leak() {
+    let bomb = format!(
+        concat!(
+            "secret-canary: \"{pass}\"\n",
+            "uuid-canary: \"{uuid}\"\n",
+            "token-canary: \"{tok}\"\n",
+            "a0: &a0 [\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\",\"x\"]\n",
+            "a1: &a1 [*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0]\n",
+            "a2: &a2 [*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1]\n",
+            "a3: &a3 [*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2]\n",
+            "a4: &a4 [*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3]\n",
+            "a5: &a5 [*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4,*a4]\n",
+            "a6: &a6 [*a5,*a5,*a5,*a5,*a5,*a5,*a5,*a5,*a5,*a5]\n",
+            "a7: &a7 [*a6,*a6,*a6,*a6,*a6,*a6,*a6,*a6,*a6,*a6]\n",
+            "proxies:\n",
+            "  - name: \"Node1\"\n",
+            "    type: trojan\n",
+            "    server: edge.example.com\n",
+            "    port: 443\n",
+            "    password: \"{pass}\"\n"
+        ),
+        pass = CANARY_PASS,
+        uuid = CANARY_UUID,
+        tok = CANARY_TOKEN,
+    );
+
+    let start = std::time::Instant::now();
+    let err1 = ClashConfig::from_yaml_str(&bomb).expect_err("alias bomb must be rejected");
+    assert_zero_secret_leak(&err1.to_string());
+
+    let err2 =
+        ClashConfig::from_yaml_str_sanitized(&bomb).expect_err("alias bomb must be rejected");
+    assert_zero_secret_leak(&err2.to_string());
+    assert!(
+        start.elapsed().as_secs() < 5,
+        "alias bomb rejection took too long: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn yaml_saphyr_wild_edge_cases_duplicate_keys_str_tags_yaml12_booleans_and_roundtrip() {
+    // Covers:
+    // 1. Duplicate YAML mapping keys (`LastWins`)
+    // 2. Subconverter `!<str> 00123456` and unquoted `00987654` leading-zero numeric passwords
+    // 3. Unquoted `NO` (Norway country code) preserved as `"NO"` via YAML 1.2 strict booleans,
+    //    while `tls: yes` and `udp: on` still coerce to `true`
+    // 4. Null (`~`) and integer (`123`) keys in mappings skipped/converted cleanly
+    // 5. 200+ proxy nodes reusing a single `&shared_tls` anchor without tripping alias-ratio false positives
+    // 6. `ClashConfig::to_yaml_string()` -> `ClashConfig::from_yaml_str()` round-trip
+    let mut yaml = String::from(concat!(
+        "mixed-port: 7890\n",
+        "mixed-port: 7892\n",
+        "~: ignored_null_key\n",
+        "123: ignored_numeric_root_key\n",
+        "shared-tls: &shared_tls\n",
+        "  sni: cdn.example.com\n",
+        "  skip-cert-verify: off\n",
+        "proxies:\n",
+        "  - name: NO\n",
+        "    type: ss\n",
+        "    server: no-edge.example.com\n",
+        "    port: 8388\n",
+        "    cipher: aes-256-gcm\n",
+        "    password: !<str> 00123456\n",
+        "    udp: false\n",
+        "    udp: on\n",
+        "  - name: LeadingZeroPass\n",
+        "    type: trojan\n",
+        "    server: trojan.example.com\n",
+        "    port: 443\n",
+        "    password: 00987654\n",
+        "    <<: *shared_tls\n",
+        "  - name: VlessYesTls\n",
+        "    type: vless\n",
+        "    server: vless.example.com\n",
+        "    port: 443\n",
+        "    uuid: 11111111-2222-3333-4444-555555555555\n",
+        "    tls: yes\n",
+        "    <<: *shared_tls\n",
+    ));
+
+    for i in 0..200 {
+        yaml.push_str(&format!(
+            "  - name: BulkNode-{i}\n    type: trojan\n    server: bulk-{i}.example.com\n    port: 443\n    password: pass-{i}-secret\n    <<: *shared_tls\n"
+        ));
+    }
+
+    yaml.push_str(concat!(
+        "proxy-groups:\n",
+        "  - name: PROXY\n",
+        "    type: select\n",
+        "    include-all: true\n",
+        "rules:\n",
+        "  - MATCH,PROXY\n",
+    ));
+
+    let (cfg, skipped) = ClashConfig::from_yaml_str_sanitized(&yaml)
+        .expect("wild edge-case YAML must parse cleanly");
+    assert!(
+        skipped.is_empty(),
+        "unexpected skipped entries: {skipped:?}"
+    );
+    assert_eq!(cfg.mixed_port, 7892);
+    assert_eq!(cfg.proxies.len(), 203);
+    assert_eq!(cfg.proxies[0].name(), "NO");
+
+    match &cfg.proxies[0] {
+        ProxyNodeConfig::Ss { password, udp, .. } => {
+            assert_eq!(password, "00123456");
+            assert!(*udp);
+        }
+        other => panic!("expected Shadowsocks node, got {other:?}"),
+    }
+    match &cfg.proxies[1] {
+        ProxyNodeConfig::Trojan {
+            password,
+            sni,
+            skip_cert_verify,
+            ..
+        } => {
+            assert_eq!(password, "00987654");
+            assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+            assert!(!*skip_cert_verify);
+        }
+        other => panic!("expected Trojan node, got {other:?}"),
+    }
+    match &cfg.proxies[2] {
+        ProxyNodeConfig::Vless {
+            tls, servername, ..
+        } => {
+            assert!(*tls);
+            assert_eq!(servername.as_deref(), Some("cdn.example.com"));
+        }
+        other => panic!("expected VLESS node, got {other:?}"),
+    }
+
+    let serialized = cfg.to_yaml_string().expect("to_yaml_string must succeed");
+    let reparsed =
+        ClashConfig::from_yaml_str(&serialized).expect("round-tripped YAML must parse cleanly");
+    assert_eq!(reparsed.mixed_port, 7892);
+    assert_eq!(reparsed.proxies.len(), 203);
+    assert_eq!(reparsed.proxies[0].name(), "NO");
+}
