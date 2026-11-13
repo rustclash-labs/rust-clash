@@ -173,6 +173,10 @@ pub struct ProfileIndex {
     pub active_profile_id: String,
     #[serde(default)]
     pub onboarding_completed: bool,
+    /// Set once `<= v0.3.6` selector defaults that skipped leading `"DIRECT"` / `"REJECT"`
+    /// members (e.g. `📺 Bilibili: [DIRECT, 🚀 节点选择, ...]`) have been restored to `proxies[0]`.
+    #[serde(default)]
+    pub selection_defaults_v2: bool,
     pub profiles: Vec<ProfileMetadata>,
 }
 
@@ -494,8 +498,11 @@ pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
     ))
 }
 
-/// Compute sensible default `Select` group selections for a `ClashConfig`, preferring the first
-/// concrete proxy node (or non-DIRECT group) over `"DIRECT"` whenever concrete proxies exist.
+/// Compute Clash/Mihomo-compliant `Select` group selections for a `ClashConfig`:
+/// - Preserves any valid existing selection in `existing` (including explicit `"DIRECT"` / `"REJECT"`).
+/// - Defaults unselected `Select` groups to `g.proxies[0]` (`proxies.first()`), matching standard
+///   Clash / Mihomo semantics so policy groups like `📺 Bilibili: [DIRECT, 🚀 节点选择, ...]` or
+///   `🛑 AdBlock: [REJECT, DIRECT]` default to `DIRECT` / `REJECT` as authored by the subscription.
 pub fn default_selected_groups_for_config(
     cfg: &ClashConfig,
     existing: &HashMap<String, String>,
@@ -516,28 +523,17 @@ pub fn default_selected_groups_for_config(
         }
         if let Some(prev) = existing.get(&g.name)
             && g.proxies.contains(prev)
-            && !(has_concrete
-                && prev == "DIRECT"
-                && g.proxies.iter().any(|m| m != "DIRECT" && m != "REJECT"))
         {
             out.insert(g.name.clone(), prev.clone());
             continue;
         }
-        if has_concrete
-            && let Some(first_real) = g
-                .proxies
-                .iter()
-                .find(|m| m.as_str() != "DIRECT" && m.as_str() != "REJECT")
-        {
-            out.insert(g.name.clone(), first_real.clone());
-        } else if let Some(first) = g.proxies.first() {
+        if let Some(first) = g.proxies.first() {
             out.insert(g.name.clone(), first.clone());
         }
     }
 
     if let Some(prev_global) = existing.get("GLOBAL")
         && valid_global_targets.contains(prev_global.as_str())
-        && !(has_concrete && prev_global == "DIRECT")
     {
         out.insert("GLOBAL".to_string(), prev_global.clone());
     } else if has_concrete {
@@ -890,6 +886,34 @@ impl ProfileManager {
                     dirty = true;
                 }
             }
+            if !idx.selection_defaults_v2 {
+                for p in &mut idx.profiles {
+                    let sanitized: String =
+                        p.id.chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                            .collect();
+                    let yaml_path = profiles_dir.join(format!("{sanitized}.yaml"));
+                    if let Ok(cfg) = ClashConfig::from_file(&yaml_path) {
+                        for g in &cfg.proxy_groups {
+                            if g.group_type != ProxyGroupType::Select {
+                                continue;
+                            }
+                            if let Some(first) = g.proxies.first()
+                                && matches!(first.as_str(), "DIRECT" | "REJECT")
+                                && let Some(legacy_forced) = g
+                                    .proxies
+                                    .iter()
+                                    .find(|m| m.as_str() != "DIRECT" && m.as_str() != "REJECT")
+                                && p.selected_groups.get(&g.name) == Some(legacy_forced)
+                            {
+                                p.selected_groups.insert(g.name.clone(), first.clone());
+                            }
+                        }
+                    }
+                }
+                idx.selection_defaults_v2 = true;
+                dirty = true;
+            }
             if dirty {
                 let _ = save_index_atomic(&index_path, &idx);
             }
@@ -907,6 +931,7 @@ impl ProfileManager {
             let idx = ProfileIndex {
                 active_profile_id: starter_id.clone(),
                 onboarding_completed: false,
+                selection_defaults_v2: true,
                 profiles: vec![ProfileMetadata {
                     id: starter_id,
                     name: "Starter Profile (Smart CN)".to_string(),
@@ -1465,7 +1490,14 @@ impl ProfileManager {
                     });
                 }
 
-                let prev_sel = if auto_select {
+                let was_empty_starter = {
+                    let idx = self.index.lock();
+                    idx.profiles
+                        .iter()
+                        .find(|p| p.id == idx.active_profile_id)
+                        .is_some_and(|p| p.proxy_count == 0)
+                };
+                let prev_sel = if auto_select || was_empty_starter {
                     HashMap::new()
                 } else {
                     self.active_selected_groups()
@@ -2143,7 +2175,9 @@ fn attach_nodes_and_update_selections(
     preferred_select_node: Option<&str>,
     auto_select: bool,
 ) {
+    let mut builtin_only_groups = HashSet::new();
     if cfg.proxy_groups.is_empty() {
+        builtin_only_groups.insert("PROXY".to_string());
         let mut proxies: Vec<String> = node_names.to_vec();
         proxies.push("DIRECT".to_string());
         cfg.proxy_groups.push(ProxyGroupConfig {
@@ -2162,8 +2196,23 @@ fn attach_nodes_and_update_selections(
         }
     } else {
         for g in &mut cfg.proxy_groups {
+            let had_only_builtins = g.proxies.iter().all(|m| m == "DIRECT" || m == "REJECT");
+            if had_only_builtins {
+                builtin_only_groups.insert(g.name.clone());
+            }
+            let starts_with_intentional_builtin = !had_only_builtins
+                && matches!(
+                    g.proxies.first().map(String::as_str),
+                    Some("DIRECT" | "REJECT")
+                );
             for n in node_names {
-                insert_before_builtins(&mut g.proxies, n);
+                if starts_with_intentional_builtin {
+                    if !g.proxies.iter().any(|m| m == n) {
+                        g.proxies.push(n.clone());
+                    }
+                } else {
+                    insert_before_builtins(&mut g.proxies, n);
+                }
             }
             if matches!(
                 g.group_type,
@@ -2176,16 +2225,20 @@ fn attach_nodes_and_update_selections(
     }
 
     let has_concrete = !cfg.proxies.is_empty();
+    let primary_group = primary_proxy_group_for_config(cfg);
     for g in &cfg.proxy_groups {
         if g.group_type != ProxyGroupType::Select {
             continue;
         }
+        let is_primary = g.name == primary_group;
+        let had_only_builtins = builtin_only_groups.contains(&g.name);
         let current = selected_groups
             .get(&g.name)
             .filter(|m| g.proxies.contains(*m))
             .cloned();
 
         if auto_select
+            && (is_primary || had_only_builtins)
             && let Some(pref) = preferred_select_node
             && g.proxies.iter().any(|m| m == pref)
         {
@@ -2194,20 +2247,15 @@ fn attach_nodes_and_update_selections(
         }
 
         match current {
-            Some(cur) if !(has_concrete && cur == "DIRECT") => {
+            Some(cur) if !(has_concrete && had_only_builtins && cur == "DIRECT") => {
                 selected_groups.insert(g.name.clone(), cur);
             }
             _ => {
-                if let Some(pref) = preferred_select_node
+                if (is_primary || had_only_builtins)
+                    && let Some(pref) = preferred_select_node
                     && g.proxies.iter().any(|m| m == pref)
                 {
                     selected_groups.insert(g.name.clone(), pref.to_string());
-                } else if let Some(first_real) = g
-                    .proxies
-                    .iter()
-                    .find(|m| m.as_str() != "DIRECT" && m.as_str() != "REJECT")
-                {
-                    selected_groups.insert(g.name.clone(), first_real.clone());
                 } else if let Some(first) = g.proxies.first() {
                     selected_groups.insert(g.name.clone(), first.clone());
                 }
@@ -2217,10 +2265,10 @@ fn attach_nodes_and_update_selections(
 
     if has_concrete {
         let global_cur = selected_groups.get("GLOBAL").map(String::as_str);
-        if global_cur.is_none() || global_cur == Some("DIRECT") {
-            let primary = primary_proxy_group_for_config(cfg);
-            if primary != "DIRECT" {
-                selected_groups.insert("GLOBAL".to_string(), primary);
+        if global_cur.is_none() || (global_cur == Some("DIRECT") && !builtin_only_groups.is_empty())
+        {
+            if primary_group != "DIRECT" {
+                selected_groups.insert("GLOBAL".to_string(), primary_group);
             } else if let Some(pref) = preferred_select_node {
                 selected_groups.insert("GLOBAL".to_string(), pref.to_string());
             } else if let Some(first_node) = cfg.proxies.first() {
@@ -3070,6 +3118,184 @@ rules:
         assert!(
             !bad_err.contains("secret-sub-tok"),
             "must redact token in error: {bad_err}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn select_group_defaults_honor_leading_direct_reject_and_migrate_v036_index() {
+        let dir = std::env::temp_dir().join(format!("rc-select-defaults-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let sub_yaml = r#"
+mixed-port: 7890
+mode: rule
+dns:
+  enable: true
+  nameserver:
+    - 223.5.5.5:53
+proxies:
+  - name: HK-Node-1x
+    type: anytls
+    server: hk.example.com
+    port: 443
+    password: dummy-password-hk
+  - name: JP-Node-3x
+    type: anytls
+    server: jp.example.com
+    port: 443
+    password: dummy-password-jp
+proxy-groups:
+  - name: "🚀 节点选择"
+    type: select
+    proxies:
+      - HK-Node-1x
+      - JP-Node-3x
+  - name: "🎥 NETFLIX"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - DIRECT
+      - HK-Node-1x
+  - name: "📺 Bilibili"
+    type: select
+    proxies:
+      - DIRECT
+      - "🚀 节点选择"
+      - HK-Node-1x
+      - JP-Node-3x
+  - name: "🛑 广告拦截"
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+rules:
+  - DOMAIN-SUFFIX,bilibili.com,📺 Bilibili
+  - DOMAIN-SUFFIX,netflix.com,🎥 NETFLIX
+  - DOMAIN-SUFFIX,ad.example.com,🛑 广告拦截
+  - MATCH,🚀 节点选择
+"#;
+
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+        let report = mgr
+            .import_unified_input(sub_yaml, Some("MultiGroupSub"), true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report
+                .selected_groups
+                .get("🚀 节点选择")
+                .map(String::as_str),
+            Some("HK-Node-1x")
+        );
+        assert_eq!(
+            report.selected_groups.get("🎥 NETFLIX").map(String::as_str),
+            Some("🚀 节点选择")
+        );
+        assert_eq!(
+            report
+                .selected_groups
+                .get("📺 Bilibili")
+                .map(String::as_str),
+            Some("DIRECT"),
+            "select group with leading DIRECT must default to DIRECT, never skip to proxy group"
+        );
+        assert_eq!(
+            report
+                .selected_groups
+                .get("🛑 广告拦截")
+                .map(String::as_str),
+            Some("REJECT"),
+            "select group with leading REJECT must default to REJECT"
+        );
+
+        // Verify Router::explain_route routes www.bilibili.com to DIRECT!
+        let dns = Arc::new(crate::dns::FakeIpDnsEngine::new(&report.config.dns).unwrap());
+        let outbounds = crate::engine::build_outbounds_with_dns(
+            &report.config.proxies,
+            &[],
+            Some(Arc::clone(&dns)),
+        )
+        .unwrap();
+        let router = Router::with_providers_mmdb_and_state_dir(
+            report.config.mode,
+            outbounds,
+            &report.config.proxy_groups,
+            &report.config.rules,
+            &report.config.rule_providers,
+            None,
+            None,
+            dns,
+        )
+        .unwrap();
+        router.apply_saved_selections(&mgr.active_selected_groups());
+        let target = crate::addr::TargetAddr::new_domain("www.bilibili.com", 443).unwrap();
+        let decision = router.route_async(None, &target).await;
+        assert_eq!(decision.outbound.exit_category(), "DIRECT");
+        assert_eq!(decision.outbound.name(), "DIRECT");
+        assert_eq!(decision.chains, vec!["DIRECT", "📺 Bilibili"]);
+
+        // Simulate a <= v0.3.6 `profiles_index.json` (without `selection_defaults_v2`) where
+        // `📺 Bilibili` had been auto-forced to `"🚀 节点选择"` while user picked `JP-Node-3x`
+        // in `"🚀 节点选择"`.
+        let active_id = mgr.active_profile_id();
+        drop(mgr);
+        let index_path = dir.join("profiles").join(INDEX_FILE);
+        let mut idx_val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
+        idx_val
+            .as_object_mut()
+            .unwrap()
+            .remove("selection_defaults_v2");
+        for p in idx_val["profiles"].as_array_mut().unwrap() {
+            if p["id"].as_str() == Some(&active_id) {
+                p["selected_groups"]["🚀 节点选择"] = serde_json::json!("JP-Node-3x");
+                p["selected_groups"]["📺 Bilibili"] = serde_json::json!("🚀 节点选择");
+                p["selected_groups"]["🛑 广告拦截"] = serde_json::json!("🚀 节点选择");
+            }
+        }
+        fs::write(&index_path, serde_json::to_string_pretty(&idx_val).unwrap()).unwrap();
+
+        let mgr_migrated = ProfileManager::open_or_init(&dir).unwrap();
+        let healed = mgr_migrated.active_selected_groups();
+        assert_eq!(
+            healed.get("🚀 节点选择").map(String::as_str),
+            Some("JP-Node-3x"),
+            "user node selection in primary group must remain untouched across migration"
+        );
+        assert_eq!(
+            healed.get("📺 Bilibili").map(String::as_str),
+            Some("DIRECT"),
+            "one-time migration must restore leading DIRECT default on <= v0.3.6 profiles"
+        );
+
+        // Once migrated (`selection_defaults_v2 == true`), an intentional manual switch of
+        // `📺 Bilibili` to `JP-Node-3x` (or back to `DIRECT`) MUST persist across restarts!
+        mgr_migrated
+            .save_group_selection("📺 Bilibili", "JP-Node-3x")
+            .unwrap();
+        drop(mgr_migrated);
+        let mgr_reopened = ProfileManager::open_or_init(&dir).unwrap();
+        assert_eq!(
+            mgr_reopened
+                .active_selected_groups()
+                .get("📺 Bilibili")
+                .map(String::as_str),
+            Some("JP-Node-3x")
+        );
+        mgr_reopened
+            .save_group_selection("📺 Bilibili", "DIRECT")
+            .unwrap();
+        drop(mgr_reopened);
+        let mgr_reopened2 = ProfileManager::open_or_init(&dir).unwrap();
+        assert_eq!(
+            mgr_reopened2
+                .active_selected_groups()
+                .get("📺 Bilibili")
+                .map(String::as_str),
+            Some("DIRECT")
         );
 
         let _ = fs::remove_dir_all(&dir);
