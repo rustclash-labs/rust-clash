@@ -1,10 +1,19 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>RustClash — Multi-Protocol &amp; Post-Quantum Proxy Console</title>
+    <title>RustClash</title>
+    <script>
+      try {
+        var t = localStorage.getItem("rust_clash_ui_theme_v2");
+        document.documentElement.setAttribute(
+          "data-theme",
+          t === "dark" ? "dark" : "light"
+        );
+      } catch (_) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

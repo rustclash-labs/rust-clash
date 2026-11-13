@@ -39,7 +39,7 @@ use crate::{
         autostart::AutostartManager,
         sysproxy::{disable_system_proxy, enable_system_proxy, query_sysproxy_status},
     },
-    profile::{CreateProfileSpec, ProfileManager},
+    profile::{CreateProfileSpec, ProfileManager, ProfileSettingsPatch},
     tracker::TelemetryHub,
 };
 
@@ -134,7 +134,10 @@ pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAd
             "/profiles/active/nodes/{name}",
             put(put_update_active_node_api).delete(delete_active_node_api),
         )
-        .route("/profiles/{id}", delete(delete_profile_api))
+        .route(
+            "/profiles/{id}",
+            delete(delete_profile_api).patch(patch_profile_settings_api),
+        )
         .route("/profiles/{id}/activate", put(put_activate_profile_api))
         .route("/profiles/{id}/refresh", post(post_refresh_profile_api))
         .route("/demo/toggle", post(post_demo_toggle_api))
@@ -143,6 +146,7 @@ pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAd
             "/diagnostics/audit",
             get(get_diagnostics_audit_api).post(post_diagnostics_audit_api),
         )
+        .route("/tools/ip", get(get_exit_ip_api))
         .route("/tools/vless-keypair", post(post_vless_keypair))
         .route("/tools/benchmark", post(post_live_benchmark))
         .route("/traffic", get(get_or_ws_traffic))
@@ -233,6 +237,7 @@ fn is_api_endpoint_path(path: &str) -> bool {
             | "/geodata"
             | "/demo/toggle"
             | "/diagnostics/export"
+            | "/tools/ip"
             | "/tools/vless-keypair"
             | "/tools/benchmark"
             | "/traffic"
@@ -613,10 +618,38 @@ async fn get_tun_status(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResp
     Json(engine.tun_health())
 }
 
+fn detect_primary_lan_ipv4() -> Option<String> {
+    for probe in ["223.5.5.5:53", "198.51.100.1:80"] {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
+            && sock.connect(probe).is_ok()
+            && let Ok(local) = sock.local_addr()
+        {
+            let ip = local.ip();
+            if !ip.is_unspecified() && !ip.is_loopback() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    None
+}
+
 async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
     let cfg = engine.config_snapshot();
+    let router = engine.router();
     let dns_bound = engine.dns_addr();
     let tun_health = engine.tun_health();
+    let tun_ip = if engine.is_tun_active() || engine.is_virtual_tun_active() {
+        tun_health
+            .ipv4_cidr
+            .as_deref()
+            .and_then(|s| s.split('/').next())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(router.dns().gateway_ipv4().to_string()))
+    } else {
+        None
+    };
+    let lan_ip = detect_primary_lan_ipv4();
     Json(serde_json::json!({
         "port": 0,
         "socks-port": 0,
@@ -634,6 +667,14 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
         "unified-delay": cfg.unified_delay,
         "log-level": cfg.log_level,
         "ipv6": cfg.dns.ipv6,
+        "started-at-ms": engine.hub().started_at_ms(),
+        "uptime-secs": engine.hub().uptime_secs(),
+        "tun-ip": tun_ip,
+        "lan-ip": lan_ip,
+        "intranet-ip": lan_ip,
+        "rule-count": router.rules_snapshot().len(),
+        "proxy-count": cfg.proxies.len(),
+        "group-count": cfg.proxy_groups.len(),
         "tun": {
             "enable": engine.is_tun_active(),
             "virtual-enable": engine.is_virtual_tun_active(),
@@ -654,12 +695,13 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
             "enhanced-mode": cfg.dns.enhanced_mode,
             "ipv6": cfg.dns.ipv6,
             "fake-ip-range": cfg.dns.fake_ip_range,
-            "fake-ip-entries": engine.router().dns().entry_count(),
+            "fake-ip-entries": router.dns().entry_count(),
+            "total-queries": router.dns().total_queries(),
         },
         "sysproxy": query_sysproxy_status(&engine.state_dir()),
         "autostart": AutostartManager::new().status(),
         "demo": engine.demo_info(),
-        "effective-outbound": engine.router().effective_primary_outbound(),
+        "effective-outbound": router.effective_primary_outbound(),
     }))
 }
 
@@ -893,6 +935,7 @@ fn connections_snapshot_json(engine: &ProxyEngine) -> serde_json::Value {
     serde_json::json!({
         "downloadTotal": down_total,
         "uploadTotal": up_total,
+        "totalConnections": engine.hub().total_connections(),
         "connections": conns,
         "memory": read_process_rss_bytes(),
     })
@@ -1260,6 +1303,7 @@ async fn get_fakeip_pool(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRes
         "gateway": dns.gateway_ipv4().to_string(),
         "enhanced_mode": dns.enhanced_mode(),
         "cached_records": dns.cached_record_count(),
+        "total_queries": dns.total_queries(),
         "count": entries.len(),
         "entries": entries,
     }))
@@ -1335,6 +1379,8 @@ struct ImportUrisReq {
     auto_select: bool,
     #[serde(default)]
     profile_name: Option<String>,
+    #[serde(default)]
+    auto_update_interval_secs: Option<u64>,
 }
 
 fn summarize_node_redacted(node: &ProxyNodeConfig) -> serde_json::Value {
@@ -1455,11 +1501,12 @@ async fn post_import_uris(
 ) -> impl IntoResponse {
     if req.apply {
         match engine
-            .import_unified_live(
+            .import_unified_live_with_options(
                 &req.uris,
                 req.profile_name.as_deref(),
                 req.deduplicate,
                 req.auto_select,
+                req.auto_update_interval_secs,
             )
             .await
         {
@@ -1482,10 +1529,12 @@ async fn post_import_uris(
                         .collect();
                 }
                 let eff = engine.router().effective_primary_outbound();
+                let active_profile_id = engine.profile_manager().map(|m| m.active_profile_id());
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "applied": true,
+                        "active-profile-id": active_profile_id,
                         "input-kind": report.input_kind,
                         "count": report.added_nodes.len(),
                         "added-nodes": report.added_nodes,
@@ -1848,6 +1897,22 @@ pub fn read_process_rss_bytes() -> u64 {
             && let Ok(pages) = rss_pages_str.parse::<u64>()
         {
             return pages.saturating_mul(4096);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::{
+            ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            Threading::GetCurrentProcess,
+        };
+        // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle and `pmc` is zero-initialized
+        // with `cb` set to its exact byte size.
+        unsafe {
+            let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                return pmc.WorkingSetSize as u64;
+            }
         }
     }
     0
@@ -2265,6 +2330,462 @@ async fn delete_profile_api(
         )
             .into_response(),
     }
+}
+
+async fn patch_profile_settings_api(
+    State(engine): State<Arc<ProxyEngine>>,
+    Path(id): Path<String>,
+    Json(patch): Json<ProfileSettingsPatch>,
+) -> Response {
+    let mgr = match ensure_profile_manager(&engine) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+            )
+                .into_response();
+        }
+    };
+
+    match mgr.update_profile_settings(&id, patch) {
+        Ok(meta) => {
+            engine.hub().push_log(
+                "info",
+                format!(
+                    "Updated profile settings for '{}' (auto_update_interval_secs={:?})",
+                    meta.name, meta.auto_update_interval_secs
+                ),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "profile": meta,
+                    "snapshot": mgr.snapshot(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ExitIpQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+struct ExitIpProbeData {
+    ip: String,
+    country: String,
+    country_code: String,
+    isp: String,
+    asn: String,
+    ip_type: String,
+}
+
+static EXIT_IP_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<Option<(String, Instant, serde_json::Value)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+fn classify_exit_ip_type(hosting_flag: Option<bool>, isp: &str, asn: &str) -> &'static str {
+    if hosting_flag == Some(true) {
+        return "Datacenter / Hosting";
+    }
+    let hay = format!("{isp} {asn}").to_ascii_lowercase();
+    const HOSTING_KEYWORDS: &[&str] = &[
+        "cloudflare",
+        "amazon",
+        "aws",
+        "google",
+        "microsoft",
+        "azure",
+        "digitalocean",
+        "vultr",
+        "linode",
+        "akamai",
+        "hetzner",
+        "oracle",
+        "ovh",
+        "choopa",
+        "alibaba",
+        "aliyun",
+        "tencent",
+        "datacamp",
+        "packethub",
+        "cogent",
+        "leaseweb",
+        "contabo",
+        "zenlayer",
+        "dmit",
+        "bandwagon",
+    ];
+    if HOSTING_KEYWORDS.iter().any(|kw| hay.contains(kw)) {
+        "Datacenter / Hosting"
+    } else if isp.is_empty() && asn.is_empty() {
+        "Unknown"
+    } else {
+        "ISP / Broadband"
+    }
+}
+
+fn extract_http_response_body_str(raw: &[u8]) -> Option<String> {
+    let hdr_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&raw[..hdr_end]).ok()?;
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let is_chunked = head.lines().any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    let body_raw = &raw[hdr_end + 4..];
+    if is_chunked {
+        let mut out = Vec::new();
+        let mut cur = body_raw;
+        while let Some(crlf) = cur.windows(2).position(|w| w == b"\r\n") {
+            let len_str = std::str::from_utf8(&cur[..crlf])
+                .ok()?
+                .split(';')
+                .next()?
+                .trim();
+            let chunk_len = usize::from_str_radix(len_str, 16).ok()?;
+            cur = &cur[crlf + 2..];
+            if chunk_len == 0 {
+                break;
+            }
+            if cur.len() < chunk_len + 2 {
+                return None;
+            }
+            out.extend_from_slice(&cur[..chunk_len]);
+            cur = &cur[chunk_len + 2..];
+        }
+        String::from_utf8(out).ok()
+    } else {
+        String::from_utf8(body_raw.to_vec()).ok()
+    }
+}
+
+async fn fetch_via_outbound_http_text(
+    outbound: &dyn crate::outbound::OutboundHandler,
+    target: &crate::addr::TargetAddr,
+    tls_sni: Option<&str>,
+    host_header: &str,
+    path_and_query: &str,
+) -> Option<String> {
+    let stream = outbound.connect_tcp(target).await.ok()?;
+    let req = format!(
+        "GET {path_and_query} HTTP/1.0\r\nHost: {host_header}\r\nUser-Agent: curl/8.7.1\r\nAccept: application/json, text/plain\r\nConnection: close\r\n\r\n"
+    );
+    let mut raw_buf = Vec::with_capacity(2048);
+    if let Some(sni) = tls_sni {
+        let tls_cfg =
+            crate::crypto::tls::build_tls_client_config(false, &[], &[b"http/1.1".to_vec()])
+                .ok()?;
+        let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+        let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).ok()?;
+        let mut tls_stream = connector.connect(server_name, stream).await.ok()?;
+        tls_stream.write_all(req.as_bytes()).await.ok()?;
+        let _ = (&mut tls_stream)
+            .take(65_536)
+            .read_to_end(&mut raw_buf)
+            .await;
+    } else {
+        let mut plain = stream;
+        plain.write_all(req.as_bytes()).await.ok()?;
+        let _ = (&mut plain).take(65_536).read_to_end(&mut raw_buf).await;
+    }
+    extract_http_response_body_str(&raw_buf)
+}
+
+async fn probe_exit_ip_via_outbound(
+    outbound: &dyn crate::outbound::OutboundHandler,
+) -> Option<ExitIpProbeData> {
+    // 1. Primary: https://api.ip.sb/geoip
+    if let Ok(target) = crate::addr::TargetAddr::new_domain("api.ip.sb", 443)
+        && let Some(body) = fetch_via_outbound_http_text(
+            outbound,
+            &target,
+            Some("api.ip.sb"),
+            "api.ip.sb",
+            "/geoip",
+        )
+        .await
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(body.trim())
+        && let Some(ip) = val
+            .get("ip")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    {
+        let country = val
+            .get("country")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        let country_code = val
+            .get("country_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let isp = val
+            .get("isp")
+            .or_else(|| val.get("organization"))
+            .or_else(|| val.get("asn_organization"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let asn = match val.get("asn") {
+            Some(serde_json::Value::Number(n)) => format!("AS{n}"),
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {
+                if s.starts_with("AS") {
+                    s.clone()
+                } else {
+                    format!("AS{s}")
+                }
+            }
+            _ => String::new(),
+        };
+        let ip_type = classify_exit_ip_type(None, &isp, &asn).to_string();
+        return Some(ExitIpProbeData {
+            ip: ip.to_string(),
+            country,
+            country_code,
+            isp,
+            asn,
+            ip_type,
+        });
+    }
+
+    // 2. Fallback: http://ip-api.com/json/?fields=status,country,countryCode,isp,org,as,hosting,query
+    if let Ok(target) = crate::addr::TargetAddr::new_domain("ip-api.com", 80)
+        && let Some(body) = fetch_via_outbound_http_text(
+            outbound,
+            &target,
+            None,
+            "ip-api.com",
+            "/json/?fields=status,country,countryCode,isp,org,as,hosting,query",
+        )
+        .await
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(body.trim())
+        && val.get("status").and_then(|v| v.as_str()) == Some("success")
+        && let Some(ip) = val
+            .get("query")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    {
+        let country = val
+            .get("country")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        let country_code = val
+            .get("countryCode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let isp = val
+            .get("isp")
+            .or_else(|| val.get("org"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let asn_full = val.get("as").and_then(|v| v.as_str()).unwrap_or("");
+        let asn = asn_full.split_whitespace().next().unwrap_or("").to_string();
+        let hosting = val.get("hosting").and_then(|v| v.as_bool());
+        let ip_type = classify_exit_ip_type(hosting, &isp, asn_full).to_string();
+        return Some(ExitIpProbeData {
+            ip: ip.to_string(),
+            country,
+            country_code,
+            isp,
+            asn,
+            ip_type,
+        });
+    }
+
+    // 3. Fallback: https://1.1.1.1/cdn-cgi/trace
+    let cf_target = crate::addr::TargetAddr::new_ip(IpAddr::from([1, 1, 1, 1]), 443);
+    if let Some(body) = fetch_via_outbound_http_text(
+        outbound,
+        &cf_target,
+        Some("cloudflare-dns.com"),
+        "1.1.1.1",
+        "/cdn-cgi/trace",
+    )
+    .await
+    {
+        let mut ip = None;
+        let mut loc = String::new();
+        for line in body.lines() {
+            if let Some(v) = line.strip_prefix("ip=") {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    ip = Some(trimmed.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("loc=") {
+                loc = v.trim().to_string();
+            }
+        }
+        if let Some(found_ip) = ip {
+            return Some(ExitIpProbeData {
+                ip: found_ip,
+                country: if loc.is_empty() {
+                    "Unknown".to_string()
+                } else {
+                    loc.clone()
+                },
+                country_code: loc,
+                isp: String::new(),
+                asn: String::new(),
+                ip_type: "Unknown".to_string(),
+            });
+        }
+    }
+
+    None
+}
+
+async fn get_exit_ip_api(
+    State(engine): State<Arc<ProxyEngine>>,
+    Query(q): Query<ExitIpQuery>,
+) -> Response {
+    let now_ms = TelemetryHub::now_ms();
+    let cfg = engine.config_snapshot();
+    let router = engine.router();
+    let eff = router.effective_primary_outbound();
+    let force_refresh = q
+        .refresh
+        .as_deref()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+
+    if engine.demo_info().enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "ip": "198.51.100.42",
+                "country": "Demo Sandbox",
+                "country_code": "SG",
+                "isp": "RustClash Loopback Sandbox",
+                "organization": "RustClash Loopback Sandbox",
+                "asn": "AS64512",
+                "ip_type": "Sandbox",
+                "node_type": "Sandbox",
+                "quality": "Normal",
+                "latency_ms": 18,
+                "outbound": eff.effective_outbound,
+                "via_outbound": eff.effective_outbound,
+                "protocol": eff.effective_protocol,
+                "checked_at_ms": now_ms,
+                "cached": false,
+            })),
+        )
+            .into_response();
+    }
+
+    if eff.effective_outbound.eq_ignore_ascii_case("REJECT")
+        || eff.effective_outbound.starts_with("ERROR")
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": false,
+                "ip": "--",
+                "country": "Blocked",
+                "country_code": "",
+                "isp": eff.effective_outbound,
+                "organization": eff.effective_outbound,
+                "asn": "",
+                "ip_type": "Blocked",
+                "node_type": "Blocked",
+                "outbound": eff.effective_outbound,
+                "via_outbound": eff.effective_outbound,
+                "protocol": eff.effective_protocol,
+                "checked_at_ms": now_ms,
+                "cached": false,
+            })),
+        )
+            .into_response();
+    }
+
+    let cache_key = format!("{}:{}", cfg.mode.as_str(), eff.effective_outbound);
+    if !force_refresh
+        && let Some((cached_key, ts, mut cached_val)) = EXIT_IP_CACHE.lock().clone()
+        && cached_key == cache_key
+        && ts.elapsed() < Duration::from_secs(30)
+    {
+        if let Some(obj) = cached_val.as_object_mut() {
+            obj.insert("cached".to_string(), serde_json::Value::Bool(true));
+        }
+        return (StatusCode::OK, Json(cached_val)).into_response();
+    }
+
+    let probe_start = Instant::now();
+    if let Some(outbound) = router.concrete_outbound(&eff.effective_outbound)
+        && let Ok(Some(probe)) = tokio::time::timeout(
+            Duration::from_secs(4),
+            probe_exit_ip_via_outbound(outbound.as_ref()),
+        )
+        .await
+    {
+        let latency_ms = probe_start.elapsed().as_millis() as u64;
+        let fresh_now = TelemetryHub::now_ms();
+        let payload = serde_json::json!({
+            "ok": true,
+            "ip": probe.ip,
+            "country": probe.country,
+            "country_code": probe.country_code,
+            "isp": probe.isp,
+            "organization": probe.isp,
+            "asn": probe.asn,
+            "ip_type": probe.ip_type,
+            "node_type": probe.ip_type,
+            "quality": "Normal",
+            "latency_ms": latency_ms,
+            "outbound": eff.effective_outbound,
+            "via_outbound": eff.effective_outbound,
+            "protocol": eff.effective_protocol,
+            "checked_at_ms": fresh_now,
+            "cached": false,
+        });
+        *EXIT_IP_CACHE.lock() = Some((cache_key, Instant::now(), payload.clone()));
+        return (StatusCode::OK, Json(payload)).into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": false,
+            "ip": "--",
+            "country": "Offline",
+            "country_code": "",
+            "isp": "Unreachable",
+            "organization": "",
+            "asn": "",
+            "ip_type": "Unknown",
+            "node_type": "",
+            "outbound": eff.effective_outbound,
+            "via_outbound": eff.effective_outbound,
+            "protocol": eff.effective_protocol,
+            "checked_at_ms": TelemetryHub::now_ms(),
+            "cached": false,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

@@ -1,0 +1,5 @@
+# Never auto-mention individual GitHub usernames or PR authors in release notes.
+changelog:
+  exclude:
+    authors:
+      - "*"

@@ -83,6 +83,7 @@ fun SettingsScreen(
     onSetDemoMode: (Boolean) -> Unit,
     onFlushDns: () -> Unit,
     onSetShowSystemApps: (Boolean) -> Unit = {},
+    onSetDefaultSubAutoUpdateSecs: (Long) -> Unit = {},
     onClearSettingsNotice: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
@@ -179,7 +180,10 @@ fun SettingsScreen(
             SettingsRowItem(
                 icon = Icons.Rounded.Tune,
                 title = "通用",
-                subtitle = "启动 · 后台运行 · 通知",
+                subtitle = "订阅自动更新 · 后台运行 · 通知",
+                trailingBadge = UiJsonParsers.formatAutoUpdateInterval(
+                    state.defaultSubAutoUpdateSecs.takeIf { it > 0L },
+                ),
                 onClick = { showGeneralSheet = true },
             )
             SettingsGroupDivider()
@@ -258,6 +262,7 @@ fun SettingsScreen(
     if (showGeneralSheet) {
         GeneralSettingsBottomSheet(
             state = state,
+            onSetDefaultSubAutoUpdateSecs = onSetDefaultSubAutoUpdateSecs,
             onDismiss = { showGeneralSheet = false },
         )
     }
@@ -505,8 +510,16 @@ private fun PerformanceBottomSheet(
 @Composable
 private fun GeneralSettingsBottomSheet(
     state: AppUiState,
+    onSetDefaultSubAutoUpdateSecs: (Long) -> Unit = {},
     onDismiss: () -> Unit,
 ) {
+    val extColors = LocalRustClashColors.current
+    val intervalChoices = listOf(0L, 21600L, 43200L, 86400L)
+    val selectedInterval = when {
+        state.defaultSubAutoUpdateSecs <= 0L -> 0L
+        state.defaultSubAutoUpdateSecs in intervalChoices -> state.defaultSubAutoUpdateSecs
+        else -> 86400L
+    }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         containerColor = MaterialTheme.colorScheme.surface,
@@ -524,6 +537,34 @@ private fun GeneralSettingsBottomSheet(
                 fontWeight = FontWeight.Bold,
             )
             Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "订阅默认自动更新",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "息屏低功耗模式下自动暂停后台轮询；订阅刷新时手动添加的自建节点会自动保留，永不覆盖。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            SegmentedSelectorRow(
+                items = intervalChoices,
+                selectedItem = selectedInterval,
+                labelOf = { secs ->
+                    when (secs) {
+                        0L -> "手动"
+                        21600L -> "6 小时"
+                        43200L -> "12 小时"
+                        else -> "24 小时"
+                    }
+                },
+                onSelect = onSetDefaultSubAutoUpdateSecs,
+            )
+
+            HorizontalDivider(color = extColors.hairline, modifier = Modifier.padding(vertical = 12.dp))
 
             InfoKeyValueRow("VPN 前台常驻通知", "已启用单色状态栏图标与息屏节电暂停")
             InfoKeyValueRow("快捷设置磁贴 (QS Tile)", "支持下拉通知栏一键开关 VPN")

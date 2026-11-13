@@ -27,3 +27,6 @@ uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres.workspace = true

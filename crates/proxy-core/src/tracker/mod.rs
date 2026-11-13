@@ -53,6 +53,9 @@ pub struct ConnectionMetadata {
     pub host: String,
     /// Set when Fake-IP (`198.18.0.0/15`) was automatically restored back to a domain.
     pub fake_ip: Option<String>,
+    /// Optional local client process executable name (e.g. `curl`, `chrome.exe`) when resolvable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +174,8 @@ impl ActiveConnection {
 
 /// Central telemetry, connection manager, and structured log hub.
 pub struct TelemetryHub {
+    started_at_ms: u64,
+    total_connections: AtomicU64,
     total_upload: AtomicU64,
     total_download: AtomicU64,
     last_sampled_up: AtomicU64,
@@ -199,6 +204,8 @@ impl TelemetryHub {
         let (traffic_tx, _) = broadcast::channel(256);
         let (log_tx, _) = broadcast::channel(512);
         Self {
+            started_at_ms: Self::now_ms(),
+            total_connections: AtomicU64::new(0),
             total_upload: AtomicU64::new(0),
             total_download: AtomicU64::new(0),
             last_sampled_up: AtomicU64::new(0),
@@ -217,6 +224,18 @@ impl TelemetryHub {
         }
     }
 
+    pub fn started_at_ms(&self) -> u64 {
+        self.started_at_ms
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        Self::now_ms().saturating_sub(self.started_at_ms) / 1000
+    }
+
+    pub fn total_connections(&self) -> u64 {
+        self.total_connections.load(Ordering::Relaxed)
+    }
+
     pub fn set_log_level(&self, level: &str) {
         self.min_log_severity
             .store(log_level_severity(level), Ordering::Relaxed);
@@ -227,6 +246,16 @@ impl TelemetryHub {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    fn resolve_source_process(network: &str, source: Option<SocketAddr>) -> Option<String> {
+        let sa = source?;
+        let transport = if network.eq_ignore_ascii_case("udp") {
+            crate::platform::process::SocketTransport::Udp
+        } else {
+            crate::platform::process::SocketTransport::Tcp
+        };
+        crate::platform::process::find_local_process(transport, sa).map(|info| info.name)
     }
 
     fn infer_exit_type_from_leaf(leaf: &str) -> &'static str {
@@ -321,10 +350,13 @@ impl TelemetryHub {
         exit_type: String,
         remote_endpoint: String,
     ) -> Arc<ActiveConnection> {
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
         let id = uuid::Uuid::new_v4().to_string();
+        let net_str = network.into();
+        let process = Self::resolve_source_process(&net_str, source);
         let metadata = ConnectionMetadata {
             id: id.clone(),
-            network: network.into(),
+            network: net_str,
             inbound_type: inbound_type.into(),
             source: source
                 .map(|s| s.to_string())
@@ -333,6 +365,7 @@ impl TelemetryHub {
             destination_port: target.port,
             host: target.host.to_string(),
             fake_ip,
+            process,
         };
         let conn = Arc::new(ActiveConnection {
             id: id.clone(),
@@ -414,14 +447,17 @@ impl TelemetryHub {
         outbound: &dyn OutboundHandler,
         raw_reason: &str,
     ) {
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
         let now = Self::now_ms();
         let id = uuid::Uuid::new_v4().to_string();
         let safe_reason = redact_sensitive_text(raw_reason);
+        let net_str = network.into();
+        let process = Self::resolve_source_process(&net_str, source);
         let snap = ConnectionSnapshot {
             id: id.clone(),
             metadata: ConnectionMetadata {
                 id,
-                network: network.into(),
+                network: net_str,
                 inbound_type: inbound_type.into(),
                 source: source
                     .map(|s| s.to_string())
@@ -430,6 +466,7 @@ impl TelemetryHub {
                 destination_port: target.port,
                 host: target.host.to_string(),
                 fake_ip,
+                process,
             },
             upload: 0,
             download: 0,

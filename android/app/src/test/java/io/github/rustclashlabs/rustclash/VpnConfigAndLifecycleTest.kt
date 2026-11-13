@@ -700,4 +700,64 @@ class VpnConfigAndLifecycleTest {
         assertTrue(scrubbed.contains("wg://***REDACTED***"))
         assertTrue(scrubbed.contains("access_token=***REDACTED***"))
     }
+
+    @Test
+    fun profilesSnapshotParserExtractsManualProxyCountAndAutoUpdateInterval() {
+        val rawProfilesJson = """
+            {
+              "ok": true,
+              "profilesSnapshot": {
+                "active_profile_id": "sub-hk",
+                "profiles": [
+                  {
+                    "id": "sub-hk",
+                    "name": "主力订阅",
+                    "kind": "subscription",
+                    "subscription_url_redacted": "https://sub.example.com/api/v1?***REDACTED***",
+                    "auto_update_interval_secs": 21600,
+                    "last_updated_ms": 1731150000000,
+                    "proxy_count": 18,
+                    "manual_proxy_count": 2,
+                    "group_count": 4,
+                    "rule_count": 120
+                  },
+                  {
+                    "id": "sub-manual-only",
+                    "name": "备用订阅",
+                    "kind": "subscription",
+                    "subscription_url_redacted": "https://sub2.example.com/clash.yaml",
+                    "auto_update_interval_secs": null,
+                    "last_updated_ms": 1731150000000,
+                    "proxy_count": 5,
+                    "manual_proxy_count": 0,
+                    "rule_count": 30
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+
+        val parsed = UiJsonParsers.parseProfilesSnapshot(rawProfilesJson)
+        assertNotNull(parsed)
+        assertEquals("sub-hk", parsed!!.first)
+        assertEquals(2, parsed.second.size)
+
+        val first = parsed.second[0]
+        assertTrue(first.isSubscription)
+        assertEquals(18, first.proxyCount)
+        assertEquals(2, first.manualProxyCount)
+        assertEquals(21600L, first.autoUpdateIntervalSecs)
+        assertEquals("每 6 小时", UiJsonParsers.formatAutoUpdateInterval(first.autoUpdateIntervalSecs))
+
+        val second = parsed.second[1]
+        assertTrue(second.isSubscription)
+        assertEquals(0, second.manualProxyCount)
+        assertNull(second.autoUpdateIntervalSecs)
+        assertEquals("手动更新", UiJsonParsers.formatAutoUpdateInterval(second.autoUpdateIntervalSecs))
+        assertEquals("手动更新", UiJsonParsers.formatAutoUpdateInterval(0L))
+        assertEquals("每 1 小时", UiJsonParsers.formatAutoUpdateInterval(3600L))
+        assertEquals("每 12 小时", UiJsonParsers.formatAutoUpdateInterval(43200L))
+        assertEquals("每 24 小时", UiJsonParsers.formatAutoUpdateInterval(86400L))
+        assertEquals("每 15 分钟", UiJsonParsers.formatAutoUpdateInterval(900L))
+    }
 }

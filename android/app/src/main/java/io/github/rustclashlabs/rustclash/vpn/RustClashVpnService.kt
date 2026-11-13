@@ -62,6 +62,7 @@ class RustClashVpnService : VpnService() {
         const val KEY_THEME_MODE = "theme_mode"
         const val KEY_FAVORITE_NODES = "favorite_nodes"
         const val KEY_PROFILE_ALIASES = "profile_aliases_json"
+        const val KEY_DEFAULT_SUB_AUTO_UPDATE_SECS = "default_sub_auto_update_secs"
         const val VAULT_KEY_ACTIVE_YAML = "active_profile_yaml"
         const val VAULT_KEY_SUBSCRIPTION_URL = "active_subscription_url"
 

@@ -1,57 +1,54 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { clashApi } from "../api";
-import type { ConnectionItem } from "../types";
-import { formatAge, formatBytes } from "../utils/format";
+import { CloseIcon, SearchIcon } from "../components/Icons";
+import { useI18n } from "../i18n";
+import type { ConnectionItem, ConnectionsResponse, TrafficPoint } from "../types";
+import {
+  extractBadgeInitial,
+  formatAge,
+  formatBytes,
+  formatSpeed,
+} from "../utils/format";
 
 interface ConnectionsViewProps {
-  items: ConnectionItem[];
+  connections: ConnectionsResponse | null;
+  latestTraffic: TrafficPoint;
   onRefresh: () => Promise<void>;
 }
 
-type ViewMode = "active" | "diagnostics";
-type DiagFilter = "ALL" | "PROXY" | "DIRECT" | "FAILED";
-
 export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
-  items,
+  connections,
+  latestTraffic,
   onRefresh,
 }) => {
-  const [viewMode, setViewMode] = useState<ViewMode>("active");
-  const [query, setQuery] = useState("");
-  const [inboundFilter, setInboundFilter] = useState("ALL");
-  const [diagFilter, setDiagFilter] = useState<DiagFilter>("ALL");
-  const [diagnostics, setDiagnostics] = useState<ConnectionItem[]>([]);
+  const { tr } = useI18n();
 
-  const loadDiagnostics = useCallback(async () => {
-    try {
-      const res = await clashApi.getConnectionDiagnostics(150);
-      setDiagnostics(res.diagnostics);
-    } catch {
-      // ignore
-    }
-  }, []);
+  const [query, setQuery] = useState("");
+  const [paused, setPaused] = useState(false);
+  const [frozenItems, setFrozenItems] = useState<ConnectionItem[]>([]);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const liveItems = connections?.connections ?? [];
 
   useEffect(() => {
-    if (viewMode !== "diagnostics") return;
-    void loadDiagnostics();
-    const timer = window.setInterval(() => {
-      if (!document.hidden) {
-        void loadDiagnostics();
-      }
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [viewMode, loadDiagnostics]);
+    if (!paused) {
+      setFrozenItems(liveItems);
+    }
+  }, [paused, liveItems]);
 
-  const filteredActive = useMemo(() => {
+  const sourceItems = paused ? frozenItems : liveItems;
+
+  const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return items.filter((c) => {
-      if (inboundFilter !== "ALL" && !c.metadata.type.includes(inboundFilter)) {
-        return false;
-      }
-      if (!q) return true;
+    if (!q) return sourceItems;
+    return sourceItems.filter((c) => {
       const hay = [
-        c.metadata.host,
+        c.metadata.process ?? "",
         c.metadata.source,
         c.metadata.type,
+        c.metadata.host,
+        c.metadata.destination_ip ?? "",
         c.metadata.fake_ip ?? "",
         c.rule,
         c.rule_payload,
@@ -62,50 +59,16 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [items, query, inboundFilter]);
-
-  const filteredDiagnostics = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return diagnostics.filter((d) => {
-      if (diagFilter === "DIRECT" && d.exit_type !== "DIRECT") return false;
-      if (diagFilter === "PROXY" && d.exit_type !== "PROXY") return false;
-      if (
-        diagFilter === "FAILED" &&
-        d.status !== "failed" &&
-        d.exit_type !== "ERROR" &&
-        !d.error
-      ) {
-        return false;
-      }
-      if (!q) return true;
-      const hay = [
-        d.metadata.host,
-        d.metadata.destination_ip ?? "",
-        d.metadata.fake_ip ?? "",
-        d.rule,
-        d.rule_payload,
-        d.effective_outbound ?? "",
-        d.effective_protocol ?? "",
-        d.remote_endpoint ?? "",
-        d.error ?? "",
-      ]
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(q);
-    });
-  }, [diagnostics, diagFilter, query]);
-
-  const [actionBusy, setActionBusy] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  }, [sourceItems, query]);
 
   const handleCloseOne = async (id: string) => {
     setActionBusy(`close:${id}`);
-    setActionError(null);
+    setErrorMsg(null);
     try {
       await clashApi.closeConnection(id);
       await onRefresh();
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setActionBusy(null);
     }
@@ -113,208 +76,226 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
 
   const handleCloseAll = async () => {
     setActionBusy("close-all");
-    setActionError(null);
+    setErrorMsg(null);
     try {
       await clashApi.closeAllConnections();
       await onRefresh();
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setActionBusy(null);
     }
   };
 
-  const handleClearDiagnostics = async () => {
-    setActionBusy("clear-diag");
-    setActionError(null);
-    try {
-      await clashApi.clearConnectionDiagnostics();
-      await loadDiagnostics();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setActionBusy(null);
-    }
-  };
+  const totalReqs =
+    connections?.totalConnections ?? Math.max(liveItems.length, 0);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-      {actionError && (
+    <div style={{ display: "flex", flexDirection: "column", gap: 13 }}>
+      {errorMsg && (
         <div className="banner banner-err">
-          <span>{actionError}</span>
+          <span>{errorMsg}</span>
           <button
             type="button"
             className="btn btn-sm"
-            onClick={() => setActionError(null)}
+            onClick={() => setErrorMsg(null)}
           >
-            Dismiss
+            {tr("关闭", "Dismiss")}
           </button>
         </div>
       )}
-      <div className="toolbar">
+
+      {/* Summary Metric Strip + Controls */}
+      <section className="bento-card" style={{ padding: "14px 18px" }}>
         <div
           style={{
             display: "flex",
-            gap: 10,
             alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
             flexWrap: "wrap",
+            marginBottom: 12,
           }}
         >
-          <div className="segmented">
-            <button
-              type="button"
-              className={`seg-btn ${viewMode === "active" ? "active" : ""}`}
-              onClick={() => setViewMode("active")}
-            >
-              Active Streams ({items.length})
-            </button>
-            <button
-              type="button"
-              className={`seg-btn ${viewMode === "diagnostics" ? "active" : ""}`}
-              onClick={() => setViewMode("diagnostics")}
-            >
-              Route Diagnostics
-            </button>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <div className="sub-pill-box" style={{ padding: "7px 14px" }}>
+              <span style={{ fontSize: 11.5, color: "var(--text-muted)", marginRight: 8 }}>
+                {tr("活跃连接", "Active")}
+              </span>
+              <strong className="tabular" style={{ fontSize: 14.5 }}>
+                {liveItems.length}
+              </strong>
+            </div>
+
+            <div className="sub-pill-box" style={{ padding: "7px 14px" }}>
+              <span style={{ fontSize: 11.5, color: "var(--text-muted)", marginRight: 8 }}>
+                {tr("累计请求", "Total Requests")}
+              </span>
+              <strong className="tabular" style={{ fontSize: 14.5 }}>
+                {totalReqs.toLocaleString()}
+              </strong>
+            </div>
+
+            <div className="sub-pill-box tabular" style={{ padding: "7px 14px" }}>
+              <span style={{ fontSize: 11.5, color: "var(--text-muted)", marginRight: 8 }}>
+                {tr("实时速率", "Live Speed")}
+              </span>
+              <strong style={{ fontSize: 13.5, color: "var(--accent-blue)" }}>
+                ↓ {formatSpeed(latestTraffic.down)}
+              </strong>
+              <span style={{ margin: "0 6px", color: "var(--text-muted)" }}>·</span>
+              <strong style={{ fontSize: 13.5 }}>
+                ↑ {formatSpeed(latestTraffic.up)}
+              </strong>
+            </div>
           </div>
 
-          <input
-            id="conn-search-input"
-            className="input"
-            style={{ width: 260, maxWidth: "100%" }}
-            placeholder="Filter host, Fake-IP, rule, outbound..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-
-          {viewMode === "active" ? (
-            <>
-              <select
-                id="conn-inbound-filter"
-                className="select"
-                value={inboundFilter}
-                onChange={(e) => setInboundFilter(e.target.value)}
-              >
-                <option value="ALL">All Inbounds</option>
-                <option value="SOCKS5">SOCKS5</option>
-                <option value="HTTP">HTTP / CONNECT</option>
-                <option value="TUN">TUN (smoltcp)</option>
-              </select>
-              <span className="badge badge-neutral tabular">
-                Showing {filteredActive.length} / {items.length} active
-              </span>
-            </>
-          ) : (
-            <div className="segmented">
-              {(["ALL", "PROXY", "DIRECT", "FAILED"] as DiagFilter[]).map(
-                (f) => (
-                  <button
-                    key={f}
-                    type="button"
-                    className={`seg-btn ${diagFilter === f ? "active" : ""}`}
-                    onClick={() => setDiagFilter(f)}
-                  >
-                    {f}
-                  </button>
-                ),
-              )}
-            </div>
-          )}
-        </div>
-
-        {viewMode === "active" ? (
           <button
-            id="close-all-conns-btn"
             type="button"
             className="btn btn-danger"
-            disabled={items.length === 0 || actionBusy === "close-all"}
+            disabled={liveItems.length === 0 || actionBusy === "close-all"}
             onClick={() => void handleCloseAll()}
           >
             {actionBusy === "close-all"
-              ? "Closing..."
-              : `Close All (${items.length})`}
+              ? tr("断开中...", "Closing...")
+              : tr(
+                  `一键断开全部连接 (${liveItems.length})`,
+                  `Close All (${liveItems.length})`,
+                )}
           </button>
-        ) : (
-          <div style={{ display: "flex", gap: 8 }}>
+        </div>
+
+        <div className="toolbar">
+          <div
+            style={{
+              position: "relative",
+              flex: "1 1 280px",
+              maxWidth: 420,
+            }}
+          >
+            <span
+              style={{
+                position: "absolute",
+                left: 11,
+                top: "50%",
+                transform: "translateY(-50%)",
+                color: "var(--text-muted)",
+                display: "inline-flex",
+              }}
+            >
+              <SearchIcon size={14} />
+            </span>
+            <input
+              type="text"
+              className="input"
+              style={{ width: "100%", paddingLeft: 32 }}
+              placeholder={tr(
+                "搜索域名、IP、进程名、出站节点或规则...",
+                "Filter by domain, IP, process, outbound, or rule...",
+              )}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span
+              className="tabular"
+              style={{ fontSize: 12, color: "var(--text-muted)" }}
+            >
+              {tr(
+                `显示 ${filtered.length} / ${sourceItems.length}`,
+                `Showing ${filtered.length} / ${sourceItems.length}`,
+              )}
+            </span>
+
             <button
               type="button"
-              className="btn btn-sm"
-              onClick={() => void loadDiagnostics()}
+              className={`btn btn-sm ${paused ? "btn-primary" : ""}`}
+              onClick={() => setPaused((v) => !v)}
             >
-              Refresh
-            </button>
-            <button
-              type="button"
-              className="btn btn-danger btn-sm"
-              disabled={diagnostics.length === 0 || actionBusy === "clear-diag"}
-              onClick={() => void handleClearDiagnostics()}
-            >
-              {actionBusy === "clear-diag"
-                ? "Clearing..."
-                : "Clear Ring Buffer"}
+              {paused ? tr("恢复刷新", "Resume") : tr("暂停列表", "Pause")}
             </button>
           </div>
-        )}
-      </div>
+        </div>
+      </section>
 
-      {viewMode === "active" ? (
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
+      {/* Full-Width Bento Connections Table */}
+      <div className="table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>{tr("进程 / 来源", "Source / Process")}</th>
+              <th>{tr("目标地址", "Target")}</th>
+              <th>{tr("匹配规则", "Rule")}</th>
+              <th>{tr("出站链路", "Outbound Chain")}</th>
+              <th>{tr("下载 / 上传", "Traffic")}</th>
+              <th>{tr("耗时", "Age")}</th>
+              <th style={{ width: 46, textAlign: "center" }} />
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 ? (
               <tr>
-                <th>Inbound</th>
-                <th>Target Host &amp; Fake-IP Restoration</th>
-                <th>Matched Rule</th>
-                <th>Outbound Chain</th>
-                <th>Download</th>
-                <th>Upload</th>
-                <th>Age</th>
-                <th>Action</th>
+                <td
+                  colSpan={7}
+                  style={{
+                    textAlign: "center",
+                    padding: "36px 14px",
+                    color: "var(--text-muted)",
+                  }}
+                >
+                  {query.trim()
+                    ? tr("没有匹配的连接记录", "No connections match your filter")
+                    : tr("当前暂无活跃连接", "No active connections right now")}
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {filteredActive.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={8}
-                    style={{
-                      textAlign: "center",
-                      padding: "28px 12px",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    No active connections right now. Run the Live Benchmark on
-                    Overview or send traffic to Mixed Inbound.
-                  </td>
-                </tr>
-              ) : (
-                filteredActive.map((c) => (
+            ) : (
+              filtered.map((c) => {
+                const procName =
+                  c.metadata.process?.trim() ||
+                  c.metadata.type ||
+                  c.metadata.source;
+                const targetStr = `${
+                  c.metadata.host || c.metadata.destination_ip || "*"
+                }:${c.metadata.destination_port}`;
+                const chainDisplay =
+                  c.chains.length > 0
+                    ? c.chains.slice().reverse().join(" → ")
+                    : c.effective_outbound || "DIRECT";
+
+                return (
                   <tr key={c.id}>
                     <td>
-                      <span className="badge badge-neutral mono">
-                        {c.metadata.type}
-                      </span>
-                    </td>
-                    <td>
-                      <div className="mono" style={{ fontWeight: 600 }}>
-                        {(c.metadata.host || c.metadata.destination_ip) ?? "*"}:
-                        {c.metadata.destination_port}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span className="source-avatar">
+                          {extractBadgeInitial(procName)}
+                        </span>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontWeight: 600 }}>{procName}</div>
+                          <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                            {c.metadata.network.toUpperCase()} · {c.metadata.source}
+                          </div>
+                        </div>
                       </div>
+                    </td>
+
+                    <td>
+                      <div style={{ fontWeight: 550 }}>{targetStr}</div>
                       {c.metadata.fake_ip && (
-                        <div style={{ marginTop: 3 }}>
-                          <span className="badge badge-sky mono">
-                            Fake-IP {c.metadata.fake_ip} → {c.metadata.host}
-                          </span>
+                        <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                          Fake-IP: {c.metadata.fake_ip}
                         </div>
                       )}
                     </td>
+
                     <td>
-                      <span className="badge badge-amber">{c.rule}</span>
+                      <span className="badge badge-neutral">{c.rule}</span>
                       {c.rule_payload && (
                         <span
-                          className="mono"
                           style={{
                             marginLeft: 6,
-                            fontSize: 11.5,
+                            fontSize: 12,
                             color: "var(--text-secondary)",
                           }}
                         >
@@ -322,139 +303,40 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
                         </span>
                       )}
                     </td>
-                    <td className="mono" style={{ fontSize: 12 }}>
-                      {c.chains.join(" ← ")}
+
+                    <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>
+                      {chainDisplay}
                     </td>
-                    <td className="tabular">{formatBytes(c.download)}</td>
-                    <td className="tabular">{formatBytes(c.upload)}</td>
-                    <td
-                      className="tabular"
-                      style={{ color: "var(--text-muted)" }}
-                    >
+
+                    <td className="tabular">
+                      <div>↓ {formatBytes(c.download)}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                        ↑ {formatBytes(c.upload)}
+                      </div>
+                    </td>
+
+                    <td className="tabular" style={{ color: "var(--text-muted)" }}>
                       {formatAge(c.start_epoch_ms)}
                     </td>
-                    <td>
+
+                    <td style={{ textAlign: "center" }}>
                       <button
                         type="button"
-                        className="btn btn-sm btn-danger"
+                        className="bento-icon-action"
+                        disabled={actionBusy === `close:${c.id}`}
                         onClick={() => void handleCloseOne(c.id)}
+                        title={tr("断开此连接", "Close connection")}
                       >
-                        Close
+                        <CloseIcon size={14} />
                       </button>
                     </td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>Target &amp; Fake-IP</th>
-                <th>Rule Match</th>
-                <th>Exit &amp; Protocol</th>
-                <th>Traffic</th>
-                <th>Remote / Error</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredDiagnostics.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={6}
-                    style={{
-                      textAlign: "center",
-                      padding: "28px 12px",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    No diagnostic records match the current filter.
-                  </td>
-                </tr>
-              ) : (
-                filteredDiagnostics.map((d) => {
-                  const statusBadge =
-                    d.status === "failed" || d.error
-                      ? "badge-rose"
-                      : d.status === "active"
-                        ? "badge-emerald"
-                        : "badge-neutral";
-                  const exitBadge =
-                    d.exit_type === "PROXY"
-                      ? "badge-emerald"
-                      : d.exit_type === "REJECT" || d.exit_type === "ERROR"
-                        ? "badge-rose"
-                        : "badge-neutral";
-                  return (
-                    <tr key={`${d.id}-${d.start_epoch_ms}`}>
-                      <td>
-                        <span className={`badge ${statusBadge} mono`}>
-                          {d.status ?? "closed"}
-                        </span>
-                      </td>
-                      <td>
-                        <div className="mono" style={{ fontWeight: 600 }}>
-                          {d.metadata.host || d.metadata.destination_ip || "*"}:
-                          {d.metadata.destination_port} (
-                          {d.metadata.network.toUpperCase()})
-                        </div>
-                        {d.metadata.fake_ip && (
-                          <span className="badge badge-sky mono">
-                            Fake-IP {d.metadata.fake_ip}
-                          </span>
-                        )}
-                      </td>
-                      <td>
-                        <span className="badge badge-amber">{d.rule}</span>{" "}
-                        <span
-                          className="mono"
-                          style={{
-                            fontSize: 11.5,
-                            color: "var(--text-secondary)",
-                          }}
-                        >
-                          {d.rule_payload || "*"}
-                        </span>
-                      </td>
-                      <td>
-                        <span className={`badge ${exitBadge}`}>
-                          {d.exit_type || "DIRECT"}
-                        </span>{" "}
-                        <span className="mono" style={{ fontSize: 12 }}>
-                          {d.effective_outbound || d.chains[0] || "DIRECT"}
-                          {d.effective_protocol
-                            ? ` (${d.effective_protocol})`
-                            : ""}
-                        </span>
-                      </td>
-                      <td className="tabular">
-                        ↓ {formatBytes(d.download)} · ↑ {formatBytes(d.upload)}
-                      </td>
-                      <td
-                        className="mono"
-                        style={{
-                          fontSize: 11.5,
-                          color: d.error
-                            ? "var(--accent-rose)"
-                            : "var(--text-muted)",
-                          maxWidth: 280,
-                          wordBreak: "break-word",
-                        }}
-                      >
-                        {d.error ? d.error : d.remote_endpoint || "-"}
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 };

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+check_ident() {
+  local role="$1"
+  local ident="$2"
+  local email
+  email="$(printf '%s' "$ident" | sed -n 's/.*<\([^>]*\)>.*/\1/p' | tr '[:upper:]' '[:lower:]')"
+  case "$email" in
+    rustclash.labs@proton.me|noreply@github.com|*"[bot]@users.noreply.github.com")
+      return 0
+      ;;
+    *)
+      echo "ERROR: Refusing commit — $role email '$email' exposes a personal account." >&2
+      echo "Run: ./scripts/setup_git_identity.sh" >&2
+      exit 1
+      ;;
+  esac
+}
+
+check_ident "author" "$(git var GIT_AUTHOR_IDENT)"
+check_ident "committer" "$(git var GIT_COMMITTER_IDENT)"

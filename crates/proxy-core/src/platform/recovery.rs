@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -321,26 +321,32 @@ impl SingleInstanceGuard {
         fs::create_dir_all(state_dir)?;
         let lock_path = state_dir.join(LOCK_FILENAME);
 
-        if let Ok(existing_raw) = fs::read_to_string(&lock_path)
-            && let Ok(existing_pid) = existing_raw.trim().parse::<u32>()
-            && existing_pid != std::process::id()
-            && is_pid_alive(existing_pid)
+        #[cfg(not(any(unix, windows)))]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!(
-                    "another rust-clash instance (PID {existing_pid}) is already running (lock: '{}')",
-                    lock_path.display()
-                ),
-            ));
+            if let Ok(existing_raw) = fs::read_to_string(&lock_path)
+                && let Ok(existing_pid) = existing_raw.trim().parse::<u32>()
+                && existing_pid != std::process::id()
+                && is_pid_alive(existing_pid)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "another rust-clash instance (PID {existing_pid}) is already running (lock: '{}')",
+                        lock_path.display()
+                    ),
+                ));
+            }
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&lock_path)?;
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ (0x1) | FILE_SHARE_WRITE (0x2) | FILE_SHARE_DELETE (0x4) = 0x7
+            open_opts.share_mode(0x7);
+        }
+        let mut file = open_opts.open(&lock_path)?;
 
         #[cfg(unix)]
         {
@@ -348,16 +354,62 @@ impl SingleInstanceGuard {
             // SAFETY: `flock` with `LOCK_EX | LOCK_NB` on a valid open `File` fd is safe and non-blocking.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
+                let pid_note = fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|pid| format!(" (PID {pid})"))
+                    .unwrap_or_default();
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!(
-                        "another rust-clash instance holds exclusive lock '{}'",
+                        "another rust-clash instance{pid_note} holds exclusive lock '{}'",
                         lock_path.display()
                     ),
                 ));
             }
         }
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{
+                Storage::FileSystem::{
+                    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+                },
+                System::IO::OVERLAPPED,
+            };
+            // SAFETY: `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` and a
+            // zeroed `OVERLAPPED` on a valid open `File` handle is non-blocking; the Windows NT kernel
+            // automatically releases the lock when the handle closes or the process terminates.
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                LockFileEx(
+                    file.as_raw_handle() as _,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    1,
+                    0,
+                    &mut overlapped,
+                )
+            };
+            if ok == 0 {
+                let pid_note = fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|pid| format!(" (PID {pid})"))
+                    .unwrap_or_default();
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "another rust-clash instance{pid_note} holds exclusive lock '{}'",
+                        lock_path.display()
+                    ),
+                ));
+            }
+        }
+
+        file.set_len(0)?;
+        Seek::seek(&mut file, SeekFrom::Start(0))?;
         writeln!(file, "{}", std::process::id())?;
         file.sync_all()?;
 
@@ -644,10 +696,10 @@ mod tests {
         // 3. SingleInstanceGuard prevents duplicate acquisition in the same directory
         let g1 = SingleInstanceGuard::acquire(&dir).expect("first lock");
         let g2_same_pid = SingleInstanceGuard::acquire(&dir);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert!(
             g2_same_pid.is_err(),
-            "flock must reject second open handle even from same PID"
+            "OS file lock must reject second open handle even from same PID"
         );
         let _ = g2_same_pid;
         drop(g1);
