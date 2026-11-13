@@ -24,6 +24,9 @@ desktop = ["dep:tauri", "dep:tauri-build"]
 [build-dependencies]
 tauri-build = { version = "2", optional = true }
 
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres.workspace = true
+
 [dependencies]
 proxy-core = { path = "../proxy-core" }
 tokio.workspace = true
@@ -34,3 +37,6 @@ parking_lot.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tauri = { version = "2", optional = true, features = ["tray-icon"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

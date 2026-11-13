@@ -2612,3 +2612,91 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     };
     rust_to_jstring(&mut env, &out)
 }
+
+/// Update profile display name and/or subscription auto-update interval (`None` = unchanged,
+/// `Some(None)` / `Some(Some(0))` = disabled, `Some(Some(secs))` = interval >= 60s) offline or live.
+pub fn android_update_profile_settings_core(
+    state_dir: &Path,
+    profile_id: &str,
+    name: Option<String>,
+    auto_update_interval_secs: Option<Option<u64>>,
+) -> Result<serde_json::Value, String> {
+    let patch = proxy_core::profile::ProfileSettingsPatch {
+        name,
+        auto_update_interval_secs,
+    };
+    if let Some((_, engine)) = live_handle_and_engine() {
+        let mgr = engine
+            .ensure_profile_manager()
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let meta = mgr
+            .update_profile_settings(profile_id, patch)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        return Ok(serde_json::json!({
+            "ok": true,
+            "vpnRunning": true,
+            "profile": meta,
+            "profilesSnapshot": mgr.snapshot(),
+        }));
+    }
+
+    let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+    let mgr = ProfileManager::open_or_init(state_dir)
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    let meta = mgr
+        .update_profile_settings(profile_id, patch)
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "vpnRunning": false,
+        "profile": meta,
+        "profilesSnapshot": mgr.snapshot(),
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeUpdateProfileSettingsJson<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    state_dir_jstr: JString<'local>,
+    profile_id_jstr: JString<'local>,
+    name_jstr: JString<'local>,
+    interval_secs: jlong,
+) -> jstring {
+    ensure_tracing_initialized();
+    let res = (|| -> Result<serde_json::Value, String> {
+        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+        let id = jstring_to_rust(&mut env, &profile_id_jstr)?;
+        let name_raw = jstring_to_rust(&mut env, &name_jstr)?;
+        let name_opt = {
+            let t = name_raw.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        let interval_opt = if interval_secs < 0 {
+            None
+        } else if interval_secs == 0 {
+            Some(None)
+        } else {
+            Some(Some(interval_secs as u64))
+        };
+        android_update_profile_settings_core(
+            Path::new(dir.trim()),
+            id.trim(),
+            name_opt,
+            interval_opt,
+        )
+    })();
+    let out = match res {
+        Ok(v) => v.to_string(),
+        Err(e) => {
+            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
+        }
+    };
+    rust_to_jstring(&mut env, &out)
+}

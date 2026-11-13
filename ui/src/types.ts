@@ -13,6 +13,28 @@ export interface DemoInfo {
   endpoints: Record<string, string>;
 }
 
+export interface ExitIpInfo {
+  ok?: boolean;
+  ip: string;
+  country_code: string;
+  country: string;
+  organization?: string;
+  isp?: string;
+  asn?: string;
+  quality?: string;
+  ip_type?: string;
+  node_type?: string;
+  latency_ms?: number;
+  outbound?: string;
+  via_outbound?: string;
+  cached?: boolean;
+  error?: string;
+}
+
+export interface DesktopPrefs {
+  close_to_tray: boolean;
+}
+
 export interface TunHealthSnapshot {
   platform: string;
   backend: string;
@@ -77,6 +99,16 @@ export interface ConfigSnapshot {
   "selected-groups"?: Record<string, string>;
   "log-level": string;
   ipv6: boolean;
+  "started-at-ms"?: number;
+  "uptime-secs"?: number;
+  "intranet-ip"?: string;
+  "tun-ip"?: string;
+  "tun-active"?: boolean;
+  "lan-ip"?: string | null;
+  "rule-count"?: number;
+  "proxy-count"?: number;
+  "group-count"?: number;
+  "process-rss-bytes"?: number;
   tun: {
     enable: boolean;
     "virtual-enable"?: boolean;
@@ -128,6 +160,8 @@ export interface ProfileMetadata {
   userinfo?: SubscriptionUserInfo | null;
   proxy_count: number;
   rule_count: number;
+  group_count?: number;
+  manual_proxy_count?: number;
   last_skipped_count?: number;
   selected_groups?: Record<string, string>;
 }
@@ -249,6 +283,8 @@ export interface ImportNodesResponse {
   "total-nodes"?: number;
   "selected-groups"?: Record<string, string>;
   "effective-outbound"?: EffectiveOutboundSummary;
+  profile?: ProfileMetadata;
+  snapshot?: ProfilesSnapshot;
 }
 
 export interface ActiveNodesResponse {
@@ -345,6 +381,7 @@ export interface ConnectionMetadata {
   network: string;
   type: string;
   source: string;
+  process?: string | null;
   destination_ip?: string | null;
   destination_port: number;
   host: string;
@@ -374,6 +411,7 @@ export interface ConnectionsResponse {
   uploadTotal: number;
   connections: ConnectionItem[];
   memory: number;
+  totalConnections?: number;
 }
 
 export interface TrafficPoint {
@@ -393,6 +431,8 @@ export interface LogEntry {
 export interface FakeIpEntry {
   ip: string;
   domain: string;
+  real_ip?: string | null;
+  ttl_secs?: number | null;
 }
 
 export interface FakeIpPoolResponse {
@@ -400,6 +440,7 @@ export interface FakeIpPoolResponse {
   gateway: string;
   enhanced_mode?: string;
   cached_records?: number;
+  total_queries?: number;
   count: number;
   entries: FakeIpEntry[];
 }
@@ -584,4 +625,3 @@ export interface EndpointMatrixReport {
   udp_probe: UdpProbeResult;
   items: EndpointMatrixItem[];
 }
-

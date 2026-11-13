@@ -157,6 +157,10 @@ pub struct ProfileMetadata {
     pub last_error: Option<String>,
     pub userinfo: Option<SubscriptionUserInfo>,
     pub proxy_count: usize,
+    #[serde(default)]
+    pub manual_proxy_count: usize,
+    #[serde(default)]
+    pub group_count: usize,
     pub rule_count: usize,
     #[serde(default)]
     pub last_skipped_count: usize,
@@ -166,6 +170,32 @@ pub struct ProfileMetadata {
     pub rule_preset: Option<RulePreset>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_rules_backup: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ProfileSettingsPatch {
+    pub name: Option<String>,
+    /// `None` = leave unchanged; `Some(None)` or `Some(Some(0))` = disable auto-update; `Some(Some(secs))` = set interval (clamp minimum to 60s).
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_u64")]
+    pub auto_update_interval_secs: Option<Option<u64>>,
+}
+
+fn deserialize_optional_nullable_u64<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<u64>::deserialize(deserializer)?))
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ManualNodesOverlay {
+    #[serde(default)]
+    proxies: Vec<ProxyNodeConfig>,
+    /// Optional mapping of proxy_name -> list of group names the manual node was attached to
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    group_attachments: HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -754,7 +784,9 @@ pub fn parse_subscription_payload_sanitized(
     let (kind, normalized) = classify_import_input(raw_body)?;
     match kind {
         ImportInputKind::ClashYaml => {
-            let (cfg, skipped) = ClashConfig::from_yaml_str_sanitized(&normalized)?;
+            let (mut cfg, skipped) = ClashConfig::from_yaml_str_sanitized(&normalized)?;
+            let had_tun_enabled = cfg.tun.enable;
+            cfg.tun.enable = false;
             if cfg.proxies.is_empty() {
                 let detail = if skipped.is_empty() {
                     "subscription Clash YAML contains 0 proxy nodes".to_string()
@@ -767,12 +799,14 @@ pub fn parse_subscription_payload_sanitized(
                 return Err(ProxyError::Config(detail));
             }
             validate_profile_config(&cfg, extra_ca_der)?;
-            let persisted_yaml =
-                if skipped.is_empty() && ClashConfig::from_yaml_str(&normalized).is_ok() {
-                    normalized
-                } else {
-                    cfg.to_yaml_string()?
-                };
+            let persisted_yaml = if !had_tun_enabled
+                && skipped.is_empty()
+                && ClashConfig::from_yaml_str(&normalized).is_ok()
+            {
+                normalized
+            } else {
+                cfg.to_yaml_string()?
+            };
             Ok((cfg, persisted_yaml, skipped))
         }
         ImportInputKind::ShareUris | ImportInputKind::Base64UriList => {
@@ -802,6 +836,7 @@ pub struct ProfileManager {
     vault: SecretVault,
     extra_ca_der: Vec<CertificateDer<'static>>,
     index: Mutex<ProfileIndex>,
+    last_attempt_ms: Mutex<HashMap<String, u64>>,
     router_slot: RwLock<Option<Weak<RwLock<Arc<Router>>>>>,
 }
 
@@ -838,15 +873,22 @@ impl ProfileManager {
             // ONLY upgrades untouched <= v0.2.1 minimal starter rule lists; NEVER modifies user custom YAML/rules.
             let mut dirty = false;
             for p in &mut idx.profiles {
-                if p.rule_preset.is_some() {
-                    continue;
-                }
-                let sanitized: String =
-                    p.id.chars()
-                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                        .collect();
+                let sanitized = sanitize_profile_id(&p.id);
                 let yaml_path = profiles_dir.join(format!("{sanitized}.yaml"));
+                let overlay_path = profiles_dir.join(format!("{sanitized}.manual.yaml"));
+                let expected_manual = read_manual_overlay_from_path(&overlay_path).proxies.len();
+                if p.manual_proxy_count != expected_manual {
+                    p.manual_proxy_count = expected_manual;
+                    dirty = true;
+                }
                 if let Ok(mut cfg) = ClashConfig::from_file(&yaml_path) {
+                    if p.group_count != cfg.proxy_groups.len() {
+                        p.group_count = cfg.proxy_groups.len();
+                        dirty = true;
+                    }
+                    if p.rule_preset.is_some() {
+                        continue;
+                    }
                     if matches!(p.kind, ProfileKind::Starter | ProfileKind::ShareUris)
                         && let Some(target_grp) = detect_untouched_legacy_starter_group(&cfg)
                     {
@@ -870,6 +912,7 @@ impl ProfileManager {
                             && write_atomic_with_backup(&yaml_path, &new_yaml).is_ok()
                         {
                             p.rule_count = rule_count;
+                            p.group_count = cfg.proxy_groups.len();
                             p.rule_preset = Some(RulePreset::SmartCn);
                             p.selected_groups =
                                 default_selected_groups_for_config(&cfg, &p.selected_groups);
@@ -888,10 +931,7 @@ impl ProfileManager {
             }
             if !idx.selection_defaults_v2 {
                 for p in &mut idx.profiles {
-                    let sanitized: String =
-                        p.id.chars()
-                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                            .collect();
+                    let sanitized = sanitize_profile_id(&p.id);
                     let yaml_path = profiles_dir.join(format!("{sanitized}.yaml"));
                     if let Ok(cfg) = ClashConfig::from_file(&yaml_path) {
                         for g in &cfg.proxy_groups {
@@ -942,6 +982,8 @@ impl ProfileManager {
                     last_error: None,
                     userinfo: None,
                     proxy_count,
+                    manual_proxy_count: 0,
+                    group_count: starter_cfg.proxy_groups.len(),
                     rule_count,
                     last_skipped_count: 0,
                     selected_groups: default_selected_groups_for_config(
@@ -961,6 +1003,7 @@ impl ProfileManager {
             vault,
             extra_ca_der,
             index: Mutex::new(index),
+            last_attempt_ms: Mutex::new(HashMap::new()),
             router_slot: RwLock::new(None),
         }))
     }
@@ -1216,8 +1259,11 @@ impl ProfileManager {
             let active_id = idx.active_profile_id.clone();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                 p.proxy_count = proxy_count;
+                p.group_count = cfg.proxy_groups.len();
                 p.rule_count = rule_count;
-                p.last_updated_ms = now_unix_ms();
+                if p.kind != ProfileKind::Subscription {
+                    p.last_updated_ms = now_unix_ms();
+                }
                 p.last_error = None;
                 p.rule_preset = Some(next_preset);
                 p.custom_rules_backup = backup;
@@ -1260,8 +1306,11 @@ impl ProfileManager {
             let active_id = idx.active_profile_id.clone();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                 p.proxy_count = proxy_count;
+                p.group_count = cfg.proxy_groups.len();
                 p.rule_count = rule_count;
-                p.last_updated_ms = now_unix_ms();
+                if p.kind != ProfileKind::Subscription {
+                    p.last_updated_ms = now_unix_ms();
+                }
                 p.last_error = None;
                 p.rule_preset = Some(RulePreset::Custom);
                 p.custom_rules_backup = cleaned;
@@ -1285,12 +1334,37 @@ impl ProfileManager {
             Some(s) => s.to_string(),
             None => cfg.to_yaml_string()?,
         };
-        let path = self.active_profile_path();
+        let active_id = self.active_profile_id();
+        let path = self.profile_yaml_path(&active_id);
         write_atomic_with_backup(&path, &yaml)?;
         let detected_preset = classify_rule_preset(cfg);
 
+        let mut overlay = self.load_manual_overlay(&active_id);
+        if !overlay.proxies.is_empty() {
+            let mut synced_proxies = Vec::with_capacity(overlay.proxies.len());
+            let mut synced_attachments = HashMap::new();
+            for existing_manual in &overlay.proxies {
+                if let Some(in_cfg) = cfg
+                    .proxies
+                    .iter()
+                    .find(|n| n.name() == existing_manual.name())
+                {
+                    let mut updated = in_cfg.clone();
+                    updated.restore_credentials_from(existing_manual);
+                    let groups = collect_group_attachments_for_node(cfg, updated.name());
+                    if !groups.is_empty() {
+                        synced_attachments.insert(updated.name().to_string(), groups);
+                    }
+                    synced_proxies.push(updated);
+                }
+            }
+            overlay.proxies = synced_proxies;
+            overlay.group_attachments = synced_attachments;
+            self.save_manual_overlay(&active_id, &overlay)?;
+        }
+        let manual_proxy_count = overlay.proxies.len();
+
         let mut idx = self.index.lock();
-        let active_id = idx.active_profile_id.clone();
         let mut final_selections = HashMap::new();
         if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
             let mut merged = p.selected_groups.clone();
@@ -1302,8 +1376,12 @@ impl ProfileManager {
             let normalized = default_selected_groups_for_config(cfg, &merged);
             p.selected_groups = normalized.clone();
             p.proxy_count = proxy_count;
+            p.group_count = cfg.proxy_groups.len();
+            p.manual_proxy_count = manual_proxy_count;
             p.rule_count = rule_count;
-            p.last_updated_ms = now_unix_ms();
+            if p.kind != ProfileKind::Subscription {
+                p.last_updated_ms = now_unix_ms();
+            }
             p.last_error = None;
             p.rule_preset = Some(detected_preset);
             if detected_preset == RulePreset::Custom {
@@ -1388,17 +1466,40 @@ impl ProfileManager {
         let yaml = cfg.to_yaml_string()?;
         write_atomic_with_backup(&path, &yaml)?;
 
+        let active_id = self.active_profile_id();
+        let mut overlay = self.load_manual_overlay(&active_id);
+        for added_name in &added_names {
+            if let Some(node_cfg) = cfg.proxies.iter().find(|n| n.name() == added_name) {
+                if let Some(existing) = overlay.proxies.iter_mut().find(|n| n.name() == added_name)
+                {
+                    *existing = node_cfg.clone();
+                } else {
+                    overlay.proxies.push(node_cfg.clone());
+                }
+                let groups = collect_group_attachments_for_node(&cfg, added_name);
+                if !groups.is_empty() {
+                    overlay.group_attachments.insert(added_name.clone(), groups);
+                }
+            }
+        }
+        self.save_manual_overlay(&active_id, &overlay)?;
+        let manual_proxy_count = overlay.proxies.len();
+
         {
             let mut idx = self.index.lock();
-            let active_id = idx.active_profile_id.clone();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                 if p.kind == ProfileKind::Starter && proxy_count > 0 {
                     p.kind = ProfileKind::ShareUris;
                 }
                 p.proxy_count = proxy_count;
+                p.group_count = cfg.proxy_groups.len();
+                p.manual_proxy_count = manual_proxy_count;
                 p.rule_count = rule_count;
                 p.last_skipped_count = skipped_unsupported.len();
-                p.last_updated_ms = now_unix_ms();
+                // Preserve subscription refresh clock when manually importing nodes onto a Subscription profile!
+                if p.kind != ProfileKind::Subscription {
+                    p.last_updated_ms = now_unix_ms();
+                }
                 p.last_error = None;
                 p.selected_groups = selected_groups.clone();
             }
@@ -1432,6 +1533,26 @@ impl ProfileManager {
         deduplicate: bool,
         auto_select: bool,
     ) -> Result<NodeMutationReport> {
+        self.import_unified_input_with_options(
+            raw_input,
+            profile_name_hint,
+            deduplicate,
+            auto_select,
+            None,
+        )
+        .await
+    }
+
+    /// Unified import entrypoint with optional explicit subscription `auto_update_interval_secs`
+    /// (`Some(0)` disables periodic auto-update, `Some(secs)` clamps to `>= 60s`, `None` uses default `3600s`).
+    pub async fn import_unified_input_with_options(
+        &self,
+        raw_input: &str,
+        profile_name_hint: Option<&str>,
+        deduplicate: bool,
+        auto_select: bool,
+        auto_update_interval_secs: Option<u64>,
+    ) -> Result<NodeMutationReport> {
         let (kind, normalized) = classify_import_input(raw_input)
             .map_err(|e| ProxyError::config_clean(redact_sensitive_text(&e.to_string())))?;
 
@@ -1444,6 +1565,8 @@ impl ProfileManager {
                     ClashConfig::from_yaml_str_sanitized(&normalized).map_err(|e| {
                         ProxyError::config_clean(redact_sensitive_text(&e.to_string()))
                     })?;
+                // Sanitize external template `tun.enable` so non-Admin cold restarts never fail on Wintun.
+                cfg.tun.enable = false;
                 let mut skipped_duplicates = 0usize;
                 if deduplicate {
                     let (removed, _) = deduplicate_config_in_place(&mut cfg, &mut HashMap::new());
@@ -1490,11 +1613,12 @@ impl ProfileManager {
                     });
                 }
 
+                let active_id = self.active_profile_id();
                 let was_empty_starter = {
                     let idx = self.index.lock();
                     idx.profiles
                         .iter()
-                        .find(|p| p.id == idx.active_profile_id)
+                        .find(|p| p.id == active_id)
                         .is_some_and(|p| p.proxy_count == 0)
                 };
                 let prev_sel = if auto_select || was_empty_starter {
@@ -1505,17 +1629,19 @@ impl ProfileManager {
                 let selected_groups = default_selected_groups_for_config(&cfg, &prev_sel);
                 let detected_preset = classify_rule_preset(&cfg);
                 let yaml_out = cfg.to_yaml_string()?;
-                let path = self.active_profile_path();
+                let path = self.profile_yaml_path(&active_id);
                 write_atomic_with_backup(&path, &yaml_out)?;
+                self.save_manual_overlay(&active_id, &ManualNodesOverlay::default())?;
 
                 {
                     let mut idx = self.index.lock();
-                    let active_id = idx.active_profile_id.clone();
                     if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                         if p.kind == ProfileKind::Starter {
                             p.kind = ProfileKind::LocalYaml;
                         }
                         p.proxy_count = proxy_count;
+                        p.group_count = cfg.proxy_groups.len();
+                        p.manual_proxy_count = 0;
                         p.rule_count = rule_count;
                         p.last_skipped_count = skipped_unsupported.len();
                         p.last_updated_ms = now_unix_ms();
@@ -1556,13 +1682,19 @@ impl ProfileManager {
                             .unwrap_or_else(|| "HTTPS Subscription".to_string())
                     });
 
+                let effective_interval = match auto_update_interval_secs {
+                    None => Some(3600),
+                    Some(0) => None,
+                    Some(secs) => Some(secs.max(60)),
+                };
+
                 let (meta, activated_cfg, skipped_unsupported) = self
                     .create_profile_detailed(CreateProfileSpec {
                         name: sub_name,
                         yaml: None,
                         uris: None,
                         subscription_url: Some(normalized.clone()),
-                        auto_update_interval_secs: Some(3600),
+                        auto_update_interval_secs: effective_interval,
                         activate: true,
                     })
                     .await
@@ -1616,15 +1748,19 @@ impl ProfileManager {
         let mut selected_groups = self.active_selected_groups();
         let mut added_nodes = Vec::new();
         let mut updated_node = None;
+        let cleaned_orig = original_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
 
-        if let Some(orig_raw) = original_name.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(ref orig_raw) = cleaned_orig {
             let pos = cfg
                 .proxies
                 .iter()
                 .position(|p| p.name() == orig_raw)
                 .ok_or_else(|| ProxyError::Config(format!("node '{orig_raw}' not found")))?;
 
-            if new_name != orig_raw {
+            if new_name != *orig_raw {
                 let collision = cfg
                     .proxies
                     .iter()
@@ -1641,7 +1777,7 @@ impl ProfileManager {
             node.restore_credentials_from(&cfg.proxies[pos]);
             cfg.proxies[pos] = node;
 
-            if new_name != orig_raw {
+            if new_name != *orig_raw {
                 cascade_rename_reference(&mut cfg, &mut selected_groups, orig_raw, &new_name);
             }
 
@@ -1652,7 +1788,7 @@ impl ProfileManager {
                 Some(&new_name),
                 auto_select,
             );
-            updated_node = Some(new_name);
+            updated_node = Some(new_name.clone());
         } else {
             let taken = collect_taken_names(&cfg);
             if taken.contains(&new_name) {
@@ -1668,7 +1804,7 @@ impl ProfileManager {
                 Some(&new_name),
                 auto_select,
             );
-            added_nodes.push(new_name);
+            added_nodes.push(new_name.clone());
         }
 
         let (proxy_count, rule_count) = validate_profile_config(&cfg, &self.extra_ca_der)
@@ -1676,16 +1812,54 @@ impl ProfileManager {
         let yaml = cfg.to_yaml_string()?;
         write_atomic_with_backup(&path, &yaml)?;
 
+        let (active_id, is_sub) = {
+            let idx = self.index.lock();
+            let id = idx.active_profile_id.clone();
+            let is_sub = idx
+                .profiles
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.kind == ProfileKind::Subscription);
+            (id, is_sub)
+        };
+        let mut overlay = self.load_manual_overlay(&active_id);
+        let should_track_in_overlay = match &cleaned_orig {
+            Some(orig_raw) => overlay.proxies.iter().any(|p| p.name() == orig_raw) || is_sub,
+            None => true,
+        };
+        if should_track_in_overlay
+            && let Some(saved_node) = cfg.proxies.iter().find(|p| p.name() == new_name)
+        {
+            if let Some(ref orig_raw) = cleaned_orig {
+                overlay.proxies.retain(|p| p.name() != orig_raw);
+                overlay.group_attachments.remove(orig_raw);
+            }
+            if let Some(existing) = overlay.proxies.iter_mut().find(|p| p.name() == new_name) {
+                *existing = saved_node.clone();
+            } else {
+                overlay.proxies.push(saved_node.clone());
+            }
+            let groups = collect_group_attachments_for_node(&cfg, &new_name);
+            if !groups.is_empty() {
+                overlay.group_attachments.insert(new_name.clone(), groups);
+            }
+            self.save_manual_overlay(&active_id, &overlay)?;
+        }
+        let manual_proxy_count = overlay.proxies.len();
+
         {
             let mut idx = self.index.lock();
-            let active_id = idx.active_profile_id.clone();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                 if p.kind == ProfileKind::Starter && proxy_count > 0 {
                     p.kind = ProfileKind::LocalYaml;
                 }
                 p.proxy_count = proxy_count;
+                p.group_count = cfg.proxy_groups.len();
+                p.manual_proxy_count = manual_proxy_count;
                 p.rule_count = rule_count;
-                p.last_updated_ms = now_unix_ms();
+                if p.kind != ProfileKind::Subscription {
+                    p.last_updated_ms = now_unix_ms();
+                }
                 p.last_error = None;
                 p.selected_groups = selected_groups.clone();
             }
@@ -1743,13 +1917,26 @@ impl ProfileManager {
         let yaml = cfg.to_yaml_string()?;
         write_atomic_with_backup(&path, &yaml)?;
 
+        let active_id = self.active_profile_id();
+        let mut overlay = self.load_manual_overlay(&active_id);
+        let before_len = overlay.proxies.len();
+        overlay.proxies.retain(|p| p.name() != clean_target);
+        overlay.group_attachments.remove(clean_target);
+        if overlay.proxies.len() != before_len {
+            self.save_manual_overlay(&active_id, &overlay)?;
+        }
+        let manual_proxy_count = overlay.proxies.len();
+
         {
             let mut idx = self.index.lock();
-            let active_id = idx.active_profile_id.clone();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                 p.proxy_count = proxy_count;
+                p.group_count = cfg.proxy_groups.len();
+                p.manual_proxy_count = manual_proxy_count;
                 p.rule_count = rule_count;
-                p.last_updated_ms = now_unix_ms();
+                if p.kind != ProfileKind::Subscription {
+                    p.last_updated_ms = now_unix_ms();
+                }
                 p.last_error = None;
                 p.selected_groups = selected_groups.clone();
             }
@@ -1780,13 +1967,28 @@ impl ProfileManager {
         let yaml = cfg.to_yaml_string()?;
         write_atomic_with_backup(&path, &yaml)?;
 
+        let active_id = self.active_profile_id();
+        let mut overlay = self.load_manual_overlay(&active_id);
+        if !removed_nodes.is_empty() && !overlay.proxies.is_empty() {
+            let removed_set: HashSet<&str> = removed_nodes.iter().map(String::as_str).collect();
+            overlay.proxies.retain(|p| !removed_set.contains(p.name()));
+            overlay
+                .group_attachments
+                .retain(|k, _| !removed_set.contains(k.as_str()));
+            self.save_manual_overlay(&active_id, &overlay)?;
+        }
+        let manual_proxy_count = overlay.proxies.len();
+
         {
             let mut idx = self.index.lock();
-            let active_id = idx.active_profile_id.clone();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
                 p.proxy_count = proxy_count;
+                p.group_count = cfg.proxy_groups.len();
+                p.manual_proxy_count = manual_proxy_count;
                 p.rule_count = rule_count;
-                p.last_updated_ms = now_unix_ms();
+                if p.kind != ProfileKind::Subscription {
+                    p.last_updated_ms = now_unix_ms();
+                }
                 p.last_error = None;
                 p.selected_groups = selected_groups.clone();
             }
@@ -1825,11 +2027,14 @@ impl ProfileManager {
         let yaml = self.load_profile_yaml(id)?;
         let cfg = ClashConfig::from_yaml_str(&yaml)?;
         validate_profile_config(&cfg, &self.extra_ca_der)?;
+        let manual_proxy_count = self.load_manual_overlay(id).proxies.len();
 
         {
             let mut idx = self.index.lock();
             idx.active_profile_id = id.to_string();
             if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == id) {
+                p.group_count = cfg.proxy_groups.len();
+                p.manual_proxy_count = manual_proxy_count;
                 p.selected_groups = default_selected_groups_for_config(&cfg, &p.selected_groups);
             }
             if !cfg.proxies.is_empty() {
@@ -1838,6 +2043,48 @@ impl ProfileManager {
             save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)?;
         }
         Ok(cfg)
+    }
+
+    pub fn update_profile_settings(
+        &self,
+        id: &str,
+        patch: ProfileSettingsPatch,
+    ) -> Result<ProfileMetadata> {
+        let cleaned_name = match patch.name {
+            Some(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(ProxyError::Config("profile name cannot be empty".into()));
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
+
+        let updated = {
+            let mut idx = self.index.lock();
+            let p = idx
+                .profiles
+                .iter_mut()
+                .find(|p| p.id == id)
+                .ok_or_else(|| ProxyError::Config(format!("profile '{id}' not found")))?;
+            if let Some(new_name) = cleaned_name {
+                p.name = new_name;
+            }
+            if let Some(interval_opt) = patch.auto_update_interval_secs {
+                p.auto_update_interval_secs = match interval_opt {
+                    None | Some(0) => None,
+                    Some(secs) => Some(secs.max(60)),
+                };
+            }
+            let cloned = p.clone();
+            save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)?;
+            cloned
+        };
+        if patch.auto_update_interval_secs.is_some() {
+            self.last_attempt_ms.lock().remove(id);
+        }
+        Ok(updated)
     }
 
     pub async fn create_profile(
@@ -1906,14 +2153,18 @@ impl ProfileManager {
             } else if let Some(raw_yaml) = spec.yaml.as_deref().map(str::trim)
                 && !raw_yaml.is_empty()
             {
-                let (parsed_cfg, skipped) = ClashConfig::from_yaml_str_sanitized(raw_yaml)
+                let (mut parsed_cfg, skipped) = ClashConfig::from_yaml_str_sanitized(raw_yaml)
                     .map_err(|e| ProxyError::config_clean(redact_sensitive_text(&e.to_string())))?;
-                let persisted_yaml =
-                    if skipped.is_empty() && ClashConfig::from_yaml_str(raw_yaml).is_ok() {
-                        raw_yaml.to_string()
-                    } else {
-                        parsed_cfg.to_yaml_string()?
-                    };
+                let had_tun_enabled = parsed_cfg.tun.enable;
+                parsed_cfg.tun.enable = false;
+                let persisted_yaml = if !had_tun_enabled
+                    && skipped.is_empty()
+                    && ClashConfig::from_yaml_str(raw_yaml).is_ok()
+                {
+                    raw_yaml.to_string()
+                } else {
+                    parsed_cfg.to_yaml_string()?
+                };
                 (
                     ProfileKind::LocalYaml,
                     parsed_cfg,
@@ -1944,11 +2195,16 @@ impl ProfileManager {
             name: clean_name.to_string(),
             kind,
             subscription_url_redacted: redacted_url,
-            auto_update_interval_secs: spec.auto_update_interval_secs.filter(|&s| s >= 60),
+            auto_update_interval_secs: match spec.auto_update_interval_secs {
+                None | Some(0) => None,
+                Some(secs) => Some(secs.max(60)),
+            },
             last_updated_ms: now_unix_ms(),
             last_error: None,
             userinfo,
             proxy_count,
+            manual_proxy_count: 0,
+            group_count: cfg.proxy_groups.len(),
             rule_count,
             last_skipped_count: skipped_unsupported.len(),
             selected_groups,
@@ -1974,6 +2230,7 @@ impl ProfileManager {
 
     /// Refresh an HTTPS subscription profile.
     /// If download or validation fails, the existing `<id>.yaml` is NEVER overwritten and `last_error` is recorded.
+    /// Any user-added manual nodes stored in `<id>.manual.yaml` are merged back before validation and persistence.
     pub async fn refresh_subscription(
         &self,
         id: &str,
@@ -2023,18 +2280,76 @@ impl ProfileManager {
         .await;
 
         match outcome {
-            Ok((cfg, yaml, uinfo, skipped)) => {
+            Ok((mut cfg, mut yaml, uinfo, skipped)) => {
+                let overlay = self.load_manual_overlay(id);
+                if !overlay.proxies.is_empty() {
+                    let mut manual_names = Vec::with_capacity(overlay.proxies.len());
+                    for manual_node in &overlay.proxies {
+                        if let Some(pos) = cfg
+                            .proxies
+                            .iter()
+                            .position(|p| p.name() == manual_node.name())
+                        {
+                            cfg.proxies[pos] = manual_node.clone();
+                        } else {
+                            cfg.proxies.push(manual_node.clone());
+                        }
+                        manual_names.push(manual_node.name().to_string());
+                    }
+                    attach_nodes_and_update_selections(
+                        &mut cfg,
+                        &manual_names,
+                        &mut HashMap::new(),
+                        None,
+                        false,
+                    );
+                    for (m_name, extra_groups) in &overlay.group_attachments {
+                        for grp_name in extra_groups {
+                            if let Some(grp) =
+                                cfg.proxy_groups.iter_mut().find(|g| &g.name == grp_name)
+                                && !grp.proxies.iter().any(|m| m == m_name)
+                            {
+                                insert_before_builtins(&mut grp.proxies, m_name);
+                            }
+                        }
+                    }
+                    yaml = serde_saphyr::to_string(&cfg).map_err(|e| {
+                        ProxyError::Config(format!(
+                            "failed to serialize merged subscription YAML: {e}"
+                        ))
+                    })?;
+                }
+                let manual_proxy_count = overlay.proxies.len();
+
                 let (proxy_count, rule_count) = validate_profile_config(&cfg, &self.extra_ca_der)?;
                 write_atomic_with_backup(&self.profile_yaml_path(id), &yaml)?;
+                self.last_attempt_ms.lock().remove(id);
+
+                let live_router_sel = self
+                    .router_slot
+                    .read()
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|slot| slot.read().manual_selections_snapshot())
+                    .unwrap_or_default();
+
                 let detected_preset = classify_rule_preset(&cfg);
                 let mut idx = self.index.lock();
                 let is_active = idx.active_profile_id == id;
                 let mut updated_meta = None;
                 for p in &mut idx.profiles {
                     if p.id == id {
+                        let mut prev_selected = p.selected_groups.clone();
+                        if is_active {
+                            for (k, v) in &live_router_sel {
+                                prev_selected.insert(k.clone(), v.clone());
+                            }
+                        }
                         p.last_updated_ms = now_unix_ms();
                         p.last_error = None;
                         p.proxy_count = proxy_count;
+                        p.group_count = cfg.proxy_groups.len();
+                        p.manual_proxy_count = manual_proxy_count;
                         p.rule_count = rule_count;
                         p.last_skipped_count = skipped.len();
                         p.rule_preset = Some(detected_preset);
@@ -2042,7 +2357,7 @@ impl ProfileManager {
                             p.custom_rules_backup = cfg.rules.clone();
                         }
                         p.selected_groups =
-                            default_selected_groups_for_config(&cfg, &p.selected_groups);
+                            default_selected_groups_for_config(&cfg, &prev_selected);
                         if uinfo.is_some() {
                             p.userinfo = uinfo.clone();
                         }
@@ -2054,6 +2369,9 @@ impl ProfileManager {
                 Ok((updated_meta.unwrap_or(exists), cfg, is_active))
             }
             Err(err) => {
+                self.last_attempt_ms
+                    .lock()
+                    .insert(id.to_string(), now_unix_ms());
                 let cleaned_err = ProxyError::config_clean(
                     redact_sensitive_text(&err.to_string()).replace(&raw_url, "***REDACTED_URL***"),
                 );
@@ -2071,15 +2389,27 @@ impl ProfileManager {
         }
     }
 
-    /// Return IDs of subscription profiles whose `auto_update_interval_secs` has elapsed.
+    /// Return IDs of subscription profiles whose `auto_update_interval_secs` has elapsed,
+    /// skipping disabled (`None` / `0`) profiles and applying a 10-minute backoff after failures.
     pub fn due_auto_update_ids(&self) -> Vec<String> {
+        const FAILURE_BACKOFF_MS: u64 = 10 * 60 * 1000;
         let now_ms = now_unix_ms();
+        let attempts = self.last_attempt_ms.lock().clone();
         let idx = self.index.lock();
         idx.profiles
             .iter()
             .filter(|p| p.kind == ProfileKind::Subscription)
             .filter_map(|p| {
-                let interval_ms = p.auto_update_interval_secs?.saturating_mul(1000);
+                let secs = p.auto_update_interval_secs?;
+                if secs == 0 {
+                    return None;
+                }
+                if let Some(&last_try) = attempts.get(&p.id)
+                    && now_ms.saturating_sub(last_try) < FAILURE_BACKOFF_MS
+                {
+                    return None;
+                }
+                let interval_ms = secs.saturating_mul(1000);
                 if interval_ms > 0 && now_ms.saturating_sub(p.last_updated_ms) >= interval_ms {
                     Some(p.id.clone())
                 } else {
@@ -2105,23 +2435,77 @@ impl ProfileManager {
             }
             save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)?;
         }
+        self.last_attempt_ms.lock().remove(id);
         let _ = self.vault.delete_secret(&Self::sub_vault_key(id));
         let _ = fs::remove_file(self.profile_yaml_path(id));
         let _ = fs::remove_file(self.profile_yaml_path(id).with_extension("yaml.bak"));
+        let overlay_path = self.manual_overlay_path(id);
+        let _ = fs::remove_file(&overlay_path);
+        let _ = fs::remove_file(overlay_path.with_extension("yaml.bak"));
         Ok(())
     }
 
     fn profile_yaml_path(&self, id: &str) -> PathBuf {
-        let sanitized: String = id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
+        let sanitized = sanitize_profile_id(id);
         self.profiles_dir.join(format!("{sanitized}.yaml"))
+    }
+
+    fn manual_overlay_path(&self, id: &str) -> PathBuf {
+        let sanitized = sanitize_profile_id(id);
+        self.profiles_dir.join(format!("{sanitized}.manual.yaml"))
+    }
+
+    fn load_manual_overlay(&self, id: &str) -> ManualNodesOverlay {
+        read_manual_overlay_from_path(&self.manual_overlay_path(id))
+    }
+
+    fn save_manual_overlay(&self, id: &str, overlay: &ManualNodesOverlay) -> Result<()> {
+        let path = self.manual_overlay_path(id);
+        if overlay.proxies.is_empty() {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path.with_extension("yaml.bak"));
+            return Ok(());
+        }
+        let mut cleaned = overlay.clone();
+        let valid_names: HashSet<&str> = cleaned.proxies.iter().map(|p| p.name()).collect();
+        cleaned
+            .group_attachments
+            .retain(|k, v| valid_names.contains(k.as_str()) && !v.is_empty());
+        let yaml = serde_saphyr::to_string(&cleaned).map_err(|e| {
+            ProxyError::Config(format!("failed to serialize manual nodes overlay: {e}"))
+        })?;
+        write_atomic_with_backup(&path, &yaml)
     }
 
     fn sub_vault_key(id: &str) -> String {
         format!("subscription_url:{id}")
     }
+}
+
+fn sanitize_profile_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
+fn read_manual_overlay_from_path(path: &Path) -> ManualNodesOverlay {
+    for candidate in [path.to_path_buf(), path.with_extension("yaml.bak")] {
+        if let Ok(raw) = fs::read_to_string(&candidate)
+            && !raw.trim().is_empty()
+            && let Ok(parsed) = serde_saphyr::from_str::<ManualNodesOverlay>(&raw)
+        {
+            return parsed;
+        }
+    }
+    ManualNodesOverlay::default()
+}
+
+fn collect_group_attachments_for_node(cfg: &ClashConfig, node_name: &str) -> Vec<String> {
+    cfg.proxy_groups
+        .iter()
+        .filter(|g| g.proxies.iter().any(|m| m == node_name))
+        .map(|g| g.name.clone())
+        .collect()
 }
 
 fn collect_taken_names(cfg: &ClashConfig) -> HashSet<String> {

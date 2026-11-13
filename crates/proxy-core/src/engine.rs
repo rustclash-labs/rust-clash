@@ -2221,32 +2221,34 @@ impl ProxyEngine {
                         let Some(eng) = weak_eng.upgrade() else {
                             break;
                         };
-                        let due_ids = mgr.due_auto_update_ids();
-                        for id in due_ids {
-                            match mgr.refresh_subscription(&id).await {
-                                Ok((meta, cfg, is_active)) => {
-                                    eng.hub.push_log(
-                                        "info",
-                                        format!("Auto-updated subscription profile '{}' ({} nodes)", meta.name, meta.proxy_count),
-                                    );
-                                    if is_active && eng.demo_cluster.read().is_none() {
-                                        let _ = eng.activate_profile_config_with_selections(cfg, Some(&meta.selected_groups)).await;
+                        if !eng.is_low_power_mode() {
+                            let due_ids = mgr.due_auto_update_ids();
+                            for id in due_ids {
+                                match mgr.refresh_subscription(&id).await {
+                                    Ok((meta, cfg, is_active)) => {
+                                        eng.hub.push_log(
+                                            "info",
+                                            format!("Auto-updated subscription profile '{}' ({} nodes)", meta.name, meta.proxy_count),
+                                        );
+                                        if is_active && eng.demo_cluster.read().is_none() {
+                                            let _ = eng.activate_profile_config_with_selections(cfg, Some(&meta.selected_groups)).await;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eng.hub.push_log(
+                                            "warn",
+                                            format!("Subscription auto-update failed for '{id}': {err}"),
+                                        );
                                     }
                                 }
-                                Err(err) => {
-                                    eng.hub.push_log(
-                                        "warn",
-                                        format!("Subscription auto-update failed for '{id}': {err}"),
-                                    );
-                                }
                             }
-                        }
-                        // Check cached GeoData staleness every 6 hours when previously downloaded
-                        if ticks.is_multiple_of(720)
-                            && let Some(gm) = eng.geodata_manager()
-                            && gm.status().last_updated_ms > 0
-                        {
-                            let _ = gm.refresh_if_expired().await;
+                            // Check cached GeoData staleness every 6 hours when previously downloaded
+                            if ticks.is_multiple_of(720)
+                                && let Some(gm) = eng.geodata_manager()
+                                && gm.status().last_updated_ms > 0
+                            {
+                                let _ = gm.refresh_if_expired().await;
+                            }
                         }
                     }
                 }
@@ -2960,9 +2962,33 @@ impl ProxyEngine {
         deduplicate: bool,
         auto_select: bool,
     ) -> Result<crate::profile::NodeMutationReport> {
+        self.import_unified_live_with_options(
+            raw_input,
+            profile_name_hint,
+            deduplicate,
+            auto_select,
+            None,
+        )
+        .await
+    }
+
+    pub async fn import_unified_live_with_options(
+        self: &Arc<Self>,
+        raw_input: &str,
+        profile_name_hint: Option<&str>,
+        deduplicate: bool,
+        auto_select: bool,
+        auto_update_interval_secs: Option<u64>,
+    ) -> Result<crate::profile::NodeMutationReport> {
         let mgr = self.ensure_profile_manager()?;
         let report = mgr
-            .import_unified_input(raw_input, profile_name_hint, deduplicate, auto_select)
+            .import_unified_input_with_options(
+                raw_input,
+                profile_name_hint,
+                deduplicate,
+                auto_select,
+                auto_update_interval_secs,
+            )
             .await?;
         self.activate_profile_config_with_selections(
             report.config.clone(),

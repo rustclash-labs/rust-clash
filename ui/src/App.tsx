@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   androidBridge,
   ApiHttpError,
@@ -7,7 +7,26 @@ import {
   ensureRuntimeApiReady,
   loadControllerSettings,
   saveControllerSettings,
+  toggleDemoMode,
 } from "./api";
+import {
+  CheckIcon,
+  CloseIcon,
+  DashboardGridIcon,
+  GlobeIcon,
+  MoonIcon,
+  NetworkNodesIcon,
+  ProfileDocIcon,
+  RefreshIcon,
+  SidebarToggleIcon,
+  SunIcon,
+  ToolboxIcon,
+} from "./components/Icons";
+import {
+  loadInitialTheme,
+  saveThemePreference,
+  useI18n,
+} from "./i18n";
 import type {
   AndroidPlatformInfo,
   ConfigSnapshot,
@@ -16,29 +35,40 @@ import type {
   ProfilesSnapshot,
   ProxyInfo,
   RuleItem,
-  RunMode,
   TrafficPoint,
   VersionInfo,
 } from "./types";
-import { formatSpeed } from "./utils/format";
 import { ConnectionsView } from "./views/ConnectionsView";
-import { LogsView } from "./views/LogsView";
-import { OverviewView } from "./views/OverviewView";
+import { DashboardView } from "./views/DashboardView";
+import { ProfilesView } from "./views/ProfilesView";
 import { ProxiesView } from "./views/ProxiesView";
-import { RulesDnsView } from "./views/RulesDnsView";
-import { StudioView } from "./views/StudioView";
+import { ToolsView } from "./views/ToolsView";
 
-type NavTab =
-  | "overview"
-  | "proxies"
-  | "connections"
-  | "rules"
-  | "studio"
-  | "logs";
+type NavTab = "dashboard" | "proxies" | "profiles" | "connections" | "tools";
+
+const SIDEBAR_COLLAPSED_KEY = "rust_clash_sidebar_collapsed_v1";
+
+function loadInitialSidebarCollapsed(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export const App: React.FC = () => {
-  const [tab, setTab] = useState<NavTab>("overview");
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const { lang, toggleLang, tr } = useI18n();
+
+  const [tab, setTab] = useState<NavTab>("dashboard");
+  const [theme, setTheme] = useState<"light" | "dark">(() => loadInitialTheme());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() =>
+    loadInitialSidebarCollapsed(),
+  );
+  const [focusGroup, setFocusGroup] = useState<string | null>(null);
+  const [healthOpen, setHealthOpen] = useState(false);
+  const healthWrapRef = useRef<HTMLDivElement | null>(null);
+
   const [online, setOnline] = useState(true);
   const [authRequired, setAuthRequired] = useState(false);
   const [apiReady, setApiReady] = useState(false);
@@ -49,7 +79,6 @@ export const App: React.FC = () => {
     () => loadControllerSettings().secret,
   );
   const [wsEpoch, setWsEpoch] = useState(0);
-  const [openAddModalSignal, setOpenAddModalSignal] = useState(0);
 
   const [version, setVersion] = useState<VersionInfo | null>(null);
   const [config, setConfig] = useState<ConfigSnapshot | null>(null);
@@ -65,6 +94,46 @@ export const App: React.FC = () => {
   const [androidInfo, setAndroidInfo] = useState<AndroidPlatformInfo | null>(
     () => androidBridge.getPlatformInfo(),
   );
+
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [demoExitBusy, setDemoExitBusy] = useState(false);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+
+  const handleChangeTheme = useCallback((next: "light" | "dark") => {
+    setTheme(next);
+    saveThemePreference(next);
+  }, []);
+
+  const handleToggleSidebar = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? "1" : "0");
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!healthOpen) return;
+    const onDocPointerDown = (ev: MouseEvent) => {
+      if (
+        healthWrapRef.current &&
+        !healthWrapRef.current.contains(ev.target as Node)
+      ) {
+        setHealthOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocPointerDown);
+    return () => document.removeEventListener("mousedown", onDocPointerDown);
+  }, [healthOpen]);
 
   const refreshCore = useCallback(async () => {
     try {
@@ -87,7 +156,7 @@ export const App: React.FC = () => {
         const prof = await clashApi.getProfiles();
         setProfilesSnapshot(prof);
       } catch {
-        // older or embedded read-only core without profile manager
+        // optional profile endpoint on read-only/minimal cores
       }
     } catch (err) {
       if (err instanceof ApiHttpError && err.status === 401) {
@@ -98,10 +167,6 @@ export const App: React.FC = () => {
       }
     }
   }, []);
-
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-  }, [theme]);
 
   useEffect(() => {
     let cancelled = false;
@@ -154,7 +219,7 @@ export const App: React.FC = () => {
     return () => window.clearInterval(timer);
   }, [pageVisible]);
 
-  // Live WebSocket stream for `/traffic` with visibility-aware exponential backoff & HTTP fallback
+  // Live WebSocket stream for `/traffic` with HTTP fallback
   useEffect(() => {
     if (!apiReady || !pageVisible || authRequired) return;
 
@@ -223,7 +288,7 @@ export const App: React.FC = () => {
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch]);
 
-  // Live WebSocket stream for `/connections` with automatic HTTP fallback
+  // Live WebSocket stream for `/connections` with HTTP fallback
   useEffect(() => {
     if (!apiReady || !pageVisible || authRequired) return;
 
@@ -305,7 +370,7 @@ export const App: React.FC = () => {
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch]);
 
-  // Live WebSocket stream for `/logs` with exponential backoff reconnect
+  // Live WebSocket stream for `/logs`
   useEffect(() => {
     if (!apiReady || !pageVisible || authRequired) return;
 
@@ -334,7 +399,7 @@ export const App: React.FC = () => {
               return [...prev.slice(-299), item];
             });
           } catch {
-            // ignore
+            // ignore malformed frame
           }
         };
         ws.onclose = () => {
@@ -345,7 +410,7 @@ export const App: React.FC = () => {
           }, backoffMs);
         };
       } catch {
-        // initial HTTP snapshot already loaded
+        // initial snapshot already loaded
       }
     };
 
@@ -357,11 +422,6 @@ export const App: React.FC = () => {
       if (ws) ws.close();
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch]);
-
-  const [modeBusy, setModeBusy] = useState(false);
-  const [authBusy, setAuthBusy] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
-  const [appError, setAppError] = useState<string | null>(null);
 
   const handleSaveSecret = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -377,7 +437,9 @@ export const App: React.FC = () => {
     } catch (err) {
       if (err instanceof ApiHttpError && err.status === 401) {
         setAuthRequired(true);
-        setAuthError("Invalid Bearer Secret — authentication rejected (401).");
+        setAuthError(
+          tr("密钥不正确（401 未授权）", "Invalid Bearer Secret (401)."),
+        );
       } else {
         setAuthError(err instanceof Error ? err.message : String(err));
       }
@@ -386,17 +448,16 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleModeChange = async (mode: RunMode) => {
-    if (modeBusy || config?.mode === mode) return;
-    setModeBusy(true);
-    setAppError(null);
+  const handleExitDemo = async () => {
+    if (demoExitBusy) return;
+    setDemoExitBusy(true);
     try {
-      await clashApi.patchConfigs({ mode });
+      await toggleDemoMode(false);
       await refreshCore();
     } catch (err) {
-      setAppError(err instanceof Error ? err.message : String(err));
+      setToastMsg(err instanceof Error ? err.message : String(err));
     } finally {
-      setModeBusy(false);
+      setDemoExitBusy(false);
     }
   };
 
@@ -410,186 +471,104 @@ export const App: React.FC = () => {
     total_down: 0,
   };
 
-  const GROUP_PROXY_TYPES = new Set([
-    "Selector",
-    "URLTest",
-    "Fallback",
-    "LoadBalance",
-  ]);
-  const concreteNodeCount = Object.values(proxies).filter(
-    (p) =>
-      !GROUP_PROXY_TYPES.has(p.type) &&
-      p.name !== "DIRECT" &&
-      p.name !== "REJECT",
-  ).length;
-  const activeCount = connections?.connections.length ?? 0;
-  const tabMeta: Record<NavTab, { title: string; subtitle: string }> = {
-    overview: {
-      title: "System Telemetry & OS Integration",
-      subtitle:
-        "Real-time kernel throughput, OS TUN & System Proxy controls, and diagnostics",
+  const navItems: Array<{
+    id: NavTab;
+    label: string;
+    shortLabel: string;
+    renderIcon: (active: boolean) => React.ReactNode;
+  }> = [
+    {
+      id: "dashboard",
+      label: tr("仪表盘", "Dashboard"),
+      shortLabel: tr("仪表盘", "Home"),
+      renderIcon: (active) => <DashboardGridIcon size={18} active={active} />,
     },
-    proxies: {
-      title: "Outbounds & Policy Groups",
-      subtitle:
-        "Selector, URLTest, Fallback, and LoadBalance groups across SS, VLESS, Trojan, AnyTLS, SOCKS5 & HTTP",
+    {
+      id: "proxies",
+      label: tr("代理节点", "Proxies"),
+      shortLabel: tr("节点", "Proxies"),
+      renderIcon: () => <GlobeIcon size={18} />,
     },
-    connections: {
-      title: "Active Connections & Stream Diagnostics",
-      subtitle:
-        "Live TCP/UDP stream tracking, Fake-IP domain restoration, and recent route/exit diagnostics",
+    {
+      id: "profiles",
+      label: tr("订阅配置", "Profiles"),
+      shortLabel: tr("订阅", "Profiles"),
+      renderIcon: () => <ProfileDocIcon size={18} />,
     },
-    rules: {
-      title: "Routing Presets, Custom Rules, GeoData & Fake-IP DNS",
-      subtitle:
-        "One-tap Smart-CN / Custom rule presets, GeoSite/GeoIP updater, explainer, and DNS inspector",
+    {
+      id: "connections",
+      label: tr("实时连接", "Live connections"),
+      shortLabel: tr("连接", "Streams"),
+      renderIcon: () => <NetworkNodesIcon size={18} />,
     },
-    studio: {
-      title: "Profiles, Subscriptions & PQ Studio",
-      subtitle:
-        "Keystore-backed HTTPS subscriptions, URI importer, PQ keygen, and YAML reload",
+    {
+      id: "tools",
+      label: tr("工具与设置", "Tools"),
+      shortLabel: tr("工具", "Tools"),
+      renderIcon: () => <ToolboxIcon size={18} />,
     },
-    logs: {
-      title: "Engine Event Stream",
-      subtitle: "Structured kernel telemetry and connection audit logs",
-    },
-  };
-
-  const mobileTabs: Array<{ id: NavTab; label: string; badge?: number }> = [
-    { id: "overview", label: "Home" },
-    { id: "proxies", label: "Proxies", badge: concreteNodeCount },
-    { id: "connections", label: "Streams", badge: activeCount },
-    { id: "rules", label: "Rules" },
-    { id: "studio", label: "Profiles" },
-    { id: "logs", label: "Logs" },
   ];
 
+  const pageTitles: Record<NavTab, string> = {
+    dashboard: tr("仪表盘", "Dashboard"),
+    proxies: tr("代理节点", "Proxies"),
+    profiles: tr("订阅配置", "Profiles"),
+    connections: tr("实时连接", "Live connections"),
+    tools: tr("工具与设置", "Tools"),
+  };
+
+  const sysProxyOn = Boolean(config?.sysproxy?.enabled);
+  const tunOn = Boolean(config?.["tun-active"] ?? config?.tun?.enable);
+
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
+    >
       <aside className="sidebar">
-        <div className="brand-header">
-          <div className="brand-mark" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path
-                d="M5 19L12 5L19 19"
-                stroke="#10b981"
-                strokeWidth="2.4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <path
-                d="M8 15H16"
-                stroke="#38bdf8"
-                strokeWidth="2.2"
-                strokeLinecap="round"
-              />
-            </svg>
-          </div>
-          <div>
-            <div className="brand-title">RustClash</div>
-            <div className="brand-subtitle">
-              {config?.demo.enabled ? "Demo Sandbox" : "Real User Mode"}
-            </div>
-          </div>
+        <div className="sidebar-top">
+          <button
+            id="sidebar-collapse-btn"
+            type="button"
+            className="sidebar-collapse-btn"
+            onClick={handleToggleSidebar}
+            title={
+              sidebarCollapsed
+                ? tr("展开侧边栏", "Expand sidebar")
+                : tr("收起侧边栏", "Collapse sidebar")
+            }
+            aria-label={
+              sidebarCollapsed
+                ? tr("展开侧边栏", "Expand sidebar")
+                : tr("收起侧边栏", "Collapse sidebar")
+            }
+          >
+            <SidebarToggleIcon size={18} />
+          </button>
         </div>
 
-        <nav className="nav-list" aria-label="Main Navigation">
-          <button
-            id="nav-overview"
-            type="button"
-            className={`nav-btn ${tab === "overview" ? "active" : ""}`}
-            onClick={() => setTab("overview")}
-          >
-            <span className="nav-btn-left">Overview</span>
-          </button>
-
-          <button
-            id="nav-proxies"
-            type="button"
-            className={`nav-btn ${tab === "proxies" ? "active" : ""}`}
-            onClick={() => setTab("proxies")}
-            title={`${concreteNodeCount} proxy node(s), ${Object.keys(proxies).length} total outbounds/groups`}
-          >
-            <span className="nav-btn-left">Proxies &amp; Groups</span>
-            <span className="nav-count">{concreteNodeCount}</span>
-          </button>
-
-          <button
-            id="nav-connections"
-            type="button"
-            className={`nav-btn ${tab === "connections" ? "active" : ""}`}
-            onClick={() => setTab("connections")}
-          >
-            <span className="nav-btn-left">Connections</span>
-            <span className="nav-count">{activeCount}</span>
-          </button>
-
-          <button
-            id="nav-rules"
-            type="button"
-            className={`nav-btn ${tab === "rules" ? "active" : ""}`}
-            onClick={() => setTab("rules")}
-          >
-            <span className="nav-btn-left">Rules &amp; Fake-IP</span>
-            <span className="nav-count">{rules.length}</span>
-          </button>
-
-          <button
-            id="nav-studio"
-            type="button"
-            className={`nav-btn ${tab === "studio" ? "active" : ""}`}
-            onClick={() => setTab("studio")}
-          >
-            <span className="nav-btn-left">Profiles &amp; PQ Studio</span>
-            {profilesSnapshot && (
-              <span className="nav-count">
-                {profilesSnapshot.profiles.length}
-              </span>
-            )}
-          </button>
-
-          <button
-            id="nav-logs"
-            type="button"
-            className={`nav-btn ${tab === "logs" ? "active" : ""}`}
-            onClick={() => setTab("logs")}
-          >
-            <span className="nav-btn-left">Live Logs</span>
-            <span className="nav-count">{logs.length}</span>
-          </button>
+        <nav className="nav-list" aria-label={tr("主导航", "Main Navigation")}>
+          {navItems.map((item) => {
+            const active = tab === item.id;
+            return (
+              <button
+                key={item.id}
+                id={`nav-${item.id}`}
+                type="button"
+                className={`nav-btn ${active ? "active" : ""}`}
+                title={sidebarCollapsed ? item.label : undefined}
+                onClick={() => {
+                  if (item.id === "proxies") {
+                    setFocusGroup(null);
+                  }
+                  setTab(item.id);
+                }}
+              >
+                <span className="nav-icon">{item.renderIcon(active)}</span>
+                <span className="nav-label">{item.label}</span>
+              </button>
+            );
+          })}
         </nav>
-
-        <div className="sidebar-footer">
-          <div className="sidebar-speed-box tabular mono">
-            <div className="speed-row">
-              <span style={{ color: "var(--text-muted)" }}>DL</span>
-              <span className="speed-down">
-                {formatSpeed(latestTraffic.down)}
-              </span>
-            </div>
-            <div className="speed-row">
-              <span style={{ color: "var(--text-muted)" }}>UL</span>
-              <span className="speed-up">{formatSpeed(latestTraffic.up)}</span>
-            </div>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              fontSize: 11.5,
-              color: "var(--text-muted)",
-              padding: "2px 4px",
-            }}
-          >
-            <span>
-              <span className={`status-dot ${online ? "" : "offline"}`} />
-              {online ? "Engine Connected" : "Reconnecting..."}
-            </span>
-            <span className="mono">:{config?.["mixed-port"] ?? 7890}</span>
-          </div>
-        </div>
       </aside>
 
       <div className="workspace">
@@ -611,73 +590,304 @@ export const App: React.FC = () => {
                 className="btn btn-sm"
                 onClick={() => androidBridge.openPerAppSelector()}
               >
-                Per-App Split Tunnel
+                {tr("分应用代理", "Per-App Split Tunnel")}
               </button>
               <button
                 type="button"
                 className="btn btn-danger btn-sm"
                 onClick={() => androidBridge.disconnectVpn()}
               >
-                Stop VPN
+                {tr("断开 VPN", "Stop VPN")}
               </button>
             </div>
           </div>
         )}
 
         <header className="topbar">
-          <div className="topbar-title-group">
-            <h1 className="topbar-title">{tabMeta[tab].title}</h1>
-            <span className="topbar-meta">{tabMeta[tab].subtitle}</span>
-          </div>
+          <h1 className="topbar-title">{pageTitles[tab]}</h1>
 
-          <div className="topbar-actions">
-            <div className="segmented" role="group" aria-label="Routing Mode">
-              {(["rule", "global", "direct"] as RunMode[]).map((m) => (
-                <button
-                  key={m}
-                  id={`mode-${m}-btn`}
-                  type="button"
-                  disabled={modeBusy}
-                  className={`seg-btn ${config?.mode === m ? "active" : ""}`}
-                  onClick={() => void handleModeChange(m)}
-                >
-                  {m.charAt(0).toUpperCase() + m.slice(1)}
-                </button>
-              ))}
-            </div>
+          <div className="topbar-actions" ref={healthWrapRef}>
+            {config?.demo?.enabled && (
+              <button
+                type="button"
+                className="header-pill-btn"
+                disabled={demoExitBusy}
+                onClick={() => void handleExitDemo()}
+                title={tr(
+                  "当前处于演示模式，点击切换回真实代理环境",
+                  "Demo mode active — click to return to real proxy mode",
+                )}
+              >
+                <span
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: "50%",
+                    background: "var(--accent-amber)",
+                  }}
+                />
+                <span>
+                  {demoExitBusy
+                    ? tr("切换中...", "Switching...")
+                    : tr("演示模式 · 退出", "Demo · Exit")}
+                </span>
+              </button>
+            )}
+
+            {!online && (
+              <button
+                type="button"
+                className="header-pill-btn"
+                onClick={() => void refreshCore()}
+                title={tr("点击立即重连核心", "Click to reconnect now")}
+              >
+                <span
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: "50%",
+                    background: "var(--accent-amber)",
+                  }}
+                />
+                <span>{tr("正在重连...", "Reconnecting...")}</span>
+              </button>
+            )}
+
+            <button
+              id="lang-toggle-btn"
+              type="button"
+              className="header-pill-btn"
+              onClick={toggleLang}
+              title={tr("切换语言 (简体中文 / English)", "Switch language (中文 / EN)")}
+            >
+              <span
+                style={{
+                  color:
+                    lang === "zh" ? "var(--accent-blue)" : "var(--text-muted)",
+                  fontWeight: lang === "zh" ? 700 : 500,
+                }}
+              >
+                中
+              </span>
+              <span style={{ opacity: 0.35 }}>/</span>
+              <span
+                style={{
+                  color:
+                    lang === "en" ? "var(--accent-blue)" : "var(--text-muted)",
+                  fontWeight: lang === "en" ? 700 : 500,
+                }}
+              >
+                EN
+              </span>
+            </button>
 
             <button
               id="theme-toggle-btn"
               type="button"
-              className="btn btn-sm"
+              className="header-icon-btn"
               onClick={() =>
-                setTheme((prev) => (prev === "dark" ? "light" : "dark"))
+                handleChangeTheme(theme === "light" ? "dark" : "light")
               }
+              title={
+                theme === "light"
+                  ? tr("切换深色外观", "Switch to Dark theme")
+                  : tr("切换浅色外观", "Switch to Light theme")
+              }
+              aria-label={tr("切换外观主题", "Toggle theme")}
             >
-              {theme === "dark" ? "Light" : "Dark"}
+              {theme === "light" ? (
+                <MoonIcon size={15} />
+              ) : (
+                <SunIcon size={15} />
+              )}
             </button>
+
+            <button
+              id="health-status-btn"
+              type="button"
+              className={`health-check-btn ${
+                !online || authRequired ? "offline" : ""
+              }`}
+              onClick={() => setHealthOpen((o) => !o)}
+              title={
+                online && !authRequired
+                  ? tr("核心运行正常", "Engine healthy")
+                  : authRequired
+                    ? tr("需要访问密钥", "Authentication required")
+                    : tr("核心未连接", "Engine offline")
+              }
+              aria-label={tr("核心状态概览", "Engine status")}
+            >
+              {online && !authRequired ? (
+                <CheckIcon size={17} />
+              ) : (
+                <RefreshIcon size={15} />
+              )}
+            </button>
+
+            {healthOpen && (
+              <div className="health-popover" role="dialog">
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                      fontWeight: 600,
+                      fontSize: 13,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        background:
+                          online && !authRequired
+                            ? "#22c55e"
+                            : "var(--accent-amber)",
+                      }}
+                    />
+                    <span>
+                      {authRequired
+                        ? tr("需要密钥认证", "Auth Required")
+                        : online
+                          ? tr("核心引擎已连接", "Engine Connected")
+                          : tr("核心离线重连中", "Reconnecting")}
+                    </span>
+                  </div>
+                  <span
+                    className="tabular"
+                    style={{ fontSize: 11.5, color: "var(--text-muted)" }}
+                  >
+                    {version?.version ? `v${version.version}` : "RustClash"}
+                  </span>
+                </div>
+
+                <div
+                  style={{
+                    background: "var(--bg-subcard)",
+                    borderRadius: 11,
+                    padding: "9px 11px",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 5,
+                    fontSize: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span>{tr("混合端口", "Mixed Port")}</span>
+                    <strong className="tabular" style={{ color: "var(--text-primary)" }}>
+                      127.0.0.1:{config?.["mixed-port"] ?? 7890}
+                    </strong>
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span>{tr("出站模式", "Outbound Mode")}</span>
+                    <strong style={{ color: "var(--text-primary)" }}>
+                      {config?.mode === "global"
+                        ? tr("全局 (Global)", "Global")
+                        : config?.mode === "direct"
+                          ? tr("直连 (Direct)", "Direct")
+                          : tr("规则 (Rule)", "Rule")}
+                    </strong>
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <span>{tr("接管状态", "Takeover")}</span>
+                    <strong style={{ color: "var(--text-primary)" }}>
+                      {tunOn && sysProxyOn
+                        ? tr("TUN + 系统代理", "TUN + System Proxy")
+                        : tunOn
+                          ? "TUN"
+                          : sysProxyOn
+                            ? tr("系统代理", "System Proxy")
+                            : tr("待机", "Standby")}
+                    </strong>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 8,
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    style={{ flex: 1 }}
+                    onClick={() => void refreshCore()}
+                  >
+                    <RefreshIcon size={13} />
+                    <span>{tr("刷新状态", "Refresh")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => {
+                      setHealthOpen(false);
+                      setTab("tools");
+                    }}
+                  >
+                    {tr("更多设置", "Settings")}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </header>
 
         <main className="content-scroll">
-          {appError && (
-            <div className="banner banner-err">
-              <span>{appError}</span>
+          {toastMsg && (
+            <div
+              className="bento-card bento-card-compact"
+              style={{
+                borderColor: "var(--accent-amber)",
+                background: "var(--accent-amber-soft)",
+              }}
+            >
+              <span style={{ fontSize: 12.5 }}>{toastMsg}</span>
               <button
                 type="button"
-                className="btn btn-sm"
-                onClick={() => setAppError(null)}
+                className="bento-icon-action"
+                onClick={() => setToastMsg(null)}
+                aria-label={tr("关闭提示", "Dismiss")}
               >
-                Dismiss
+                <CloseIcon size={13} />
               </button>
             </div>
           )}
+
           {authRequired && (
             <form
               onSubmit={handleSaveSecret}
-              className="banner banner-err"
+              className="bento-card"
               style={{
-                marginBottom: 4,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
@@ -685,13 +895,21 @@ export const App: React.FC = () => {
                 flexWrap: "wrap",
               }}
             >
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <span>
-                  Control API requires a <strong>Bearer Secret</strong> to
-                  access management endpoints.
-                </span>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <strong style={{ fontSize: 13.5 }}>
+                  {tr(
+                    "核心已开启接口密钥保护，请输入 Bearer Secret",
+                    "Controller requires a Bearer Secret",
+                  )}
+                </strong>
                 {authError && (
-                  <span style={{ fontSize: 12, fontWeight: 600 }}>
+                  <span
+                    style={{
+                      fontSize: 12,
+                      color: "var(--accent-rose)",
+                      fontWeight: 500,
+                    }}
+                  >
                     {authError}
                   </span>
                 )}
@@ -708,7 +926,8 @@ export const App: React.FC = () => {
                   id="controller-secret-input"
                   type="password"
                   className="input"
-                  placeholder="Enter controller secret..."
+                  style={{ width: 210 }}
+                  placeholder={tr("输入访问密钥...", "Enter controller secret...")}
                   value={secretInput}
                   onChange={(ev) => setSecretInput(ev.target.value)}
                 />
@@ -717,25 +936,31 @@ export const App: React.FC = () => {
                   className="btn btn-primary btn-sm"
                   disabled={authBusy}
                 >
-                  {authBusy ? "Verifying..." : "Authenticate"}
+                  {authBusy
+                    ? tr("验证中...", "Verifying...")
+                    : tr("连接", "Connect")}
                 </button>
               </div>
             </form>
           )}
-          {tab === "overview" && (
-            <OverviewView
-              version={version}
+
+          {tab === "dashboard" && (
+            <DashboardView
+              online={online}
               config={config}
               profilesSnapshot={profilesSnapshot}
+              proxies={proxies}
+              rules={rules}
               connections={connections}
               trafficHistory={trafficHistory}
               latestTraffic={latestTraffic}
               onRefreshAll={refreshCore}
-              onOpenProfiles={() => setTab("studio")}
-              onOpenAddNode={() => {
+              onOpenProfiles={() => setTab("profiles")}
+              onOpenProxies={(groupName) => {
+                setFocusGroup(groupName ?? null);
                 setTab("proxies");
-                setOpenAddModalSignal((n) => n + 1);
               }}
+              onOpenTools={() => setTab("tools")}
             />
           )}
 
@@ -744,13 +969,22 @@ export const App: React.FC = () => {
               config={config}
               proxies={proxies}
               onRefreshProxies={refreshCore}
-              openAddModalSignal={openAddModalSignal}
+              focusGroup={focusGroup}
+              onOpenProfiles={() => setTab("profiles")}
+            />
+          )}
+
+          {tab === "profiles" && (
+            <ProfilesView
+              profilesSnapshot={profilesSnapshot}
+              onReloaded={refreshCore}
             />
           )}
 
           {tab === "connections" && (
             <ConnectionsView
-              items={connections?.connections ?? []}
+              connections={connections}
+              latestTraffic={latestTraffic}
               onRefresh={async () => {
                 const c = await clashApi.getConnections();
                 setConnections(c);
@@ -758,42 +992,50 @@ export const App: React.FC = () => {
             />
           )}
 
-          {tab === "rules" && (
-            <RulesDnsView
+          {tab === "tools" && (
+            <ToolsView
+              version={version}
+              config={config}
+              proxies={proxies}
               rules={rules}
-              onRefreshRules={refreshCore}
+              logs={logs}
+              theme={theme}
+              onChangeTheme={handleChangeTheme}
+              onRefreshCore={refreshCore}
+              onClearLogs={() => setLogs([])}
+              onControllerUpdated={() => {
+                setSecretInput(loadControllerSettings().secret);
+                setWsEpoch((n) => n + 1);
+                void refreshCore();
+              }}
             />
-          )}
-
-          {tab === "studio" && (
-            <StudioView
-              profilesSnapshot={profilesSnapshot}
-              onReloaded={refreshCore}
-            />
-          )}
-
-          {tab === "logs" && (
-            <LogsView logs={logs} onClear={() => setLogs([])} />
           )}
         </main>
 
-        <nav className="mobile-bottom-nav" aria-label="Mobile Navigation">
-          {mobileTabs.map((item) => (
-            <button
-              key={item.id}
-              id={`mobile-nav-${item.id}`}
-              type="button"
-              className={`mobile-nav-btn ${tab === item.id ? "active" : ""}`}
-              onClick={() => setTab(item.id)}
-            >
-              <span>{item.label}</span>
-              {item.badge !== undefined && (
-                <span className="tabular" style={{ fontSize: 10, opacity: 0.8 }}>
-                  {item.badge}
-                </span>
-              )}
-            </button>
-          ))}
+        <nav
+          className="mobile-bottom-nav"
+          aria-label={tr("底部导航", "Mobile Navigation")}
+        >
+          {navItems.map((item) => {
+            const active = tab === item.id;
+            return (
+              <button
+                key={item.id}
+                id={`mobile-nav-${item.id}`}
+                type="button"
+                className={`mobile-nav-btn ${active ? "active" : ""}`}
+                onClick={() => {
+                  if (item.id === "proxies") {
+                    setFocusGroup(null);
+                  }
+                  setTab(item.id);
+                }}
+              >
+                {item.renderIcon(active)}
+                <span>{item.shortLabel}</span>
+              </button>
+            );
+          })}
         </nav>
       </div>
     </div>

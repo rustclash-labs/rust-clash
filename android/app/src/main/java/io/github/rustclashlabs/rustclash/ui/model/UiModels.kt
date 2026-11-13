@@ -244,6 +244,8 @@ data class ProfileUiItem(
     val downloadBytes: Long?,
     val totalBytes: Long?,
     val expireUnixSecs: Long?,
+    val manualProxyCount: Int = 0,
+    val autoUpdateIntervalSecs: Long? = null,
 ) {
     val isSubscription: Boolean
         get() = kind.contains("subscription", ignoreCase = true) || !subscriptionUrlRedacted.isNullOrBlank()
@@ -320,6 +322,7 @@ data class AppUiState(
     val editableRulesText: String = "",
     val favoriteNodes: Set<String> = emptySet(),
     val profileAliases: Map<String, String> = emptyMap(),
+    val defaultSubAutoUpdateSecs: Long = 86400L,
     val rateHistory: List<Long> = emptyList(),
 ) {
     fun resolveProfileDisplayName(profile: ProfileUiItem): String {
@@ -704,6 +707,11 @@ object UiJsonParsers {
             }
             val backupArr = p.optJSONArray("custom_rules_backup")
             val userInfo = p.optJSONObject("userinfo")
+            val autoUpdateSecs = if (p.has("auto_update_interval_secs") && !p.isNull("auto_update_interval_secs")) {
+                p.optLong("auto_update_interval_secs", 0L).takeIf { it > 0L }
+            } else {
+                null
+            }
             list.add(
                 ProfileUiItem(
                     id = p.optString("id", ""),
@@ -728,10 +736,27 @@ object UiJsonParsers {
                     } else {
                         null
                     },
+                    manualProxyCount = p.optInt("manual_proxy_count", 0),
+                    autoUpdateIntervalSecs = autoUpdateSecs,
                 ),
             )
         }
         return activeId to list
+    }
+
+    fun formatAutoUpdateInterval(secs: Long?): String {
+        if (secs == null || secs <= 0L) return "手动更新"
+        return when (secs) {
+            3600L -> "每 1 小时"
+            21600L -> "每 6 小时"
+            43200L -> "每 12 小时"
+            86400L -> "每 24 小时"
+            else -> if (secs % 3600L == 0L) {
+                "每 ${secs / 3600L} 小时"
+            } else {
+                "每 ${(secs / 60L).coerceAtLeast(1L)} 分钟"
+            }
+        }
     }
 
     /**

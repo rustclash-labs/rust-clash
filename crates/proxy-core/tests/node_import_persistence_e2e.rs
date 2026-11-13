@@ -1088,3 +1088,497 @@ rules:
     let _ = srv_stop_tx.send(true);
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscription_manual_node_overlay_auto_update_patch_and_telemetry_api_e2e() {
+    use std::sync::atomic::AtomicBool;
+    use tokio_rustls::TlsAcceptor;
+
+    let state_dir = std::env::temp_dir().join(format!("rc-sub-overlay-e2e-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let (srv_stop_tx, srv_stop_rx) = watch::channel(false);
+    let (origin_addr, _) = spawn_origin_http_server(srv_stop_rx.clone()).await;
+
+    let ss_remote_psk = STANDARD.encode([0x31u8; 32]);
+    let (ss_remote_addr, _ss_remote_task) = spawn_ss_server(
+        "127.0.0.1:0",
+        "2022-blake3-aes-256-gcm",
+        &ss_remote_psk,
+        srv_stop_rx.clone(),
+    )
+    .await
+    .unwrap();
+
+    let ss_manual_psk = STANDARD.encode([0x63u8; 32]);
+    let (ss_manual_addr, _ss_manual_task) = spawn_ss_server(
+        "127.0.0.1:0",
+        "2022-blake3-aes-256-gcm",
+        &ss_manual_psk,
+        srv_stop_rx.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Dynamic TLS 1.3 HTTPS subscription server with `tun.enable: true` in remote YAML
+    let (server_tls, ca_der) =
+        generate_self_signed_server_config(&["localhost".into(), "127.0.0.1".into()], &[]).unwrap();
+    let acceptor = TlsAcceptor::from(server_tls);
+    let sub_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sub_addr = sub_listener.local_addr().unwrap();
+
+    let sub_yaml_v1 = format!(
+        r#"mixed-port: 7890
+mode: rule
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+proxies:
+  - name: Remote-Node-A
+    type: ss
+    server: 127.0.0.1
+    port: {port}
+    cipher: 2022-blake3-aes-256-gcm
+    password: "{psk}"
+    udp: true
+  - name: Remote-Node-B
+    type: ss
+    server: 127.0.0.1
+    port: {port}
+    cipher: 2022-blake3-aes-256-gcm
+    password: "{psk}"
+    udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - Remote-Node-A
+      - Remote-Node-B
+      - DIRECT
+rules:
+  - MATCH,PROXY
+"#,
+        port = ss_remote_addr.port(),
+        psk = ss_remote_psk,
+    );
+
+    let sub_yaml_v2 = format!(
+        r#"mixed-port: 7890
+mode: rule
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+proxies:
+  - name: Remote-Node-C
+    type: ss
+    server: 127.0.0.1
+    port: {port}
+    cipher: 2022-blake3-aes-256-gcm
+    password: "{psk}"
+    udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - Remote-Node-C
+      - DIRECT
+rules:
+  - MATCH,PROXY
+"#,
+        port = ss_remote_addr.port(),
+        psk = ss_remote_psk,
+    );
+
+    let served_yaml = Arc::new(parking_lot::Mutex::new(sub_yaml_v1));
+    let fail_sub_fetch = Arc::new(AtomicBool::new(false));
+    {
+        let served_yaml_bg = Arc::clone(&served_yaml);
+        let fail_sub_bg = Arc::clone(&fail_sub_fetch);
+        let mut stop_bg = srv_stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_bg.changed() => break,
+                    acc_res = sub_listener.accept() => {
+                        let Ok((tcp, _)) = acc_res else { break };
+                        let acc = acceptor.clone();
+                        let body = served_yaml_bg.lock().clone();
+                        let should_fail = fail_sub_bg.load(Ordering::Acquire);
+                        tokio::spawn(async move {
+                            if let Ok(mut tls) = acc.accept(tcp).await {
+                                let mut buf = [0u8; 2048];
+                                let _ = tls.read(&mut buf).await;
+                                let resp = if should_fail {
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\nConnection: close\r\n\r\nupstream down".to_string()
+                                } else {
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/yaml\r\nSubscription-Userinfo: upload=1024; download=2048; total=10485760\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        body.len(),
+                                        body
+                                    )
+                                };
+                                let _ = tls.write_all(resp.as_bytes()).await;
+                                let _ = tls.shutdown().await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    let ctrl_secret = "overlay-ctrl-secret-224466";
+    let mgr = ProfileManager::open_or_init_with_ca(&state_dir, vec![ca_der]).unwrap();
+    let (mut boot_cfg, _) = mgr.load_active_config().unwrap();
+    boot_cfg.mixed_port = 0;
+    boot_cfg.dns.listen = "127.0.0.1:0".into();
+    boot_cfg.external_controller = "127.0.0.1:0".into();
+    boot_cfg.secret = Some(ctrl_secret.into());
+
+    let engine = ProxyEngine::start_with_state_dir(boot_cfg, state_dir.clone())
+        .await
+        .unwrap();
+    engine.attach_profile_manager(Arc::clone(&mgr));
+
+    let (api_stop_tx, api_stop_rx) = watch::channel(false);
+    let (api_addr, _api_task) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), api_stop_rx)
+        .await
+        .unwrap();
+
+    // 1. Import HTTPS subscription via `POST /profiles/import` with custom `auto_update_interval_secs: 7200`
+    let sub_secret_tok = "SUB_SECRET_TOKEN_889900";
+    let sub_url = format!(
+        "https://localhost:{}/api/v1/subscribe?token={sub_secret_tok}",
+        sub_addr.port()
+    );
+    let (st_sub_imp, body_sub_imp) = api_request(
+        api_addr,
+        "POST",
+        "/profiles/import",
+        Some(ctrl_secret),
+        Some(
+            &serde_json::json!({
+                "uris": sub_url,
+                "apply": true,
+                "auto_update_interval_secs": 7200
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        st_sub_imp, 200,
+        "HTTPS subscription import failed: {body_sub_imp}"
+    );
+    let sub_imp_json: serde_json::Value = serde_json::from_str(&body_sub_imp).unwrap();
+    let sub_id = sub_imp_json["active-profile-id"]
+        .as_str()
+        .expect("active-profile-id in import response")
+        .to_string();
+    assert_eq!(sub_imp_json["total-nodes"], 2);
+
+    // Verify imported `tun.enable: true` from external subscription YAML was sanitized to `false` on disk!
+    let (disk_cfg_v1, _) = mgr.load_active_config().unwrap();
+    assert!(
+        !disk_cfg_v1.tun.enable,
+        "imported external subscription YAML must sanitize tun.enable to false on disk"
+    );
+
+    let (_, profiles_init_str) =
+        api_request(api_addr, "GET", "/profiles", Some(ctrl_secret), None).await;
+    let profiles_init_json: serde_json::Value = serde_json::from_str(&profiles_init_str).unwrap();
+    let sub_meta_init = profiles_init_json["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == sub_id)
+        .unwrap();
+    assert_eq!(sub_meta_init["auto_update_interval_secs"], 7200);
+    assert_eq!(sub_meta_init["manual_proxy_count"], 0);
+    assert_eq!(sub_meta_init["group_count"], 1);
+    let initial_sub_updated_ms = sub_meta_init["last_updated_ms"].as_u64().unwrap();
+
+    // 2. Add 2 manual nodes on top of the active subscription (1 via share URI, 1 via POST /profiles/active/nodes)
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let manual_userinfo =
+        URL_SAFE_NO_PAD.encode(format!("2022-blake3-aes-256-gcm:{ss_manual_psk}"));
+    let manual_ss_uri = format!(
+        "ss://{manual_userinfo}@127.0.0.1:{}#Manual-SS-Custom",
+        ss_manual_addr.port()
+    );
+    let (st_add_uri, body_add_uri) = api_request(
+        api_addr,
+        "POST",
+        "/profiles/import",
+        Some(ctrl_secret),
+        Some(
+            &serde_json::json!({
+                "uris": manual_ss_uri,
+                "apply": true,
+                "auto_select": true
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st_add_uri, 200, "manual URI import failed: {body_add_uri}");
+
+    let socks_manual_pass = "SOCKS_MANUAL_PASS_445566";
+    let (st_add_form, body_add_form) = api_request(
+        api_addr,
+        "POST",
+        "/profiles/active/nodes",
+        Some(ctrl_secret),
+        Some(
+            &serde_json::json!({
+                "node": {
+                    "type": "socks5",
+                    "name": "Manual-SOCKS5-Custom",
+                    "server": "127.0.0.1",
+                    "port": 10808,
+                    "username": "muser",
+                    "password": socks_manual_pass,
+                    "udp": true
+                },
+                "auto_select": false
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        st_add_form, 200,
+        "manual node create failed: {body_add_form}"
+    );
+
+    // Select `Manual-SS-Custom` in `PROXY` and verify live HTTP relay works
+    let (st_sel_man, _) = api_request(
+        api_addr,
+        "PUT",
+        "/proxies/PROXY",
+        Some(ctrl_secret),
+        Some(r#"{"name":"Manual-SS-Custom"}"#),
+    )
+    .await;
+    assert_eq!(st_sel_man, 204);
+
+    let (st_http_man1, body_http_man1) =
+        http_get_via_mixed_proxy(engine.mixed_addr(), origin_addr.port(), "/hello").await;
+    assert_eq!(st_http_man1, 200);
+    assert_eq!(body_http_man1, "rust-clash-node-e2e-ok");
+
+    // Verify manual node additions updated `manual_proxy_count == 2` WITHOUT skewing subscription `last_updated_ms`!
+    let (_, profiles_after_manual_str) =
+        api_request(api_addr, "GET", "/profiles", Some(ctrl_secret), None).await;
+    let profiles_after_manual: serde_json::Value =
+        serde_json::from_str(&profiles_after_manual_str).unwrap();
+    let sub_meta_after_manual = profiles_after_manual["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == sub_id)
+        .unwrap();
+    assert_eq!(sub_meta_after_manual["manual_proxy_count"], 2);
+    assert_eq!(sub_meta_after_manual["proxy_count"], 4);
+    assert_eq!(
+        sub_meta_after_manual["last_updated_ms"].as_u64().unwrap(),
+        initial_sub_updated_ms,
+        "manual node edits must NOT overwrite subscription last_updated_ms"
+    );
+
+    // 3. Remote subscription updates from v1 (`Remote-Node-A`, `Remote-Node-B`) -> v2 (`Remote-Node-C`).
+    //    Trigger `POST /profiles/{sub_id}/refresh` and verify manual nodes + `Manual-SS-Custom` selection survive!
+    *served_yaml.lock() = sub_yaml_v2;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let (st_ref1, body_ref1) = api_request(
+        api_addr,
+        "POST",
+        &format!("/profiles/{sub_id}/refresh"),
+        Some(ctrl_secret),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(st_ref1, 200, "subscription refresh #1 failed: {body_ref1}");
+    let ref1_json: serde_json::Value = serde_json::from_str(&body_ref1).unwrap();
+    assert_eq!(ref1_json["profile"]["manual_proxy_count"], 2);
+    assert_eq!(
+        ref1_json["profile"]["proxy_count"], 3,
+        "expected Remote-Node-C + 2 preserved manual nodes"
+    );
+    assert!(ref1_json["profile"]["last_updated_ms"].as_u64().unwrap() >= initial_sub_updated_ms);
+
+    let (disk_cfg_v2, _) = mgr.load_active_config().unwrap();
+    assert!(
+        !disk_cfg_v2.tun.enable,
+        "refreshed subscription YAML must also sanitize tun.enable to false"
+    );
+    let disk_names: Vec<&str> = disk_cfg_v2.proxies.iter().map(|p| p.name()).collect();
+    assert!(disk_names.contains(&"Remote-Node-C"));
+    assert!(!disk_names.contains(&"Remote-Node-A"));
+    assert!(disk_names.contains(&"Manual-SS-Custom"));
+    assert!(disk_names.contains(&"Manual-SOCKS5-Custom"));
+
+    // Verify `PROXY` group STILL has `Manual-SS-Custom` selected and live traffic still flows!
+    let (_, proxies_after_ref1_str) =
+        api_request(api_addr, "GET", "/proxies", Some(ctrl_secret), None).await;
+    let proxies_after_ref1: serde_json::Value =
+        serde_json::from_str(&proxies_after_ref1_str).unwrap();
+    assert_eq!(
+        proxies_after_ref1["proxies"]["PROXY"]["now"], "Manual-SS-Custom",
+        "manual node selection in PROXY must be 100% preserved across subscription refresh"
+    );
+    assert_eq!(
+        proxies_after_ref1["effective-outbound"]["effective_outbound"],
+        "Manual-SS-Custom"
+    );
+    let (st_http_man2, body_http_man2) =
+        http_get_via_mixed_proxy(engine.mixed_addr(), origin_addr.port(), "/hello").await;
+    assert_eq!(st_http_man2, 200);
+    assert_eq!(body_http_man2, "rust-clash-node-e2e-ok");
+
+    // 4. Delete `Manual-SOCKS5-Custom`, then refresh subscription again -> deleted manual node MUST NOT resurrect!
+    let (st_del_man, body_del_man) = api_request(
+        api_addr,
+        "DELETE",
+        "/profiles/active/nodes/Manual-SOCKS5-Custom",
+        Some(ctrl_secret),
+        None,
+    )
+    .await;
+    assert_eq!(st_del_man, 200, "delete manual node failed: {body_del_man}");
+
+    let (st_ref2, body_ref2) = api_request(
+        api_addr,
+        "POST",
+        &format!("/profiles/{sub_id}/refresh"),
+        Some(ctrl_secret),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(st_ref2, 200, "subscription refresh #2 failed: {body_ref2}");
+    let ref2_json: serde_json::Value = serde_json::from_str(&body_ref2).unwrap();
+    assert_eq!(ref2_json["profile"]["manual_proxy_count"], 1);
+    assert_eq!(ref2_json["profile"]["proxy_count"], 2);
+    let (disk_cfg_v3, _) = mgr.load_active_config().unwrap();
+    let disk_names_v3: Vec<&str> = disk_cfg_v3.proxies.iter().map(|p| p.name()).collect();
+    assert!(disk_names_v3.contains(&"Remote-Node-C"));
+    assert!(disk_names_v3.contains(&"Manual-SS-Custom"));
+    assert!(
+        !disk_names_v3.contains(&"Manual-SOCKS5-Custom"),
+        "deleted manual node must NOT resurrect on subsequent subscription refresh"
+    );
+
+    // 5. Test `PATCH /profiles/{id}` (rename + disable auto-update `0`/`null` + clamp `< 60` -> `60`) & failure backoff
+    let (st_patch_off, body_patch_off) = api_request(
+        api_addr,
+        "PATCH",
+        &format!("/profiles/{sub_id}"),
+        Some(ctrl_secret),
+        Some(r#"{"name":"主力订阅-保护测试","auto_update_interval_secs":0}"#),
+    )
+    .await;
+    assert_eq!(st_patch_off, 200, "PATCH disable failed: {body_patch_off}");
+    let patch_off_json: serde_json::Value = serde_json::from_str(&body_patch_off).unwrap();
+    assert_eq!(patch_off_json["profile"]["name"], "主力订阅-保护测试");
+    assert!(patch_off_json["profile"]["auto_update_interval_secs"].is_null());
+    assert!(mgr.due_auto_update_ids().is_empty());
+
+    let (st_patch_clamp, body_patch_clamp) = api_request(
+        api_addr,
+        "PATCH",
+        &format!("/profiles/{sub_id}"),
+        Some(ctrl_secret),
+        Some(r#"{"auto_update_interval_secs":15}"#),
+    )
+    .await;
+    assert_eq!(
+        st_patch_clamp, 200,
+        "PATCH clamp failed: {body_patch_clamp}"
+    );
+    let patch_clamp_json: serde_json::Value = serde_json::from_str(&body_patch_clamp).unwrap();
+    assert_eq!(patch_clamp_json["profile"]["auto_update_interval_secs"], 60);
+
+    // Simulate failed refresh and verify `due_auto_update_ids()` enforces 10-minute backoff
+    fail_sub_fetch.store(true, Ordering::Release);
+    assert!(mgr.refresh_subscription(&sub_id).await.is_err());
+    assert!(
+        mgr.due_auto_update_ids().is_empty(),
+        "failed subscription refresh must enter 10-minute backoff and not immediately re-trigger"
+    );
+    fail_sub_fetch.store(false, Ordering::Release);
+
+    // 6. Verify enriched telemetry & exit IP endpoints (`GET /configs`, `/connections`, `/dns/fakeip`, `/tools/ip`)
+    let (st_cfgs, body_cfgs) =
+        api_request(api_addr, "GET", "/configs", Some(ctrl_secret), None).await;
+    assert_eq!(st_cfgs, 200);
+    let cfgs_json: serde_json::Value = serde_json::from_str(&body_cfgs).unwrap();
+    assert!(cfgs_json["started-at-ms"].as_u64().unwrap() > 0);
+    assert!(cfgs_json["uptime-secs"].is_u64());
+    assert_eq!(cfgs_json["proxy-count"], 2);
+    assert_eq!(cfgs_json["group-count"], 1);
+    assert!(cfgs_json["rule-count"].as_u64().unwrap() >= 1);
+    assert!(cfgs_json["dns"]["total-queries"].is_u64());
+
+    let (st_conns, body_conns) =
+        api_request(api_addr, "GET", "/connections", Some(ctrl_secret), None).await;
+    assert_eq!(st_conns, 200);
+    let conns_json: serde_json::Value = serde_json::from_str(&body_conns).unwrap();
+    assert!(conns_json["totalConnections"].as_u64().unwrap() >= 1);
+
+    let (st_fip, body_fip) =
+        api_request(api_addr, "GET", "/dns/fakeip", Some(ctrl_secret), None).await;
+    assert_eq!(st_fip, 200);
+    let fip_json: serde_json::Value = serde_json::from_str(&body_fip).unwrap();
+    assert!(fip_json["total_queries"].is_u64());
+
+    let (st_ip, body_ip) = api_request(api_addr, "GET", "/tools/ip", Some(ctrl_secret), None).await;
+    assert_eq!(st_ip, 200, "GET /tools/ip must always return 200 JSON");
+    let ip_json: serde_json::Value = serde_json::from_str(&body_ip).unwrap();
+    assert!(ip_json["ok"].is_boolean());
+    assert!(ip_json["ip"].is_string());
+    assert!(ip_json["country"].is_string());
+    assert!(ip_json["isp"].is_string());
+    assert!(ip_json["ip_type"].is_string());
+    assert_eq!(ip_json["outbound"], "Manual-SS-Custom");
+    assert!(ip_json["checked_at_ms"].as_u64().unwrap() > 0);
+
+    // 7. Strict secret redaction audit across `/profiles`, `/logs`, `/diagnostics/export`, and `profiles_index.json`
+    let (_, profs_final_body) =
+        api_request(api_addr, "GET", "/profiles", Some(ctrl_secret), None).await;
+    let (_, diag_final_body) = api_request(
+        api_addr,
+        "GET",
+        "/diagnostics/export",
+        Some(ctrl_secret),
+        None,
+    )
+    .await;
+    let index_raw = std::fs::read_to_string(state_dir.join("profiles").join("profiles_index.json"))
+        .expect("read profiles_index.json");
+    for secret_marker in [
+        sub_secret_tok,
+        ss_remote_psk.as_str(),
+        ss_manual_psk.as_str(),
+        socks_manual_pass,
+    ] {
+        assert!(
+            !profs_final_body.contains(secret_marker),
+            "SECRET LEAKED in GET /profiles: {secret_marker}"
+        );
+        assert!(
+            !diag_final_body.contains(secret_marker),
+            "SECRET LEAKED in GET /diagnostics/export: {secret_marker}"
+        );
+        assert!(
+            !index_raw.contains(secret_marker),
+            "SECRET LEAKED in profiles_index.json: {secret_marker}"
+        );
+    }
+
+    let _ = api_stop_tx.send(true);
+    engine.shutdown();
+    let _ = srv_stop_tx.send(true);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

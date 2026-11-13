@@ -80,10 +80,10 @@ jobs:
           RUN_WINDOWS="false"
           RUN_ANDROID="false"
 
-          if echo "$CHANGED" | grep -Eq '^(platforms/macos-ne/|crates/proxy-core/src/platform/tun/macos\.rs|crates/proxy-core/src/platform/sysproxy/|crates/proxy-ffi/src/ios_macos\.rs)'; then
+          if echo "$CHANGED" | grep -Eq '^(platforms/macos-ne/|crates/tauri-app/|crates/proxy-cli/|crates/proxy-core/src/platform/tun/macos\.rs|crates/proxy-core/src/platform/sysproxy/|crates/proxy-ffi/src/ios_macos\.rs)'; then
             RUN_MACOS="true"
           fi
-          if echo "$CHANGED" | grep -Eq '^(crates/proxy-core/src/platform/tun/windows\.rs|scripts/fetch_wintun\.py)'; then
+          if echo "$CHANGED" | grep -Eq '^(crates/tauri-app/|crates/proxy-cli/|crates/proxy-core/src/platform/tun/windows\.rs|scripts/fetch_wintun\.py)'; then
             RUN_WINDOWS="true"
           fi
           if echo "$CHANGED" | grep -Eq '^(android/|crates/proxy-ffi/|scripts/build_android\.sh)'; then
@@ -288,10 +288,11 @@ jobs:
         run: |
           python scripts/fetch_wintun.py --self-test
           python scripts/fetch_wintun.py --out-dir target/debug
-      - name: Clippy & Integration Suite
+      - name: Clippy & Integration Suite (Workspace + Tauri Desktop)
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace -- --nocapture
+          cargo clippy --locked -p tauri-app --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features tauri-app/desktop -- -D warnings
+          cargo test --locked --workspace --features tauri-app/desktop -- --nocapture
 
   macos:
     name: macOS Kernel & NetworkExtension Check (On macOS Change)
@@ -317,7 +318,8 @@ jobs:
             platforms/macos-ne/PacketTunnelProvider.swift \
             -import-objc-header platforms/macos-ne/RustClashNEBridge.h \
             -target arm64-apple-macos13.0
-      - name: Clippy & Integration Suite
+      - name: Clippy & Integration Suite (Workspace + Tauri Desktop)
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace -- --nocapture
+          cargo clippy --locked -p tauri-app --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features tauri-app/desktop -- -D warnings
+          cargo test --locked --workspace --features tauri-app/desktop -- --nocapture

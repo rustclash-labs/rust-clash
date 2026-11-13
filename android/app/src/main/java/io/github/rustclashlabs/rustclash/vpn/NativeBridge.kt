@@ -142,4 +142,11 @@ object NativeBridge {
     external fun nativeSetDemoSandboxJson(enable: Boolean): String
 
     external fun nativeSetLowPowerMode(enable: Boolean): Boolean
+
+    external fun nativeUpdateProfileSettingsJson(
+        stateDir: String,
+        profileId: String,
+        name: String,
+        intervalSecs: Long,
+    ): String
 }

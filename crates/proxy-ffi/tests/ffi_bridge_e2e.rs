@@ -1162,3 +1162,93 @@ rules:
     bg_rt.shutdown_timeout(Duration::from_millis(200));
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn android_update_profile_settings_and_manual_overlay_ffi_e2e() {
+    use proxy_core::profile::{CreateProfileSpec, ProfileManager};
+    use proxy_ffi::android_jni::{
+        android_import_unified_core, android_profiles_snapshot_core,
+        android_update_profile_settings_core, stop_android_vpn_core,
+    };
+    use uuid::Uuid;
+
+    let _serial = SERIAL_ANDROID_FFI_LOCK.blocking_lock();
+    let _ = stop_android_vpn_core();
+
+    let state_dir =
+        std::env::temp_dir().join(format!("rc-android-prof-settings-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let prof_id = rt.block_on(async {
+        let mgr = ProfileManager::open_or_init(&state_dir).unwrap();
+        let (meta, _) = mgr
+            .create_profile(CreateProfileSpec {
+                name: "Android Sub".into(),
+                yaml: None,
+                uris: Some("socks5://127.0.0.1:1080#Base-SOCKS".into()),
+                subscription_url: None,
+                auto_update_interval_secs: Some(86400),
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let _ = mgr.set_active_profile(&meta.id).unwrap();
+        meta.id
+    });
+
+    // Add a manual SOCKS5 node offline via `android_import_unified_core`
+    let imp = android_import_unified_core(
+        &state_dir,
+        "socks5://127.0.0.1:1081#Manual-Android-Node",
+        true,
+        true,
+    )
+    .expect("import manual node onto active profile");
+    assert_eq!(imp["ok"], true);
+    assert_eq!(imp["effectiveOutbound"], "Manual-Android-Node");
+
+    // Rename + disable auto-update (`Some(Some(0))` -> `null`) via `android_update_profile_settings_core`
+    let updated_off = android_update_profile_settings_core(
+        &state_dir,
+        &prof_id,
+        Some("主力订阅-已改名".to_string()),
+        Some(Some(0)),
+    )
+    .expect("disable auto-update via FFI helper");
+    assert_eq!(updated_off["ok"], true);
+    assert_eq!(updated_off["profile"]["name"], "主力订阅-已改名");
+    assert!(updated_off["profile"]["auto_update_interval_secs"].is_null());
+    assert_eq!(updated_off["profile"]["manual_proxy_count"], 1);
+
+    // Re-enable auto-update (`Some(Some(21600))`) without changing name (`None`)
+    let updated_on =
+        android_update_profile_settings_core(&state_dir, &prof_id, None, Some(Some(21600)))
+            .expect("enable 6h auto-update via FFI helper");
+    assert_eq!(updated_on["ok"], true);
+    assert_eq!(updated_on["profile"]["name"], "主力订阅-已改名");
+    assert_eq!(updated_on["profile"]["auto_update_interval_secs"], 21600);
+
+    // Clamp sub-60s intervals to 60s
+    let updated_clamp =
+        android_update_profile_settings_core(&state_dir, &prof_id, None, Some(Some(10)))
+            .expect("clamp interval via FFI helper");
+    assert_eq!(updated_clamp["profile"]["auto_update_interval_secs"], 60);
+
+    let snap = android_profiles_snapshot_core(&state_dir).expect("profiles snapshot");
+    let prof_entry = snap["profilesSnapshot"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == prof_id)
+        .unwrap();
+    assert_eq!(prof_entry["manual_proxy_count"], 1);
+    assert_eq!(prof_entry["auto_update_interval_secs"], 60);
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

@@ -79,6 +79,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val ipv6 = prefs.getBoolean(RustClashVpnService.KEY_ENABLE_IPV6, true)
         val demo = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
+        val defaultSubSecs = prefs.getLong(RustClashVpnService.KEY_DEFAULT_SUB_AUTO_UPDATE_SECS, 86400L)
         return AppUiState(
             nativeLoaded = NativeBridge.ensureLoaded(),
             vpnState = RustClashVpnService.stateTracker.state,
@@ -89,6 +90,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             selectedPackages = pkgs,
             favoriteNodes = favs,
             profileAliases = aliases,
+            defaultSubAutoUpdateSecs = defaultSubSecs,
             enableIpv6 = ipv6,
             demoMode = demo,
         )
@@ -352,6 +354,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         rawPayload: String,
         deduplicate: Boolean = true,
         autoSelect: Boolean = true,
+        subscriptionAutoUpdateSecs: Long? = null,
         onSuccess: (() -> Unit)? = null,
     ) {
         if (_uiState.value.isImporting) return
@@ -388,6 +391,21 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 val skippedUnsupported = resp.optJSONArray("skippedUnsupported")?.length()
                     ?: resp.optInt("skippedUnsupported", 0)
                 val eff = resp.optString("effectiveOutbound", "DIRECT")
+                val inputKind = resp.optString("inputKind", "")
+                val activeProfId = resp.optString("activeProfileId", "").trim()
+                val isSubImport = inputKind.contains("subscription", ignoreCase = true) ||
+                    inputKind.equals("clash-install-config-url", ignoreCase = true) ||
+                    trimmed.startsWith("https://", ignoreCase = true) ||
+                    trimmed.startsWith("clash://", ignoreCase = true)
+                if (isSubImport && activeProfId.isNotEmpty()) {
+                    val rawTargetSecs = subscriptionAutoUpdateSecs ?: _uiState.value.defaultSubAutoUpdateSecs
+                    val targetSecs = if (rawTargetSecs <= 0L) 0L else rawTargetSecs.coerceAtLeast(60L)
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            NativeBridge.nativeUpdateProfileSettingsJson(stateDir, activeProfId, "", targetSecs)
+                        }
+                    }
+                }
 
                 if (prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)) {
                     prefs.edit().putBoolean(RustClashVpnService.KEY_DEMO_MODE, false).apply()
@@ -932,6 +950,48 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         nextAliases.forEach { (k, v) -> jsonObj.put(k, v) }
         prefs.edit().putString(RustClashVpnService.KEY_PROFILE_ALIASES, jsonObj.toString()).apply()
         _uiState.update { it.copy(profileAliases = nextAliases.toMap()) }
+        if (NativeBridge.ensureLoaded()) {
+            viewModelScope.launch {
+                val raw = withContext(Dispatchers.IO) {
+                    runCatching {
+                        NativeBridge.nativeUpdateProfileSettingsJson(stateDir, cleanId, cleanName, -1L)
+                    }.getOrNull()
+                }
+                if (!raw.isNullOrBlank()) {
+                    UiJsonParsers.parseProfilesSnapshot(raw)?.let { parsed ->
+                        _uiState.update { it.copy(activeProfileId = parsed.first, profiles = parsed.second) }
+                    }
+                }
+            }
+        }
         emitMessage("配置名称已更新为：$cleanName")
+    }
+
+    fun setDefaultSubAutoUpdateSecs(secs: Long) {
+        val normalized = if (secs <= 0L) 0L else secs.coerceAtLeast(60L)
+        prefs.edit().putLong(RustClashVpnService.KEY_DEFAULT_SUB_AUTO_UPDATE_SECS, normalized).apply()
+        _uiState.update { it.copy(defaultSubAutoUpdateSecs = normalized) }
+        val label = UiJsonParsers.formatAutoUpdateInterval(normalized.takeIf { it > 0L })
+        emitMessage("新导入订阅默认自动更新已设为：$label")
+    }
+
+    fun updateProfileAutoUpdate(profileId: String, intervalSecs: Long) {
+        val cleanId = profileId.trim()
+        if (cleanId.isEmpty() || !NativeBridge.ensureLoaded()) return
+        val targetSecs = if (intervalSecs <= 0L) 0L else intervalSecs.coerceAtLeast(60L)
+        viewModelScope.launch {
+            val raw = withContext(Dispatchers.IO) {
+                NativeBridge.nativeUpdateProfileSettingsJson(stateDir, cleanId, "", targetSecs)
+            }
+            val parsed = UiJsonParsers.parseProfilesSnapshot(raw)
+            if (parsed != null) {
+                _uiState.update { it.copy(activeProfileId = parsed.first, profiles = parsed.second) }
+                val label = UiJsonParsers.formatAutoUpdateInterval(targetSecs.takeIf { it > 0L })
+                emitMessage("订阅自动更新已设为：$label（手动添加节点自动受保护）")
+            } else {
+                val err = runCatching { JSONObject(raw).optString("error") }.getOrNull()
+                emitMessage(err ?: "更新订阅自动刷新频率失败")
+            }
+        }
     }
 }

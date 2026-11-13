@@ -45,6 +45,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -79,6 +80,7 @@ fun ProfilesScreen(
     onRefreshProfile: (String) -> Unit,
     onDeleteProfile: (String) -> Unit,
     onRenameProfile: (String, String) -> Unit = { _, _ -> },
+    onUpdateProfileAutoUpdate: (String, Long) -> Unit = { _, _ -> },
     onOpenCustomRulesEditor: () -> Unit,
     onOpenYamlEditor: () -> Unit,
     onImportYamlFile: () -> Unit = {},
@@ -87,6 +89,7 @@ fun ProfilesScreen(
     val extColors = LocalRustClashColors.current
     var pendingDeleteProfile by remember { mutableStateOf<ProfileUiItem?>(null) }
     var pendingRenameProfile by remember { mutableStateOf<ProfileUiItem?>(null) }
+    var pendingAutoUpdateProfile by remember { mutableStateOf<ProfileUiItem?>(null) }
     var showHeaderMenu by remember { mutableStateOf(false) }
 
     Column(
@@ -300,11 +303,75 @@ fun ProfilesScreen(
                         onActivate = { if (!isActive) onActivateProfile(profile.id) },
                         onRefresh = { onRefreshProfile(profile.id) },
                         onRename = { pendingRenameProfile = profile },
+                        onConfigureAutoUpdate = { pendingAutoUpdateProfile = profile },
                         onDelete = { pendingDeleteProfile = profile },
                     )
                 }
             }
         }
+    }
+
+    if (pendingAutoUpdateProfile != null) {
+        val target = pendingAutoUpdateProfile!!
+        val currentSecs = target.autoUpdateIntervalSecs?.takeIf { it > 0L } ?: 0L
+        val scheduleOptions = listOf(
+            0L to "关闭自动更新（手动刷新）",
+            3600L to "每 1 小时",
+            21600L to "每 6 小时",
+            43200L to "每 12 小时",
+            86400L to "每 24 小时",
+        )
+        AlertDialog(
+            onDismissRequest = { pendingAutoUpdateProfile = null },
+            title = { Text("订阅自动更新频率") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    Text(
+                        text = "息屏省电 (Doze) 期间会自动推迟后台轮询；每次更新订阅时，您手动添加或导入的自建节点及策略组选中项会自动保留，不会被远程覆盖。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    scheduleOptions.forEach { (secs, label) ->
+                        val selected = currentSecs == secs
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable {
+                                    pendingAutoUpdateProfile = null
+                                    onUpdateProfileAutoUpdate(target.id, secs)
+                                }
+                                .padding(vertical = 4.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(
+                                selected = selected,
+                                onClick = {
+                                    pendingAutoUpdateProfile = null
+                                    onUpdateProfileAutoUpdate(target.id, secs)
+                                },
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { pendingAutoUpdateProfile = null }) {
+                    Text("关闭")
+                }
+            },
+        )
     }
 
     if (pendingRenameProfile != null) {
@@ -394,6 +461,7 @@ private fun ProfileCard(
     onActivate: () -> Unit,
     onRefresh: () -> Unit,
     onRename: () -> Unit,
+    onConfigureAutoUpdate: () -> Unit = {},
     onDelete: () -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
@@ -476,6 +544,48 @@ private fun ProfileCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+
+                    if (profile.isSubscription || profile.manualProxyCount > 0) {
+                        Spacer(modifier = Modifier.height(5.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            if (profile.isSubscription) {
+                                Surface(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable(onClick = onConfigureAutoUpdate),
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = extColors.iconBadgeBg,
+                                ) {
+                                    Text(
+                                        text = UiJsonParsers.formatAutoUpdateInterval(profile.autoUpdateIntervalSecs),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                            if (profile.manualProxyCount > 0) {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = extColors.emeraldContainer,
+                                ) {
+                                    Text(
+                                        text = "+${profile.manualProxyCount} 自建节点已保护",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = extColors.onEmeraldContainer,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if (profile.isSubscription) {
@@ -553,6 +663,16 @@ private fun ProfileCard(
                                 onClick = {
                                     showMenu = false
                                     onRefresh()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text("自动更新频率 (${UiJsonParsers.formatAutoUpdateInterval(profile.autoUpdateIntervalSecs)})")
+                                },
+                                leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
+                                onClick = {
+                                    showMenu = false
+                                    onConfigureAutoUpdate()
                                 },
                             )
                         }

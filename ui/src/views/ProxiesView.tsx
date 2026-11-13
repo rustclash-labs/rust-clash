@@ -1,24 +1,39 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { androidBridge, clashApi, readClipboardText } from "../api";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  androidBridge,
+  clashApi,
+  importActiveNodes,
+  readClipboardText,
+  testProxyDelay,
+  upsertActiveNode,
+} from "../api";
+import {
+  BoltIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  PlusIcon,
+  SearchIcon,
+} from "../components/Icons";
+import { useI18n } from "../i18n";
 import type {
   ConfigSnapshot,
-  EndpointMatrixReport,
   ProxyInfo,
   ProxyNodeConfigPayload,
-  WaterfallProbeReport,
 } from "../types";
 import {
-  delayBadgeVariant,
   nodeProtocolBadge,
+  prettyProtocolLabel,
   protocolBadgeVariant,
 } from "../utils/format";
-import { renderInlineCode } from "../utils/inlineCode";
 
 interface ProxiesViewProps {
   config: ConfigSnapshot | null;
   proxies: Record<string, ProxyInfo>;
   onRefreshProxies: () => Promise<void>;
   openAddModalSignal?: number;
+  focusGroup?: string | null;
+  onOpenProfiles?: () => void;
 }
 
 const GROUP_TYPES = new Set(["Selector", "URLTest", "Fallback", "LoadBalance"]);
@@ -34,54 +49,60 @@ const SS_CIPHERS = [
   "2022-blake3-chacha20-poly1305",
 ];
 
+type SortOrder = "default" | "latency" | "name";
 type ModalMode = "paste" | "manual";
-type NodeProto = "ss" | "vless" | "trojan" | "anytls" | "socks5" | "http";
+type NodeProto = "vless" | "trojan" | "ss" | "anytls" | "socks5" | "http";
 
 export const ProxiesView: React.FC<ProxiesViewProps> = ({
   config,
   proxies,
   onRefreshProxies,
   openAddModalSignal = 0,
+  focusGroup = null,
+  onOpenProfiles,
 }) => {
+  const { tr } = useI18n();
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("default");
   const [testingMap, setTestingMap] = useState<Record<string, boolean>>({});
   const [probingAll, setProbingAll] = useState(false);
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const [errorBanner, setErrorBanner] = useState<string | null>(null);
-  const [okBanner, setOkBanner] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>(
+    {},
+  );
+  const [managerOpen, setManagerOpen] = useState(false);
+  const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
   const [activeNodes, setActiveNodes] = useState<ProxyNodeConfigPayload[]>([]);
-  const [quickPasteText, setQuickPasteText] = useState("");
 
-  // Add / Edit Modal state
+  // Modal state
   const [modalOpen, setModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<ModalMode>("paste");
+  const [modalError, setModalError] = useState<string | null>(null);
   const [editingOriginalName, setEditingOriginalName] = useState<string | null>(
     null,
   );
   const [editingOriginalProto, setEditingOriginalProto] =
     useState<NodeProto | null>(null);
-  const [modalError, setModalError] = useState<string | null>(null);
-  const modalErrorRef = useRef<HTMLDivElement | null>(null);
 
-  // Paste tab state
+  // Paste tab
   const [pasteInput, setPasteInput] = useState("");
   const [dedupOnImport, setDedupOnImport] = useState(true);
   const [autoSelectOnImport, setAutoSelectOnImport] = useState(true);
 
-  // Manual / Edit node form state
-  const [proto, setProto] = useState<NodeProto>("ss");
+  // Form tab
+  const [proto, setProto] = useState<NodeProto>("vless");
   const [nodeName, setNodeName] = useState("");
   const [serverHost, setServerHost] = useState("");
   const [serverPort, setServerPort] = useState("443");
   const [udpEnabled, setUdpEnabled] = useState(true);
   const [autoSelectManual, setAutoSelectManual] = useState(true);
 
-  // SS fields
+  // Protocol-specific fields
   const [ssCipher, setSsCipher] = useState("aes-256-gcm");
   const [ssPassword, setSsPassword] = useState("");
 
-  // VLESS fields
   const [vlessUuid, setVlessUuid] = useState("");
   const [vlessEncryption, setVlessEncryption] = useState("none");
   const [vlessHadRedactedEnc, setVlessHadRedactedEnc] = useState(false);
@@ -90,26 +111,22 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [vlessSkipVerify, setVlessSkipVerify] = useState(false);
   const [vlessAlpn, setVlessAlpn] = useState("");
 
-  // Trojan fields
   const [trojanPassword, setTrojanPassword] = useState("");
   const [trojanTls, setTrojanTls] = useState(true);
   const [trojanSni, setTrojanSni] = useState("");
   const [trojanSkipVerify, setTrojanSkipVerify] = useState(false);
   const [trojanAlpn, setTrojanAlpn] = useState("h2, http/1.1");
 
-  // WebSocket transport fields (shared by VLESS & Trojan)
   const [transportNet, setTransportNet] = useState<"tcp" | "ws">("tcp");
   const [wsPath, setWsPath] = useState("/");
   const [wsHost, setWsHost] = useState("");
   const [wsMaxEarlyData, setWsMaxEarlyData] = useState("");
 
-  // AnyTLS fields
   const [anytlsPassword, setAnytlsPassword] = useState("");
   const [anytlsSni, setAnytlsSni] = useState("");
   const [anytlsSkipVerify, setAnytlsSkipVerify] = useState(false);
   const [anytlsAlpn, setAnytlsAlpn] = useState("h2, http/1.1");
 
-  // SOCKS5 / HTTP fields
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authHadSavedPassword, setAuthHadSavedPassword] = useState(false);
@@ -117,33 +134,52 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [proxySni, setProxySni] = useState("");
   const [proxySkipVerify, setProxySkipVerify] = useState(false);
 
-  const modalInflight =
-    busyAction === "import" || busyAction === "save-node";
+  const groupRefs = useRef<Record<string, HTMLElement | null>>({});
 
-  const requestCloseModal = useCallback(() => {
-    if (busyAction === "import" || busyAction === "save-node") return;
-    setModalError(null);
-    setModalOpen(false);
-  }, [busyAction]);
-
-  useEffect(() => {
-    if (!modalOpen || !modalError) return;
-    modalErrorRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
+  const groups = useMemo(() => {
+    const list = Object.values(proxies).filter(
+      (p) => GROUP_TYPES.has(p.type) && p.all && p.all.length > 0,
+    );
+    list.sort((a, b) => {
+      if (a.name === "GLOBAL") return 1;
+      if (b.name === "GLOBAL") return -1;
+      return 0;
     });
-  }, [modalOpen, modalError]);
+    return list;
+  }, [proxies]);
 
+  const primaryGroupName = useMemo(() => {
+    const primary =
+      groups.find(
+        (g) =>
+          g.type === "Selector" &&
+          (g.name === "PROXY" || g.name === "🚀 Proxy"),
+      ) ??
+      groups.find((g) => g.type === "Selector" && g.name !== "GLOBAL") ??
+      groups[0];
+    return primary?.name ?? null;
+  }, [groups]);
+
+  // Expand primary group by default
   useEffect(() => {
-    if (!modalOpen) return;
-    const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        requestCloseModal();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [modalOpen, requestCloseModal]);
+    if (!primaryGroupName) return;
+    setExpandedGroups((prev) => {
+      if (Object.keys(prev).length > 0) return prev;
+      return { [primaryGroupName]: true };
+    });
+  }, [primaryGroupName]);
+
+  // Expand and scroll when navigated from Dashboard mini-card
+  useEffect(() => {
+    if (!focusGroup) return;
+    setExpandedGroups((prev) => ({ ...prev, [focusGroup]: true }));
+    window.setTimeout(() => {
+      groupRefs.current[focusGroup]?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 60);
+  }, [focusGroup]);
 
   const loadActiveNodes = useCallback(async () => {
     try {
@@ -158,46 +194,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     void loadActiveNodes();
   }, [loadActiveNodes, proxies]);
 
-  useEffect(() => {
-    if (openAddModalSignal > 0) {
-      openCreateModal("paste");
+  const nodeByName = useMemo(() => {
+    const map: Record<string, ProxyNodeConfigPayload> = {};
+    for (const n of activeNodes) {
+      map[n.name] = n;
     }
-  }, [openAddModalSignal]);
+    return map;
+  }, [activeNodes]);
 
-  const groups = Object.values(proxies).filter(
-    (p) => GROUP_TYPES.has(p.type) && p.all && p.all.length > 0,
-  );
-
-  groups.sort((a, b) => {
-    if (a.name === "GLOBAL") return 1;
-    if (b.name === "GLOBAL") return -1;
-    return 0;
-  });
-
-  const primarySelectorGroup =
-    groups.find(
-      (g) =>
-        g.type === "Selector" &&
-        (g.name === "PROXY" || g.name === "🚀 Proxy"),
-    ) ?? groups.find((g) => g.type === "Selector" && g.name !== "GLOBAL");
-
-  const effectiveSummary = config?.["effective-outbound"];
-  const effectiveName =
-    effectiveSummary?.effective_outbound ??
-    primarySelectorGroup?.effective_outbound ??
-    primarySelectorGroup?.now ??
-    "DIRECT";
-  const effectiveProto =
-    effectiveSummary?.effective_protocol ??
-    primarySelectorGroup?.effective_protocol ??
-    "DIRECT";
-  const effectiveChains =
-    effectiveSummary?.chains ?? primarySelectorGroup?.chains ?? [];
-
-  const resetManualForm = () => {
+  const resetManualForm = useCallback(() => {
     setEditingOriginalName(null);
     setEditingOriginalProto(null);
-    setProto("ss");
+    setProto("vless");
     setNodeName("");
     setServerHost("");
     setServerPort("443");
@@ -231,14 +239,23 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setProxyTls(false);
     setProxySni("");
     setProxySkipVerify(false);
-  };
+  }, []);
 
-  const openCreateModal = (initialTab: ModalMode = "paste") => {
-    resetManualForm();
-    setModalError(null);
-    setModalMode(initialTab);
-    setModalOpen(true);
-  };
+  const openCreateModal = useCallback(
+    (initialTab: ModalMode = "paste") => {
+      resetManualForm();
+      setModalError(null);
+      setModalMode(initialTab);
+      setModalOpen(true);
+    },
+    [resetManualForm],
+  );
+
+  useEffect(() => {
+    if (openAddModalSignal > 0) {
+      openCreateModal("paste");
+    }
+  }, [openAddModalSignal, openCreateModal]);
 
   const openEditModal = (node: ProxyNodeConfigPayload) => {
     resetManualForm();
@@ -275,9 +292,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       setTransportNet(isWs ? "ws" : "tcp");
       setWsPath(node["ws-opts"]?.path ?? "/");
       setWsHost(
-        node["ws-opts"]?.headers?.Host ??
-          node["ws-opts"]?.headers?.host ??
-          "",
+        node["ws-opts"]?.headers?.Host ?? node["ws-opts"]?.headers?.host ?? "",
       );
       setWsMaxEarlyData(
         node["ws-opts"]?.["max-early-data"]
@@ -295,9 +310,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       setTransportNet(isWs ? "ws" : "tcp");
       setWsPath(node["ws-opts"]?.path ?? "/");
       setWsHost(
-        node["ws-opts"]?.headers?.Host ??
-          node["ws-opts"]?.headers?.host ??
-          "",
+        node["ws-opts"]?.headers?.Host ?? node["ws-opts"]?.headers?.host ?? "",
       );
       setWsMaxEarlyData(
         node["ws-opts"]?.["max-early-data"]
@@ -320,97 +333,127 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setModalOpen(true);
   };
 
-  const latestDelay = (info: ProxyInfo | undefined): number | undefined => {
+  const latestDelay = (name: string): number | undefined => {
+    const info = proxies[name];
     if (!info || info.history.length === 0) return undefined;
     return info.history[info.history.length - 1]?.delay;
   };
 
-  const executeImportText = async (
-    rawText: string,
-    opts?: { deduplicate?: boolean; autoSelect?: boolean; closeModal?: boolean },
+  const handleSelectMember = async (group: ProxyInfo, memberName: string) => {
+    if (group.type !== "Selector") return;
+    setToast(null);
+    try {
+      await clashApi.selectProxy(group.name, memberName);
+      if (config?.mode === "direct") {
+        await clashApi.patchConfigs({ mode: "rule" });
+      }
+      await onRefreshProxies();
+    } catch (err) {
+      setToast({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  const handleProbeSingle = async (
+    e: React.MouseEvent,
+    targetName: string,
   ) => {
-    const trimmed = rawText.trim();
+    e.stopPropagation();
+    setTestingMap((prev) => ({ ...prev, [targetName]: true }));
+    try {
+      await testProxyDelay(targetName, undefined, 4000);
+      await onRefreshProxies();
+    } catch {
+      await onRefreshProxies();
+    } finally {
+      setTestingMap((prev) => ({ ...prev, [targetName]: false }));
+    }
+  };
+
+  const handleProbeGroup = async (group: ProxyInfo) => {
+    const members = group.all ?? [];
+    const flags: Record<string, boolean> = { [group.name]: true };
+    for (const m of members) flags[m] = true;
+    setTestingMap((prev) => ({ ...prev, ...flags }));
+
+    try {
+      await Promise.allSettled(
+        members.map((m) => testProxyDelay(m, undefined, 4000)),
+      );
+      await testProxyDelay(group.name, undefined, 4000).catch(() => undefined);
+      await onRefreshProxies();
+    } finally {
+      const clear: Record<string, boolean> = { [group.name]: false };
+      for (const m of members) clear[m] = false;
+      setTestingMap((prev) => ({ ...prev, ...clear }));
+    }
+  };
+
+  const handleTestAll = async () => {
+    if (probingAll) return;
+    setProbingAll(true);
+    try {
+      for (const grp of groups) {
+        await handleProbeGroup(grp);
+      }
+    } finally {
+      setProbingAll(false);
+    }
+  };
+
+  const handleImportPaste = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = pasteInput.trim();
     if (!trimmed) {
-      const msg =
-        "Please paste one or more ss://, vless://, trojan://, anytls://, socks5://, or http-proxy:// links, Base64 subscription, Clash YAML, or HTTPS subscription URL.";
-      if (opts?.closeModal) setModalError(msg);
-      else setErrorBanner(msg);
+      setModalError(
+        tr(
+          "请粘贴节点链接（如 vless://、vmess://、ss://、trojan://、hy2://、tuic://）、Base64 列表或 Clash YAML",
+          "Please paste share links (vless://, vmess://, ss://, trojan://, hy2://, tuic://), Base64 list, or Clash YAML",
+        ),
+      );
       return;
     }
-
     setBusyAction("import");
-    setErrorBanner(null);
-    setOkBanner(null);
     setModalError(null);
     try {
-      const res = await clashApi.importUris(trimmed, true, {
-        deduplicate: opts?.deduplicate ?? true,
-        autoSelect: opts?.autoSelect ?? true,
+      const res = await importActiveNodes(trimmed, {
+        deduplicate: dedupOnImport,
+        autoSelect: autoSelectOnImport,
       });
       await onRefreshProxies();
       await loadActiveNodes();
       setPasteInput("");
-      setQuickPasteText("");
-      if (opts?.closeModal) {
-        setModalOpen(false);
-      }
-      const effAfter =
-        res["effective-outbound"]?.effective_outbound ?? "updated";
-      const dupNote =
-        res["skipped-duplicates"] && res["skipped-duplicates"] > 0
-          ? ` (${res["skipped-duplicates"]} duplicate skipped)`
-          : "";
-      const skippedUnsupported = res["skipped-unsupported"] ?? [];
-      const skippedProtos = Array.from(
-        new Set(skippedUnsupported.map((s) => s.protocol)),
-      ).join(", ");
-      const unsupportedNote =
-        skippedUnsupported.length > 0
-          ? ` [${skippedUnsupported.length} unsupported skipped: ${skippedProtos}]`
-          : "";
-      setOkBanner(
-        `Saved ${res.count} node(s) to active profile${dupNote}${unsupportedNote}. Effective outbound: ${effAfter}.`,
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (opts?.closeModal) {
-        setModalError(msg);
-      } else {
-        setErrorBanner(msg);
-      }
+      setModalOpen(false);
+      const dup = res["skipped-duplicates"] ?? 0;
+      setToast({
+        ok: true,
+        text: tr(
+          `成功导入 ${res.count} 个节点${dup > 0 ? `（已自动跳过 ${dup} 个重复节点）` : ""}，已受手动节点保护。`,
+          `Imported ${res.count} node(s)${dup > 0 ? ` (${dup} duplicates skipped)` : ""} with manual-node protection.`,
+        ),
+      });
+    } catch (err) {
+      setModalError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyAction(null);
     }
   };
 
-  const handlePasteFromClipboardAndImport = async () => {
-    setErrorBanner(null);
-    setOkBanner(null);
-    const clip = await readClipboardText();
-    if (clip && clip.trim().length > 0) {
-      await executeImportText(clip, {
-        deduplicate: true,
-        autoSelect: true,
-        closeModal: false,
-      });
-    } else {
-      openCreateModal("paste");
-      setModalError(
-        "Clipboard is empty or requires browser permission — press Ctrl+V / Cmd+V (or long-press Paste) below to import immediately.",
-      );
-    }
-  };
-
-  const handleFillModalFromClipboard = async () => {
+  const handleReadClipboardToPaste = async () => {
     setModalError(null);
     const clip = await readClipboardText();
-    if (clip && clip.trim().length > 0) {
+    if (clip && clip.trim()) {
       setPasteInput((prev) =>
         prev.trim() ? `${prev.trim()}\n${clip.trim()}` : clip.trim(),
       );
     } else {
       setModalError(
-        "Clipboard is empty or blocked by browser permissions — please paste directly into the text box.",
+        tr(
+          "剪贴板为空或未授予读取权限，请在下方输入框直接按 Ctrl+V / Cmd+V 粘贴",
+          "Clipboard is empty or blocked — press Ctrl+V / Cmd+V directly into the box below",
+        ),
       );
     }
   };
@@ -420,21 +463,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       return { network: "tcp", wsOpts: undefined };
     }
     const headers: Record<string, string> = {};
-    if (wsHost.trim()) {
-      headers.Host = wsHost.trim();
-    }
+    if (wsHost.trim()) headers.Host = wsHost.trim();
     const trimmedEarly = wsMaxEarlyData.trim();
     let earlyNum = 0;
     if (trimmedEarly.length > 0) {
-      if (!/^\d+$/.test(trimmedEarly)) {
-        throw new Error(
-          "WebSocket 0-RTT max-early-data must be an integer between 0 and 65535.",
-        );
-      }
       earlyNum = Number.parseInt(trimmedEarly, 10);
       if (!Number.isFinite(earlyNum) || earlyNum < 0 || earlyNum > 65535) {
         throw new Error(
-          "WebSocket 0-RTT max-early-data must be between 0 and 65535.",
+          tr(
+            "WebSocket max-early-data 需为 0–65535 的整数",
+            "WebSocket max-early-data must be between 0 and 65535",
+          ),
         );
       }
     }
@@ -458,25 +497,24 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     const cleanHost = serverHost.trim();
     const portNum = Number.parseInt(serverPort.trim(), 10);
     if (!cleanName) {
-      throw new Error("Node name is required.");
+      throw new Error(tr("请填写节点名称", "Node name is required"));
     }
     if (!cleanHost) {
-      throw new Error("Server hostname or IP is required.");
+      throw new Error(tr("请填写服务器地址", "Server address is required"));
     }
     if (!Number.isFinite(portNum) || portNum < 1 || portNum > 65535) {
-      throw new Error("Port must be between 1 and 65535.");
+      throw new Error(
+        tr("端口必须在 1 到 65535 之间", "Port must be between 1 and 65535"),
+      );
     }
     const isEditing = Boolean(editingOriginalName);
-    const sameProtoAsExisting =
-      isEditing && editingOriginalProto === proto;
+    const sameProto = isEditing && editingOriginalProto === proto;
 
     if (proto === "ss") {
       const pass = ssPassword.trim();
-      if (!sameProtoAsExisting && !pass) {
+      if (!sameProto && !pass) {
         throw new Error(
-          isEditing
-            ? "Switching node protocol to Shadowsocks requires entering a new password / PSK."
-            : "Shadowsocks password / PSK is required.",
+          tr("请填写 Shadowsocks 密码", "Shadowsocks password is required"),
         );
       }
       return {
@@ -492,16 +530,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
     if (proto === "vless") {
       const rawUuid = vlessUuid.trim();
-      if (!sameProtoAsExisting && !rawUuid) {
-        throw new Error(
-          isEditing
-            ? "Switching node protocol to VLESS requires entering a valid UUID."
-            : "VLESS UUID is required.",
-        );
+      if (!sameProto && !rawUuid) {
+        throw new Error(tr("请填写 VLESS UUID", "VLESS UUID is required"));
       }
       const encTrimmed = vlessEncryption.trim();
       const effectiveEnc =
-        sameProtoAsExisting && !encTrimmed && vlessHadRedactedEnc
+        sameProto && !encTrimmed && vlessHadRedactedEnc
           ? REDACTED_SECRET
           : encTrimmed || "none";
       const alpnList = vlessAlpn
@@ -528,12 +562,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
     if (proto === "trojan") {
       const pass = trojanPassword.trim();
-      if (!sameProtoAsExisting && !pass) {
-        throw new Error(
-          isEditing
-            ? "Switching node protocol to Trojan requires entering a Trojan password."
-            : "Trojan password is required.",
-        );
+      if (!sameProto && !pass) {
+        throw new Error(tr("请填写 Trojan 密码", "Trojan password is required"));
       }
       const alpnList = trojanAlpn
         .split(",")
@@ -560,7 +590,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       const passTrimmed = authPassword.trim();
       const resolvedPass = passTrimmed
         ? passTrimmed
-        : sameProtoAsExisting && authHadSavedPassword
+        : sameProto && authHadSavedPassword
           ? REDACTED_SECRET
           : null;
       return {
@@ -581,7 +611,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       const passTrimmed = authPassword.trim();
       const resolvedPass = passTrimmed
         ? passTrimmed
-        : sameProtoAsExisting && authHadSavedPassword
+        : sameProto && authHadSavedPassword
           ? REDACTED_SECRET
           : null;
       return {
@@ -598,12 +628,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     }
 
     const pass = anytlsPassword.trim();
-    if (!sameProtoAsExisting && !pass) {
-      throw new Error(
-        isEditing
-          ? "Switching node protocol to AnyTLS requires entering an AnyTLS password."
-          : "AnyTLS password is required.",
-      );
+    if (!sameProto && !pass) {
+      throw new Error(tr("请填写 AnyTLS 密码", "AnyTLS password is required"));
     }
     const alpnList = anytlsAlpn
       .split(",")
@@ -628,32 +654,30 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     let payload: ProxyNodeConfigPayload;
     try {
       payload = buildNodePayloadFromForm();
-    } catch (validationErr) {
-      setModalError(
-        validationErr instanceof Error
-          ? validationErr.message
-          : String(validationErr),
-      );
+    } catch (err) {
+      setModalError(err instanceof Error ? err.message : String(err));
       return;
     }
 
     setBusyAction("save-node");
     try {
-      const res = editingOriginalName
-        ? await clashApi.updateActiveNode(
-            editingOriginalName,
-            payload,
-            autoSelectManual,
-          )
-        : await clashApi.createActiveNode(payload, autoSelectManual);
+      const res = await upsertActiveNode(
+        payload,
+        editingOriginalName,
+        autoSelectManual,
+      );
       await onRefreshProxies();
       setActiveNodes(res.nodes);
       setModalOpen(false);
-      setOkBanner(
-        editingOriginalName
-          ? `Updated node '${payload.name}'. Effective outbound: ${res["effective-outbound"].effective_outbound}.`
-          : `Added node '${payload.name}'. Effective outbound: ${res["effective-outbound"].effective_outbound}.`,
-      );
+      setToast({
+        ok: true,
+        text: editingOriginalName
+          ? tr(`已更新节点「${payload.name}」`, `Updated node '${payload.name}'`)
+          : tr(
+              `已添加手动节点「${payload.name}」（订阅更新时自动保留）`,
+              `Added manual node '${payload.name}' (protected across updates)`,
+            ),
+      });
     } catch (err) {
       setModalError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -661,1234 +685,586 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     }
   };
 
-  const handleDeleteNode = async (e: React.MouseEvent, targetName: string) => {
-    e.stopPropagation();
+  const handleDeleteNode = async (targetName: string) => {
     setBusyAction(`del:${targetName}`);
-    setErrorBanner(null);
-    setOkBanner(null);
+    setToast(null);
     try {
       const res = await clashApi.deleteActiveNode(targetName);
       await onRefreshProxies();
       setActiveNodes(res.nodes);
-      setOkBanner(
-        `Deleted node '${targetName}'. Effective outbound: ${res["effective-outbound"].effective_outbound}.`,
-      );
+      setToast({
+        ok: true,
+        text: tr(`已删除节点「${targetName}」`, `Deleted node '${targetName}'`),
+      });
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
+      setToast({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setBusyAction(null);
     }
   };
 
-  const handleDeduplicateNodes = async () => {
+  const handleDeduplicate = async () => {
     setBusyAction("dedup");
-    setErrorBanner(null);
-    setOkBanner(null);
+    setToast(null);
     try {
       const res = await clashApi.deduplicateActiveNodes();
       await onRefreshProxies();
       setActiveNodes(res.nodes);
-      const removedCount = res["removed-nodes"]?.length ?? 0;
-      setOkBanner(
-        removedCount > 0
-          ? `Removed ${removedCount} duplicate node(s). ${res.nodes.length} unique node(s) remain.`
-          : "No duplicate proxy nodes found.",
-      );
+      const removed = res["removed-nodes"]?.length ?? 0;
+      setToast({
+        ok: true,
+        text:
+          removed > 0
+            ? tr(
+                `已清理 ${removed} 个重复节点，保留 ${res.nodes.length} 个唯一节点`,
+                `Removed ${removed} duplicate node(s), ${res.nodes.length} unique remaining`,
+              )
+            : tr("未发现重复节点", "No duplicate nodes found"),
+      });
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
+      setToast({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setBusyAction(null);
     }
   };
 
-  const handleSelectConcreteNodeQuick = async (targetNodeName: string) => {
-    if (!primarySelectorGroup) return;
-    setErrorBanner(null);
-    setOkBanner(null);
-    try {
-      await clashApi.selectProxy(primarySelectorGroup.name, targetNodeName);
-      if (config?.mode === "direct") {
-        await clashApi.patchConfigs({ mode: "rule" });
-      }
-      await onRefreshProxies();
-      setOkBanner(
-        `Selected '${targetNodeName}' in ${primarySelectorGroup.name}.`,
-      );
-    } catch (e) {
-      setErrorBanner(e instanceof Error ? e.message : String(e));
-    }
-  };
+  const filterAndSortMembers = (members: string[]): string[] => {
+    const q = searchQuery.trim().toLowerCase();
+    const filtered = q
+      ? members.filter((m) => {
+          const info = proxies[m];
+          const protoText = info?.type ?? "";
+          return (
+            m.toLowerCase().includes(q) || protoText.toLowerCase().includes(q)
+          );
+        })
+      : members.slice();
 
-  const handleSelectMember = async (group: ProxyInfo, memberName: string) => {
-    if (group.type !== "Selector") return;
-    setErrorBanner(null);
-    try {
-      await clashApi.selectProxy(group.name, memberName);
-      await onRefreshProxies();
-    } catch (e) {
-      setErrorBanner(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const handleProbeSingle = async (
-    e: React.MouseEvent,
-    targetName: string,
-  ) => {
-    e.stopPropagation();
-    setTestingMap((prev) => ({ ...prev, [targetName]: true }));
-    try {
-      await clashApi.testDelay(targetName, 4000);
-      await onRefreshProxies();
-    } catch {
-      await onRefreshProxies();
-    } finally {
-      setTestingMap((prev) => ({ ...prev, [targetName]: false }));
-    }
-  };
-
-  const handleProbeGroup = async (group: ProxyInfo) => {
-    const members = group.all ?? [];
-    const nextFlags: Record<string, boolean> = { [group.name]: true };
-    for (const m of members) nextFlags[m] = true;
-    setTestingMap((prev) => ({ ...prev, ...nextFlags }));
-
-    try {
-      await Promise.allSettled(
-        members.map((m) => clashApi.testDelay(m, 4000)),
-      );
-      await clashApi.testDelay(group.name, 4000).catch(() => undefined);
-      await onRefreshProxies();
-    } finally {
-      const clearFlags: Record<string, boolean> = { [group.name]: false };
-      for (const m of members) clearFlags[m] = false;
-      setTestingMap((prev) => ({ ...prev, ...clearFlags }));
-    }
-  };
-
-  const handleProbeAllGroups = async () => {
-    if (probingAll) return;
-    setProbingAll(true);
-    try {
-      for (const grp of groups) {
-        await handleProbeGroup(grp);
-      }
-    } finally {
-      setProbingAll(false);
-    }
-  };
-
-  // Deep Waterfall Probe & AI Endpoint Matrix state
-  const defaultProbeProxy =
-    primarySelectorGroup?.name ??
-    (effectiveName && effectiveName !== "DIRECT" ? effectiveName : "DIRECT");
-  const [selectedProbeTarget, setSelectedProbeTarget] = useState<string>("");
-  const [probeUrl, setProbeUrl] = useState<string>("https://api.github.com/");
-  const [waterfallRes, setWaterfallRes] = useState<WaterfallProbeReport | null>(
-    null,
-  );
-  const [matrixRes, setMatrixRes] = useState<EndpointMatrixReport | null>(null);
-  const [deepProbeBusy, setDeepProbeBusy] = useState<
-    "waterfall" | "matrix" | null
-  >(null);
-  const [deepProbeErr, setDeepProbeErr] = useState<string | null>(null);
-
-  const effectiveProbeProxy =
-    selectedProbeTarget && proxies[selectedProbeTarget]
-      ? selectedProbeTarget
-      : defaultProbeProxy;
-
-  const concreteProxyNames = Object.values(proxies)
-    .filter(
-      (p) =>
-        !GROUP_TYPES.has(p.type) &&
-        p.name !== "DIRECT" &&
-        p.name !== "REJECT",
-    )
-    .map((p) => p.name);
-
-  const handleRunWaterfallProbe = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    setDeepProbeBusy("waterfall");
-    setDeepProbeErr(null);
-    try {
-      const targetUrl =
-        probeUrl.trim() ||
-        (config?.demo.enabled && config.demo.http_benchmark_origin
-          ? `${config.demo.http_benchmark_origin}/generate_204`
-          : "https://api.github.com/");
-      const rep = await clashApi.probeWaterfall(effectiveProbeProxy, {
-        url: targetUrl,
-        checkUdp: true,
-        timeoutMs: 5000,
+    if (sortOrder === "name") {
+      filtered.sort((a, b) => a.localeCompare(b));
+    } else if (sortOrder === "latency") {
+      filtered.sort((a, b) => {
+        const da = latestDelay(a);
+        const db = latestDelay(b);
+        const va = da && da > 0 ? da : Number.MAX_SAFE_INTEGER;
+        const vb = db && db > 0 ? db : Number.MAX_SAFE_INTEGER;
+        return va - vb;
       });
-      setWaterfallRes(rep);
-    } catch (err) {
-      setDeepProbeErr(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDeepProbeBusy(null);
     }
+    return filtered;
   };
-
-  const handleRunEndpointMatrix = async () => {
-    setDeepProbeBusy("matrix");
-    setDeepProbeErr(null);
-    try {
-      const rep = await clashApi.probeEndpointMatrix(effectiveProbeProxy, 4500);
-      setMatrixRes(rep);
-      if (rep.items.length > 0 && !waterfallRes) {
-        setWaterfallRes(rep.items[0].report);
-      }
-    } catch (err) {
-      setDeepProbeErr(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDeepProbeBusy(null);
-    }
-  };
-
-  const verdictBadgeClass = (verdict: WaterfallProbeReport["verdict"]) => {
-    if (verdict === "reachable") return "badge-emerald";
-    if (verdict === "auth_required") return "badge-sky";
-    if (
-      verdict === "rate_limited" ||
-      verdict === "blocked_or_challenged" ||
-      verdict === "server_error"
-    ) {
-      return "badge-amber";
-    }
-    return "badge-rose";
-  };
-
-  const verdictLabel = (r: WaterfallProbeReport) => {
-    if (r.verdict === "reachable") {
-      return r.http_status ? `REACHABLE (HTTP ${r.http_status})` : "REACHABLE";
-    }
-    if (r.verdict === "auth_required") {
-      return `AUTH REQ / UNBLOCKED (HTTP ${r.http_status ?? 401})`;
-    }
-    if (r.verdict === "rate_limited") {
-      return `RATE LIMITED (HTTP ${r.http_status ?? 429})`;
-    }
-    if (r.verdict === "blocked_or_challenged") {
-      return r.cf_mitigated
-        ? `WAF CHALLENGE (HTTP ${r.http_status ?? 403})`
-        : `GEO / WAF BLOCKED (HTTP ${r.http_status ?? 403})`;
-    }
-    if (r.verdict === "server_error") {
-      return `ORIGIN 5XX (HTTP ${r.http_status ?? 500})`;
-    }
-    return r.failed_stage
-      ? `FAILED @ ${r.failed_stage.toUpperCase()}`
-      : "UNREACHABLE";
-  };
-
-  const activeNodeMap = new Map(activeNodes.map((n) => [n.name, n]));
-  const isDirectWarning =
-    effectiveName === "DIRECT" &&
-    activeNodes.length > 0 &&
-    config?.mode !== "direct";
 
   return (
-    <div className="group-stack">
-      {/* Top Action Bar & Effective Outbound Status */}
-      <section className="card">
-        <div
-          className="toolbar"
-          style={{ alignItems: "flex-start", gap: 14 }}
-        >
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 13 }}>
+      {toast && (
+        <div className={`banner ${toast.ok ? "banner-ok" : "banner-err"}`}>
+          <span>{toast.text}</span>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setToast(null)}
+          >
+            {tr("知道了", "Dismiss")}
+          </button>
+        </div>
+      )}
+
+      {/* Top Toolbar Card */}
+      <section className="bento-card" style={{ padding: "12px 16px" }}>
+        <div className="toolbar">
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              flexWrap: "wrap",
+              flex: "1 1 320px",
+            }}
+          >
             <div
               style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                flexWrap: "wrap",
+                position: "relative",
+                flex: "1 1 210px",
+                maxWidth: 300,
               }}
             >
               <span
                 style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  color: "var(--text-secondary)",
+                  position: "absolute",
+                  left: 11,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  color: "var(--text-muted)",
+                  display: "inline-flex",
                 }}
               >
-                Effective Outbound:
+                <SearchIcon size={14} />
               </span>
-              <span
-                id="effective-outbound-badge"
-                className={`badge ${
-                  effectiveName === "DIRECT"
-                    ? "badge-amber"
-                    : effectiveName === "REJECT"
-                      ? "badge-rose"
-                      : "badge-emerald"
-                }`}
-                style={{ fontSize: 12, padding: "3px 9px" }}
-              >
-                {effectiveName} ({effectiveProto})
-              </span>
-              <span className="badge badge-neutral">
-                Mode: {(config?.mode ?? "rule").toUpperCase()}
-              </span>
-              <span className="badge badge-sky">
-                Saved Nodes: {activeNodes.length}
-              </span>
+              <input
+                type="text"
+                className="input"
+                style={{ width: "100%", paddingLeft: 32 }}
+                placeholder={tr(
+                  "搜索节点名称或协议...",
+                  "Search node name or protocol...",
+                )}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
             </div>
 
-            {effectiveChains.length > 1 && (
-              <div
-                className="mono"
-                style={{
-                  fontSize: 11.5,
-                  color: "var(--text-muted)",
-                  overflowWrap: "anywhere",
-                }}
+            <div className="segmented" role="group" aria-label={tr("排序方式", "Sort order")}>
+              <button
+                type="button"
+                className={`seg-btn ${sortOrder === "default" ? "active" : ""}`}
+                onClick={() => setSortOrder("default")}
               >
-                Chain: {[...effectiveChains].reverse().join(" → ")}
-              </div>
-            )}
+                {tr("默认排序", "Default")}
+              </button>
+              <button
+                type="button"
+                className={`seg-btn ${sortOrder === "latency" ? "active" : ""}`}
+                onClick={() => setSortOrder("latency")}
+              >
+                {tr("按延迟", "Latency")}
+              </button>
+              <button
+                type="button"
+                className={`seg-btn ${sortOrder === "name" ? "active" : ""}`}
+                onClick={() => setSortOrder("name")}
+              >
+                {tr("按名称", "Name")}
+              </button>
+            </div>
           </div>
 
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <button
-              id="proxies-add-node-btn"
+              type="button"
+              className="btn"
+              disabled={probingAll || groups.length === 0}
+              onClick={() => void handleTestAll()}
+            >
+              <BoltIcon size={14} />
+              <span>
+                {probingAll
+                  ? tr("测速中...", "Testing...")
+                  : tr("一键测速", "Test All")}
+              </span>
+            </button>
+
+            {activeNodes.length > 0 && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setManagerOpen((v) => !v)}
+              >
+                <span>
+                  {tr("节点管理", "Manage Nodes")} ({activeNodes.length})
+                </span>
+              </button>
+            )}
+
+            <button
+              id="open-add-node-modal-btn"
               type="button"
               className="btn btn-primary"
               onClick={() => openCreateModal("paste")}
             >
-              + Add Node / 添加节点
-            </button>
-            <button
-              id="proxies-paste-clipboard-btn"
-              type="button"
-              className="btn"
-              disabled={busyAction === "import"}
-              onClick={() => void handlePasteFromClipboardAndImport()}
-            >
-              {busyAction === "import" ? "Importing..." : "Paste Clipboard"}
-            </button>
-            {androidBridge.canScanQr() && (
-              <button
-                id="proxies-scan-qr-btn"
-                type="button"
-                className="btn"
-                onClick={() => androidBridge.requestQrScan()}
-              >
-                Scan QR
-              </button>
-            )}
-            <button
-              id="proxies-dedup-btn"
-              type="button"
-              className="btn"
-              disabled={activeNodes.length < 2 || busyAction === "dedup"}
-              onClick={() => void handleDeduplicateNodes()}
-            >
-              {busyAction === "dedup" ? "Deduplicating..." : "Deduplicate"}
-            </button>
-            <button
-              id="proxies-probe-all-btn"
-              type="button"
-              className="btn"
-              disabled={concreteProxyNames.length === 0 || probingAll}
-              onClick={() => void handleProbeAllGroups()}
-            >
-              {probingAll ? "Probing..." : "Probe All"}
+              <PlusIcon size={14} />
+              <span>{tr("手动添加节点", "Add Node")}</span>
             </button>
           </div>
         </div>
       </section>
 
-      {errorBanner && (
-        <div id="proxies-error-banner" className="banner banner-err">
-          <span>{renderInlineCode(errorBanner)}</span>
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={() => setErrorBanner(null)}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {okBanner && (
-        <div id="proxies-ok-banner" className="banner banner-ok">
-          <span>{renderInlineCode(okBanner)}</span>
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={() => setOkBanner(null)}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {isDirectWarning && activeNodes[0] && (
-        <div className="banner banner-warn">
-          <span>
-            <strong>Notice:</strong> Current effective outbound is{" "}
-            <strong>DIRECT</strong> while {activeNodes.length} proxy node(s) are
-            available. Select a node below to route traffic through your proxy.
-          </span>
-          <button
-            type="button"
-            className="btn btn-primary btn-sm"
-            onClick={() =>
-              void handleSelectConcreteNodeQuick(activeNodes[0].name)
-            }
-          >
-            Use {activeNodes[0].name}
-          </button>
-        </div>
-      )}
-
-      {/* Inline Quick Import Card when Blank / Zero Saved Nodes */}
-      {activeNodes.length === 0 && !config?.demo.enabled && (
-        <section className="onboarding-card" style={{ alignItems: "stretch" }}>
-          <div style={{ width: "100%", minWidth: 0 }}>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 10,
-                flexWrap: "wrap",
-                marginBottom: 8,
-              }}
-            >
-              <div>
-                <div style={{ fontSize: 14.5, fontWeight: 700 }}>
-                  Quick Node Import — Paste &amp; Connect Immediately
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                  Paste single or multiple{" "}
-                  <code className="mono">ss://</code>,{" "}
-                  <code className="mono">vless://</code>,{" "}
-                  <code className="mono">trojan://</code>,{" "}
-                  <code className="mono">anytls://</code>,{" "}
-                  <code className="mono">socks5://</code>, or{" "}
-                  <code className="mono">http-proxy://</code> links, a Base64
-                  subscription, Clash YAML, or an{" "}
-                  <code className="mono">https://</code> subscription URL.
-                  Saved automatically across restarts.
-                </div>
+      {/* Collapsible Node Manager Drawer */}
+      {managerOpen && activeNodes.length > 0 && (
+        <section className="bento-card">
+          <div className="bento-card-head" style={{ marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 14.5, fontWeight: 650 }}>
+                {tr("节点管理", "Node Manager")}
               </div>
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => openCreateModal("manual")}
-              >
-                Manual Node Form
-              </button>
-            </div>
-
-            <textarea
-              id="quick-paste-uris-input"
-              className="code-editor"
-              rows={3}
-              placeholder={"ss://2022-blake3-aes-256-gcm:...@example.com:8388#HK-Node\nvless://uuid@example.com:443?type=ws&path=%2Fws&security=tls&sni=example.com#JP-WS\ntrojan://password@example.com:443?sni=example.com#SG-Trojan"}
-              value={quickPasteText}
-              onChange={(ev) => {
-                if (errorBanner) setErrorBanner(null);
-                setQuickPasteText(ev.target.value);
-              }}
-            />
-
-            <div
-              style={{
-                marginTop: 10,
-                display: "flex",
-                gap: 8,
-                flexWrap: "wrap",
-              }}
-            >
-              <button
-                id="quick-import-submit-btn"
-                type="button"
-                className="btn btn-primary"
-                disabled={busyAction === "import"}
-                onClick={() =>
-                  void executeImportText(quickPasteText, {
-                    deduplicate: true,
-                    autoSelect: true,
-                  })
-                }
-              >
-                {busyAction === "import"
-                  ? "Importing..."
-                  : "Save & Select Node"}
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={busyAction === "import"}
-                onClick={() => void handlePasteFromClipboardAndImport()}
-              >
-                Paste from Clipboard
-              </button>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* Deep Per-Stage Timing Waterfall & AI / Dev Endpoint Readiness Matrix */}
-      <section className="card">
-        <div className="card-header">
-          <div>
-            <h2 className="card-title">
-              Deep Timing Waterfall &amp; AI / Dev Endpoint Readiness Matrix
-            </h2>
-            <div className="card-subtitle">
-              Decompose TCP latency into{" "}
-              <code className="mono">DNS → Tunnel → TLS → HTTP TTFB</code>{" "}
-              (isolated from parallel UDP checks), and distinguish HTTP{" "}
-              <code className="mono">401</code> auth-required,{" "}
-              <code className="mono">429</code> rate-limits, and{" "}
-              <code className="mono">403</code> Geo/WAF blocks
-            </div>
-          </div>
-          {waterfallRes?.udp_probe && (
-            <span
-              className={`badge ${
-                waterfallRes.udp_probe.status === "verified"
-                  ? "badge-emerald"
-                  : waterfallRes.udp_probe.status === "blackholed"
-                    ? "badge-rose"
-                    : "badge-neutral"
-              }`}
-              title={waterfallRes.udp_probe.detail}
-            >
-              UDP: {waterfallRes.udp_probe.status.toUpperCase()}
-              {waterfallRes.udp_probe.rtt_ms != null
-                ? ` (${waterfallRes.udp_probe.rtt_ms.toFixed(0)} ms)`
-                : ""}
-            </span>
-          )}
-        </div>
-
-        <form
-          onSubmit={(e) => void handleRunWaterfallProbe(e)}
-          style={{
-            display: "flex",
-            gap: 8,
-            flexWrap: "wrap",
-            minWidth: 0,
-            marginBottom: deepProbeErr || waterfallRes || matrixRes ? 12 : 0,
-          }}
-        >
-          <select
-            id="waterfall-proxy-select"
-            className="select"
-            style={{
-              flex: "1 1 180px",
-              width: 0,
-              minWidth: 150,
-              maxWidth: "100%",
-            }}
-            value={effectiveProbeProxy}
-            onChange={(ev) => setSelectedProbeTarget(ev.target.value)}
-          >
-            {groups.length > 0 && (
-              <optgroup label="Policy Groups">
-                {groups.map((g) => (
-                  <option key={g.name} value={g.name}>
-                    {g.name} ({g.now ?? g.type})
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            {concreteProxyNames.length > 0 && (
-              <optgroup label="Concrete Nodes">
-                {concreteProxyNames.map((n) => (
-                  <option key={n} value={n}>
-                    {n}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            <optgroup label="Built-in">
-              <option value="DIRECT">DIRECT</option>
-            </optgroup>
-          </select>
-
-          <input
-            id="waterfall-url-input"
-            className="input mono"
-            style={{ flex: "1 1 240px" }}
-            value={probeUrl}
-            onChange={(ev) => setProbeUrl(ev.target.value)}
-            placeholder="https://api.openai.com/v1/models (public URL)"
-          />
-
-          <button
-            id="run-waterfall-probe-btn"
-            type="submit"
-            className="btn btn-primary"
-            disabled={deepProbeBusy !== null}
-          >
-            {deepProbeBusy === "waterfall"
-              ? "Probing Waterfall..."
-              : "Waterfall + UDP Probe"}
-          </button>
-
-          <button
-            id="run-ai-matrix-btn"
-            type="button"
-            className="btn"
-            disabled={deepProbeBusy !== null}
-            onClick={() => void handleRunEndpointMatrix()}
-          >
-            {deepProbeBusy === "matrix"
-              ? "Scanning Matrix..."
-              : "1-Click AI & Dev Matrix"}
-          </button>
-        </form>
-
-        {deepProbeErr && (
-          <div className="banner banner-err" style={{ marginBottom: 12 }}>
-            <span>{deepProbeErr}</span>
-          </div>
-        )}
-
-        {waterfallRes && (
-          <div
-            className="kv-box"
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 10,
-              marginBottom: matrixRes ? 12 : 0,
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 8,
-                flexWrap: "wrap",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  flexWrap: "wrap",
-                }}
-              >
-                <strong className="mono">{waterfallRes.url}</strong>
-                <span className="badge badge-neutral">
-                  {waterfallRes.effective_outbound} ({waterfallRes.protocol})
-                </span>
-                {waterfallRes.tls_version && (
-                  <span className="badge badge-sky">
-                    {waterfallRes.tls_version}
-                    {waterfallRes.alpn ? ` · ${waterfallRes.alpn}` : ""}
-                  </span>
+              <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                {tr(
+                  "编辑、删除或清理当前配置中的节点。手动新增的节点在订阅更新时会自动保留。",
+                  "Edit, remove, or deduplicate nodes. Manually added nodes are preserved when subscriptions refresh.",
                 )}
               </div>
-              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                <span
-                  className={`badge ${verdictBadgeClass(waterfallRes.verdict)}`}
-                >
-                  {verdictLabel(waterfallRes)}
-                </span>
-                <span
-                  className="badge badge-neutral tabular"
-                  title={
-                    waterfallRes.overall_probe_duration_ms != null
-                      ? `TCP Waterfall: ${waterfallRes.total_ms.toFixed(1)} ms · Overall wall-clock (incl. parallel UDP): ${waterfallRes.overall_probe_duration_ms.toFixed(1)} ms`
-                      : undefined
-                  }
-                >
-                  TCP {waterfallRes.total_ms.toFixed(1)} ms
-                </span>
-              </div>
-            </div>
-
-            {/* Segmented Timing Waterfall Bar */}
-            {(() => {
-              const d = waterfallRes.dns_resolve_ms ?? 0;
-              const c = waterfallRes.tunnel_connect_ms ?? 0;
-              const t = waterfallRes.tls_handshake_ms ?? 0;
-              const h = waterfallRes.http_ttfb_ms ?? 0;
-              const sum = Math.max(d + c + t + h, 0.1);
-              return (
-                <div>
-                  <div
-                    style={{
-                      display: "flex",
-                      height: 10,
-                      borderRadius: 999,
-                      overflow: "hidden",
-                      background: "var(--bg-elevated)",
-                      marginBottom: 8,
-                    }}
-                  >
-                    {d > 0 && (
-                      <div
-                        style={{
-                          width: `${(d / sum) * 100}%`,
-                          background: "#38bdf8",
-                        }}
-                        title={`DNS Resolve: ${d.toFixed(1)} ms`}
-                      />
-                    )}
-                    {c > 0 && (
-                      <div
-                        style={{
-                          width: `${(c / sum) * 100}%`,
-                          background: "#f59e0b",
-                        }}
-                        title={`Tunnel Connect: ${c.toFixed(1)} ms`}
-                      />
-                    )}
-                    {t > 0 && (
-                      <div
-                        style={{
-                          width: `${(t / sum) * 100}%`,
-                          background: "#818cf8",
-                        }}
-                        title={`TLS Handshake: ${t.toFixed(1)} ms`}
-                      />
-                    )}
-                    {h > 0 && (
-                      <div
-                        style={{
-                          width: `${(h / sum) * 100}%`,
-                          background: "#10b981",
-                        }}
-                        title={`HTTP TTFB: ${h.toFixed(1)} ms`}
-                      />
-                    )}
-                  </div>
-
-                  <div
-                    className="tabular"
-                    style={{
-                      display: "flex",
-                      gap: 14,
-                      flexWrap: "wrap",
-                      fontSize: 11.5,
-                      color: "var(--text-secondary)",
-                    }}
-                  >
-                    <span>
-                      <strong style={{ color: "#38bdf8" }}>● DNS:</strong>{" "}
-                      {waterfallRes.dns_resolve_ms != null
-                        ? `${waterfallRes.dns_resolve_ms.toFixed(1)} ms`
-                        : waterfallRes.remote_dns
-                          ? "Remote Tunnel DNS"
-                          : "Literal IP"}
-                    </span>
-                    <span>
-                      <strong style={{ color: "#f59e0b" }}>● Tunnel:</strong>{" "}
-                      {waterfallRes.tunnel_connect_ms != null
-                        ? `${waterfallRes.tunnel_connect_ms.toFixed(1)} ms`
-                        : "—"}
-                    </span>
-                    <span>
-                      <strong style={{ color: "#818cf8" }}>● TLS:</strong>{" "}
-                      {waterfallRes.tls_handshake_ms != null
-                        ? `${waterfallRes.tls_handshake_ms.toFixed(1)} ms`
-                        : "n/a"}
-                    </span>
-                    <span>
-                      <strong style={{ color: "#10b981" }}>● HTTP TTFB:</strong>{" "}
-                      {waterfallRes.http_ttfb_ms != null
-                        ? `${waterfallRes.http_ttfb_ms.toFixed(1)} ms`
-                        : "—"}
-                    </span>
-                  </div>
-                </div>
-              );
-            })()}
-
-            <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-              {waterfallRes.note}
-              {waterfallRes.udp_probe
-                ? ` · UDP Check: ${waterfallRes.udp_probe.detail}`
-                : ""}
-            </div>
-          </div>
-        )}
-
-        {matrixRes && (
-          <div>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 8,
-                flexWrap: "wrap",
-                marginBottom: 8,
-              }}
-            >
-              <div
-                style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  color: "var(--text-secondary)",
-                }}
-              >
-                AI &amp; Developer Endpoint Matrix via{" "}
-                <span className="mono">{matrixRes.effective_outbound}</span> (
-                {matrixRes.protocol}) — {matrixRes.ai_status_note}
-              </div>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                <span
-                  className={`badge ${matrixRes.ai_egress_unblocked ? "badge-emerald" : "badge-amber"}`}
-                  title={matrixRes.ai_status_note}
-                >
-                  AI Egress:{" "}
-                  {matrixRes.ai_egress_unblocked
-                    ? "UNBLOCKED (AUTH REQ)"
-                    : matrixRes.rate_limited_count > 0
-                      ? "RATE-LIMITED (429)"
-                      : "BLOCKED / PARTIAL"}
-                </span>
-                <span className="badge badge-sky tabular">
-                  Unblocked {matrixRes.reachable_count}/{matrixRes.items.length}
-                </span>
-                {matrixRes.rate_limited_count > 0 && (
-                  <span className="badge badge-amber tabular">
-                    429 Rate-Limited: {matrixRes.rate_limited_count}
-                  </span>
-                )}
-                <span
-                  className={`badge ${
-                    matrixRes.udp_probe.status === "verified"
-                      ? "badge-emerald"
-                      : matrixRes.udp_probe.status === "blackholed"
-                        ? "badge-rose"
-                        : "badge-neutral"
-                  }`}
-                >
-                  UDP: {matrixRes.udp_probe.status.toUpperCase()}
-                </span>
-              </div>
-            </div>
-
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Endpoint</th>
-                    <th>Verdict</th>
-                    <th>Tunnel</th>
-                    <th>TLS</th>
-                    <th>HTTP TTFB</th>
-                    <th>Total</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {matrixRes.items.map((item) => {
-                    const p = item.report;
-                    return (
-                      <tr
-                        key={item.id}
-                        style={{ cursor: "pointer" }}
-                        onClick={() => {
-                          setProbeUrl(p.url);
-                          setWaterfallRes(p);
-                        }}
-                      >
-                        <td>
-                          <div style={{ fontWeight: 600 }}>{item.label}</div>
-                          <div
-                            className="mono"
-                            style={{ fontSize: 11, color: "var(--text-muted)" }}
-                          >
-                            {p.target_host}
-                          </div>
-                        </td>
-                        <td>
-                          <span
-                            className={`badge ${verdictBadgeClass(p.verdict)}`}
-                          >
-                            {verdictLabel(p)}
-                          </span>
-                        </td>
-                        <td className="tabular">
-                          {p.tunnel_connect_ms != null
-                            ? `${p.tunnel_connect_ms.toFixed(0)} ms`
-                            : "—"}
-                        </td>
-                        <td className="tabular">
-                          {p.tls_handshake_ms != null
-                            ? `${p.tls_handshake_ms.toFixed(0)} ms`
-                            : "n/a"}
-                        </td>
-                        <td className="tabular">
-                          {p.http_ttfb_ms != null
-                            ? `${p.http_ttfb_ms.toFixed(0)} ms`
-                            : "—"}
-                        </td>
-                        <td className="tabular" style={{ fontWeight: 600 }}>
-                          {p.total_ms.toFixed(0)} ms
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-      </section>
-
-      {/* Saved Proxy Nodes Management Card */}
-      {activeNodes.length > 0 && !config?.demo.enabled && (
-        <section className="card">
-          <div
-            className="card-header"
-            style={{
-              marginBottom: collapsed["__saved_nodes__"] ? 0 : 12,
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                flexWrap: "wrap",
-              }}
-            >
-              <h2 className="card-title" style={{ fontSize: 15 }}>
-                Saved Proxy Nodes ({activeNodes.length})
-              </h2>
-              <span className="badge badge-sky">Persistent Profile</span>
             </div>
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => openCreateModal("manual")}
+                disabled={busyAction === "dedup"}
+                onClick={() => void handleDeduplicate()}
               >
-                + Manual Node
+                {busyAction === "dedup"
+                  ? tr("去重中...", "Deduplicating...")
+                  : tr("一键去重", "Deduplicate")}
               </button>
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() =>
-                  setCollapsed((prev) => ({
-                    ...prev,
-                    __saved_nodes__: !prev["__saved_nodes__"],
-                  }))
-                }
+                onClick={() => setManagerOpen(false)}
               >
-                {collapsed["__saved_nodes__"]
-                  ? `Expand (${activeNodes.length})`
-                  : "Collapse"}
+                {tr("收起", "Hide")}
               </button>
             </div>
           </div>
 
-          {!collapsed["__saved_nodes__"] && (
-            <div className="node-grid">
-              {activeNodes.map((node) => {
-                const liveInfo = proxies[node.name];
-                const rtt = latestDelay(liveInfo);
-                const isEffective = effectiveName === node.name;
-                const isTesting = Boolean(testingMap[node.name]);
-                const protoLabel = nodeProtocolBadge(
-                  node,
-                  liveInfo?.type ?? node.type.toUpperCase(),
-                );
-
-                return (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+              gap: 9,
+              maxHeight: 280,
+              overflowY: "auto",
+            }}
+          >
+            {activeNodes.map((n) => (
+              <div
+                key={n.name}
+                className="sub-pill-box"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
                   <div
-                    key={node.name}
-                    className={`node-tile ${isEffective ? "selected" : ""}`}
-                    onClick={() => void handleSelectConcreteNodeQuick(node.name)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(ev) => {
-                      if (ev.key === "Enter" || ev.key === " ") {
-                        ev.preventDefault();
-                        void handleSelectConcreteNodeQuick(node.name);
-                      }
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 600,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                    title={n.name}
+                  >
+                    {n.name}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: "var(--text-muted)",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
                     }}
                   >
-                    <div className="node-tile-top">
-                      <div style={{ minWidth: 0 }}>
-                        <div className="node-name">{node.name}</div>
-                        <div
-                          className="mono"
-                          style={{
-                            fontSize: 11,
-                            color: "var(--text-muted)",
-                            marginTop: 2,
-                            overflowWrap: "anywhere",
-                          }}
-                        >
-                          {node.server}:{node.port}
-                        </div>
-                      </div>
-                      <span
-                        className={`badge tabular ${delayBadgeVariant(rtt)}`}
-                        onClick={(e) => void handleProbeSingle(e, node.name)}
-                        title="Click to probe latency"
-                      >
-                        {isTesting
-                          ? "..."
-                          : rtt && rtt > 0
-                            ? `${rtt} ms`
-                            : "Probe"}
-                      </span>
-                    </div>
-
-                    <div className="node-tile-bottom">
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 5,
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <span
-                          className={`badge ${protocolBadgeVariant(protoLabel)}`}
-                        >
-                          {protoLabel}
-                        </span>
-                        {isEffective && (
-                          <span className="badge badge-emerald">Active</span>
-                        )}
-                      </div>
-
-                      <div className="node-tile-actions">
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            openEditModal(node);
-                          }}
-                        >
-                          Edit
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          disabled={busyAction === `del:${node.name}`}
-                          onClick={(e) => void handleDeleteNode(e, node.name)}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </div>
+                    {nodeProtocolBadge(n)} · {n.server}:{n.port}
                   </div>
-                );
-              })}
-            </div>
-          )}
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => openEditModal(n)}
+                  >
+                    {tr("编辑", "Edit")}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    disabled={busyAction === `del:${n.name}`}
+                    onClick={() => void handleDeleteNode(n.name)}
+                  >
+                    {tr("删除", "Delete")}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </section>
       )}
 
-      {/* Policy Groups */}
-      {groups.map((grp) => {
-        const isCollapsed = Boolean(collapsed[grp.name]);
-        const isGroupTesting = Boolean(testingMap[grp.name]);
-        const leafDiffers =
-          grp.effective_outbound &&
-          grp.now &&
-          grp.effective_outbound !== grp.now;
+      {/* Policy Groups Section */}
+      {groups.length === 0 ? (
+        <section
+          className="bento-card"
+          style={{ padding: "36px 24px", textAlign: "center" }}
+        >
+          <div style={{ fontSize: 16, fontWeight: 650, marginBottom: 6 }}>
+            {tr("还没有代理节点", "No Proxy Nodes Yet")}
+          </div>
+          <div
+            style={{
+              fontSize: 13,
+              color: "var(--text-muted)",
+              maxWidth: 460,
+              margin: "0 auto 16px",
+            }}
+          >
+            {tr(
+              "您可以直接粘贴节点分享链接快速使用，或者前往「订阅配置」导入机场订阅地址。",
+              "Paste share links right away or import a subscription URL in Profiles.",
+            )}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => openCreateModal("paste")}
+            >
+              <PlusIcon size={14} />
+              <span>{tr("粘贴节点链接", "Paste Node Links")}</span>
+            </button>
+            {onOpenProfiles && (
+              <button type="button" className="btn" onClick={onOpenProfiles}>
+                {tr("导入订阅配置", "Import Subscription")}
+              </button>
+            )}
+          </div>
+        </section>
+      ) : (
+        groups.map((group) => {
+          const isExpanded = Boolean(expandedGroups[group.name]);
+          const members = filterAndSortMembers(group.all ?? []);
+          const currentSelected = group.now ?? group.effective_outbound ?? "";
+          const canSelect = group.type === "Selector";
 
-        return (
-          <section key={grp.name} className="card">
-            <div
-              className="card-header"
-              style={{ marginBottom: isCollapsed ? 0 : 12 }}
+          return (
+            <section
+              key={group.name}
+              ref={(el) => {
+                groupRefs.current[group.name] = el;
+              }}
+              className="bento-card"
+              style={{ padding: "14px 18px" }}
             >
               <div
                 style={{
                   display: "flex",
                   alignItems: "center",
+                  justifyContent: "space-between",
                   gap: 10,
-                  flexWrap: "wrap",
+                  cursor: "pointer",
+                  userSelect: "none",
                 }}
+                onClick={() =>
+                  setExpandedGroups((prev) => ({
+                    ...prev,
+                    [group.name]: !prev[group.name],
+                  }))
+                }
               >
-                <h2 className="card-title" style={{ fontSize: 15 }}>
-                  {grp.name}
-                </h2>
-                <span className="badge badge-neutral">{grp.type}</span>
-                {grp.now && (
-                  <span
-                    className={`badge ${
-                      grp.now === "DIRECT" ? "badge-amber" : "badge-emerald"
-                    }`}
-                  >
-                    Selected: {grp.now}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    minWidth: 0,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ color: "var(--text-muted)", display: "inline-flex" }}>
+                    {isExpanded ? (
+                      <ChevronDownIcon size={16} />
+                    ) : (
+                      <ChevronRightIcon size={16} />
+                    )}
                   </span>
-                )}
-                {leafDiffers && (
+                  <span style={{ fontSize: 15, fontWeight: 650 }}>
+                    {group.name}
+                  </span>
+                  <span className="badge badge-neutral">
+                    {prettyProtocolLabel(group.type)}
+                  </span>
                   <span className="badge badge-sky">
-                    Effective: {grp.effective_outbound}
+                    {currentSelected || "DIRECT"}
                   </span>
-                )}
-              </div>
+                  <span
+                    className="tabular"
+                    style={{ fontSize: 12, color: "var(--text-muted)" }}
+                  >
+                    {members.length} {tr("个节点", "nodes")}
+                  </span>
+                </div>
 
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <button
                   type="button"
                   className="btn btn-sm"
-                  disabled={isGroupTesting}
-                  onClick={() => void handleProbeGroup(grp)}
+                  disabled={Boolean(testingMap[group.name])}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void handleProbeGroup(group);
+                  }}
+                  title={tr("测试本组延迟", "Test group latency")}
                 >
-                  {isGroupTesting ? "Probing..." : "Latency Test"}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() =>
-                    setCollapsed((prev) => ({
-                      ...prev,
-                      [grp.name]: !prev[grp.name],
-                    }))
-                  }
-                >
-                  {isCollapsed
-                    ? `Expand (${grp.all?.length ?? 0})`
-                    : "Collapse"}
+                  <BoltIcon size={13} />
+                  <span>
+                    {testingMap[group.name]
+                      ? tr("测速中", "Testing")
+                      : tr("测速", "Test")}
+                  </span>
                 </button>
               </div>
-            </div>
 
-            {!isCollapsed && (
-              <div className="node-grid">
-                {(grp.all ?? []).map((memberName) => {
-                  const node = proxies[memberName];
-                  const editableCfg = activeNodeMap.get(memberName);
-                  const isSelected = grp.now === memberName;
-                  const rtt = latestDelay(node);
-                  const protoLabel = editableCfg
-                    ? nodeProtocolBadge(editableCfg, node?.type)
-                    : (node?.type ?? "Unknown");
-                  const isTesting = Boolean(testingMap[memberName]);
-
-                  return (
+              {isExpanded && (
+                <div className="node-grid" style={{ marginTop: 13 }}>
+                  {members.length === 0 ? (
                     <div
-                      key={memberName}
-                      role="button"
-                      tabIndex={0}
-                      className={`node-tile ${isSelected ? "selected" : ""}`}
-                      onClick={() => void handleSelectMember(grp, memberName)}
-                      onKeyDown={(ev) => {
-                        if (ev.key === "Enter" || ev.key === " ") {
-                          ev.preventDefault();
-                          void handleSelectMember(grp, memberName);
-                        }
+                      style={{
+                        gridColumn: "1 / -1",
+                        padding: "16px 8px",
+                        textAlign: "center",
+                        color: "var(--text-muted)",
                       }}
                     >
-                      <div className="node-tile-top">
-                        <span className="node-name">{memberName}</span>
-                        <span
-                          className={`badge tabular ${delayBadgeVariant(rtt)}`}
-                          onClick={(e) => void handleProbeSingle(e, memberName)}
-                          title="Click to probe node latency"
-                        >
-                          {isTesting
-                            ? "..."
-                            : rtt && rtt > 0
-                              ? `${rtt} ms`
-                              : "Probe"}
-                        </span>
-                      </div>
+                      {tr("没有匹配的节点", "No matching nodes")}
+                    </div>
+                  ) : (
+                    members.map((memberName) => {
+                      const isSelected = group.now === memberName;
+                      const info = proxies[memberName];
+                      const cfgNode = nodeByName[memberName];
+                      const protoText = cfgNode
+                        ? nodeProtocolBadge(cfgNode, info?.type)
+                        : prettyProtocolLabel(info?.type ?? "Node");
+                      const delay = latestDelay(memberName);
+                      const isTesting = Boolean(testingMap[memberName]);
 
-                      <div className="node-tile-bottom">
+                      const latencyClass =
+                        delay && delay > 0
+                          ? delay < 150
+                            ? "fast"
+                            : delay < 400
+                              ? "mid"
+                              : "slow"
+                          : "";
+
+                      return (
                         <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
+                          key={memberName}
+                          role={canSelect ? "button" : undefined}
+                          tabIndex={canSelect ? 0 : undefined}
+                          className={`node-tile ${isSelected ? "selected" : ""}`}
+                          style={{ cursor: canSelect ? "pointer" : "default" }}
+                          onClick={() => {
+                            if (canSelect) {
+                              void handleSelectMember(group, memberName);
+                            }
+                          }}
+                          onKeyDown={(ev) => {
+                            if (
+                              canSelect &&
+                              (ev.key === "Enter" || ev.key === " ")
+                            ) {
+                              ev.preventDefault();
+                              void handleSelectMember(group, memberName);
+                            }
                           }}
                         >
-                          <span
-                            className={`badge ${protocolBadgeVariant(protoLabel)}`}
-                          >
-                            {protoLabel}
-                          </span>
-                          <span
+                          <div
                             style={{
-                              fontSize: 11,
-                              color: "var(--text-muted)",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 6,
+                              minWidth: 0,
                             }}
                           >
-                            {node?.udp ? "TCP + UDP" : "TCP"}
-                          </span>
+                            <span className="node-name" title={memberName}>
+                              {memberName}
+                            </span>
+                            {isSelected && (
+                              <span
+                                style={{
+                                  width: 8,
+                                  height: 8,
+                                  borderRadius: "50%",
+                                  background: "var(--accent-blue)",
+                                  flexShrink: 0,
+                                }}
+                              />
+                            )}
+                          </div>
+
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 6,
+                            }}
+                          >
+                            <span
+                              className={`badge ${protocolBadgeVariant(protoText)}`}
+                            >
+                              {protoText}
+                            </span>
+
+                            <button
+                              type="button"
+                              className={`latency-pill tabular ${latencyClass}`}
+                              onClick={(e) => void handleProbeSingle(e, memberName)}
+                              title={tr("点击单点测速", "Click to re-test latency")}
+                            >
+                              {isTesting
+                                ? "..."
+                                : delay && delay > 0
+                                  ? `${delay} ms`
+                                  : tr("测速", "Test")}
+                            </button>
+                          </div>
                         </div>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </section>
+          );
+        })
+      )}
 
-                        {editableCfg && !config?.demo.enabled && (
-                          <button
-                            type="button"
-                            className="btn btn-sm"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openEditModal(editableCfg);
-                            }}
-                          >
-                            Edit
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        );
-      })}
-
-      {/* Add / Edit / Paste Node Modal */}
+      {/* Add / Edit Manual Node Modal */}
       {modalOpen && (
         <div
           className="modal-backdrop"
-          onClick={() => requestCloseModal()}
-          role="presentation"
+          onClick={() => {
+            if (!busyAction) setModalOpen(false);
+          }}
         >
-          <div
-            className="modal-card"
-            onClick={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-            aria-label={
-              editingOriginalName
-                ? `Edit Node ${editingOriginalName}`
-                : "Add Proxy Node"
-            }
-          >
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <div
               style={{
                 display: "flex",
-                justifyContent: "space-between",
                 alignItems: "center",
-                gap: 12,
+                justifyContent: "space-between",
+                gap: 8,
               }}
             >
-              <div style={{ minWidth: 0 }}>
-                <h2 className="card-title" style={{ fontSize: 16 }}>
-                  {editingOriginalName
-                    ? `Edit / Rename Node: ${editingOriginalName}`
-                    : "Add Proxy Node / 添加节点"}
-                </h2>
-                <div className="card-subtitle">
-                  {editingOriginalName
-                    ? "Renaming updates all policy groups, routing rules, and saved selections automatically."
-                    : "Persists directly to your active profile and survives hot-reloads & restarts."}
-                </div>
+              <div style={{ fontSize: 16.5, fontWeight: 650 }}>
+                {editingOriginalName
+                  ? tr(`编辑节点：${editingOriginalName}`, `Edit Node: ${editingOriginalName}`)
+                  : tr("手动添加节点", "Add Manual Node")}
               </div>
               <button
                 type="button"
-                className="btn btn-sm"
-                disabled={modalInflight}
-                onClick={() => requestCloseModal()}
+                className="bento-icon-action"
+                onClick={() => {
+                  if (!busyAction) setModalOpen(false);
+                }}
               >
-                Close
+                <CloseIcon size={15} />
               </button>
             </div>
 
@@ -1897,221 +1273,219 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                 <button
                   type="button"
                   className={`seg-btn ${modalMode === "paste" ? "active" : ""}`}
-                  disabled={modalInflight}
                   onClick={() => {
-                    setModalError(null);
                     setModalMode("paste");
+                    setModalError(null);
                   }}
                 >
-                  Paste Share Link / Subscription
+                  {tr("快速粘贴链接 / 二维码文本", "Paste Share Links")}
                 </button>
                 <button
                   type="button"
                   className={`seg-btn ${modalMode === "manual" ? "active" : ""}`}
-                  disabled={modalInflight}
                   onClick={() => {
-                    setModalError(null);
                     setModalMode("manual");
+                    setModalError(null);
                   }}
                 >
-                  Manual Node Configuration
+                  {tr("表单新建 / 编辑节点", "Form Builder")}
                 </button>
               </div>
             )}
 
+            <div className="banner banner-ok" style={{ fontSize: 12 }}>
+              <span>
+                🛡{" "}
+                {tr(
+                  "手动添加的节点会自动独立保存，订阅自动更新时绝不会被覆盖或删除。",
+                  "Manually added nodes are saved independently and will never be overwritten or deleted when subscriptions auto-update.",
+                )}
+              </span>
+            </div>
+
             {modalError && (
-              <div
-                ref={modalErrorRef}
-                id="modal-inline-error-banner"
-                className="banner banner-err"
-              >
-                <span>{renderInlineCode(modalError)}</span>
+              <div className="banner banner-err">
+                <span>{modalError}</span>
               </div>
             )}
 
-            {modalMode === "paste" && !editingOriginalName ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    disabled={modalInflight}
-                    onClick={() => void handleFillModalFromClipboard()}
-                  >
-                    Read Clipboard
-                  </button>
-                  {androidBridge.canScanQr() && (
+            {modalMode === "paste" ? (
+              <form
+                onSubmit={handleImportPaste}
+                style={{ display: "flex", flexDirection: "column", gap: 12 }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                    {tr(
+                      "支持 vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls://、Base64 列表与 Clash YAML",
+                      "Supports vless://, vmess://, ss://, trojan://, hy2://, tuic://, anytls://, Base64 lists & Clash YAML",
+                    )}
+                  </span>
+                  <div style={{ display: "flex", gap: 6 }}>
                     <button
                       type="button"
                       className="btn btn-sm"
-                      disabled={modalInflight}
-                      onClick={() => {
-                        requestCloseModal();
-                        androidBridge.requestQrScan();
-                      }}
+                      onClick={() => void handleReadClipboardToPaste()}
                     >
-                      Scan QR Code
+                      {tr("从剪贴板粘贴", "Paste Clipboard")}
                     </button>
-                  )}
+                    {androidBridge.canScanQr() && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => androidBridge.requestQrScan()}
+                      >
+                        {tr("扫码导入", "Scan QR")}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <textarea
-                  id="modal-paste-uris-textarea"
                   className="code-editor"
                   rows={6}
-                  placeholder={"Paste one or multiple share links (one per line), Base64 subscription, Clash YAML, or HTTPS subscription URL:\nss://...\nvless://...\ntrojan://...\nanytls://...\nsocks5://...\nhttp-proxy://..."}
+                  placeholder="vless://...&#10;trojan://...&#10;ss://..."
                   value={pasteInput}
-                  onChange={(e) => {
-                    if (modalError) setModalError(null);
-                    setPasteInput(e.target.value);
-                  }}
+                  onChange={(e) => setPasteInput(e.target.value)}
                 />
-
-                <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 6,
-                      fontSize: 12.5,
-                      cursor: "pointer",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={dedupOnImport}
-                      onChange={(e) => setDedupOnImport(e.target.checked)}
-                    />
-                    Skip duplicate nodes
-                  </label>
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 6,
-                      fontSize: 12.5,
-                      cursor: "pointer",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={autoSelectOnImport}
-                      onChange={(e) => setAutoSelectOnImport(e.target.checked)}
-                    />
-                    Select &amp; activate immediately
-                  </label>
-                </div>
 
                 <div
                   style={{
                     display: "flex",
-                    justifyContent: "flex-end",
-                    gap: 8,
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    flexWrap: "wrap",
                   }}
                 >
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={modalInflight}
-                    onClick={() => requestCloseModal()}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    id="modal-import-submit-btn"
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={busyAction === "import"}
-                    onClick={() =>
-                      void executeImportText(pasteInput, {
-                        deduplicate: dedupOnImport,
-                        autoSelect: autoSelectOnImport,
-                        closeModal: true,
-                      })
-                    }
-                  >
-                    {busyAction === "import"
-                      ? "Importing..."
-                      : "Import & Save"}
-                  </button>
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: 12.5,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={dedupOnImport}
+                        onChange={(e) => setDedupOnImport(e.target.checked)}
+                      />
+                      {tr("自动跳过重复节点", "Skip duplicates")}
+                    </label>
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: 12.5,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={autoSelectOnImport}
+                        onChange={(e) =>
+                          setAutoSelectOnImport(e.target.checked)
+                        }
+                      />
+                      {tr("导入后自动选中", "Select after import")}
+                    </label>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busyAction === "import"}
+                      onClick={() => setModalOpen(false)}
+                    >
+                      {tr("取消", "Cancel")}
+                    </button>
+                    <button
+                      type="submit"
+                      className="btn btn-primary"
+                      disabled={busyAction === "import"}
+                    >
+                      {busyAction === "import"
+                        ? tr("导入中...", "Importing...")
+                        : tr("立即导入", "Import Nodes")}
+                    </button>
+                  </div>
                 </div>
-              </div>
+              </form>
             ) : (
               <form
-                onSubmit={(e) => void handleSaveManualNode(e)}
+                onSubmit={handleSaveManualNode}
                 style={{ display: "flex", flexDirection: "column", gap: 12 }}
               >
                 <div className="form-grid">
                   <div className="form-field">
-                    <label className="form-label">Protocol</label>
+                    <label className="form-label">
+                      {tr("协议类型", "Protocol")}
+                    </label>
                     <select
-                      id="manual-node-proto-select"
                       className="select"
                       value={proto}
-                      onChange={(e) => {
-                        if (modalError) setModalError(null);
-                        setProto(e.target.value as NodeProto);
-                      }}
+                      onChange={(e) => setProto(e.target.value as NodeProto)}
                     >
-                      <option value="ss">Shadowsocks / SS-2022</option>
-                      <option value="vless">VLESS / VLESS+PQ (TCP / WS)</option>
-                      <option value="trojan">Trojan (TLS / WS)</option>
-                      <option value="anytls">AnyTLS v2 (TLS 1.3 Mux)</option>
-                      <option value="socks5">SOCKS5 / SOCKS5+TLS</option>
-                      <option value="http">HTTP / HTTPS CONNECT</option>
+                      <option value="vless">VLESS</option>
+                      <option value="trojan">Trojan</option>
+                      <option value="ss">Shadowsocks (SS / SS-2022)</option>
+                      <option value="anytls">AnyTLS v2</option>
+                      <option value="socks5">SOCKS5</option>
+                      <option value="http">HTTP / HTTPS</option>
                     </select>
                   </div>
 
                   <div className="form-field">
-                    <label className="form-label">Node Name</label>
+                    <label className="form-label">
+                      {tr("节点名称", "Node Name")}
+                    </label>
                     <input
                       className="input"
-                      type="text"
-                      placeholder="e.g. HK-IEPL-01"
+                      placeholder={tr("例如：香港高速 01", "e.g. HK Edge 01")}
                       value={nodeName}
-                      onChange={(e) => {
-                        if (modalError) setModalError(null);
-                        setNodeName(e.target.value);
-                      }}
-                      required
+                      onChange={(e) => setNodeName(e.target.value)}
                     />
                   </div>
 
                   <div className="form-field">
-                    <label className="form-label">Server Host / IP</label>
+                    <label className="form-label">
+                      {tr("服务器地址", "Server Host / IP")}
+                    </label>
                     <input
-                      className="input"
-                      type="text"
+                      className="input mono"
                       placeholder="edge.example.com"
                       value={serverHost}
-                      onChange={(e) => {
-                        if (modalError) setModalError(null);
-                        setServerHost(e.target.value);
-                      }}
-                      required
+                      onChange={(e) => setServerHost(e.target.value)}
                     />
                   </div>
 
                   <div className="form-field">
-                    <label className="form-label">Port</label>
+                    <label className="form-label">{tr("端口", "Port")}</label>
                     <input
                       className="input tabular"
-                      type="number"
-                      min={1}
-                      max={65535}
+                      placeholder="443"
                       value={serverPort}
-                      onChange={(e) => {
-                        if (modalError) setModalError(null);
-                        setServerPort(e.target.value);
-                      }}
-                      required
+                      onChange={(e) => setServerPort(e.target.value)}
                     />
                   </div>
 
                   {proto === "ss" && (
                     <>
                       <div className="form-field">
-                        <label className="form-label">Cipher</label>
+                        <label className="form-label">
+                          {tr("加密方式", "Cipher")}
+                        </label>
                         <select
                           className="select"
                           value={ssCipher}
@@ -2124,25 +1498,20 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           ))}
                         </select>
                       </div>
-
                       <div className="form-field">
                         <label className="form-label">
-                          Password / Base64 PSK
+                          {tr("密码 / PSK", "Password / PSK")}
                         </label>
                         <input
-                          className="input"
                           type="password"
-                          autoComplete="off"
+                          className="input mono"
                           placeholder={
-                            editingOriginalName && editingOriginalProto === "ss"
-                              ? "Leave blank to keep saved password"
-                              : "Password or Base64 PSK"
+                            editingOriginalName
+                              ? tr("留空保持原密码不变", "Leave blank to keep saved")
+                              : tr("输入连接密码", "Enter password")
                           }
                           value={ssPassword}
-                          onChange={(e) => {
-                            if (modalError) setModalError(null);
-                            setSsPassword(e.target.value);
-                          }}
+                          onChange={(e) => setSsPassword(e.target.value)}
                         />
                       </div>
                     </>
@@ -2150,66 +1519,39 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
 
                   {proto === "vless" && (
                     <>
-                      <div className="form-field full">
+                      <div className="form-field">
                         <label className="form-label">UUID</label>
                         <input
                           className="input mono"
-                          type="password"
-                          autoComplete="off"
                           placeholder={
-                            editingOriginalName &&
-                            editingOriginalProto === "vless"
-                              ? "Leave blank to keep saved UUID"
+                            editingOriginalName
+                              ? tr("留空保持原 UUID", "Leave blank to keep saved")
                               : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
                           }
                           value={vlessUuid}
-                          onChange={(e) => {
-                            if (modalError) setModalError(null);
-                            setVlessUuid(e.target.value);
-                          }}
+                          onChange={(e) => setVlessUuid(e.target.value)}
                         />
                       </div>
-
-                      <div className="form-field full">
+                      <div className="form-field">
                         <label className="form-label">
-                          Client Encryption (<code className="mono">none</code>{" "}
-                          or{" "}
-                          <code className="mono">mlkem768x25519plus...</code>)
+                          {tr("SNI / 域名", "Server Name (SNI)")}
                         </label>
                         <input
                           className="input mono"
-                          type="text"
-                          placeholder={
-                            editingOriginalName && vlessHadRedactedEnc
-                              ? "Leave blank to keep saved PQ key, or enter 'none'"
-                              : "none"
-                          }
-                          value={vlessEncryption}
-                          onChange={(e) => setVlessEncryption(e.target.value)}
-                        />
-                      </div>
-
-                      <div className="form-field">
-                        <label className="form-label">SNI / Servername</label>
-                        <input
-                          className="input"
-                          type="text"
-                          placeholder="Optional TLS SNI"
+                          placeholder="edge.example.com"
                           value={vlessServername}
                           onChange={(e) => setVlessServername(e.target.value)}
                         />
                       </div>
-
-                      <div className="form-field">
+                      <div className="form-field full">
                         <label className="form-label">
-                          ALPN (comma-separated)
+                          {tr("VLESS 加密参数 (可选 PQ)", "Encryption (none or mlkem768x25519plus...)")}
                         </label>
                         <input
-                          className="input"
-                          type="text"
-                          placeholder="h2, http/1.1"
-                          value={vlessAlpn}
-                          onChange={(e) => setVlessAlpn(e.target.value)}
+                          className="input mono"
+                          placeholder="none"
+                          value={vlessEncryption}
+                          onChange={(e) => setVlessEncryption(e.target.value)}
                         />
                       </div>
                     </>
@@ -2218,46 +1560,84 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   {proto === "trojan" && (
                     <>
                       <div className="form-field">
-                        <label className="form-label">Password</label>
+                        <label className="form-label">
+                          {tr("密码", "Password")}
+                        </label>
                         <input
-                          className="input"
                           type="password"
-                          autoComplete="off"
+                          className="input mono"
                           placeholder={
-                            editingOriginalName &&
-                            editingOriginalProto === "trojan"
-                              ? "Leave blank to keep saved password"
-                              : "Trojan password"
+                            editingOriginalName
+                              ? tr("留空保持原密码", "Leave blank to keep saved")
+                              : tr("输入 Trojan 密码", "Enter Trojan password")
                           }
                           value={trojanPassword}
-                          onChange={(e) => {
-                            if (modalError) setModalError(null);
-                            setTrojanPassword(e.target.value);
-                          }}
+                          onChange={(e) => setTrojanPassword(e.target.value)}
                         />
                       </div>
-
                       <div className="form-field">
-                        <label className="form-label">TLS SNI</label>
+                        <label className="form-label">SNI</label>
                         <input
-                          className="input"
-                          type="text"
-                          placeholder="Defaults to server host"
+                          className="input mono"
+                          placeholder="edge.example.com"
                           value={trojanSni}
                           onChange={(e) => setTrojanSni(e.target.value)}
                         />
                       </div>
+                    </>
+                  )}
 
-                      <div className="form-field full">
+                  {proto === "anytls" && (
+                    <>
+                      <div className="form-field">
                         <label className="form-label">
-                          ALPN (comma-separated)
+                          {tr("密码", "Password")}
+                        </label>
+                        <input
+                          type="password"
+                          className="input mono"
+                          placeholder={
+                            editingOriginalName
+                              ? tr("留空保持原密码", "Leave blank to keep saved")
+                              : tr("输入 AnyTLS 密码", "Enter AnyTLS password")
+                          }
+                          value={anytlsPassword}
+                          onChange={(e) => setAnytlsPassword(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">SNI</label>
+                        <input
+                          className="input mono"
+                          placeholder="edge.example.com"
+                          value={anytlsSni}
+                          onChange={(e) => setAnytlsSni(e.target.value)}
+                        />
+                      </div>
+                    </>
+                  )}
+
+                  {(proto === "socks5" || proto === "http") && (
+                    <>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("用户名 (可选)", "Username (optional)")}
                         </label>
                         <input
                           className="input"
-                          type="text"
-                          placeholder="h2, http/1.1"
-                          value={trojanAlpn}
-                          onChange={(e) => setTrojanAlpn(e.target.value)}
+                          value={authUsername}
+                          onChange={(e) => setAuthUsername(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("密码 (可选)", "Password (optional)")}
+                        </label>
+                        <input
+                          type="password"
+                          className="input"
+                          value={authPassword}
+                          onChange={(e) => setAuthPassword(e.target.value)}
                         />
                       </div>
                     </>
@@ -2266,7 +1646,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   {(proto === "vless" || proto === "trojan") && (
                     <>
                       <div className="form-field">
-                        <label className="form-label">Transport</label>
+                        <label className="form-label">
+                          {tr("传输层协议", "Transport")}
+                        </label>
                         <select
                           className="select"
                           value={transportNet}
@@ -2275,358 +1657,100 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           }
                         >
                           <option value="tcp">TCP</option>
-                          <option value="ws">WebSocket (WS / CDN)</option>
+                          <option value="ws">WebSocket (WS)</option>
                         </select>
                       </div>
-
                       {transportNet === "ws" && (
                         <>
                           <div className="form-field">
                             <label className="form-label">WS Path</label>
                             <input
                               className="input mono"
-                              type="text"
                               placeholder="/ws"
                               value={wsPath}
                               onChange={(e) => setWsPath(e.target.value)}
                             />
                           </div>
-
-                          <div className="form-field">
+                          <div className="form-field full">
                             <label className="form-label">
-                              WS Host Header (optional)
+                              WS Host Header ({tr("可选", "optional")})
                             </label>
                             <input
-                              className="input"
-                              type="text"
+                              className="input mono"
                               placeholder="cdn.example.com"
                               value={wsHost}
                               onChange={(e) => setWsHost(e.target.value)}
-                            />
-                          </div>
-
-                          <div className="form-field">
-                            <label className="form-label">
-                              0-RTT Max Early Data (bytes)
-                            </label>
-                            <input
-                              className="input tabular"
-                              type="number"
-                              min={0}
-                              max={65535}
-                              placeholder="0 (or 2048 for 0-RTT)"
-                              value={wsMaxEarlyData}
-                              onChange={(e) => {
-                                if (modalError) setModalError(null);
-                                setWsMaxEarlyData(e.target.value);
-                              }}
                             />
                           </div>
                         </>
                       )}
                     </>
                   )}
-
-                  {proto === "anytls" && (
-                    <>
-                      <div className="form-field">
-                        <label className="form-label">Password</label>
-                        <input
-                          className="input"
-                          type="password"
-                          autoComplete="off"
-                          placeholder={
-                            editingOriginalName &&
-                            editingOriginalProto === "anytls"
-                              ? "Leave blank to keep saved password"
-                              : "AnyTLS password"
-                          }
-                          value={anytlsPassword}
-                          onChange={(e) => {
-                            if (modalError) setModalError(null);
-                            setAnytlsPassword(e.target.value);
-                          }}
-                        />
-                      </div>
-
-                      <div className="form-field">
-                        <label className="form-label">TLS SNI</label>
-                        <input
-                          className="input"
-                          type="text"
-                          placeholder="Defaults to server host"
-                          value={anytlsSni}
-                          onChange={(e) => setAnytlsSni(e.target.value)}
-                        />
-                      </div>
-
-                      <div className="form-field full">
-                        <label className="form-label">
-                          ALPN (comma-separated)
-                        </label>
-                        <input
-                          className="input"
-                          type="text"
-                          placeholder="h2, http/1.1"
-                          value={anytlsAlpn}
-                          onChange={(e) => setAnytlsAlpn(e.target.value)}
-                        />
-                      </div>
-                    </>
-                  )}
-
-                  {(proto === "socks5" || proto === "http") && (
-                    <>
-                      <div className="form-field">
-                        <label className="form-label">
-                          Username (optional)
-                        </label>
-                        <input
-                          className="input"
-                          type="text"
-                          autoComplete="off"
-                          placeholder="Optional username"
-                          value={authUsername}
-                          onChange={(e) => setAuthUsername(e.target.value)}
-                        />
-                      </div>
-
-                      <div className="form-field">
-                        <label className="form-label">
-                          Password (optional)
-                        </label>
-                        <input
-                          className="input"
-                          type="password"
-                          autoComplete="off"
-                          placeholder={
-                            editingOriginalName && authHadSavedPassword
-                              ? "Leave blank to keep saved password"
-                              : "Optional password"
-                          }
-                          value={authPassword}
-                          onChange={(e) => setAuthPassword(e.target.value)}
-                        />
-                      </div>
-
-                      {proxyTls && (
-                        <div className="form-field full">
-                          <label className="form-label">TLS SNI</label>
-                          <input
-                            className="input"
-                            type="text"
-                            placeholder="Defaults to server host"
-                            value={proxySni}
-                            onChange={(e) => setProxySni(e.target.value)}
-                          />
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-
-                <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-                  {proto !== "http" && (
-                    <label
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 6,
-                        fontSize: 12.5,
-                        cursor: "pointer",
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={udpEnabled}
-                        onChange={(e) => setUdpEnabled(e.target.checked)}
-                      />
-                      Enable UDP Relay
-                    </label>
-                  )}
-
-                  {proto === "vless" && (
-                    <>
-                      <label
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 6,
-                          fontSize: 12.5,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={vlessTls}
-                          onChange={(e) => setVlessTls(e.target.checked)}
-                        />
-                        TLS Enabled
-                      </label>
-                      <label
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 6,
-                          fontSize: 12.5,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={vlessSkipVerify}
-                          onChange={(e) => setVlessSkipVerify(e.target.checked)}
-                        />
-                        Skip Cert Verify
-                      </label>
-                    </>
-                  )}
-
-                  {proto === "trojan" && (
-                    <>
-                      <label
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 6,
-                          fontSize: 12.5,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={trojanTls}
-                          onChange={(e) => setTrojanTls(e.target.checked)}
-                        />
-                        TLS Enabled
-                      </label>
-                      <label
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 6,
-                          fontSize: 12.5,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={trojanSkipVerify}
-                          onChange={(e) =>
-                            setTrojanSkipVerify(e.target.checked)
-                          }
-                        />
-                        Skip Cert Verify
-                      </label>
-                    </>
-                  )}
-
-                  {proto === "anytls" && (
-                    <label
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 6,
-                        fontSize: 12.5,
-                        cursor: "pointer",
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={anytlsSkipVerify}
-                        onChange={(e) => setAnytlsSkipVerify(e.target.checked)}
-                      />
-                      Skip Cert Verify
-                    </label>
-                  )}
-
-                  {(proto === "socks5" || proto === "http") && (
-                    <>
-                      <label
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 6,
-                          fontSize: 12.5,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={proxyTls}
-                          onChange={(e) => setProxyTls(e.target.checked)}
-                        />
-                        TLS / HTTPS Upstream
-                      </label>
-                      {proxyTls && (
-                        <label
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 6,
-                            fontSize: 12.5,
-                            cursor: "pointer",
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={proxySkipVerify}
-                            onChange={(e) =>
-                              setProxySkipVerify(e.target.checked)
-                            }
-                          />
-                          Skip Cert Verify
-                        </label>
-                      )}
-                    </>
-                  )}
-
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 6,
-                      fontSize: 12.5,
-                      cursor: "pointer",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={autoSelectManual}
-                      onChange={(e) => setAutoSelectManual(e.target.checked)}
-                    />
-                    Select immediately in PROXY group
-                  </label>
                 </div>
 
                 <div
                   style={{
                     display: "flex",
-                    justifyContent: "flex-end",
-                    gap: 8,
-                    marginTop: 4,
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    flexWrap: "wrap",
                   }}
                 >
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={modalInflight}
-                    onClick={() => requestCloseModal()}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    id="modal-save-node-btn"
-                    type="submit"
-                    className="btn btn-primary"
-                    disabled={busyAction === "save-node"}
-                  >
-                    {busyAction === "save-node"
-                      ? "Saving..."
-                      : editingOriginalName
-                        ? "Save Changes"
-                        : "Add & Save Node"}
-                  </button>
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                    {proto !== "http" && (
+                      <label
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 6,
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={udpEnabled}
+                          onChange={(e) => setUdpEnabled(e.target.checked)}
+                        />
+                        {tr("启用 UDP 转发", "Enable UDP")}
+                      </label>
+                    )}
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: 12.5,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={autoSelectManual}
+                        onChange={(e) => setAutoSelectManual(e.target.checked)}
+                      />
+                      {tr("保存后立即选中", "Select after save")}
+                    </label>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busyAction === "save-node"}
+                      onClick={() => setModalOpen(false)}
+                    >
+                      {tr("取消", "Cancel")}
+                    </button>
+                    <button
+                      type="submit"
+                      className="btn btn-primary"
+                      disabled={busyAction === "save-node"}
+                    >
+                      {busyAction === "save-node"
+                        ? tr("保存中...", "Saving...")
+                        : tr("保存节点", "Save Node")}
+                    </button>
+                  </div>
                 </div>
               </form>
             )}

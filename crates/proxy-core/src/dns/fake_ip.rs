@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -432,6 +435,7 @@ pub struct FakeIpDnsEngine {
     inflight_direct: DashMap<String, watch::Sender<bool>>,
     inflight_proxy: DashMap<String, watch::Sender<bool>>,
     inflight_bootstrap: DashMap<String, watch::Sender<bool>>,
+    total_queries: AtomicU64,
 }
 
 impl FakeIpDnsEngine {
@@ -663,11 +667,14 @@ impl FakeIpDnsEngine {
             inflight_direct: DashMap::new(),
             inflight_proxy: DashMap::new(),
             inflight_bootstrap: DashMap::new(),
+            total_queries: AtomicU64::new(0),
         })
     }
 
     /// Preserve active Fake-IP <-> domain mappings across a config hot-reload when `fake-ip-range` matches.
     pub fn import_entries_from(&self, prev: &FakeIpDnsEngine) {
+        self.total_queries
+            .store(prev.total_queries(), Ordering::Relaxed);
         if prev.net != self.net {
             return;
         }
@@ -1738,8 +1745,13 @@ impl FakeIpDnsEngine {
         self.pool.lock().ip_to_domain.len()
     }
 
+    pub fn total_queries(&self) -> u64 {
+        self.total_queries.load(Ordering::Relaxed)
+    }
+
     /// Process a raw RFC 1035 DNS request packet, returning the encoded DNS response packet.
     pub async fn handle_dns_packet(&self, raw_query: &[u8]) -> Result<Vec<u8>> {
+        self.total_queries.fetch_add(1, Ordering::Relaxed);
         let query = DnsQueryPacket::parse(raw_query)?;
         let domain = query.question.name.as_str();
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();

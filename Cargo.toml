@@ -14,7 +14,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["RustClash Labs <rustclash.labs@proton.me>"]
@@ -74,6 +74,7 @@ rust-embed = { version = "8.7", features = ["interpolate-folder-path"] }
 socket2 = { version = "0.5", features = ["all"] }
 flate2 = "1.1"
 proptest = "1.6"
+tauri-winres = "0.3"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
@@ -82,9 +83,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.release]

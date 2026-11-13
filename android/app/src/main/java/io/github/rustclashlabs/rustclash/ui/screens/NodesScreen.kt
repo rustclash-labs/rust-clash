@@ -835,12 +835,14 @@ fun ImportPayloadBottomSheet(
     isImporting: Boolean,
     errorMessage: String? = null,
     onClearError: () -> Unit = {},
+    defaultSubAutoUpdateSecs: Long = 86400L,
     onDismiss: () -> Unit,
     onReadClipboard: () -> String?,
     onLaunchCameraQr: () -> Unit,
     onLaunchGalleryQr: () -> Unit,
     onOpenManualForm: () -> Unit,
-    onSubmitImport: (payload: String, deduplicate: Boolean, autoSelect: Boolean) -> Unit,
+    onSubmitImport: (payload: String, deduplicate: Boolean, autoSelect: Boolean) -> Unit = { _, _, _ -> },
+    onSubmitImportDetailed: ((payload: String, deduplicate: Boolean, autoSelect: Boolean, subscriptionAutoUpdateSecs: Long?) -> Unit)? = null,
 ) {
     val extColors = LocalRustClashColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -849,7 +851,13 @@ fun ImportPayloadBottomSheet(
     var payloadText by remember { mutableStateOf("") }
     var deduplicate by remember { mutableStateOf(true) }
     var autoSelect by remember { mutableStateOf(true) }
+    var enableSubAutoUpdate by remember(defaultSubAutoUpdateSecs) { mutableStateOf(defaultSubAutoUpdateSecs > 0L) }
     var clipboardHint by remember { mutableStateOf<String?>(null) }
+
+    val isSubscriptionUrl = remember(payloadText) {
+        val trimmed = payloadText.trim()
+        trimmed.startsWith("https://", ignoreCase = true) || trimmed.startsWith("clash://", ignoreCase = true)
+    }
 
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.85f).coerceAtLeast(320f).dp
 
@@ -1018,6 +1026,33 @@ fun ImportPayloadBottomSheet(
                 )
             }
 
+            AnimatedVisibility(visible = isSubscriptionUrl) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "开启订阅定时自动更新",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = "自动刷新时保留您手动添加的节点与当前选中项",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = enableSubAutoUpdate,
+                            enabled = !isImporting,
+                            onCheckedChange = { enableSubAutoUpdate = it },
+                        )
+                    }
+                }
+            }
+
             if (!errorMessage.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 ModalInlineErrorBanner(
@@ -1031,7 +1066,16 @@ fun ImportPayloadBottomSheet(
             Button(
                 onClick = {
                     focusManager.clearFocus()
-                    onSubmitImport(payloadText, deduplicate, autoSelect)
+                    val subSecs: Long? = if (isSubscriptionUrl) {
+                        if (enableSubAutoUpdate) (defaultSubAutoUpdateSecs.takeIf { it > 0L } ?: 86400L) else 0L
+                    } else {
+                        null
+                    }
+                    if (onSubmitImportDetailed != null) {
+                        onSubmitImportDetailed(payloadText, deduplicate, autoSelect, subSecs)
+                    } else {
+                        onSubmitImport(payloadText, deduplicate, autoSelect)
+                    }
                 },
                 enabled = !isImporting && payloadText.isNotBlank(),
                 modifier = Modifier

@@ -593,6 +593,7 @@ internal fun RustClashAppScaffold(
                     onRefreshProfile = viewModel::refreshProfileSubscription,
                     onDeleteProfile = viewModel::deleteProfile,
                     onRenameProfile = viewModel::renameProfile,
+                    onUpdateProfileAutoUpdate = viewModel::updateProfileAutoUpdate,
                     onOpenCustomRulesEditor = {
                         viewModel.loadActiveYamlAndRules {
                             viewModel.clearModalError()
@@ -618,6 +619,7 @@ internal fun RustClashAppScaffold(
                     onSetDemoMode = viewModel::setDemoMode,
                     onFlushDns = viewModel::flushDnsCache,
                     onSetShowSystemApps = viewModel::setShowSystemApps,
+                    onSetDefaultSubAutoUpdateSecs = viewModel::setDefaultSubAutoUpdateSecs,
                     onClearSettingsNotice = viewModel::clearSettingsSheetNotice,
                 )
             }
@@ -629,6 +631,7 @@ internal fun RustClashAppScaffold(
             isImporting = state.isImporting,
             errorMessage = state.modalError,
             onClearError = viewModel::clearModalError,
+            defaultSubAutoUpdateSecs = state.defaultSubAutoUpdateSecs,
             onDismiss = {
                 viewModel.cancelImportAndClearModalError()
                 showImportSheet = false
@@ -641,11 +644,12 @@ internal fun RustClashAppScaffold(
                 editingNode = null
                 showNodeEditor = true
             },
-            onSubmitImport = { payload, dedup, autoSel ->
+            onSubmitImportDetailed = { payload, dedup, autoSel, subSecs ->
                 viewModel.importUnifiedPayload(
                     rawPayload = payload,
                     deduplicate = dedup,
                     autoSelect = autoSel,
+                    subscriptionAutoUpdateSecs = subSecs,
                     onSuccess = {
                         viewModel.clearModalError()
                         showImportSheet = false
