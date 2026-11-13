@@ -400,13 +400,13 @@ fn parse_provider_raw_str(name: &str, raw: &str, format: &str) -> Result<Vec<Str
         let mut val = crate::config::parse_yaml_value_with_merges(cleaned).map_err(|e| {
             ProxyError::Config(format!("failed parsing YAML rule-provider '{name}': {e}"))
         })?;
-        if let serde_yml::Value::Mapping(ref mut m) = val
+        if let serde_json::Value::Object(ref mut m) = val
             && let Some(p) = m.get_mut("payload")
-            && let serde_yml::Value::Sequence(seq) = p
+            && let serde_json::Value::Array(seq) = p
         {
             seq.retain(|v| !v.is_null());
         }
-        let parsed: PayloadYaml = serde_yml::from_value(val).map_err(|e| {
+        let parsed: PayloadYaml = serde_json::from_value(val).map_err(|e| {
             ProxyError::Config(format!("failed parsing YAML rule-provider '{name}': {e}"))
         })?;
         Ok(parsed.payload)

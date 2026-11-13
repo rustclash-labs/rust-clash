@@ -471,7 +471,7 @@ async fn main() -> Result<()> {
         Commands::ParseUri { input } => {
             let nodes = parse_subscription_uris(&input)?;
             let wrapper = serde_json::json!({ "proxies": nodes });
-            let yaml = serde_yml::to_string(&wrapper)?;
+            let yaml = serde_saphyr::to_string(&wrapper)?;
             print!("{yaml}");
         }
 
