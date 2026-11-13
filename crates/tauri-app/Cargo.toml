@@ -10,7 +10,7 @@ homepage.workspace = true
 
 [lib]
 name = "rust_clash_tauri_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "rust-clash-desktop"
