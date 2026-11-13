@@ -21,7 +21,7 @@
 `rust-clash` combines a pure-Rust proxy kernel (`crates/proxy-core`), CLI daemon (`crates/proxy-cli`), Tauri 2 desktop client (`crates/tauri-app`), JNI/C-ABI bridge (`crates/proxy-ffi`), Jetpack Compose Android `VpnService` app (`android/`), and embedded React 19 Web Console (`ui/`) — supporting **VLESS (`mlkem768x25519plus` Post-Quantum 0-RTT/1-RTT)**, **Trojan**, **AnyTLS v2**, **Shadowsocks-2022 (`SIP022`)**, **SOCKS5 / HTTP(S)**, **Multi-Transport Fake-IP DNS**, and **event-driven `smoltcp` Userspace TUN** without Go (`mihomo`/`sing-box`/`xray-core`) or C/C++ proxy sidecars.
 
 > [!IMPORTANT]
-> **Experimental & AI-Authored Prototype (`v0.3.6`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
+> **Experimental & AI-Authored Prototype (`v0.3.7`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
 
 ---
 
@@ -96,15 +96,15 @@ Instead of competing purely on legacy protocol sprawl, `rust-clash` targets thre
 
 ## Download & Quick Start
 
-### Prebuilt Releases ([`v0.3.6` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
+### Prebuilt Releases ([`v0.3.7` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
 
 Every release publishes [`SHA256SUMS.txt`](https://github.com/rustclash-labs/rust-clash/releases/latest) across all 14 desktop, CLI, and mobile artifacts:
 
 | Platform | Desktop / Mobile App | Headless CLI (`rust-clash`) | Notes |
 |---|---|---|---|
-| **Linux (`x86_64`)** | `RustClash_0.3.6_amd64.deb`<br/>`RustClash-0.3.6-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
-| **Windows 10/11 (`x86_64`)** | `RustClash_0.3.6_x64-setup.exe`<br/>`RustClash_0.3.6_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
-| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.3.6_aarch64.dmg`<br/>`RustClash_0.3.6_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
+| **Linux (`x86_64`)** | `RustClash_0.3.7_amd64.deb`<br/>`RustClash-0.3.7-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
+| **Windows 10/11 (`x86_64`)** | `RustClash_0.3.7_x64-setup.exe`<br/>`RustClash_0.3.7_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
+| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.3.7_aarch64.dmg`<br/>`RustClash_0.3.7_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
 | **Android 8.0+ (`API 26+`)** | `rust-clash-android-arm64-v8a.apk`<br/>`rust-clash-android-universal.apk` | — *(JNI `libproxy_ffi.so` bundled)* | Signed with project release keystore (`x86_64` APK & `.aab` also attached) |
 
 ### 60-Second Demo Sandbox & CLI Quick Start
