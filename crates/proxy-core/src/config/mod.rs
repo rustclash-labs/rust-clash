@@ -208,7 +208,172 @@ pub struct SkippedProxyEntry {
     pub reason: String,
 }
 
-pub(crate) fn parse_yaml_value_with_merges(yaml: &str) -> Result<serde_yml::Value> {
+pub(crate) type YamlValue = serde_json::Value;
+pub(crate) type YamlMap = serde_json::Map<String, serde_json::Value>;
+
+struct YamlJsonDoc(YamlValue);
+
+impl<'de> Deserialize<'de> for YamlJsonDoc {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct YamlJsonVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for YamlJsonVisitor {
+            type Value = YamlJsonDoc;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("any valid YAML value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::Bool(v)))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::Number(v.into())))
+            }
+
+            fn visit_i128<E>(self, v: i128) -> std::result::Result<Self::Value, E> {
+                if let Ok(n) = i64::try_from(v) {
+                    Ok(YamlJsonDoc(YamlValue::Number(n.into())))
+                } else {
+                    Ok(YamlJsonDoc(YamlValue::String(v.to_string())))
+                }
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::Number(v.into())))
+            }
+
+            fn visit_u128<E>(self, v: u128) -> std::result::Result<Self::Value, E> {
+                if let Ok(n) = u64::try_from(v) {
+                    Ok(YamlJsonDoc(YamlValue::Number(n.into())))
+                } else {
+                    Ok(YamlJsonDoc(YamlValue::String(v.to_string())))
+                }
+            }
+
+            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(
+                    serde_json::Number::from_f64(v)
+                        .map(YamlValue::Number)
+                        .unwrap_or_else(|| YamlValue::String(v.to_string())),
+                ))
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(YamlJsonDoc(YamlValue::String(v.to_owned())))
+            }
+
+            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::String(v)))
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::String(
+                    String::from_utf8_lossy(v).into_owned(),
+                )))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> std::result::Result<Self::Value, E> {
+                let s = String::from_utf8(v)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                Ok(YamlJsonDoc(YamlValue::String(s)))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::Null))
+            }
+
+            fn visit_some<D2>(self, deserializer: D2) -> std::result::Result<Self::Value, D2::Error>
+            where
+                D2: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(YamlJsonDoc(YamlValue::Null))
+            }
+
+            fn visit_newtype_struct<D2>(
+                self,
+                deserializer: D2,
+            ) -> std::result::Result<Self::Value, D2::Error>
+            where
+                D2: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_seq<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut vec = Vec::with_capacity(access.size_hint().unwrap_or(0).min(1024));
+                while let Some(elem) = access.next_element::<YamlJsonDoc>()? {
+                    vec.push(elem.0);
+                }
+                Ok(YamlJsonDoc(YamlValue::Array(vec)))
+            }
+
+            fn visit_map<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut map = YamlMap::with_capacity(access.size_hint().unwrap_or(0).min(1024));
+                while let Some((k, v)) = access.next_entry::<YamlJsonDoc, YamlJsonDoc>()? {
+                    let key_str = match k.0 {
+                        YamlValue::String(s) => s,
+                        YamlValue::Number(n) => n.to_string(),
+                        YamlValue::Bool(b) => b.to_string(),
+                        YamlValue::Null | YamlValue::Array(_) | YamlValue::Object(_) => continue,
+                    };
+                    map.insert(key_str, v.0);
+                }
+                Ok(YamlJsonDoc(YamlValue::Object(map)))
+            }
+        }
+
+        deserializer.deserialize_any(YamlJsonVisitor)
+    }
+}
+
+fn clash_yaml_parse_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_depth: 64,
+            max_documents: 32,
+            max_nodes: 100_000,
+            max_events: 250_000,
+            max_aliases: 10_000,
+            max_anchors: 10_000,
+            max_merge_keys: 10_000,
+            max_recorded_anchor_events: 200_000,
+            max_recorded_anchor_bytes: 16 * 1024 * 1024,
+            max_total_scalar_bytes: 16 * 1024 * 1024,
+            enforce_alias_anchor_ratio: false,
+        },
+        alias_limits: serde_saphyr::alias_limits! {
+            max_total_replayed_events: 200_000,
+            max_replay_stack_depth: 32,
+        },
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::LastWins,
+        merge_keys: serde_saphyr::MergeKeyPolicy::Merge,
+        strict_booleans: true,
+        leading_zero_numbers_as_strings: true,
+        non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::AsString,
+        with_snippet: false,
+        crop_radius: 0,
+    }
+}
+
+pub(crate) fn parse_yaml_value_with_merges(yaml: &str) -> Result<YamlValue> {
     let trimmed = uri::trim_bom_and_controls(yaml);
     let cleaned: std::borrow::Cow<'_, str> = if trimmed.contains('\0') {
         std::borrow::Cow::Owned(trimmed.replace('\0', ""))
@@ -216,19 +381,24 @@ pub(crate) fn parse_yaml_value_with_merges(yaml: &str) -> Result<serde_yml::Valu
         std::borrow::Cow::Borrowed(trimmed)
     };
 
-    let mut first_mapping: Option<serde_yml::Value> = None;
-    let mut first_non_null: Option<serde_yml::Value> = None;
-    for doc in serde_yml::Deserializer::from_str(&cleaned) {
-        let val = serde_yml::Value::deserialize(doc).map_err(|e| {
-            ProxyError::Config(format!(
-                "YAML parse error: {}",
-                uri::redact_sensitive_text(&e.to_string())
-            ))
-        })?;
+    let docs = serde_saphyr::from_multiple_with_options::<YamlJsonDoc>(
+        &cleaned,
+        clash_yaml_parse_options(),
+    )
+    .map_err(|e| {
+        ProxyError::Config(format!(
+            "YAML parse error: {}",
+            uri::redact_sensitive_text(&e.to_string())
+        ))
+    })?;
+
+    let mut first_mapping: Option<YamlValue> = None;
+    let mut first_non_null: Option<YamlValue> = None;
+    for YamlJsonDoc(val) in docs {
         if val.is_null() {
             continue;
         }
-        if val.is_mapping() {
+        if val.is_object() {
             first_mapping = Some(val);
             break;
         }
@@ -237,19 +407,13 @@ pub(crate) fn parse_yaml_value_with_merges(yaml: &str) -> Result<serde_yml::Valu
         }
     }
 
-    let mut root = first_mapping
-        .or(first_non_null)
-        .unwrap_or(serde_yml::Value::Null);
+    let mut root = first_mapping.or(first_non_null).unwrap_or(YamlValue::Null);
     let mut budget = 100_000usize;
     resolve_yaml_merge_keys(&mut root, 0, &mut budget)?;
     Ok(root)
 }
 
-fn resolve_yaml_merge_keys(
-    val: &mut serde_yml::Value,
-    depth: usize,
-    budget: &mut usize,
-) -> Result<()> {
+fn resolve_yaml_merge_keys(val: &mut YamlValue, depth: usize, budget: &mut usize) -> Result<()> {
     if depth > 64 {
         return Err(ProxyError::Config(
             "YAML nesting depth exceeds safety limit (64)".into(),
@@ -263,28 +427,27 @@ fn resolve_yaml_merge_keys(
     }
 
     match val {
-        serde_yml::Value::Sequence(seq) => {
+        YamlValue::Array(seq) => {
             for item in seq.iter_mut() {
                 resolve_yaml_merge_keys(item, depth + 1, budget)?;
             }
         }
-        serde_yml::Value::Mapping(map) => {
+        YamlValue::Object(map) => {
             for (_, v) in map.iter_mut() {
                 resolve_yaml_merge_keys(v, depth + 1, budget)?;
             }
-            let merge_key = serde_yml::Value::String("<<".to_string());
-            if let Some(merge_val) = map.remove(&merge_key) {
+            if let Some(merge_val) = map.swap_remove("<<") {
                 match merge_val {
-                    serde_yml::Value::Mapping(src_map) => {
+                    YamlValue::Object(src_map) => {
                         for (k, v) in src_map {
                             if !map.contains_key(&k) {
                                 map.insert(k, v);
                             }
                         }
                     }
-                    serde_yml::Value::Sequence(seq) => {
+                    YamlValue::Array(seq) => {
                         for elem in seq {
-                            if let serde_yml::Value::Mapping(src_map) = elem {
+                            if let YamlValue::Object(src_map) = elem {
                                 for (k, v) in src_map {
                                     if !map.contains_key(&k) {
                                         map.insert(k, v);
@@ -311,7 +474,7 @@ impl ClashConfig {
 
     pub fn from_yaml_str_unchecked(yaml: &str) -> Result<Self> {
         let mut root = parse_yaml_value_with_merges(yaml)?;
-        let serde_yml::Value::Mapping(ref mut map) = root else {
+        let YamlValue::Object(ref mut map) = root else {
             return Err(ProxyError::Config(
                 "YAML configuration root must be a key-value mapping".into(),
             ));
@@ -361,7 +524,7 @@ impl ClashConfig {
     /// - If `skipped` is non-empty and `0` valid proxy nodes remain, fails closed with the redacted error!
     pub fn from_yaml_str_sanitized(yaml: &str) -> Result<(Self, Vec<SkippedProxyEntry>)> {
         let mut root = parse_yaml_value_with_merges(yaml)?;
-        let serde_yml::Value::Mapping(ref mut map) = root else {
+        let YamlValue::Object(ref mut map) = root else {
             return Err(ProxyError::Config(
                 "YAML configuration root must be a key-value mapping".into(),
             ));
@@ -373,11 +536,10 @@ impl ClashConfig {
         let mut first_err: Option<ProxyError> = None;
         let mut skipped_names = HashSet::new();
 
-        let proxies_key = serde_yml::Value::String("proxies".to_string());
-        if let Some(proxies_val) = map.get(&proxies_key).cloned()
+        if let Some(proxies_val) = map.get("proxies").cloned()
             && !proxies_val.is_null()
         {
-            let serde_yml::Value::Sequence(seq) = proxies_val else {
+            let YamlValue::Array(seq) = proxies_val else {
                 return Err(ProxyError::Config(
                     "'proxies' field in YAML must be a list".into(),
                 ));
@@ -396,7 +558,7 @@ impl ClashConfig {
                 }
             }
             for kept_item in &kept_seq {
-                if let Some(pmap) = kept_item.as_mapping()
+                if let Some(pmap) = kept_item.as_object()
                     && let Some(kept_name) = yaml_str_field(pmap, "name")
                 {
                     skipped_names.remove(kept_name.trim());
@@ -428,7 +590,7 @@ impl ClashConfig {
                     )
                 )));
             }
-            map.insert(proxies_key, serde_yml::Value::Sequence(kept_seq));
+            map.insert(yaml_key("proxies"), YamlValue::Array(kept_seq));
         }
 
         expand_proxy_groups_yaml(map, true);
@@ -464,7 +626,7 @@ impl ClashConfig {
     }
 
     pub fn to_yaml_string(&self) -> Result<String> {
-        serde_yml::to_string(self)
+        serde_saphyr::to_string(self)
             .map_err(|e| ProxyError::Config(format!("YAML serialize error: {e}")))
     }
 
@@ -854,27 +1016,27 @@ fn validate_single_proxy_node(p: &ProxyNodeConfig) -> Result<()> {
     Ok(())
 }
 
-fn yaml_key(k: &str) -> serde_yml::Value {
-    serde_yml::Value::String(k.to_string())
+fn yaml_key(k: &str) -> String {
+    k.to_string()
 }
 
-fn strip_null_entries(map: &mut serde_yml::Mapping) {
+fn strip_null_entries(map: &mut YamlMap) {
     map.retain(|_, v| !v.is_null());
 }
 
-fn coerce_yaml_u64(val: &mut serde_yml::Value) {
+fn coerce_yaml_u64(val: &mut YamlValue) {
     match val {
-        serde_yml::Value::String(s) => {
+        YamlValue::String(s) => {
             let trimmed = s.trim();
             if let Ok(n) = trimmed.parse::<u64>() {
-                *val = serde_yml::Value::Number(n.into());
+                *val = YamlValue::Number(n.into());
             } else if let Some(num_part) = trimmed.strip_suffix('s')
                 && let Ok(n) = num_part.trim().parse::<u64>()
             {
-                *val = serde_yml::Value::Number(n.into());
+                *val = YamlValue::Number(n.into());
             }
         }
-        serde_yml::Value::Number(n) => {
+        YamlValue::Number(n) => {
             if n.as_u64().is_none()
                 && let Some(f) = n.as_f64()
                 && f.is_finite()
@@ -882,53 +1044,52 @@ fn coerce_yaml_u64(val: &mut serde_yml::Value) {
                 && f <= (u64::MAX as f64)
                 && f.fract() == 0.0
             {
-                *val = serde_yml::Value::Number((f as u64).into());
+                *val = YamlValue::Number((f as u64).into());
             }
         }
         _ => {}
     }
 }
 
-fn coerce_yaml_string(val: &mut serde_yml::Value) {
+fn coerce_yaml_string(val: &mut YamlValue) {
     match val {
-        serde_yml::Value::Number(n) => {
-            *val = serde_yml::Value::String(n.to_string());
+        YamlValue::Number(n) => {
+            *val = YamlValue::String(n.to_string());
         }
-        serde_yml::Value::Bool(b) => {
-            *val = serde_yml::Value::String(b.to_string());
+        YamlValue::Bool(b) => {
+            *val = YamlValue::String(b.to_string());
         }
         _ => {}
     }
 }
 
-fn coerce_yaml_bool(val: &mut serde_yml::Value) {
+fn coerce_yaml_bool(val: &mut YamlValue) {
     match val {
-        serde_yml::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => *val = serde_yml::Value::Bool(true),
-            "false" | "0" | "no" | "off" | "none" | "" => *val = serde_yml::Value::Bool(false),
+        YamlValue::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => *val = YamlValue::Bool(true),
+            "false" | "0" | "no" | "off" | "none" | "" => *val = YamlValue::Bool(false),
             _ => {}
         },
-        serde_yml::Value::Number(n) => match n.as_u64() {
-            Some(1) => *val = serde_yml::Value::Bool(true),
-            Some(0) => *val = serde_yml::Value::Bool(false),
+        YamlValue::Number(n) => match n.as_u64() {
+            Some(1) => *val = YamlValue::Bool(true),
+            Some(0) => *val = YamlValue::Bool(false),
             _ => {}
         },
         _ => {}
     }
 }
 
-fn sanitize_yaml_string_seq(val: &mut serde_yml::Value) {
+fn sanitize_yaml_string_seq(val: &mut YamlValue) {
     match val {
-        serde_yml::Value::String(s) => {
+        YamlValue::String(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                *val = serde_yml::Value::Sequence(Vec::new());
+                *val = YamlValue::Array(Vec::new());
             } else {
-                *val =
-                    serde_yml::Value::Sequence(vec![serde_yml::Value::String(trimmed.to_string())]);
+                *val = YamlValue::Array(vec![YamlValue::String(trimmed.to_string())]);
             }
         }
-        serde_yml::Value::Sequence(seq) => {
+        YamlValue::Array(seq) => {
             seq.retain(|item| !item.is_null());
             for item in seq.iter_mut() {
                 coerce_yaml_string(item);
@@ -938,20 +1099,20 @@ fn sanitize_yaml_string_seq(val: &mut serde_yml::Value) {
     }
 }
 
-fn normalize_yaml_dns_hijack(val: &mut serde_yml::Value) {
+fn normalize_yaml_dns_hijack(val: &mut YamlValue) {
     match val {
-        serde_yml::Value::Bool(_) => {}
-        serde_yml::Value::Sequence(seq) => {
+        YamlValue::Bool(_) => {}
+        YamlValue::Array(seq) => {
             let enabled = !seq.is_empty() && !seq.iter().all(yaml_value_is_effectively_empty);
-            *val = serde_yml::Value::Bool(enabled);
+            *val = YamlValue::Bool(enabled);
         }
-        serde_yml::Value::String(s) => {
+        YamlValue::String(s) => {
             let low = s.trim().to_ascii_lowercase();
             let enabled = !matches!(low.as_str(), "" | "false" | "0" | "no" | "off" | "none");
-            *val = serde_yml::Value::Bool(enabled);
+            *val = YamlValue::Bool(enabled);
         }
-        serde_yml::Value::Number(n) => {
-            *val = serde_yml::Value::Bool(n.as_u64() != Some(0));
+        YamlValue::Number(n) => {
+            *val = YamlValue::Bool(n.as_u64() != Some(0));
         }
         _ => {}
     }
@@ -970,8 +1131,8 @@ fn normalize_go_host_port(raw: &str, default_addr: &str) -> String {
     trimmed.to_string()
 }
 
-fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
-    let serde_yml::Value::Mapping(pmap) = item else {
+fn normalize_proxy_yaml_item(item: &mut YamlValue) {
+    let YamlValue::Object(pmap) = item else {
         return;
     };
     strip_null_entries(pmap);
@@ -998,10 +1159,10 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
             coerce_yaml_string(v);
         }
     }
-    if let Some(serde_yml::Value::String(u)) = pmap.get_mut("uuid") {
+    if let Some(YamlValue::String(u)) = pmap.get_mut("uuid") {
         *u = u.trim().to_string();
     }
-    if let Some(serde_yml::Value::String(srv)) = pmap.get_mut("server") {
+    if let Some(YamlValue::String(srv)) = pmap.get_mut("server") {
         let clean = srv
             .trim()
             .trim_start_matches('[')
@@ -1012,7 +1173,7 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
 
     let mut force_tls_default = false;
     let mut proto_lc = String::new();
-    if let Some(serde_yml::Value::String(t)) = pmap.get_mut("type") {
+    if let Some(YamlValue::String(t)) = pmap.get_mut("type") {
         let low = t.trim().to_ascii_lowercase();
         let mapped = match low.as_str() {
             "shadowsocks" => "ss",
@@ -1033,7 +1194,7 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
         force_tls_default = true;
     }
     if force_tls_default && !pmap.contains_key("tls") {
-        pmap.insert(yaml_key("tls"), serde_yml::Value::Bool(true));
+        pmap.insert(yaml_key("tls"), YamlValue::Bool(true));
     }
 
     // Map legacy `peer` into SNI if neither `sni` nor `servername` is set
@@ -1082,14 +1243,14 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
     let legacy_ws_path = pmap.remove("ws-path");
     let legacy_ws_headers = pmap.remove("ws-headers");
     if !pmap.contains_key("ws-opts") && (legacy_ws_path.is_some() || legacy_ws_headers.is_some()) {
-        let mut wmap = serde_yml::Mapping::new();
+        let mut wmap = YamlMap::new();
         if let Some(p) = legacy_ws_path {
             wmap.insert(yaml_key("path"), p);
         }
         if let Some(h) = legacy_ws_headers {
             wmap.insert(yaml_key("headers"), h);
         }
-        pmap.insert(yaml_key("ws-opts"), serde_yml::Value::Mapping(wmap));
+        pmap.insert(yaml_key("ws-opts"), YamlValue::Object(wmap));
     }
 
     for num_k in [
@@ -1102,43 +1263,43 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
             coerce_yaml_u64(v);
         }
     }
-    if let Some(serde_yml::Value::String(s)) = pmap.get_mut("tls")
+    if let Some(YamlValue::String(s)) = pmap.get_mut("tls")
         && s.trim().eq_ignore_ascii_case("tls")
     {
-        *pmap.get_mut("tls").unwrap() = serde_yml::Value::Bool(true);
+        *pmap.get_mut("tls").unwrap() = YamlValue::Bool(true);
     }
     for bool_k in ["udp", "tls", "skip-cert-verify"] {
         if let Some(v) = pmap.get_mut(bool_k) {
             coerce_yaml_bool(v);
-            if !v.is_bool() {
+            if !v.is_boolean() {
                 pmap.remove(bool_k);
             }
         }
     }
     if let Some(alpn_val) = pmap.get_mut("alpn") {
         match alpn_val {
-            serde_yml::Value::Bool(false) => {
-                *alpn_val = serde_yml::Value::Sequence(Vec::new());
+            YamlValue::Bool(false) => {
+                *alpn_val = YamlValue::Array(Vec::new());
             }
-            serde_yml::Value::String(s) => {
-                let items: Vec<serde_yml::Value> = s
+            YamlValue::String(s) => {
+                let items: Vec<YamlValue> = s
                     .split(',')
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
-                    .map(|p| serde_yml::Value::String(p.to_string()))
+                    .map(|p| YamlValue::String(p.to_string()))
                     .collect();
-                *alpn_val = serde_yml::Value::Sequence(items);
+                *alpn_val = YamlValue::Array(items);
             }
-            serde_yml::Value::Sequence(_) => {
+            YamlValue::Array(_) => {
                 sanitize_yaml_string_seq(alpn_val);
             }
             _ => {}
         }
     }
-    if let Some(serde_yml::Value::Mapping(hmap)) = pmap.get_mut("headers") {
+    if let Some(YamlValue::Object(hmap)) = pmap.get_mut("headers") {
         strip_null_entries(hmap);
         for (_, hv) in hmap.iter_mut() {
-            if let serde_yml::Value::Sequence(seq) = hv
+            if let YamlValue::Array(seq) = hv
                 && let Some(first) = seq.first().cloned()
             {
                 *hv = first;
@@ -1146,7 +1307,7 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
             coerce_yaml_string(hv);
         }
     }
-    if let Some(serde_yml::Value::Mapping(wmap)) = pmap.get_mut("ws-opts") {
+    if let Some(YamlValue::Object(wmap)) = pmap.get_mut("ws-opts") {
         strip_null_entries(wmap);
         for str_k in ["path", "early-data-header-name"] {
             if let Some(v) = wmap.get_mut(str_k) {
@@ -1156,10 +1317,10 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
         if let Some(ed_val) = wmap.get_mut("max-early-data") {
             coerce_yaml_u64(ed_val);
         }
-        if let Some(serde_yml::Value::Mapping(hmap)) = wmap.get_mut("headers") {
+        if let Some(YamlValue::Object(hmap)) = wmap.get_mut("headers") {
             strip_null_entries(hmap);
             for (_, hv) in hmap.iter_mut() {
-                if let serde_yml::Value::Sequence(seq) = hv
+                if let YamlValue::Array(seq) = hv
                     && let Some(first) = seq.first().cloned()
                 {
                     *hv = first;
@@ -1170,13 +1331,13 @@ fn normalize_proxy_yaml_item(item: &mut serde_yml::Value) {
     }
 }
 
-fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: bool) {
+fn expand_proxy_groups_yaml(map: &mut YamlMap, lenient_subscription: bool) {
     let concrete_nodes: Vec<(String, String)> = map
         .get("proxies")
-        .and_then(serde_yml::Value::as_sequence)
+        .and_then(YamlValue::as_array)
         .map(|seq| {
             seq.iter()
-                .filter_map(|v| v.as_mapping())
+                .filter_map(|v| v.as_object())
                 .filter_map(|m| {
                     let name = yaml_str_field(m, "name")?.trim();
                     if name.is_empty() {
@@ -1192,13 +1353,13 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
         })
         .unwrap_or_default();
 
-    let Some(serde_yml::Value::Sequence(gseq)) = map.get_mut("proxy-groups") else {
+    let Some(YamlValue::Array(gseq)) = map.get_mut("proxy-groups") else {
         return;
     };
     gseq.retain(|g| !g.is_null());
 
     for gval in gseq.iter_mut() {
-        let serde_yml::Value::Mapping(gmap) = gval else {
+        let YamlValue::Object(gmap) = gval else {
             continue;
         };
         strip_null_entries(gmap);
@@ -1235,7 +1396,7 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
                 )
             });
             if !valid_gtype {
-                gmap.insert(yaml_key("type"), serde_yml::Value::String("select".into()));
+                gmap.insert(yaml_key("type"), YamlValue::String("select".into()));
             }
         }
         for num_k in ["interval", "tolerance"] {
@@ -1257,15 +1418,15 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
         }
         let include_all = gmap
             .get("include-all")
-            .and_then(serde_yml::Value::as_bool)
+            .and_then(YamlValue::as_bool)
             .unwrap_or(false)
             || gmap
                 .get("include-all-proxies")
-                .and_then(serde_yml::Value::as_bool)
+                .and_then(YamlValue::as_bool)
                 .unwrap_or(false)
             || gmap
                 .get("include-all-providers")
-                .and_then(serde_yml::Value::as_bool)
+                .and_then(YamlValue::as_bool)
                 .unwrap_or(false);
 
         let filter_re = yaml_str_field(gmap, "filter")
@@ -1288,9 +1449,9 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
         if let Some(p_val) = gmap.get_mut("proxies") {
             sanitize_yaml_string_seq(p_val);
         }
-        if let Some(serde_yml::Value::Sequence(pseq)) = gmap.get_mut("proxies") {
+        if let Some(YamlValue::Array(pseq)) = gmap.get_mut("proxies") {
             for elem in pseq.iter_mut() {
-                if let serde_yml::Value::String(s) = elem {
+                if let YamlValue::String(s) = elem {
                     let t = s.trim();
                     if t.eq_ignore_ascii_case("DIRECT") || t.eq_ignore_ascii_case("COMPATIBLE") {
                         *s = "DIRECT".to_string();
@@ -1306,11 +1467,11 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
 
         let has_explicit_proxies = gmap
             .get("proxies")
-            .and_then(serde_yml::Value::as_sequence)
+            .and_then(YamlValue::as_array)
             .is_some_and(|s| !s.is_empty());
         let has_use = gmap
             .get("use")
-            .and_then(serde_yml::Value::as_sequence)
+            .and_then(YamlValue::as_array)
             .is_some_and(|s| !s.is_empty());
         let should_expand = include_all
             || (lenient_subscription
@@ -1322,12 +1483,12 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
 
         if should_expand {
             let mut list = match gmap.remove("proxies") {
-                Some(serde_yml::Value::Sequence(seq)) => seq,
+                Some(YamlValue::Array(seq)) => seq,
                 _ => Vec::new(),
             };
             let mut existing: HashSet<String> = list
                 .iter()
-                .filter_map(serde_yml::Value::as_str)
+                .filter_map(YamlValue::as_str)
                 .map(ToOwned::to_owned)
                 .collect();
             for (cname, cproto) in &concrete_nodes {
@@ -1345,15 +1506,15 @@ fn expand_proxy_groups_yaml(map: &mut serde_yml::Mapping, lenient_subscription: 
                     continue;
                 }
                 if existing.insert(cname.clone()) {
-                    list.push(serde_yml::Value::String(cname.clone()));
+                    list.push(YamlValue::String(cname.clone()));
                 }
             }
-            gmap.insert(yaml_key("proxies"), serde_yml::Value::Sequence(list));
+            gmap.insert(yaml_key("proxies"), YamlValue::Array(list));
         }
     }
 }
 
-fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subscription: bool) {
+fn normalize_clash_yaml_root_mapping(map: &mut YamlMap, lenient_subscription: bool) {
     strip_null_entries(map);
 
     // Alias legacy Clash root keys (`Proxy`, `Proxy Group`, `Rule`, `Rule Provider`)
@@ -1377,20 +1538,20 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
     }
     let mixed_missing_or_zero = match map.get("mixed-port") {
         None => true,
-        Some(serde_yml::Value::Number(n)) => n.as_u64() == Some(0),
+        Some(YamlValue::Number(n)) => n.as_u64() == Some(0),
         _ => false,
     };
     let fallback_port = map
         .get("port")
-        .and_then(serde_yml::Value::as_u64)
+        .and_then(YamlValue::as_u64)
         .filter(|p| (1..=65535).contains(p))
         .or_else(|| {
             map.get("socks-port")
-                .and_then(serde_yml::Value::as_u64)
+                .and_then(YamlValue::as_u64)
                 .filter(|p| (1..=65535).contains(p))
         });
     if mixed_missing_or_zero && let Some(p) = fallback_port {
-        map.insert(yaml_key("mixed-port"), serde_yml::Value::Number(p.into()));
+        map.insert(yaml_key("mixed-port"), YamlValue::Number(p.into()));
     } else if lenient_subscription
         && let Some(mp) = map.get("mixed-port")
         && mp.as_u64().is_none_or(|p| p == 0 || p > 65535)
@@ -1401,7 +1562,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
     for bool_k in ["allow-lan", "geodata-mode"] {
         if let Some(v) = map.get_mut(bool_k) {
             coerce_yaml_bool(v);
-            if lenient_subscription && !v.is_bool() {
+            if lenient_subscription && !v.is_boolean() {
                 map.remove(bool_k);
             }
         }
@@ -1421,10 +1582,10 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
             )
         })
     {
-        map.insert(yaml_key("mode"), serde_yml::Value::String("rule".into()));
+        map.insert(yaml_key("mode"), YamlValue::String("rule".into()));
     }
 
-    if let Some(serde_yml::Value::String(b)) = map.get_mut("bind-address") {
+    if let Some(YamlValue::String(b)) = map.get_mut("bind-address") {
         let bt = b.trim();
         if bt.is_empty() {
             *b = "*".to_string();
@@ -1439,22 +1600,22 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         map.remove("bind-address");
     }
     match map.get_mut("external-controller") {
-        Some(serde_yml::Value::Bool(false)) => {
+        Some(YamlValue::Bool(false)) => {
             map.remove("external-controller");
         }
-        Some(serde_yml::Value::Number(n)) => {
+        Some(YamlValue::Number(n)) => {
             if let Some(port) = n.as_u64()
                 && (1..=65535).contains(&port)
             {
                 map.insert(
                     yaml_key("external-controller"),
-                    serde_yml::Value::String(format!("127.0.0.1:{port}")),
+                    YamlValue::String(format!("127.0.0.1:{port}")),
                 );
             } else if lenient_subscription {
                 map.remove("external-controller");
             }
         }
-        Some(serde_yml::Value::String(ec)) => {
+        Some(YamlValue::String(ec)) => {
             let normalized = normalize_go_host_port(ec, "127.0.0.1:9090");
             if lenient_subscription && normalized.parse::<SocketAddr>().is_err() {
                 *ec = "127.0.0.1:9090".to_string();
@@ -1473,9 +1634,9 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
             sanitize_yaml_string_seq(v);
         }
     }
-    if let Some(serde_yml::Value::Sequence(cidrs)) = map.get_mut("lan-allowed-ips") {
+    if let Some(YamlValue::Array(cidrs)) = map.get_mut("lan-allowed-ips") {
         for item in cidrs.iter_mut() {
-            if let serde_yml::Value::String(s) = item {
+            if let YamlValue::String(s) = item {
                 let t = s.trim();
                 if t.parse::<IpNet>().is_err()
                     && let Ok(ip) = t.parse::<IpAddr>()
@@ -1499,20 +1660,20 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         parse_hosts_ip_entry(s).is_some()
     });
 
-    if let Some(serde_yml::Value::Mapping(dmap)) = map.get_mut("dns") {
+    if let Some(YamlValue::Object(dmap)) = map.get_mut("dns") {
         strip_null_entries(dmap);
         match dmap.get("listen").cloned() {
-            Some(serde_yml::Value::Bool(false)) => {
-                dmap.insert(yaml_key("enable"), serde_yml::Value::Bool(false));
+            Some(YamlValue::Bool(false)) => {
+                dmap.insert(yaml_key("enable"), YamlValue::Bool(false));
                 dmap.remove("listen");
             }
-            Some(serde_yml::Value::Number(n)) => {
+            Some(YamlValue::Number(n)) => {
                 if let Some(port) = n.as_u64()
                     && (1..=65535).contains(&port)
                 {
                     dmap.insert(
                         yaml_key("listen"),
-                        serde_yml::Value::String(format!("127.0.0.1:{port}")),
+                        YamlValue::String(format!("127.0.0.1:{port}")),
                     );
                 } else if lenient_subscription {
                     dmap.remove("listen");
@@ -1528,12 +1689,12 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         ] {
             if let Some(v) = dmap.get_mut(bool_k) {
                 coerce_yaml_bool(v);
-                if lenient_subscription && !v.is_bool() {
+                if lenient_subscription && !v.is_boolean() {
                     dmap.remove(bool_k);
                 }
             }
         }
-        if let Some(serde_yml::Value::String(listen)) = dmap.get_mut("listen") {
+        if let Some(YamlValue::String(listen)) = dmap.get_mut("listen") {
             let normalized = normalize_go_host_port(listen, "127.0.0.1:1053");
             if lenient_subscription && normalized.parse::<SocketAddr>().is_err() {
                 *listen = "127.0.0.1:1053".to_string();
@@ -1543,7 +1704,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         }
         if let Some(em_val) = dmap.get_mut("enhanced-mode") {
             coerce_yaml_string(em_val);
-            if let serde_yml::Value::String(em) = em_val {
+            if let YamlValue::String(em) = em_val {
                 let low = em.trim().to_ascii_lowercase();
                 match low.as_str() {
                     "mapping" => *em = "fake-ip".to_string(),
@@ -1554,26 +1715,26 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                 }
             }
         }
-        if let Some(serde_yml::Value::Sequence(seq)) = dmap.get("fake-ip-range").cloned() {
+        if let Some(YamlValue::Array(seq)) = dmap.get("fake-ip-range").cloned() {
             let preferred_v4 = seq
                 .iter()
-                .filter_map(serde_yml::Value::as_str)
+                .filter_map(YamlValue::as_str)
                 .map(str::trim)
                 .find(|s| s.parse::<Ipv4Net>().is_ok())
                 .map(ToOwned::to_owned);
             let first_any = seq
                 .iter()
-                .filter_map(serde_yml::Value::as_str)
+                .filter_map(YamlValue::as_str)
                 .map(str::trim)
                 .find(|s| !s.is_empty())
                 .map(ToOwned::to_owned);
             if let Some(chosen) = preferred_v4.or(first_any) {
-                dmap.insert(yaml_key("fake-ip-range"), serde_yml::Value::String(chosen));
+                dmap.insert(yaml_key("fake-ip-range"), YamlValue::String(chosen));
             } else {
                 dmap.remove("fake-ip-range");
             }
         }
-        if let Some(serde_yml::Value::String(s)) = dmap.get_mut("fake-ip-range") {
+        if let Some(YamlValue::String(s)) = dmap.get_mut("fake-ip-range") {
             let trimmed = s.trim();
             if trimmed.is_empty() || (lenient_subscription && trimmed.parse::<Ipv4Net>().is_err()) {
                 *s = default_fake_ip_range();
@@ -1606,7 +1767,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
             |s| DnsUpstream::parse(s).is_ok(),
         );
         if lenient_subscription {
-            if let Some(serde_yml::Value::Sequence(seq)) = dmap.get_mut("default-nameserver") {
+            if let Some(YamlValue::Array(seq)) = dmap.get_mut("default-nameserver") {
                 seq.retain(|v| {
                     v.as_str()
                         .map(str::trim)
@@ -1620,7 +1781,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                 "proxy-server-nameserver",
                 "fallback",
             ] {
-                if let Some(serde_yml::Value::Sequence(seq)) = dmap.get_mut(ns_k) {
+                if let Some(YamlValue::Array(seq)) = dmap.get_mut(ns_k) {
                     seq.retain(|v| {
                         v.as_str()
                             .map(str::trim)
@@ -1629,13 +1790,13 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                     });
                 }
             }
-            if let Some(serde_yml::Value::Sequence(seq)) = dmap.get_mut("nameserver")
+            if let Some(YamlValue::Array(seq)) = dmap.get_mut("nameserver")
                 && seq.is_empty()
             {
                 *seq = vec![
-                    serde_yml::Value::String("223.5.5.5:53".to_string()),
-                    serde_yml::Value::String("119.29.29.29:53".to_string()),
-                    serde_yml::Value::String("1.1.1.1:53".to_string()),
+                    YamlValue::String("223.5.5.5:53".to_string()),
+                    YamlValue::String("119.29.29.29:53".to_string()),
+                    YamlValue::String("1.1.1.1:53".to_string()),
                 ];
             }
             let seq_needs_bootstrap = [
@@ -1645,51 +1806,51 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                 "fallback",
             ]
             .iter()
-            .filter_map(|&k| dmap.get(k).and_then(serde_yml::Value::as_sequence))
+            .filter_map(|&k| dmap.get(k).and_then(YamlValue::as_array))
             .flatten()
-            .filter_map(serde_yml::Value::as_str)
+            .filter_map(YamlValue::as_str)
             .any(|s| DnsUpstream::parse(s).is_ok_and(|u| u.requires_bootstrap()));
             let policy_needs_bootstrap = ["nameserver-policy", "proxy-server-nameserver-policy"]
                 .iter()
-                .filter_map(|&k| dmap.get(k).and_then(serde_yml::Value::as_mapping))
+                .filter_map(|&k| dmap.get(k).and_then(YamlValue::as_object))
                 .flat_map(|m| m.values())
-                .filter_map(serde_yml::Value::as_sequence)
+                .filter_map(YamlValue::as_array)
                 .flatten()
-                .filter_map(serde_yml::Value::as_str)
+                .filter_map(YamlValue::as_str)
                 .any(|s| DnsUpstream::parse(s).is_ok_and(|u| u.requires_bootstrap()));
             let needs_bootstrap = seq_needs_bootstrap || policy_needs_bootstrap;
             let has_bootstrap = match dmap.get("default-nameserver") {
                 None => true, // serde default provides 1.1.1.1:53, 8.8.8.8:53
-                Some(serde_yml::Value::Sequence(seq)) => !seq.is_empty(),
+                Some(YamlValue::Array(seq)) => !seq.is_empty(),
                 _ => false,
             };
             if needs_bootstrap && !has_bootstrap {
                 dmap.insert(
                     yaml_key("default-nameserver"),
-                    serde_yml::Value::Sequence(vec![
-                        serde_yml::Value::String("223.5.5.5:53".to_string()),
-                        serde_yml::Value::String("119.29.29.29:53".to_string()),
-                        serde_yml::Value::String("1.1.1.1:53".to_string()),
+                    YamlValue::Array(vec![
+                        YamlValue::String("223.5.5.5:53".to_string()),
+                        YamlValue::String("119.29.29.29:53".to_string()),
+                        YamlValue::String("1.1.1.1:53".to_string()),
                     ]),
                 );
             }
         }
     }
 
-    if let Some(serde_yml::Value::Mapping(tmap)) = map.get_mut("tun") {
+    if let Some(YamlValue::Object(tmap)) = map.get_mut("tun") {
         strip_null_entries(tmap);
         if let Some(dh) = tmap.get_mut("dns-hijack") {
             normalize_yaml_dns_hijack(dh);
-            if lenient_subscription && !dh.is_bool() {
+            if lenient_subscription && !dh.is_boolean() {
                 tmap.remove("dns-hijack");
             }
         }
         if let Some(inet6_val) = tmap.get("inet6-address").cloned() {
             match inet6_val {
-                serde_yml::Value::Sequence(seq) => {
+                YamlValue::Array(seq) => {
                     let first = seq
                         .iter()
-                        .find_map(serde_yml::Value::as_str)
+                        .find_map(YamlValue::as_str)
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(ToOwned::to_owned);
@@ -1697,13 +1858,13 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                         if lenient_subscription && cidr.parse::<ipnet::Ipv6Net>().is_err() {
                             tmap.remove("inet6-address");
                         } else {
-                            tmap.insert(yaml_key("inet6-address"), serde_yml::Value::String(cidr));
+                            tmap.insert(yaml_key("inet6-address"), YamlValue::String(cidr));
                         }
                     } else {
                         tmap.remove("inet6-address");
                     }
                 }
-                serde_yml::Value::String(s) => {
+                YamlValue::String(s) => {
                     let trimmed = s.trim();
                     if trimmed.is_empty()
                         || (lenient_subscription && trimmed.parse::<ipnet::Ipv6Net>().is_err())
@@ -1712,7 +1873,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                     } else {
                         tmap.insert(
                             yaml_key("inet6-address"),
-                            serde_yml::Value::String(trimmed.to_string()),
+                            YamlValue::String(trimmed.to_string()),
                         );
                     }
                 }
@@ -1731,7 +1892,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         ] {
             if let Some(v) = tmap.get_mut(bool_k) {
                 coerce_yaml_bool(v);
-                if lenient_subscription && !v.is_bool() {
+                if lenient_subscription && !v.is_boolean() {
                     tmap.remove(bool_k);
                 }
             }
@@ -1749,13 +1910,13 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
         }
     }
 
-    if let Some(serde_yml::Value::Mapping(rpmap)) = map.get_mut("rule-providers") {
+    if let Some(YamlValue::Object(rpmap)) = map.get_mut("rule-providers") {
         strip_null_entries(rpmap);
         if lenient_subscription {
-            rpmap.retain(|_, v| v.is_mapping());
+            rpmap.retain(|_, v| v.is_object());
         }
         for (_, pval) in rpmap.iter_mut() {
-            let serde_yml::Value::Mapping(pm) = pval else {
+            let YamlValue::Object(pm) = pval else {
                 continue;
             };
             strip_null_entries(pm);
@@ -1781,12 +1942,12 @@ fn normalize_clash_yaml_root_mapping(map: &mut serde_yml::Mapping, lenient_subsc
                 } else {
                     "file"
                 };
-                pm.insert(yaml_key("type"), serde_yml::Value::String(inferred.into()));
+                pm.insert(yaml_key("type"), YamlValue::String(inferred.into()));
             }
         }
     }
 
-    if let Some(serde_yml::Value::Sequence(seq)) = map.get_mut("proxies") {
+    if let Some(YamlValue::Array(seq)) = map.get_mut("proxies") {
         seq.retain(|item| !item.is_null());
         for item in seq.iter_mut() {
             normalize_proxy_yaml_item(item);
@@ -2078,37 +2239,32 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
     cfg.rules = sanitized_rules;
 }
 
-fn yaml_str_field<'a>(map: &'a serde_yml::Mapping, key: &str) -> Option<&'a str> {
-    map.get(serde_yml::Value::String(key.to_string()))
-        .and_then(serde_yml::Value::as_str)
+fn yaml_str_field<'a>(map: &'a YamlMap, key: &str) -> Option<&'a str> {
+    map.get(key).and_then(YamlValue::as_str)
 }
 
-fn yaml_value_is_effectively_empty(val: &serde_yml::Value) -> bool {
+fn yaml_value_is_effectively_empty(val: &YamlValue) -> bool {
     match val {
-        serde_yml::Value::Null => true,
-        serde_yml::Value::Bool(b) => !*b,
-        serde_yml::Value::String(s) => s.trim().is_empty(),
-        serde_yml::Value::Sequence(seq) => {
-            seq.is_empty() || seq.iter().all(yaml_value_is_effectively_empty)
-        }
-        serde_yml::Value::Mapping(m) => {
-            m.is_empty() || m.values().all(yaml_value_is_effectively_empty)
-        }
+        YamlValue::Null => true,
+        YamlValue::Bool(b) => !*b,
+        YamlValue::String(s) => s.trim().is_empty(),
+        YamlValue::Array(seq) => seq.is_empty() || seq.iter().all(yaml_value_is_effectively_empty),
+        YamlValue::Object(m) => m.is_empty() || m.values().all(yaml_value_is_effectively_empty),
         _ => false,
     }
 }
 
-fn yaml_has_non_null_key(map: &serde_yml::Mapping, key: &str) -> bool {
-    map.get(serde_yml::Value::String(key.to_string()))
+fn yaml_has_non_null_key(map: &YamlMap, key: &str) -> bool {
+    map.get(key)
         .is_some_and(|v| !yaml_value_is_effectively_empty(v))
 }
 
 fn validate_raw_yaml_proxy_mapping(
     idx: usize,
-    item: &serde_yml::Value,
+    item: &YamlValue,
 ) -> std::result::Result<(), (SkippedProxyEntry, ProxyError)> {
     let fallback_name = format!("proxies[{idx}]");
-    let serde_yml::Value::Mapping(pmap) = item else {
+    let YamlValue::Object(pmap) = item else {
         let err = ProxyError::Config(format!("proxies[{idx}] must be a YAML mapping"));
         return Err((
             SkippedProxyEntry {
@@ -2269,12 +2425,12 @@ fn validate_raw_yaml_proxy_mapping(
 
 fn validate_and_parse_single_yaml_proxy(
     idx: usize,
-    item: &serde_yml::Value,
+    item: &YamlValue,
 ) -> std::result::Result<ProxyNodeConfig, (SkippedProxyEntry, ProxyError)> {
     validate_raw_yaml_proxy_mapping(idx, item)?;
     let fallback_name = format!("proxies[{idx}]");
     let (name, proto) = match item {
-        serde_yml::Value::Mapping(pmap) => (
+        YamlValue::Object(pmap) => (
             yaml_str_field(pmap, "name")
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -2320,14 +2476,14 @@ fn validate_and_parse_single_yaml_proxy(
     Ok(node)
 }
 
-fn validate_raw_yaml_proxies(root_map: &serde_yml::Mapping) -> Result<()> {
-    let Some(proxies_val) = root_map.get(serde_yml::Value::String("proxies".to_string())) else {
+fn validate_raw_yaml_proxies(root_map: &YamlMap) -> Result<()> {
+    let Some(proxies_val) = root_map.get("proxies") else {
         return Ok(());
     };
     if proxies_val.is_null() {
         return Ok(());
     };
-    let serde_yml::Value::Sequence(seq) = proxies_val else {
+    let YamlValue::Array(seq) = proxies_val else {
         return Err(ProxyError::Config(
             "'proxies' field in YAML must be a list".into(),
         ));
@@ -2488,7 +2644,7 @@ pub(crate) fn parse_hosts_ip_entry(raw: &str) -> Option<IpAddr> {
 }
 
 fn normalize_yaml_string_list_map(
-    parent: &mut serde_yml::Mapping,
+    parent: &mut YamlMap,
     key: &str,
     lenient_subscription: bool,
     filter_fn: impl Fn(&str) -> bool,
@@ -2497,26 +2653,19 @@ fn normalize_yaml_string_list_map(
         return;
     };
     match raw_val {
-        serde_yml::Value::Null => {}
-        serde_yml::Value::Mapping(mut m) => {
+        YamlValue::Null => {}
+        YamlValue::Object(mut m) => {
             strip_null_entries(&mut m);
-            let mut cleaned = serde_yml::Mapping::new();
+            let mut cleaned = YamlMap::new();
             for (k, mut v) in m {
-                let mut k_coerced = k;
-                coerce_yaml_string(&mut k_coerced);
-                let Some(k_str) = k_coerced.as_str().map(str::trim) else {
-                    if !lenient_subscription {
-                        cleaned.insert(k_coerced, v);
-                    }
-                    continue;
-                };
+                let k_str = k.trim();
                 if k_str.is_empty() {
                     continue;
                 }
                 sanitize_yaml_string_seq(&mut v);
-                if let serde_yml::Value::Sequence(ref mut seq) = v {
+                if let YamlValue::Array(ref mut seq) = v {
                     for item in seq.iter_mut() {
-                        if let serde_yml::Value::String(s) = item {
+                        if let YamlValue::String(s) = item {
                             *s = s.trim().to_string();
                         }
                     }
@@ -2532,7 +2681,7 @@ fn normalize_yaml_string_list_map(
                 }
             }
             if !cleaned.is_empty() {
-                parent.insert(yaml_key(key), serde_yml::Value::Mapping(cleaned));
+                parent.insert(yaml_key(key), YamlValue::Object(cleaned));
             }
         }
         other if !lenient_subscription => {
@@ -2869,7 +3018,7 @@ where
     #[serde(untagged)]
     enum DnsHijackRepr {
         Bool(bool),
-        Seq(Vec<serde_yml::Value>),
+        Seq(Vec<YamlValue>),
         Str(String),
         Num(i64),
     }
