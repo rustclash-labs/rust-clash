@@ -331,7 +331,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun onConnectToggleClicked() {
         val currentState = RustClashVpnService.stateTracker.state
-        if (currentState == VpnLifecycleState.RUNNING || currentState == VpnLifecycleState.STARTING) {
+        if (currentState == VpnLifecycleState.RUNNING ||
+            currentState == VpnLifecycleState.STARTING ||
+            currentState == VpnLifecycleState.RECONNECTING
+        ) {
             val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
                 action = RustClashVpnService.ACTION_STOP_VPN
             }
@@ -339,12 +342,24 @@ class MainActivity : AppCompatActivity() {
             viewModel.syncServiceStateImmediate()
             return
         }
+        if (currentState == VpnLifecycleState.PREPARING || currentState == VpnLifecycleState.STOPPING) {
+            return
+        }
 
         RustClashVpnService.stateTracker.onPrepareRequested()
         viewModel.syncServiceStateImmediate()
-        val prepareIntent = VpnService.prepare(this)
+        val prepareIntent = runCatching { VpnService.prepare(this) }.getOrElse { err ->
+            RustClashVpnService.stateTracker.onError("无法请求系统 VPN 授权：${err.message ?: "系统限制"}")
+            viewModel.syncServiceStateImmediate()
+            return
+        }
         if (prepareIntent != null) {
-            vpnPrepareLauncher.launch(prepareIntent)
+            runCatching {
+                vpnPrepareLauncher.launch(prepareIntent)
+            }.onFailure { err ->
+                RustClashVpnService.stateTracker.onError("无法拉起系统 VPN 授权弹窗：${err.message ?: "系统限制"}")
+                viewModel.syncServiceStateImmediate()
+            }
         } else {
             launchVpnForegroundService()
         }
@@ -478,7 +493,11 @@ internal fun RustClashAppScaffold(
                 MainDestination.HOME -> HomeScreen(
                     state = state,
                     onToggleVpn = {
-                        if (state.vpnState == VpnLifecycleState.DISCONNECTED &&
+                        if (state.vpnState in setOf(
+                                VpnLifecycleState.DISCONNECTED,
+                                VpnLifecycleState.ERROR,
+                                VpnLifecycleState.REVOKED,
+                            ) &&
                             state.nodes.isEmpty() &&
                             !state.demoMode &&
                             state.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
@@ -506,6 +525,7 @@ internal fun RustClashAppScaffold(
                             viewModel.testLatency(null)
                         }
                     },
+                    onDismissError = viewModel::clearLastError,
                 )
 
                 MainDestination.NODES -> NodesScreen(
@@ -528,6 +548,7 @@ internal fun RustClashAppScaffold(
                         } else {
                             viewModel.clearModalError()
                             showImportSheet = true
+                            viewModel.emitUiMessage("剪贴板为空，请粘贴节点链接或订阅地址")
                         }
                     },
                     onOpenQrCamera = onLaunchCameraQr,
@@ -597,6 +618,7 @@ internal fun RustClashAppScaffold(
                     onSetDemoMode = viewModel::setDemoMode,
                     onFlushDns = viewModel::flushDnsCache,
                     onSetShowSystemApps = viewModel::setShowSystemApps,
+                    onClearSettingsNotice = viewModel::clearSettingsSheetNotice,
                 )
             }
         }
@@ -608,14 +630,14 @@ internal fun RustClashAppScaffold(
             errorMessage = state.modalError,
             onClearError = viewModel::clearModalError,
             onDismiss = {
-                viewModel.clearModalError()
+                viewModel.cancelImportAndClearModalError()
                 showImportSheet = false
             },
             onReadClipboard = onReadClipboard,
             onLaunchCameraQr = onLaunchCameraQr,
             onLaunchGalleryQr = onLaunchGalleryQr,
             onOpenManualForm = {
-                viewModel.clearModalError()
+                viewModel.cancelImportAndClearModalError()
                 editingNode = null
                 showNodeEditor = true
             },
@@ -636,11 +658,14 @@ internal fun RustClashAppScaffold(
     if (showNodeEditor) {
         NodeEditorDialog(
             existingNode = editingNode,
+            isSaving = state.isSavingModal,
             backendError = state.modalError,
             onClearBackendError = viewModel::clearModalError,
             onDismiss = {
-                viewModel.clearModalError()
-                showNodeEditor = false
+                if (!state.isSavingModal) {
+                    viewModel.clearModalError()
+                    showNodeEditor = false
+                }
             },
             onSave = { originalName, nodeJson, autoSelect ->
                 viewModel.upsertNode(
@@ -659,11 +684,14 @@ internal fun RustClashAppScaffold(
     if (showCustomRulesDialog) {
         CustomRulesEditorDialog(
             initialRulesText = state.editableRulesText,
+            isSaving = state.isSavingModal,
             errorMessage = state.modalError,
             onClearError = viewModel::clearModalError,
             onDismiss = {
-                viewModel.clearModalError()
-                showCustomRulesDialog = false
+                if (!state.isSavingModal) {
+                    viewModel.clearModalError()
+                    showCustomRulesDialog = false
+                }
             },
             onSaveRules = { text ->
                 viewModel.saveCustomRules(
@@ -680,11 +708,14 @@ internal fun RustClashAppScaffold(
     if (showYamlEditorDialog) {
         ActiveYamlEditorDialog(
             initialYamlText = state.activeYamlRedacted,
+            isSaving = state.isSavingModal,
             errorMessage = state.modalError,
             onClearError = viewModel::clearModalError,
             onDismiss = {
-                viewModel.clearModalError()
-                showYamlEditorDialog = false
+                if (!state.isSavingModal) {
+                    viewModel.clearModalError()
+                    showYamlEditorDialog = false
+                }
             },
             onSaveYaml = { yaml ->
                 viewModel.saveActiveYaml(

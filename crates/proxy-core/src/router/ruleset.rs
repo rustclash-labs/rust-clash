@@ -157,14 +157,18 @@ impl RuleSetMatcher {
                 let mut v6_raw = Vec::new();
                 for raw in entries {
                     let s = raw.trim().trim_matches('\'').trim_matches('"');
-                    if s.is_empty() || s.starts_with('#') {
+                    if s.is_empty() || s.starts_with('#') || s.starts_with("//") {
                         continue;
                     }
-                    let net: IpNet = s.parse().map_err(|e| {
-                        ProxyError::Config(format!(
-                            "rule-provider '{name}' invalid ipcidr entry '{s}': {e}"
-                        ))
-                    })?;
+                    let token = s.split('#').next().unwrap_or(s).trim();
+                    let net: IpNet = token
+                        .parse::<IpNet>()
+                        .or_else(|e| token.parse::<IpAddr>().map(IpNet::from).map_err(|_| e))
+                        .map_err(|e| {
+                            ProxyError::Config(format!(
+                                "rule-provider '{name}' invalid ipcidr entry '{s}': {e}"
+                            ))
+                        })?;
                     match net {
                         IpNet::V4(v4) => {
                             v4_raw.push((u32::from(v4.network()), u32::from(v4.broadcast())));
@@ -183,7 +187,7 @@ impl RuleSetMatcher {
                 let mut rules = Vec::with_capacity(entries.len());
                 for raw in entries {
                     let s = raw.trim().trim_matches('\'').trim_matches('"');
-                    if s.is_empty() || s.starts_with('#') {
+                    if s.is_empty() || s.starts_with('#') || s.starts_with("//") {
                         continue;
                     }
                     // Classical rule-set entries have `TYPE,PAYLOAD[,no-resolve]` (no target column);
@@ -206,11 +210,14 @@ impl RuleSetMatcher {
                     } else {
                         s.to_string()
                     };
-                    rules.push(CompiledRule::parse_with_context(
-                        &normalized_line,
-                        mmdb,
-                        None,
-                    )?);
+                    match CompiledRule::parse_with_context(&normalized_line, mmdb, None) {
+                        Ok(compiled) => rules.push(compiled),
+                        Err(e) => {
+                            tracing::debug!(
+                                "skipping unsupported classical rule in provider '{name}': {e}"
+                            );
+                        }
+                    }
                 }
                 Ok(Self::Classical { rules })
             }
@@ -381,15 +388,25 @@ fn load_provider_entries(
 }
 
 fn parse_provider_raw_str(name: &str, raw: &str, format: &str) -> Result<Vec<String>> {
+    let cleaned = crate::config::uri::trim_bom_and_controls(raw);
     if format.trim().eq_ignore_ascii_case("text") {
-        Ok(raw
+        Ok(cleaned
             .lines()
             .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
             .map(ToString::to_string)
             .collect())
     } else {
-        let parsed: PayloadYaml = serde_yml::from_str(raw).map_err(|e| {
+        let mut val = crate::config::parse_yaml_value_with_merges(cleaned).map_err(|e| {
+            ProxyError::Config(format!("failed parsing YAML rule-provider '{name}': {e}"))
+        })?;
+        if let serde_yml::Value::Mapping(ref mut m) = val
+            && let Some(p) = m.get_mut("payload")
+            && let serde_yml::Value::Sequence(seq) = p
+        {
+            seq.retain(|v| !v.is_null());
+        }
+        let parsed: PayloadYaml = serde_yml::from_value(val).map_err(|e| {
             ProxyError::Config(format!("failed parsing YAML rule-provider '{name}': {e}"))
         })?;
         Ok(parsed.payload)

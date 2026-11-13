@@ -173,9 +173,15 @@ class VpnStateTracker(initial: VpnLifecycleState = VpnLifecycleState.DISCONNECTE
     }
 
     @Synchronized
-    fun onNetworkHandoff() {
+    fun onUnderlyingLost() {
         if (state == VpnLifecycleState.RUNNING) {
             state = VpnLifecycleState.RECONNECTING
+        }
+    }
+
+    @Synchronized
+    fun onNetworkHandoff() {
+        if (state == VpnLifecycleState.RUNNING || state == VpnLifecycleState.RECONNECTING) {
             state = VpnLifecycleState.RUNNING
         }
     }
@@ -197,12 +203,20 @@ class VpnStateTracker(initial: VpnLifecycleState = VpnLifecycleState.DISCONNECTE
     @Synchronized
     fun onSystemRevoked() {
         state = VpnLifecycleState.REVOKED
-        lastError = "VPN permission was revoked by Android system or another VPN app"
+        lastError = "VPN 连接权限已被系统或其他 VPN 应用接管撤销"
     }
 
     @Synchronized
     fun onError(message: String) {
         state = VpnLifecycleState.ERROR
         lastError = message
+    }
+
+    @Synchronized
+    fun clearError() {
+        lastError = null
+        if (state == VpnLifecycleState.ERROR || state == VpnLifecycleState.REVOKED) {
+            state = VpnLifecycleState.DISCONNECTED
+        }
     }
 }

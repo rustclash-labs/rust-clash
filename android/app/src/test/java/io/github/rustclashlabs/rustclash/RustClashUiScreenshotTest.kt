@@ -2,6 +2,8 @@ package io.github.rustclashlabs.rustclash
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.view.View
+import android.view.inspector.WindowInspector
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -49,7 +51,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -57,6 +67,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.GeoDataUiStatus
+import io.github.rustclashlabs.rustclash.ui.model.InstalledAppUi
 import io.github.rustclashlabs.rustclash.ui.model.LiveTelemetryUi
 import io.github.rustclashlabs.rustclash.ui.model.MainDestination
 import io.github.rustclashlabs.rustclash.ui.model.ProfileUiItem
@@ -65,14 +76,20 @@ import io.github.rustclashlabs.rustclash.ui.model.ProxyNodeItem
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.RuleItem
 import io.github.rustclashlabs.rustclash.ui.model.ThemePreference
+import io.github.rustclashlabs.rustclash.ui.screens.ActiveYamlEditorDialog
+import io.github.rustclashlabs.rustclash.ui.screens.CustomRulesEditorDialog
 import io.github.rustclashlabs.rustclash.ui.screens.HomeScreen
+import io.github.rustclashlabs.rustclash.ui.screens.ImportPayloadBottomSheet
+import io.github.rustclashlabs.rustclash.ui.screens.NodeEditorDialog
 import io.github.rustclashlabs.rustclash.ui.screens.NodesScreen
+import io.github.rustclashlabs.rustclash.ui.screens.PerAppPickerBottomSheet
 import io.github.rustclashlabs.rustclash.ui.screens.ProfilesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.RulesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.SettingsScreen
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashBrandIcon
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashTheme
+import io.github.rustclashlabs.rustclash.vpn.PerAppMode
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -437,6 +454,26 @@ class RustClashUiScreenshotTest {
         composeRule.activity.runOnUiThread {
             val canvas = Canvas(bitmap)
             decorView.draw(canvas)
+            val windowViews = runCatching {
+                WindowInspector.getGlobalWindowViews().filter {
+                    it !== decorView && it.visibility == View.VISIBLE && it.width > 0 && it.height > 0
+                }
+            }.getOrDefault(emptyList())
+            if (windowViews.isNotEmpty()) {
+                val baseLoc = IntArray(2)
+                decorView.getLocationOnScreen(baseLoc)
+                canvas.drawColor(0x66000000)
+                for (winView in windowViews) {
+                    val winLoc = IntArray(2)
+                    winView.getLocationOnScreen(winLoc)
+                    val dx = (winLoc[0] - baseLoc[0]).toFloat()
+                    val dy = (winLoc[1] - baseLoc[1]).toFloat()
+                    val count = canvas.save()
+                    canvas.translate(dx, dy)
+                    winView.draw(canvas)
+                    canvas.restoreToCount(count)
+                }
+            }
         }
         composeRule.waitForIdle()
         return bitmap
@@ -466,10 +503,6 @@ class RustClashUiScreenshotTest {
 
     @Test
     fun renderAllFiveScreensLightDarkAndBrandIconsShowcase() {
-        org.junit.Assume.assumeTrue(
-            "Skipping local screenshot generation when /tmp/robolectric-deps is absent",
-            File("/tmp/robolectric-deps").isDirectory,
-        )
         val outDir = File("build/outputs/screenshots")
         outDir.mkdirs()
         val fontFamily = buildCjkFontFamily()
@@ -556,7 +589,7 @@ class RustClashUiScreenshotTest {
         saveBitmap(iconBmp, iconFile)
         assertTrue(iconFile.isFile && iconFile.length() > 1024)
 
-        // 4. Render Compact Screen + 1.15x Font Scale Verification
+        // 4. Render Compact Screen + 1.30x Font Scale Verification
         composeRule.runOnIdle {
             currentThemeState.value = ThemePreference.LIGHT
             customModeState.intValue = 2
@@ -751,11 +784,11 @@ class RustClashUiScreenshotTest {
     @Composable
     private fun CompactAndFontScaleShowcase(state: AppUiState) {
         val currentDensity = LocalDensity.current
-        // Simulate 1.15x large system font scale on a compact width
+        // Simulate 1.30x large system font scale on a compact width
         CompositionLocalProvider(
             LocalDensity provides Density(
                 density = currentDensity.density,
-                fontScale = 1.15f,
+                fontScale = 1.3f,
             ),
         ) {
             Column(
@@ -779,28 +812,310 @@ class RustClashUiScreenshotTest {
     }
 
     @Test
-    fun importBottomSheetDisplaysInlineErrorWithoutDismissing() {
-        org.junit.Assume.assumeTrue(
-            "Skipping local Robolectric UI test when /tmp/robolectric-deps is absent",
-            File("/tmp/robolectric-deps").isDirectory,
+    fun importBottomSheetDisplaysInlineErrorAndEmptyClipboardHintWithoutDismissing() {
+        val outDir = File("build/outputs/screenshots")
+        outDir.mkdirs()
+        val fontFamily = buildCjkFontFamily()
+        val errorState = androidx.compose.runtime.mutableStateOf<String?>(
+            "导入失败：订阅返回了网页验证页面 (Cloudflare)，请在浏览器完成验证后重试",
         )
-        var cleared = false
+        var dismissed = false
+
         composeRule.setContent {
-            RustClashTheme(themePreference = ThemePreference.DARK) {
-                io.github.rustclashlabs.rustclash.ui.screens.ImportPayloadBottomSheet(
-                    isImporting = false,
-                    errorMessage = "导入失败：YAML parse error at 'tun.mtu': invalid value",
-                    onClearError = { cleared = true },
-                    onDismiss = {},
-                    onReadClipboard = { null },
-                    onLaunchCameraQr = {},
-                    onLaunchGalleryQr = {},
-                    onOpenManualForm = {},
-                    onSubmitImport = { _, _, _ -> },
-                )
+            RustClashTheme(themePreference = ThemePreference.DARK, fontFamily = fontFamily) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    SimulatedPhoneFrame(
+                        state = sampleShowcaseState(ThemePreference.DARK).copy(nodes = emptyList()),
+                        destination = MainDestination.NODES,
+                    )
+                    ImportPayloadBottomSheet(
+                        isImporting = false,
+                        errorMessage = errorState.value,
+                        onClearError = { errorState.value = null },
+                        onDismiss = { dismissed = true },
+                        onReadClipboard = { null },
+                        onLaunchCameraQr = {},
+                        onLaunchGalleryQr = {},
+                        onOpenManualForm = {},
+                        onSubmitImport = { _, _, _ -> },
+                    )
+                }
             }
         }
+
+        composeRule.onNodeWithText("导入失败：订阅返回了网页验证页面", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("验证并保存").assertIsDisplayed()
+        assertFalse(dismissed)
+
+        val errFile = File(outDir, "modal_import_inline_error_dark.png")
+        saveBitmap(captureDecorBitmap(), errFile)
+        assertTrue(errFile.isFile && errFile.length() > 1024)
+
+        // Dismiss inline error banner via close button, then tap empty clipboard button and assert inline hint
+        composeRule.onNodeWithContentDescription("关闭错误提示").performClick()
         composeRule.waitForIdle()
-        assertFalse(cleared)
+        assertTrue(errorState.value == null)
+
+        composeRule.onNodeWithText("读取剪贴板").performClick()
+        composeRule.onNodeWithText("当前剪贴板为空", substring = true).assertIsDisplayed()
+    }
+
+    @Test
+    fun nodeEditorDialogValidatesProtocolSwitchAndDisplaysInlineError() {
+        val outDir = File("build/outputs/screenshots")
+        outDir.mkdirs()
+        val fontFamily = buildCjkFontFamily()
+        val existing = ProxyNodeItem(
+            name = "香港-IPLC-01",
+            type = "ss",
+            server = "hk01.example.com",
+            port = 8388,
+            cipher = "aes-256-gcm",
+        )
+        var saved = false
+
+        composeRule.setContent {
+            RustClashTheme(themePreference = ThemePreference.LIGHT, fontFamily = fontFamily) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    SimulatedPhoneFrame(
+                        state = sampleShowcaseState(ThemePreference.LIGHT),
+                        destination = MainDestination.NODES,
+                    )
+                    NodeEditorDialog(
+                        existingNode = existing,
+                        backendError = null,
+                        onClearBackendError = {},
+                        onDismiss = {},
+                        onSave = { _, _, _ -> saved = true },
+                    )
+                }
+            }
+        }
+
+        // Switch existing SS node to VLESS and attempt to save without entering a new UUID
+        composeRule.onNode(hasText("VLESS") and hasAnyAncestor(isDialog())).performClick()
+        composeRule.onNode(hasText("保存") and hasAnyAncestor(isDialog())).performClick()
+        composeRule.onNodeWithText("切换节点协议后必须重新填写密码或 VLESS UUID").assertIsDisplayed()
+        assertFalse(saved)
+
+        val dialogFile = File(outDir, "modal_node_editor_error_light.png")
+        saveBitmap(captureDecorBitmap(), dialogFile)
+        assertTrue(dialogFile.isFile && dialogFile.length() > 1024)
+    }
+
+    @Test
+    @Config(sdk = [34], qualifiers = "w320dp-h640dp-xhdpi")
+    fun compact320dpDialogsAndPerAppZeroAllowlistKeepErrorsInViewport() {
+        val outDir = File("build/outputs/screenshots")
+        outDir.mkdirs()
+        val fontFamily = buildCjkFontFamily()
+        val dialogStep = androidx.compose.runtime.mutableIntStateOf(0)
+
+        composeRule.setContent {
+            val step = dialogStep.intValue
+            RustClashTheme(themePreference = ThemePreference.DARK, fontFamily = fontFamily) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background),
+                ) {
+                    when (step) {
+                        0 -> CustomRulesEditorDialog(
+                            initialRulesText = "# 仅包含注释而无实际规则\n# 另一行注释",
+                            errorMessage = null,
+                            onClearError = {},
+                            onDismiss = {},
+                            onSaveRules = {},
+                        )
+                        1 -> ActiveYamlEditorDialog(
+                            initialYamlText = "mixed-port: 7890\ntun:\n  mtu: invalid_value\n",
+                            errorMessage = "配置校验未通过：YAML parse error at 'tun.mtu': invalid integer",
+                            onClearError = {},
+                            onDismiss = {},
+                            onSaveYaml = {},
+                        )
+                        else -> PerAppPickerBottomSheet(
+                            initialMode = PerAppMode.ALLOWLIST,
+                            initialSelected = emptySet(),
+                            installedApps = listOf(
+                                InstalledAppUi("org.mozilla.firefox", "Firefox", isSystemApp = false),
+                                InstalledAppUi("com.github.android", "GitHub", isSystemApp = false),
+                            ),
+                            showSystemApps = false,
+                            onSetShowSystemApps = {},
+                            onDismiss = {},
+                            onSave = { _, _ -> },
+                        )
+                    }
+                }
+            }
+        }
+
+        // Step 0: CustomRulesEditorDialog blocks comment-only rules and displays inline banner on 320x640dp
+        composeRule.onNodeWithText("校验并保存").performClick()
+        composeRule.onNodeWithText("请至少保留一条有效的非注释分流规则", substring = true).assertIsDisplayed()
+        val customRulesFile = File(outDir, "compact320_custom_rules_error.png")
+        saveBitmap(captureDecorBitmap(), customRulesFile)
+        assertTrue(customRulesFile.isFile && customRulesFile.length() > 1024)
+
+        // Step 1: ActiveYamlEditorDialog keeps inline error + primary button visible on 320x640dp
+        composeRule.runOnIdle { dialogStep.intValue = 1 }
+        composeRule.onNodeWithText("配置校验未通过", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("验证并应用").assertIsDisplayed()
+        val yamlFile = File(outDir, "compact320_yaml_editor_error.png")
+        saveBitmap(captureDecorBitmap(), yamlFile)
+        assertTrue(yamlFile.isFile && yamlFile.length() > 1024)
+
+        // Step 2: PerAppPickerBottomSheet blocks 0-package ALLOWLIST save with inline banner on 320x640dp
+        composeRule.runOnIdle { dialogStep.intValue = 2 }
+        composeRule.onNodeWithText("保存").performClick()
+        composeRule.onNodeWithText("「仅选中应用」模式下请至少勾选 1 个需要代理的应用", substring = true).assertIsDisplayed()
+        val perAppFile = File(outDir, "compact320_per_app_allowlist_error.png")
+        saveBitmap(captureDecorBitmap(), perAppFile)
+        assertTrue(perAppFile.isFile && perAppFile.length() > 1024)
+    }
+
+    @Test
+    @Config(sdk = [34], qualifiers = "w360dp-h640dp-xxhdpi")
+    fun smallScreen360dpLargeFont130PercentEmptyStatesAndExtremeEmojiNodeNames() {
+        val outDir = File("build/outputs/screenshots")
+        outDir.mkdirs()
+        val fontFamily = buildCjkFontFamily()
+        val extremeEmojiName = "🇭🇰🚀🔥✨ 香港-IPLC-专线-超长节点名称压力测试-" + "极速低延迟BGP中转".repeat(12)
+        assertTrue(extremeEmojiName.length >= 130)
+
+        val extremeNode = ProxyNodeItem(
+            name = extremeEmojiName,
+            type = "vless",
+            server = "ultra-long-subdomain-edge-gateway-01.hk.example.com",
+            port = 443,
+            network = "ws",
+            tls = true,
+            delayMs = 31L,
+        )
+        val stageState = androidx.compose.runtime.mutableIntStateOf(0)
+        var homeErrorDismissed = false
+
+        composeRule.setContent {
+            val stage = stageState.intValue
+            val baseDensity = LocalDensity.current
+            RustClashTheme(themePreference = ThemePreference.DARK, fontFamily = fontFamily) {
+                CompositionLocalProvider(
+                    LocalDensity provides Density(density = baseDensity.density, fontScale = 1.3f),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.background),
+                    ) {
+                        when (stage) {
+                            0 -> HomeScreen(
+                                state = sampleShowcaseState(ThemePreference.DARK).copy(
+                                    vpnState = VpnLifecycleState.ERROR,
+                                    lastError = "VPN 连接授权已被取消，请点击上方按钮重新授权连接",
+                                    effectiveOutbound = extremeEmojiName,
+                                    nodes = listOf(extremeNode),
+                                ),
+                                onToggleVpn = {},
+                                onOpenQuickImport = {},
+                                onSelectRoutingPreset = {},
+                                onNavigateToNodes = {},
+                                onNavigateToRules = {},
+                                onTestActiveLatency = {},
+                                onDismissError = { homeErrorDismissed = true },
+                            )
+                            1 -> NodesScreen(
+                                state = sampleShowcaseState(ThemePreference.DARK).copy(
+                                    effectiveOutbound = extremeEmojiName,
+                                    nodes = listOf(
+                                        extremeNode,
+                                        ProxyNodeItem(
+                                            name = "🇸🇬⚡ 新加坡-AnyTLS-专线-02",
+                                            type = "anytls",
+                                            server = "sg02.example.com",
+                                            port = 443,
+                                            delayMs = 49L,
+                                        ),
+                                    ),
+                                    delays = mapOf(extremeEmojiName to 31L, "🇸🇬⚡ 新加坡-AnyTLS-专线-02" to 49L),
+                                ),
+                                onSearchQueryChange = {},
+                                onToggleSortByDelay = {},
+                                onSelectGroupTab = {},
+                                onSelectProxyInGroup = { _, _ -> },
+                                onTestAllDelays = {},
+                                onTestSingleDelay = {},
+                                onOpenImportSheet = {},
+                                onImportClipboardDirect = {},
+                                onOpenQrCamera = {},
+                                onOpenManualCreate = {},
+                                onOpenNodeEdit = {},
+                                onDeleteNode = {},
+                                onDeduplicateNodes = {},
+                            )
+                            2 -> NodesScreen(
+                                state = sampleShowcaseState(ThemePreference.DARK).copy(
+                                    nodes = emptyList(),
+                                    demoMode = false,
+                                ),
+                                onSearchQueryChange = {},
+                                onToggleSortByDelay = {},
+                                onSelectGroupTab = {},
+                                onSelectProxyInGroup = { _, _ -> },
+                                onTestAllDelays = {},
+                                onTestSingleDelay = {},
+                                onOpenImportSheet = {},
+                                onImportClipboardDirect = {},
+                                onOpenQrCamera = {},
+                                onOpenManualCreate = {},
+                                onOpenNodeEdit = {},
+                                onDeleteNode = {},
+                                onDeduplicateNodes = {},
+                            )
+                            else -> ProfilesScreen(
+                                state = sampleShowcaseState(ThemePreference.DARK).copy(
+                                    profiles = emptyList(),
+                                ),
+                                onOpenImportSheet = {},
+                                onActivateProfile = {},
+                                onRefreshProfile = {},
+                                onDeleteProfile = {},
+                                onOpenCustomRulesEditor = {},
+                                onOpenYamlEditor = {},
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stage 0: Home error banner + dismiss button + active LatencyPill at 360dp & 1.3f fontScale
+        composeRule.onNodeWithText("VPN 连接授权已被取消", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("连接异常").assertIsDisplayed()
+        val homeErrFile = File(outDir, "narrow360_font130_home_error.png")
+        saveBitmap(captureDecorBitmap(), homeErrFile)
+        assertTrue(homeErrFile.isFile && homeErrFile.length() > 1024)
+        composeRule.onNodeWithContentDescription("关闭错误提示").performClick()
+        assertTrue(homeErrorDismissed)
+        composeRule.onNodeWithText("31 ms").performScrollTo().assertIsDisplayed()
+
+        // Stage 1: NodesScreen with 130+-char Emoji node name at 360dp & 1.3f fontScale
+        composeRule.runOnIdle { stageState.intValue = 1 }
+        composeRule.onNodeWithText("VLESS·WS").assertIsDisplayed()
+        composeRule.onNodeWithText("31 ms").assertIsDisplayed()
+        val emojiNodesFile = File(outDir, "narrow360_font130_emoji_nodes.png")
+        saveBitmap(captureDecorBitmap(), emojiNodesFile)
+        assertTrue(emojiNodesFile.isFile && emojiNodesFile.length() > 1024)
+
+        // Stage 2: NodesScreen 0-node empty state stacked buttons at 360dp & 1.3f fontScale
+        composeRule.runOnIdle { stageState.intValue = 2 }
+        composeRule.onNodeWithText("尚未导入任何代理节点").assertIsDisplayed()
+        composeRule.onNodeWithText("粘贴导入").assertIsDisplayed()
+        composeRule.onNodeWithText("链接 / 订阅").assertIsDisplayed()
+
+        // Stage 3: ProfilesScreen 0-profile empty state at 360dp & 1.3f fontScale
+        composeRule.runOnIdle { stageState.intValue = 3 }
+        composeRule.onNodeWithText("暂无已保存的配置档案").assertIsDisplayed()
+        composeRule.onNodeWithText("导入配置或订阅").assertIsDisplayed()
     }
 }

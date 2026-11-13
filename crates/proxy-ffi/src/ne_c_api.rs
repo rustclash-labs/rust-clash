@@ -157,7 +157,8 @@ fn write_c_error(out_error: *mut *mut c_char, msg: impl Into<String>) {
     if out_error.is_null() {
         return;
     }
-    let clean = msg.into().replace('\0', " ");
+    let redacted = proxy_core::config::uri::redact_sensitive_text(&msg.into());
+    let clean = redacted.replace('\0', " ");
     if let Ok(cstr) = CString::new(clean) {
         // SAFETY: Caller passed a valid writable `*mut *mut c_char` pointer.
         unsafe {

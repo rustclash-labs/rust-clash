@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -399,11 +400,11 @@ private fun RoutingPresetsAndGeoTab(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    GeoStatMini("国内域名 (CN)", "${geo.geositeCnEntries}")
-                    GeoStatMini("国际域名 (!CN)", "${geo.geositeNonCnEntries}")
-                    GeoStatMini("中国 IP 网段", "${geo.geoipCnRanges}")
+                    GeoStatMini("国内域名 (CN)", "${geo.geositeCnEntries}", modifier = Modifier.weight(1f))
+                    GeoStatMini("国际域名 (!CN)", "${geo.geositeNonCnEntries}", modifier = Modifier.weight(1f))
+                    GeoStatMini("中国 IP 网段", "${geo.geoipCnRanges}", modifier = Modifier.weight(1f))
                 }
 
                 if (!geo.lastError.isNullOrBlank()) {
@@ -422,18 +423,22 @@ private fun RoutingPresetsAndGeoTab(
 }
 
 @Composable
-private fun GeoStatMini(label: String, value: String) {
-    Column {
+private fun GeoStatMini(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier = modifier) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
         Text(
             text = value,
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -790,6 +795,34 @@ private fun RuleExplainAndTableTab(
             )
         }
 
+        if (filteredRules.isEmpty() && state.ruleSearchQuery.isNotBlank()) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = extColors.cardSurface,
+                    border = BorderStroke(1.dp, extColors.hairline),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(18.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "未找到匹配「${state.ruleSearchQuery}」的分流规则",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        TextButton(onClick = { onRuleSearchChange("") }) {
+                            Text("清除搜索")
+                        }
+                    }
+                }
+            }
+        }
+
         items(filteredRules.take(200)) { rule ->
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -806,6 +839,8 @@ private fun RuleExplainAndTableTab(
                             text = if (rule.payload.isBlank()) rule.type else "${rule.type}, ${rule.payload}",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
                         )
                         if (rule.hits > 0L) {
                             Text(
@@ -815,8 +850,10 @@ private fun RuleExplainAndTableTab(
                             )
                         }
                     }
+                    Spacer(modifier = Modifier.width(8.dp))
                     val isDirectRule = rule.proxy.equals("DIRECT", ignoreCase = true)
                     Surface(
+                        modifier = Modifier.widthIn(max = 136.dp),
                         shape = CircleShape,
                         color = if (isDirectRule) extColors.emeraldContainer else extColors.infoContainer,
                     ) {
@@ -825,6 +862,8 @@ private fun RuleExplainAndTableTab(
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.SemiBold,
                             color = if (isDirectRule) extColors.onEmeraldContainer else extColors.onInfoContainer,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp),
                         )
                     }

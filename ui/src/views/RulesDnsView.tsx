@@ -10,6 +10,7 @@ import type {
   RuleExplainResponse,
   RuleItem,
 } from "../types";
+import { renderInlineCode } from "../utils/inlineCode";
 
 interface RulesDnsViewProps {
   rules: RuleItem[];
@@ -54,6 +55,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
     null,
   );
   const [explainErr, setExplainErr] = useState<string | null>(null);
+  const [explainBusy, setExplainBusy] = useState(false);
 
   // Config Firewall & Rule Clippy Audit state
   const [auditReport, setAuditReport] = useState<ConfigAuditReport | null>(
@@ -68,6 +70,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
   );
   const [customEditorOpen, setCustomEditorOpen] = useState(false);
   const [customRulesText, setCustomRulesText] = useState("");
+  const [customRulesError, setCustomRulesError] = useState<string | null>(null);
   const [routingBusy, setRoutingBusy] = useState(false);
   const [routingMsg, setRoutingMsg] = useState<{
     ok: boolean;
@@ -85,6 +88,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
   const [fakePool, setFakePool] = useState<FakeIpPoolResponse | null>(null);
   const [dnsError, setDnsError] = useState<string | null>(null);
   const [flushNotice, setFlushNotice] = useState<string | null>(null);
+  const [dnsBusy, setDnsBusy] = useState(false);
+  const [flushBusy, setFlushBusy] = useState(false);
 
   const runAudit = useCallback(async (resolveDns = false) => {
     setAuditBusy(true);
@@ -155,6 +160,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
 
   const handleOpenCustomRulesEditor = async () => {
     setRoutingMsg(null);
+    setCustomRulesError(null);
     try {
       const res = await clashApi.getCustomRules();
       setCustomRulesText(res.rules.join("\n"));
@@ -177,8 +183,15 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith("#"));
+    if (lines.length === 0) {
+      setCustomRulesError(
+        "Please enter at least one non-comment routing rule (for example: MATCH,PROXY).",
+      );
+      return;
+    }
     setRoutingBusy(true);
     setRoutingMsg(null);
+    setCustomRulesError(null);
     try {
       const snap = await clashApi.saveCustomRules(lines);
       setPresetSnap(snap);
@@ -190,10 +203,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
         text: `Saved & activated ${lines.length} custom rule(s) under 'custom' preset.`,
       });
     } catch (err) {
-      setRoutingMsg({
-        ok: false,
-        text: err instanceof Error ? err.message : String(err),
-      });
+      const text = err instanceof Error ? err.message : String(err);
+      setCustomRulesError(text);
     } finally {
       setRoutingBusy(false);
     }
@@ -223,7 +234,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
 
   const handleExplainRule = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!explainTarget.trim()) return;
+    if (!explainTarget.trim() || explainBusy) return;
+    setExplainBusy(true);
     setExplainErr(null);
     try {
       const res = await clashApi.explainRule(
@@ -233,12 +245,15 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
       setExplainRes(res);
     } catch (err) {
       setExplainErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setExplainBusy(false);
     }
   };
 
   const handleDnsLookup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!dnsDomain.trim()) return;
+    if (!dnsDomain.trim() || dnsBusy) return;
+    setDnsBusy(true);
     setDnsError(null);
     setFlushNotice(null);
     try {
@@ -248,10 +263,14 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
       setFakePool(p);
     } catch (err) {
       setDnsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDnsBusy(false);
     }
   };
 
   const handleFlushDns = async () => {
+    if (flushBusy) return;
+    setFlushBusy(true);
     setDnsError(null);
     try {
       const res = await clashApi.flushDnsCache();
@@ -262,6 +281,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
       );
     } catch (err) {
       setDnsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFlushBusy(false);
     }
   };
 
@@ -283,9 +304,11 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
               Static Config Audit, Rule Clippy &amp; Route Simulator
             </h2>
             <div className="card-subtitle">
-              Static linter for MITM `skip-cert-verify` risks, rule shadowing /
-              dead rules after `MATCH`, and pre-route `no-resolve` DNS behavior
-              (DoH/DoT vs plaintext `:53`)
+              Static linter for MITM{" "}
+              <code className="mono">skip-cert-verify</code> risks, rule
+              shadowing / dead rules after <code className="mono">MATCH</code>,
+              and pre-route <code className="mono">no-resolve</code> DNS
+              behavior (DoH/DoT vs plaintext <code className="mono">:53</code>)
             </div>
           </div>
           <div
@@ -362,8 +385,9 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                 <span>
                   <strong>No static config issues detected:</strong> All
                   configured nodes verify TLS certificates, no rules are
-                  statically shadowed or unreachable after `MATCH`, and IP/GeoIP
-                  rules include `no-resolve`.
+                  statically shadowed or unreachable after{" "}
+                  <code className="mono">MATCH</code>, and IP/GeoIP rules
+                  include <code className="mono">no-resolve</code>.
                 </span>
               </div>
             ) : (
@@ -419,7 +443,9 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                         <span className="mono" style={{ fontSize: 11.5 }}>
                           {f.code}
                         </span>
-                        <strong style={{ fontSize: 12.5 }}>{f.title}</strong>
+                        <strong style={{ fontSize: 12.5 }}>
+                          {renderInlineCode(f.title)}
+                        </strong>
                       </div>
                       <span
                         className="badge badge-neutral mono"
@@ -431,7 +457,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                     <div
                       style={{ fontSize: 12, color: "var(--text-secondary)" }}
                     >
-                      {f.detail}
+                      {renderInlineCode(f.detail)}
                     </div>
                     <div
                       style={{
@@ -439,7 +465,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                         color: "var(--accent-emerald)",
                       }}
                     >
-                      <strong>Fix:</strong> {f.remediation}
+                      <strong>Fix:</strong> {renderInlineCode(f.remediation)}
                     </div>
                   </div>
                 ))}
@@ -499,7 +525,9 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                             {row.effective_outbound}
                           </span>
                         </td>
-                        <td style={{ fontSize: 11.5 }}>{row.dns_strategy}</td>
+                        <td style={{ fontSize: 11.5 }}>
+                          {renderInlineCode(row.dns_strategy)}
+                        </td>
                         <td>
                           <span
                             className={`badge ${
@@ -529,7 +557,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
         <div
           className={`banner ${routingMsg.ok ? "banner-ok" : "banner-err"}`}
         >
-          <span>{routingMsg.text}</span>
+          <span>{renderInlineCode(routingMsg.text)}</span>
           <button
             type="button"
             className="btn btn-sm"
@@ -629,12 +657,27 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                 <code className="mono">IP-CIDR,10.0.0.0/8,DIRECT,no-resolve</code>
                 , <code className="mono">MATCH,PROXY</code>):
               </div>
+              {customRulesError && (
+                <div className="banner banner-err" style={{ marginBottom: 8 }}>
+                  <span>{renderInlineCode(customRulesError)}</span>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => setCustomRulesError(null)}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
               <textarea
                 id="custom-rules-textarea"
                 className="code-editor"
                 rows={7}
                 value={customRulesText}
-                onChange={(e) => setCustomRulesText(e.target.value)}
+                onChange={(e) => {
+                  setCustomRulesText(e.target.value);
+                  if (customRulesError) setCustomRulesError(null);
+                }}
               />
               <div
                 style={{
@@ -647,7 +690,11 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                 <button
                   type="button"
                   className="btn btn-sm"
-                  onClick={() => setCustomEditorOpen(false)}
+                  disabled={routingBusy}
+                  onClick={() => {
+                    setCustomRulesError(null);
+                    setCustomEditorOpen(false);
+                  }}
                 >
                   Cancel
                 </button>
@@ -736,7 +783,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
               Interactive Rule Match &amp; Outbound Chain Explainer
             </h2>
             <div className="card-subtitle">
-              Trace any domain, `host:port`, IP CIDR, or Fake-IP (`198.18.x.x`)
+              Trace any domain, <code className="mono">host:port</code>, IP
+              CIDR, or Fake-IP (<code className="mono">198.18.x.x</code>)
               through FastRuleIndex, GeoIP/GeoSite, and policy groups
             </div>
           </div>
@@ -774,8 +822,9 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
             id="rule-explain-submit"
             type="submit"
             className="btn btn-primary"
+            disabled={explainBusy}
           >
-            Explain Route
+            {explainBusy ? "Tracing..." : "Explain Route"}
           </button>
         </form>
 
@@ -822,8 +871,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                 Mihomo Routing Rules &amp; Hit Telemetry
               </h2>
               <div className="card-subtitle">
-                Evaluated after automatic Fake-IP (`198.18.0.0/15`) domain
-                restoration
+                Evaluated after automatic Fake-IP (
+                <code className="mono">198.18.0.0/15</code>) domain restoration
               </div>
             </div>
             <button
@@ -858,36 +907,76 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                 </tr>
               </thead>
               <tbody>
-                {filteredRules.map((r, idx) => (
-                  <tr key={`${r.type}-${r.payload}-${idx}`}>
+                {filteredRules.length === 0 ? (
+                  <tr>
                     <td
-                      className="tabular"
-                      style={{ color: "var(--text-muted)" }}
+                      colSpan={5}
+                      style={{
+                        textAlign: "center",
+                        padding: 18,
+                        color: "var(--text-muted)",
+                      }}
                     >
-                      {idx + 1}
-                    </td>
-                    <td>
-                      <span className="badge badge-neutral mono">{r.type}</span>
-                    </td>
-                    <td className="mono">{r.payload || "*"}</td>
-                    <td>
-                      <span
-                        className={`badge ${
-                          r.proxy === "REJECT"
-                            ? "badge-rose"
-                            : r.proxy === "DIRECT"
-                              ? "badge-neutral"
-                              : "badge-emerald"
-                        }`}
-                      >
-                        {r.proxy}
-                      </span>
-                    </td>
-                    <td className="tabular" style={{ fontWeight: 600 }}>
-                      {r.hits}
+                      {ruleSearch.trim() ? (
+                        <div
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 10,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span>
+                            No routing rules match &ldquo;{ruleSearch.trim()}
+                            &rdquo;.
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-sm"
+                            onClick={() => setRuleSearch("")}
+                          >
+                            Clear Filter
+                          </button>
+                        </div>
+                      ) : (
+                        "No routing rules configured."
+                      )}
                     </td>
                   </tr>
-                ))}
+                ) : (
+                  filteredRules.map((r, idx) => (
+                    <tr key={`${r.type}-${r.payload}-${idx}`}>
+                      <td
+                        className="tabular"
+                        style={{ color: "var(--text-muted)" }}
+                      >
+                        {idx + 1}
+                      </td>
+                      <td>
+                        <span className="badge badge-neutral mono">
+                          {r.type}
+                        </span>
+                      </td>
+                      <td className="mono">{r.payload || "*"}</td>
+                      <td>
+                        <span
+                          className={`badge ${
+                            r.proxy === "REJECT"
+                              ? "badge-rose"
+                              : r.proxy === "DIRECT"
+                                ? "badge-neutral"
+                                : "badge-emerald"
+                          }`}
+                        >
+                          {r.proxy}
+                        </span>
+                      </td>
+                      <td className="tabular" style={{ fontWeight: 600 }}>
+                        {r.hits}
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -913,9 +1002,10 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                 id="dns-flush-btn"
                 type="button"
                 className="btn btn-sm"
+                disabled={flushBusy}
                 onClick={() => void handleFlushDns()}
               >
-                Flush DNS
+                {flushBusy ? "Flushing..." : "Flush DNS"}
               </button>
             </div>
           </div>
@@ -950,8 +1040,9 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
               id="dns-query-submit"
               type="submit"
               className="btn btn-primary"
+              disabled={dnsBusy}
             >
-              Resolve
+              {dnsBusy ? "Resolving..." : "Resolve"}
             </button>
           </form>
 
@@ -1026,8 +1117,8 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
                         padding: 18,
                       }}
                     >
-                      Click Resolve above to allocate a deterministic
-                      `198.18.x.x` Fake-IP.
+                      Click Resolve above to allocate a deterministic{" "}
+                      <code className="mono">198.18.x.x</code> Fake-IP.
                     </td>
                   </tr>
                 ) : (

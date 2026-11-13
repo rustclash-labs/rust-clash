@@ -95,23 +95,62 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
     });
   }, [diagnostics, diagFilter, query]);
 
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
   const handleCloseOne = async (id: string) => {
-    await clashApi.closeConnection(id);
-    await onRefresh();
+    setActionBusy(`close:${id}`);
+    setActionError(null);
+    try {
+      await clashApi.closeConnection(id);
+      await onRefresh();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActionBusy(null);
+    }
   };
 
   const handleCloseAll = async () => {
-    await clashApi.closeAllConnections();
-    await onRefresh();
+    setActionBusy("close-all");
+    setActionError(null);
+    try {
+      await clashApi.closeAllConnections();
+      await onRefresh();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActionBusy(null);
+    }
   };
 
   const handleClearDiagnostics = async () => {
-    await clashApi.clearConnectionDiagnostics();
-    await loadDiagnostics();
+    setActionBusy("clear-diag");
+    setActionError(null);
+    try {
+      await clashApi.clearConnectionDiagnostics();
+      await loadDiagnostics();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActionBusy(null);
+    }
   };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {actionError && (
+        <div className="banner banner-err">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setActionError(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       <div className="toolbar">
         <div
           style={{
@@ -141,7 +180,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
           <input
             id="conn-search-input"
             className="input"
-            style={{ width: 260 }}
+            style={{ width: 260, maxWidth: "100%" }}
             placeholder="Filter host, Fake-IP, rule, outbound..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -187,10 +226,12 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
             id="close-all-conns-btn"
             type="button"
             className="btn btn-danger"
-            disabled={items.length === 0}
+            disabled={items.length === 0 || actionBusy === "close-all"}
             onClick={() => void handleCloseAll()}
           >
-            Close All ({items.length})
+            {actionBusy === "close-all"
+              ? "Closing..."
+              : `Close All (${items.length})`}
           </button>
         ) : (
           <div style={{ display: "flex", gap: 8 }}>
@@ -204,10 +245,12 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
             <button
               type="button"
               className="btn btn-danger btn-sm"
-              disabled={diagnostics.length === 0}
+              disabled={diagnostics.length === 0 || actionBusy === "clear-diag"}
               onClick={() => void handleClearDiagnostics()}
             >
-              Clear Ring Buffer
+              {actionBusy === "clear-diag"
+                ? "Clearing..."
+                : "Clear Ring Buffer"}
             </button>
           </div>
         )}

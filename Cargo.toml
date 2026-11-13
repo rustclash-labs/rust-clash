@@ -14,7 +14,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["RustClash Labs <rustclash.labs@proton.me>"]
@@ -72,6 +72,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 url = "2.5"
 rust-embed = { version = "8.7", features = ["interpolate-folder-path"] }
 socket2 = { version = "0.5", features = ["all"] }
+flate2 = "1.1"
+proptest = "1.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",

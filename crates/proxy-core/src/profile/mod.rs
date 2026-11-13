@@ -253,24 +253,151 @@ pub fn parse_subscription_userinfo(raw_header: &str) -> Option<SubscriptionUserI
     })
 }
 
+fn trim_bom_and_controls_str(s: &str) -> &str {
+    s.trim_matches(|c: char| c == '\u{feff}' || c.is_whitespace() || c.is_control())
+}
+
 fn looks_like_clash_yaml(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.contains("proxies:")
+    let trimmed = trim_bom_and_controls_str(text);
+    if trimmed.contains("proxies:")
         || trimmed.contains("proxy-groups:")
         || trimmed.contains("rules:")
         || trimmed.contains("mixed-port:")
         || trimmed.contains("rule-providers:")
+        || trimmed.contains("\"proxies\":")
+        || trimmed.contains("\"proxy-groups\":")
+    {
+        return true;
+    }
+    trimmed.lines().any(|line| {
+        let l = trim_bom_and_controls_str(line);
+        l.starts_with("Proxy:")
+            || l.starts_with("Proxy Group:")
+            || l.starts_with("Rule:")
+            || l.starts_with("Rule Provider:")
+            || l.starts_with("socks-port:")
+    })
+}
+
+fn extract_json_panel_error_message(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let is_error_flag = obj.get("status").and_then(|v| v.as_str()).is_some_and(|s| {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "error" | "fail" | "failed" | "false" | "unauthorized" | "forbidden"
+        )
+    }) || obj.get("success").and_then(|v| v.as_bool()) == Some(false)
+        || obj.get("ok").and_then(|v| v.as_bool()) == Some(false)
+        || obj.get("ret").and_then(|v| v.as_i64()) == Some(0)
+        || obj
+            .get("code")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|c| c != 0 && c != 200);
+
+    let msg_val = obj
+        .get("message")
+        .or_else(|| obj.get("msg"))
+        .or_else(|| obj.get("error"))
+        .or_else(|| obj.get("detail"))
+        .or_else(|| obj.get("reason"));
+
+    let raw_msg = match msg_val {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(serde_json::Value::Object(inner)) => inner
+            .get("message")
+            .or_else(|| inner.get("msg"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
+    };
+
+    if is_error_flag || (raw_msg.is_some() && obj.len() <= 4 && !obj.contains_key("proxies")) {
+        let detail =
+            raw_msg.unwrap_or_else(|| "request rejected by subscription panel".to_string());
+        let safe = redact_sensitive_text(&detail);
+        let bounded: String = safe.chars().take(160).collect();
+        return Some(bounded);
+    }
+    None
+}
+
+fn detect_non_proxy_payload_error(text: &str) -> Option<ProxyError> {
+    let trimmed = trim_bom_and_controls_str(text);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let head_lower: String = trimmed
+        .chars()
+        .take(1024)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if head_lower.starts_with("<!doctype html")
+        || head_lower.starts_with("<html")
+        || head_lower.starts_with("<head")
+        || head_lower.starts_with("<body")
+        || head_lower.starts_with("<?xml")
+        || (head_lower.contains("<html") && head_lower.contains("</html>"))
+        || (head_lower.contains("<title>") && head_lower.contains("</title>"))
+    {
+        if head_lower.contains("cloudflare")
+            || head_lower.contains("attention required")
+            || head_lower.contains("just a moment")
+            || head_lower.contains("cf-ray")
+            || head_lower.contains("cf-chl")
+        {
+            return Some(ProxyError::Config(
+                "subscription returned an HTML challenge/error page (Cloudflare protection) instead of proxy nodes; try refreshing over a direct network or pasting Clash YAML / share links directly".into(),
+            ));
+        }
+        return Some(ProxyError::Config(
+            "subscription returned an HTML webpage instead of Clash YAML or proxy share links (check whether the subscription URL requires login or has expired)".into(),
+        ));
+    }
+
+    if trimmed.starts_with('{')
+        && let Ok(serde_json::Value::Object(obj)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        if obj.contains_key("proxies")
+            || obj.contains_key("Proxy")
+            || obj.contains_key("proxy-groups")
+            || obj.contains_key("Proxy Group")
+        {
+            return None;
+        }
+        if let Some(panel_msg) = extract_json_panel_error_message(&obj) {
+            return Some(ProxyError::Config(format!(
+                "subscription panel returned an error: {panel_msg}"
+            )));
+        }
+        if obj.contains_key("outbounds")
+            && (obj.contains_key("inbounds")
+                || obj.contains_key("route")
+                || obj.contains_key("routing"))
+        {
+            return Some(ProxyError::Config(
+                "detected Sing-box / V2Ray JSON config; RustClash expects Clash / Mihomo YAML or share links (ss://, vless://, trojan://, anytls://, socks5://, http://)".into(),
+            ));
+        }
+    }
+
+    None
 }
 
 fn extract_clash_deeplink_target(line: &str) -> Option<String> {
-    let trimmed = line.trim();
+    let trimmed = trim_bom_and_controls_str(line);
     if !trimmed.to_ascii_lowercase().starts_with("clash://") {
         return None;
     }
     let parsed = Url::parse(trimmed).ok()?;
     for (k, v) in parsed.query_pairs() {
-        if k.eq_ignore_ascii_case("url") && !v.trim().is_empty() {
-            return Some(v.trim().to_string());
+        let val = trim_bom_and_controls_str(&v);
+        if k.eq_ignore_ascii_case("url") && !val.is_empty() {
+            return Some(val.to_string());
         }
     }
     None
@@ -278,14 +405,14 @@ fn extract_clash_deeplink_target(line: &str) -> Option<String> {
 
 /// Unified input classifier distinguishing Share URIs, Base64 URI lists, Clash YAML, and HTTPS Subscription URLs.
 pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
-    let trimmed = raw.trim();
+    let trimmed = trim_bom_and_controls_str(raw);
     if trimmed.is_empty() {
         return Err(ProxyError::Config("import input cannot be empty".into()));
     }
 
     let active_lines: Vec<&str> = trimmed
         .lines()
-        .map(str::trim)
+        .map(trim_bom_and_controls_str)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
@@ -322,6 +449,10 @@ pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
         return Ok((ImportInputKind::ShareUris, trimmed.to_string()));
     }
 
+    if let Some(err) = detect_non_proxy_payload_error(trimmed) {
+        return Err(err);
+    }
+
     if let Some(decoded_uris) = try_decode_base64_uri_list(trimmed) {
         return Ok((ImportInputKind::Base64UriList, decoded_uris));
     }
@@ -330,10 +461,10 @@ pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
         return Ok((ImportInputKind::ClashYaml, trimmed.to_string()));
     }
 
-    // Also support Base64-encoded Clash YAML payloads returned by some subscription gateways
+    // Also support Base64-encoded Clash YAML payloads (and surface Base64-wrapped panel errors)
     let compact: String = trimmed
         .chars()
-        .filter(|c| !c.is_ascii_whitespace())
+        .filter(|c| !c.is_whitespace() && !c.is_control() && *c != '\u{feff}')
         .collect();
     let stripped = compact.trim_end_matches('=');
     if !stripped.is_empty() {
@@ -346,9 +477,14 @@ pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
             .ok()
             .or_else(|| URL_SAFE_NO_PAD.decode(stripped).ok())
             && let Ok(decoded_str) = String::from_utf8(bytes)
-            && looks_like_clash_yaml(&decoded_str)
         {
-            return Ok((ImportInputKind::ClashYaml, decoded_str));
+            let clean_decoded = trim_bom_and_controls_str(&decoded_str);
+            if let Some(err) = detect_non_proxy_payload_error(clean_decoded) {
+                return Err(err);
+            }
+            if looks_like_clash_yaml(clean_decoded) {
+                return Ok((ImportInputKind::ClashYaml, clean_decoded.to_string()));
+            }
         }
     }
 
@@ -2135,7 +2271,10 @@ fn cascade_rename_reference(
             continue;
         }
         let mut parts: Vec<String> = trimmed.split(',').map(|s| s.trim().to_string()).collect();
-        if parts.len() == 2 && parts[0].eq_ignore_ascii_case("MATCH") && parts[1] == old_name {
+        if parts.len() == 2
+            && (parts[0].eq_ignore_ascii_case("MATCH") || parts[0].eq_ignore_ascii_case("FINAL"))
+            && parts[1] == old_name
+        {
             parts[1] = new_name.to_string();
             *line = parts.join(",");
         } else if parts.len() >= 3 && parts[2] == old_name {
@@ -2180,11 +2319,14 @@ fn deduplicate_config_in_place(
     (removed_names, alias_to_canonical)
 }
 
+static ATOMIC_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn write_atomic_with_backup(target: &Path, content: &str) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = target.with_extension(format!("yaml.tmp.{}", std::process::id()));
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = target.with_extension(format!("yaml.tmp.{}.{seq}", std::process::id()));
     {
         let mut f = OpenOptions::new()
             .create(true)
@@ -2208,7 +2350,8 @@ fn write_atomic_with_backup(target: &Path, content: &str) -> Result<()> {
 }
 
 fn save_index_atomic(index_path: &Path, index: &ProfileIndex) -> Result<()> {
-    let tmp = index_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = index_path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(index)
         .map_err(|e| ProxyError::Config(format!("serialize profile index: {e}")))?;
     {
@@ -2348,7 +2491,7 @@ pub async fn fetch_subscription_http_with_proxy(
         };
 
         let req_bytes = format!(
-            "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: rust-clash/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: rust-clash/{} Clash.Meta/1.18 mihomo/1.18\r\nAccept: */*\r\nAccept-Encoding: gzip, identity\r\nConnection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
         );
 
@@ -2411,7 +2554,7 @@ pub async fn fetch_subscription_http_with_proxy(
             }
         };
 
-        let (status, headers, body_bytes) = parse_http11_response(&raw_resp)?;
+        let (status, headers, body_bytes_raw) = parse_http11_response(&raw_resp)?;
         if matches!(status, 301 | 302 | 307 | 308) {
             let loc = headers
                 .iter()
@@ -2432,7 +2575,31 @@ pub async fn fetch_subscription_http_with_proxy(
             continue;
         }
 
+        let body_bytes = maybe_decompress_http_body(&headers, body_bytes_raw)?;
+
         if !(200..300).contains(&status) {
+            if let Ok(err_body) = std::str::from_utf8(&body_bytes) {
+                let trimmed_err = trim_bom_and_controls_str(err_body);
+                if trimmed_err.starts_with('{')
+                    && let Ok(serde_json::Value::Object(obj)) =
+                        serde_json::from_str::<serde_json::Value>(trimmed_err)
+                    && let Some(msg) = extract_json_panel_error_message(&obj)
+                {
+                    return Err(ProxyError::Config(format!(
+                        "subscription server returned HTTP {status}: {msg}"
+                    )));
+                }
+                let lower_err: String = trimmed_err
+                    .chars()
+                    .take(512)
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if lower_err.contains("cloudflare") || lower_err.contains("cf-ray") {
+                    return Err(ProxyError::Config(format!(
+                        "subscription server returned HTTP {status} (Cloudflare challenge/error page)"
+                    )));
+                }
+            }
             return Err(ProxyError::Config(format!(
                 "subscription server returned HTTP {status}"
             )));
@@ -2446,12 +2613,49 @@ pub async fn fetch_subscription_http_with_proxy(
         let body_text = String::from_utf8(body_bytes).map_err(|e| {
             ProxyError::Config(format!("subscription response is not valid UTF-8: {e}"))
         })?;
+        if trim_bom_and_controls_str(&body_text).is_empty() {
+            return Err(ProxyError::Config(format!(
+                "subscription server returned an empty response body (HTTP {status}); check whether your subscription token is valid or has active nodes"
+            )));
+        }
         return Ok((body_text, userinfo));
     }
 
     Err(ProxyError::Config(
         "too many HTTP redirects while fetching subscription".into(),
     ))
+}
+
+fn maybe_decompress_http_body(headers: &HttpHeaderList, body: Vec<u8>) -> Result<Vec<u8>> {
+    let has_gzip_header = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-encoding")
+            && (v.to_ascii_lowercase().contains("gzip")
+                || v.to_ascii_lowercase().contains("x-gzip"))
+    });
+    let has_gzip_magic = body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b;
+    if !has_gzip_header && !has_gzip_magic {
+        return Ok(body);
+    }
+
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(body.as_slice());
+    let mut limited = decoder.take((MAX_SUBSCRIPTION_BYTES + 1) as u64);
+    let mut decompressed = Vec::new();
+    limited.read_to_end(&mut decompressed).map_err(|e| {
+        if has_gzip_header {
+            ProxyError::Config(format!(
+                "failed decompressing gzip subscription payload: {e}"
+            ))
+        } else {
+            ProxyError::Config("subscription response is binary/non-UTF-8 data".into())
+        }
+    })?;
+    if decompressed.len() > MAX_SUBSCRIPTION_BYTES {
+        return Err(ProxyError::Config(
+            "decompressed subscription payload exceeds 8 MiB safety limit".into(),
+        ));
+    }
+    Ok(decompressed)
 }
 
 async fn exchange_sub_https_over_stream<S>(

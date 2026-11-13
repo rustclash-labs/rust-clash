@@ -10,6 +10,7 @@ import type {
   VersionInfo,
 } from "../types";
 import { formatBytes, formatSpeed } from "../utils/format";
+import { renderInlineCode } from "../utils/inlineCode";
 
 interface OverviewViewProps {
   version: VersionInfo | null;
@@ -221,9 +222,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               Welcome to RustClash — Paste a Share Link to Connect Immediately
             </div>
             <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-              Copy any `ss://`, `vless://`, or `anytls://` link and click{" "}
-              <strong>+ Add Node</strong>, or import an HTTPS subscription /
-              Clash YAML profile. Nodes and selections persist across restarts.
+              Copy any <code className="mono">ss://</code>,{" "}
+              <code className="mono">vless://</code>,{" "}
+              <code className="mono">trojan://</code>,{" "}
+              <code className="mono">anytls://</code>,{" "}
+              <code className="mono">socks5://</code>, or{" "}
+              <code className="mono">http-proxy://</code> link and click{" "}
+              <strong>+ Add Node</strong>, or import a Base64 bundle, Clash /
+              Mihomo YAML profile, or HTTPS subscription. Nodes and selections
+              persist across restarts.
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -260,8 +267,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         <div className="banner banner-ok">
           <span>
             <strong>Demo Sandbox Active:</strong> Running local loopback
-            SS-2022, VLESS (`mlkem768x25519plus`), and AnyTLS v2 servers for
-            safe offline testing.
+            SS-2022, VLESS (<code className="mono">mlkem768x25519plus</code>),
+            and AnyTLS v2 servers for safe offline testing.
           </span>
           <button
             id="exit-demo-btn"
@@ -377,8 +384,9 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                   Live Loopback Stress Benchmark
                 </div>
                 <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                  Pushes real SOCKS5 + Fake-IP (`198.18.0.x`) traffic through
-                  the active proxy group
+                  Pushes real SOCKS5 + Fake-IP (
+                  <code className="mono">198.18.0.x</code>) traffic through the
+                  active proxy group
                 </div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -510,7 +518,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div className="switch-row">
               <div>
                 <div style={{ fontSize: 12.5, fontWeight: 600 }}>
-                  TUN Options (`strict-route` &amp; `IPv6`)
+                  TUN Options (<code className="mono">strict-route</code> &amp;{" "}
+                  <code className="mono">IPv6</code>)
                 </div>
                 <div
                   className="tabular"
@@ -547,7 +556,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 style={{ fontSize: 11.5, color: "var(--text-secondary)" }}
               >
                 <strong>TUN Privilege / Driver Hint:</strong>{" "}
-                {tunHealth.privilege_hint}
+                {renderInlineCode(tunHealth.privilege_hint)}
               </div>
             )}
 
@@ -583,7 +592,9 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <h2 className="card-title">Protocol &amp; Crypto Stack</h2>
             <div className="card-subtitle">
               {version?.version ?? "rust-clash"} — Zero C/Go proxy dependencies
-              (`aws-lc-rs` + `rustls` + `smoltcp`)
+              (<code className="mono">aws-lc-rs</code> +{" "}
+              <code className="mono">rustls</code> +{" "}
+              <code className="mono">smoltcp</code>)
             </div>
           </div>
           <span className="badge badge-emerald">Pure Rust</span>
@@ -600,7 +611,10 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div>
               <div className="proto-title">VLESS + PQ Encryption</div>
               <div className="proto-desc">
-                Xray `mlkem768x25519plus` (`native`/`xorpub`/`random`, 0/1-RTT)
+                Xray <code className="mono">mlkem768x25519plus</code> (
+                <code className="mono">native</code>/
+                <code className="mono">xorpub</code>/
+                <code className="mono">random</code>, 0/1-RTT)
               </div>
             </div>
             <span className="badge badge-emerald">ML-KEM-768</span>
@@ -610,7 +624,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div>
               <div className="proto-title">AnyTLS v2 Multiplexing</div>
               <div className="proto-desc">
-                SHA-256 + `padding0`, dynamic MD5 `PaddingScheme`, LIFO pool
+                SHA-256 + <code className="mono">padding0</code>, dynamic MD5{" "}
+                <code className="mono">PaddingScheme</code>, LIFO pool
               </div>
             </div>
             <span className="badge badge-sky">TLS 1.3 Mux</span>
@@ -630,7 +645,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div>
               <div className="proto-title">DoH / DoT + Fake-IP TUN</div>
               <div className="proto-desc">
-                `198.18.0.0/15` LRU domain restoration + `198.19.255.254:53`
+                <code className="mono">198.18.0.0/15</code> LRU domain
+                restoration + <code className="mono">198.19.255.254:53</code>
               </div>
             </div>
             <span className="badge badge-neutral">L3/L4 Stack</span>

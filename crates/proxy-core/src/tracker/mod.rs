@@ -176,6 +176,7 @@ pub struct TelemetryHub {
     last_sampled_up: AtomicU64,
     last_sampled_down: AtomicU64,
     sample_ticks: AtomicU64,
+    telemetry_parked: AtomicBool,
     min_log_severity: AtomicU8,
     connections: DashMap<String, Arc<ActiveConnection>>,
     activity_notify: Notify,
@@ -203,6 +204,7 @@ impl TelemetryHub {
             last_sampled_up: AtomicU64::new(0),
             last_sampled_down: AtomicU64::new(0),
             sample_ticks: AtomicU64::new(0),
+            telemetry_parked: AtomicBool::new(false),
             min_log_severity: AtomicU8::new(log_level_severity("info")),
             connections: DashMap::new(),
             activity_notify: Notify::new(),
@@ -515,7 +517,21 @@ impl TelemetryHub {
     }
 
     pub fn sample_tick_count(&self) -> u64 {
-        self.sample_ticks.load(Ordering::Relaxed)
+        self.sample_ticks.load(Ordering::Acquire)
+    }
+
+    pub fn is_telemetry_parked(&self) -> bool {
+        self.telemetry_parked.load(Ordering::Acquire)
+    }
+
+    pub fn set_telemetry_parked(&self, parked: bool) {
+        self.telemetry_parked.store(parked, Ordering::Release);
+    }
+
+    pub fn has_unsampled_traffic(&self) -> bool {
+        self.total_upload.load(Ordering::Acquire) != self.last_sampled_up.load(Ordering::Acquire)
+            || self.total_download.load(Ordering::Acquire)
+                != self.last_sampled_down.load(Ordering::Acquire)
     }
 
     pub fn register_session_resetter(&self, resetter: Weak<dyn SessionResetter>) {
@@ -583,30 +599,30 @@ impl TelemetryHub {
 
     pub fn totals(&self) -> (u64, u64) {
         (
-            self.total_upload.load(Ordering::Relaxed),
-            self.total_download.load(Ordering::Relaxed),
+            self.total_upload.load(Ordering::Acquire),
+            self.total_download.load(Ordering::Acquire),
         )
     }
 
     pub fn record_upload(&self, conn: &ActiveConnection, bytes: usize) {
         let b = bytes as u64;
         conn.upload.fetch_add(b, Ordering::Relaxed);
-        self.total_upload.fetch_add(b, Ordering::Relaxed);
+        self.total_upload.fetch_add(b, Ordering::Release);
     }
 
     pub fn record_download(&self, conn: &ActiveConnection, bytes: usize) {
         let b = bytes as u64;
         conn.download.fetch_add(b, Ordering::Relaxed);
-        self.total_download.fetch_add(b, Ordering::Relaxed);
+        self.total_download.fetch_add(b, Ordering::Release);
     }
 
     /// Sample instantaneous 1-second speed delta and broadcast to `/traffic` subscribers.
     pub fn sample_tick(&self) -> TrafficPoint {
-        self.sample_ticks.fetch_add(1, Ordering::Relaxed);
-        let total_up = self.total_upload.load(Ordering::Relaxed);
-        let total_down = self.total_download.load(Ordering::Relaxed);
-        let prev_up = self.last_sampled_up.swap(total_up, Ordering::Relaxed);
-        let prev_down = self.last_sampled_down.swap(total_down, Ordering::Relaxed);
+        let total_up = self.total_upload.load(Ordering::Acquire);
+        let total_down = self.total_download.load(Ordering::Acquire);
+        let prev_up = self.last_sampled_up.swap(total_up, Ordering::AcqRel);
+        let prev_down = self.last_sampled_down.swap(total_down, Ordering::AcqRel);
+        self.sample_ticks.fetch_add(1, Ordering::Release);
         let point = TrafficPoint {
             timestamp_ms: Self::now_ms(),
             up: total_up.saturating_sub(prev_up),

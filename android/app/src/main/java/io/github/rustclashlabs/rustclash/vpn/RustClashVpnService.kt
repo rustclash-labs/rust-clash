@@ -96,6 +96,10 @@ class RustClashVpnService : VpnService() {
                 bytes >= 1_024L -> String.format("%.1f KB/s", bytes / 1_024.0)
                 else -> "$bytes B/s"
             }
+
+        fun updateLockdownWarning(warning: String?) {
+            lockdownWarning = warning
+        }
     }
 
     /**
@@ -157,7 +161,7 @@ class RustClashVpnService : VpnService() {
         underlyingNetworkTracker.reset()
 
         if (!NativeBridge.ensureLoaded()) {
-            stateTracker.onError("Native Rust library libproxy_ffi.so failed to load for this ABI")
+            stateTracker.onError("当前设备架构未能加载 Rust 核心库 (libproxy_ffi.so)")
             RustClashTileService.requestTileSync(this)
             stopForegroundCompat()
             stopSelf()
@@ -226,7 +230,7 @@ class RustClashVpnService : VpnService() {
             }
 
             val established = builder.establish()
-                ?: throw IllegalStateException("VpnService.Builder.establish() returned null (VPN permission missing or preempted)")
+                ?: throw IllegalStateException("无法建立系统 VPN 隧道：连接授权缺失或被其他 VPN 应用抢占")
             pendingPfd = established
 
             // Atomically transfer exclusive FD ownership to Rust (`OwnedFd::from_raw_fd(tun_fd)`).
@@ -352,7 +356,7 @@ class RustClashVpnService : VpnService() {
                     runCatching { setUnderlyingNetworks(null) }
                 }
                 if (decision.triggerSessionRecovery) {
-                    stateTracker.onNetworkHandoff()
+                    stateTracker.onUnderlyingLost()
                 }
                 if (decision.notifyNative && NativeBridge.isNativeLoaded) {
                     NativeBridge.nativeNotifyNetworkChanged(decision.effectiveHandle, decision.isWifi)

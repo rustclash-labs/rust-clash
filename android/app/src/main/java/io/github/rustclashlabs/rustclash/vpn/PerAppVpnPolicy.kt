@@ -53,11 +53,11 @@ object PerAppVpnPolicy {
 
         val warning = when {
             isLockdownEnabled && mode == PerAppMode.ALLOWLIST ->
-                "Android Always-On 'Block connections without VPN' (Lockdown) is enabled: apps NOT in your Allowlist will have all internet access blocked by Android."
+                "系统已开启始终在线 VPN「阻断无 VPN 连接」(Lockdown)：未勾选的应用将被系统断网，无法直连访问。"
             isLockdownEnabled && mode == PerAppMode.BLOCKLIST && cleaned.isNotEmpty() ->
-                "Android Always-On 'Block connections without VPN' (Lockdown) is enabled: apps in your Bypass Blocklist will have all internet access blocked by Android instead of bypassing."
+                "系统已开启始终在线 VPN「阻断无 VPN 连接」(Lockdown)：绕过名单中的应用将被系统直接断网，而非本地直连。"
             mode == PerAppMode.ALLOWLIST && cleaned.isEmpty() ->
-                "Per-App Allowlist is empty: select at least one app or switch to All Apps mode so traffic is routed through RustClash."
+                "分应用代理白名单为空：请至少勾选 1 个应用，或切换为「全部应用」模式。"
             else -> null
         }
 

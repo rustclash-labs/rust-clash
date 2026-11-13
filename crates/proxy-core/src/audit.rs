@@ -697,6 +697,8 @@ fn audit_config_inner(
             RuleMatcher::IpCidr { net, .. } => Some(format!("IP-CIDR:{net}")),
             RuleMatcher::SrcIpCidr(net) => Some(format!("SRC-IP-CIDR:{net}")),
             RuleMatcher::DstPort { raw, .. } => Some(format!("DST-PORT:{raw}")),
+            RuleMatcher::SrcPort { raw, .. } => Some(format!("SRC-PORT:{raw}")),
+            RuleMatcher::Network(net) => Some(format!("NETWORK:{net:?}")),
             RuleMatcher::GeoIp { code, .. } => Some(format!("GEOIP:{code}")),
             RuleMatcher::Match => None,
         };

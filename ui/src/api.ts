@@ -294,15 +294,39 @@ async function apiFetch<T>(
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const resp = await fetch(url, { ...init, headers });
+  let resp: Response;
+  try {
+    resp = await fetch(url, { ...init, headers });
+  } catch (err) {
+    const detail = err instanceof Error && err.message ? ` (${err.message})` : "";
+    throw new Error(
+      `Cannot reach RustClash controller API — check that the daemon is running${detail}.`,
+    );
+  }
   if (!resp.ok) {
-    let errText = `${resp.status} ${resp.statusText}`;
+    let errText = `${resp.status} ${resp.statusText}`.trim();
     try {
-      const body = (await resp.json()) as { message?: string };
-      if (body.message) errText = body.message;
+      const rawBody = await resp.text();
+      if (rawBody.trim().length > 0) {
+        try {
+          const parsed = JSON.parse(rawBody) as {
+            message?: string;
+            error?: string;
+          };
+          const msg = parsed.message || parsed.error;
+          if (msg && msg.trim().length > 0) {
+            errText = msg.trim();
+          } else {
+            errText = rawBody.trim().slice(0, 300);
+          }
+        } catch {
+          errText = rawBody.trim().slice(0, 300);
+        }
+      }
     } catch {
-      // ignore non-json error
+      // ignore body read error
     }
+    errText = errText.replace(/^(Configuration error:\s*)+/i, "Configuration error: ");
     throw new ApiHttpError(resp.status, errText);
   }
   if (resp.status === 204) {

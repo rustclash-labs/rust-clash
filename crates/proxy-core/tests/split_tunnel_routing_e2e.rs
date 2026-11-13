@@ -1331,16 +1331,24 @@ rules:
     // Simulate restart + TTL expiration: update with 1s TTL, reopen offline, and verify `is_expired = true`
     fail_mode.store(false, Ordering::Relaxed);
     let geo_ttl_dir = TempTestDir::new("geodata-ttl");
+    let geodata_valid_ttl = GeoDataManager::with_ttl(geo_ttl_dir.path(), 30_000, Vec::new());
+    geodata_valid_ttl
+        .update_from_urls(&test_urls)
+        .await
+        .unwrap();
+    let geodata_restarted = GeoDataManager::with_ttl(geo_ttl_dir.path(), 30_000, Vec::new());
+    assert!(geodata_restarted.status().using_persisted_data);
+    assert!(!geodata_restarted.status().is_expired);
+
     let geodata_short_ttl = GeoDataManager::with_ttl(geo_ttl_dir.path(), 1_000, Vec::new());
     geodata_short_ttl
         .update_from_urls(&test_urls)
         .await
         .unwrap();
-    let geodata_restarted = GeoDataManager::with_ttl(geo_ttl_dir.path(), 1_000, Vec::new());
-    assert!(geodata_restarted.status().using_persisted_data);
-    assert!(!geodata_restarted.status().is_expired);
-    tokio::time::sleep(Duration::from_millis(1_150)).await;
-    assert!(geodata_restarted.status().is_expired);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let geodata_expired = GeoDataManager::with_ttl(geo_ttl_dir.path(), 1_000, Vec::new());
+    assert!(geodata_expired.status().using_persisted_data);
+    assert!(geodata_expired.status().is_expired);
 
     // =========================================================================
     // PART E: Failed Outbound Connection Records `status = "failed"` & Redacted Reason
@@ -1352,13 +1360,21 @@ rules:
         .unwrap();
     let mut fail_resp = [0u8; 512];
     let _ = mixed_conn.read(&mut fail_resp).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let diags = engine_eval.hub().diagnostics_snapshot(50);
-    let failed_entry = diags
-        .iter()
-        .find(|d| d.metadata.host == "www.google.com" && d.metadata.destination_port == 443)
-        .expect("failed proxy connection must appear in diagnostics");
+    let mut failed_entry_opt = None;
+    for _ in 0..100 {
+        let diags = engine_eval.hub().diagnostics_snapshot(50);
+        if let Some(found) = diags
+            .into_iter()
+            .find(|d| d.metadata.host == "www.google.com" && d.metadata.destination_port == 443)
+        {
+            failed_entry_opt = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let failed_entry =
+        failed_entry_opt.expect("failed proxy connection must appear in diagnostics");
     assert_eq!(failed_entry.status, "failed");
     assert_eq!(failed_entry.exit_type, "PROXY");
     assert_eq!(failed_entry.effective_outbound, "Dead-VLESS");

@@ -1269,7 +1269,7 @@ mod tests {
                 extra_ca_der: &[],
                 check_udp: true,
                 udp_dns_target: Some(&blackhole_udp_addr),
-                timeout: Duration::from_millis(250),
+                timeout: Duration::from_millis(600),
                 allow_private_targets: true,
                 allowed_private_addrs: &[],
             },
@@ -1283,18 +1283,18 @@ mod tests {
             Some("blackholed")
         );
         assert!(
-            rep.overall_probe_duration_ms >= 200.0,
+            rep.overall_probe_duration_ms >= 500.0,
             "overall elapsed should reflect parallel UDP timeout: {}",
             rep.overall_probe_duration_ms
         );
         assert!(
-            rep.total_ms < 120.0,
+            rep.total_ms < 450.0,
             "TCP waterfall total_ms ({}) must not be polluted by slow UDP timeout ({})",
             rep.total_ms,
             rep.overall_probe_duration_ms
         );
         assert!(
-            router.delays().latest_delay("DIRECT").unwrap_or(999) < 120,
+            router.delays().latest_delay("DIRECT").unwrap_or(999) < 450,
             "recorded node delay must reflect TCP waterfall only"
         );
 

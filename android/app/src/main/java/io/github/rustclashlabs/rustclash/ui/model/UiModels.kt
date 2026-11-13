@@ -308,7 +308,9 @@ data class AppUiState(
     val enableIpv6: Boolean = true,
     val demoMode: Boolean = false,
     val isImporting: Boolean = false,
+    val isSavingModal: Boolean = false,
     val modalError: String? = null,
+    val settingsSheetNotice: String? = null,
     val isTestingAllDelays: Boolean = false,
     val testingNodeName: String? = null,
     val isUpdatingGeoData: Boolean = false,
@@ -351,8 +353,9 @@ data class AppUiState(
         }
 
     val effectiveNodeDelayMs: Long?
-        get() = telemetry.effectiveDelayMs?.takeIf { it > 0L }
-            ?: delays[effectiveOutbound]?.takeIf { it > 0L }
+        get() = delays[effectiveOutbound]?.takeIf { it > 0L }
+            ?: nodes.firstOrNull { it.name == effectiveOutbound }?.delayMs?.takeIf { it > 0L }
+            ?: telemetry.effectiveDelayMs?.takeIf { it > 0L }
 
     val effectiveProtocolDisplay: String
         get() {

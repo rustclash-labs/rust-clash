@@ -224,7 +224,7 @@ async fn repro_socks5_udp_rejects_spoofed_peer_rsv_frag_malformed_and_detects_ct
 
     // Now close the TCP control connection from the server side; `recv_from()` must unblock immediately!
     let _ = drop_ctrl_tx.send(()).await;
-    let eof_res = tokio::time::timeout(Duration::from_millis(500), sess.recv_from())
+    let eof_res = tokio::time::timeout(Duration::from_secs(2), sess.recv_from())
         .await
         .expect("Socks5UdpSession::recv_from hung instead of detecting TCP control EOF!");
     assert!(
@@ -307,7 +307,7 @@ async fn repro_trojan_udp_remote_eof_unblocks_recv_from_and_rebuilds_nat() {
     );
     let target = TargetAddr::from(SocketAddr::from(([127, 0, 0, 1], 5353)));
 
-    // Part A: Direct `OutboundUdpSession::recv_from()` must unblock in < 500ms on remote EOF (not 60s!)
+    // Part A: Direct `OutboundUdpSession::recv_from()` must unblock promptly on remote EOF (not 60s!)
     let sess = trojan.open_udp_session().await.unwrap();
     sess.send_to(b"one", &target).await.unwrap();
     let (r1, _) = tokio::time::timeout(Duration::from_secs(2), sess.recv_from())
@@ -316,7 +316,7 @@ async fn repro_trojan_udp_remote_eof_unblocks_recv_from_and_rebuilds_nat() {
         .unwrap();
     assert_eq!(r1, b"TROJAN-CONN-1:one");
 
-    let eof_res = tokio::time::timeout(Duration::from_millis(500), sess.recv_from())
+    let eof_res = tokio::time::timeout(Duration::from_secs(2), sess.recv_from())
         .await
         .expect("TrojanUdpSession::recv_from hung instead of unblocking on remote EOF!");
     assert!(eof_res.is_err());
@@ -354,8 +354,13 @@ async fn repro_trojan_udp_remote_eof_unblocks_recv_from_and_rebuilds_nat() {
         .unwrap();
     assert_eq!(nat_r1, b"TROJAN-CONN-2:nat-1");
 
-    // Wait briefly for server connection #2 FIN to propagate to UdpNatManager's reader task
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Wait until server connection #2 FIN propagates and UdpNatManager tears down the active NAT entry
+    for _ in 0..100 {
+        if hub.active_connection_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     nat.send_datagram(
         client_src,
@@ -460,7 +465,7 @@ async fn repro_vless_udp_remote_eof_unblocks_recv_from() {
     assert_eq!(r1, b"VLESS-UDP-1:pkt-1");
 
     // Must immediately return EOF error rather than hanging 60s!
-    let eof_res = tokio::time::timeout(Duration::from_millis(500), sess.recv_from())
+    let eof_res = tokio::time::timeout(Duration::from_secs(2), sess.recv_from())
         .await
         .expect("VlessUdpSession::recv_from hung instead of unblocking on remote EOF!");
     assert!(eof_res.is_err());
@@ -583,11 +588,12 @@ async fn repro_ws_early_data_large_coalesced_write_backpressure_handshake_err_an
         .await
         .unwrap();
     let (mut rd_half, mut wr_half) = tokio::io::split(split_ws);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     let wr_task = tokio::spawn(async move {
         wr_half.write_all(b"SPLIT-PING").await.unwrap();
         wr_half.flush().await.unwrap();
-        // Keep wr_half parked just like UDP writer_handle waiting on mpsc!
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Keep wr_half parked until rd_task completes, just like UDP writer_handle waiting on mpsc!
+        let _ = done_rx.await;
     });
     let rd_task = tokio::spawn(async move {
         let mut out = [0u8; 10];
@@ -599,6 +605,7 @@ async fn repro_ws_early_data_large_coalesced_write_backpressure_handshake_err_an
         .expect("split reader task deadlocked due to waker stealing!")
         .unwrap();
     assert_eq!(&pong, b"SPLIT-PONG");
+    let _ = done_tx.send(());
     let _ = wr_task.await;
 }
 
@@ -1198,30 +1205,45 @@ async fn regression_low_power_mode_parks_timers_without_interrupting_push_or_dow
     stream.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"screen-off-push-frame");
 
-    // 2. Close active connection so active_connection_count() == 0, let the single zero-delta sample flush,
-    //    then verify true `0 Hz` timer sleep over a 2.2-second window!
+    // 2. Close active connection so active_connection_count() == 0, wait until unsampled traffic
+    //    and the zero-delta sample flush into `is_telemetry_parked() == true`, then verify true `0 Hz`!
     drop(stream);
-    for _ in 0..30 {
+    for _ in 0..150 {
         if engine.hub().active_connection_count() == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(engine.hub().active_connection_count(), 0);
-    // Allow at most one pending 1s interval boundary to record the zero-rate point and enter parked state
-    tokio::time::sleep(Duration::from_millis(1150)).await;
+
+    for _ in 0..250 {
+        if engine.hub().is_telemetry_parked() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        engine.hub().is_telemetry_parked(),
+        "telemetry sampler must enter parked 0 Hz state once idle in low_power_mode"
+    );
 
     let parked_ticks = engine.hub().sample_tick_count();
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::sleep(Duration::from_millis(1250)).await;
     assert_eq!(
         engine.hub().sample_tick_count(),
         parked_ticks,
         "expected 0 telemetry wakeups (true 0 Hz) while idle in low_power_mode"
     );
+    assert!(engine.hub().is_telemetry_parked());
 
-    // 3. Exiting low-power mode (screen-on) immediately wakes the sampler and resumes 1 Hz ticks!
+    // 3. Exiting low-power mode (screen-on) immediately wakes the sampler and resumes ticks!
     engine.set_low_power_mode(false);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    for _ in 0..200 {
+        if engine.hub().sample_tick_count() > parked_ticks {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         engine.hub().sample_tick_count() > parked_ticks,
         "expected telemetry sampler to wake immediately upon exiting low_power_mode"

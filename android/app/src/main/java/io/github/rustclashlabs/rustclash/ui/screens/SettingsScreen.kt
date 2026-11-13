@@ -1,5 +1,6 @@
 package io.github.rustclashlabs.rustclash.ui.screens
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -39,6 +41,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -60,6 +63,7 @@ import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.ThemePreference
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
+import io.github.rustclashlabs.rustclash.ui.theme.ModalInlineErrorBanner
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashBrandIcon
 import io.github.rustclashlabs.rustclash.ui.theme.SegmentedSelectorRow
 import io.github.rustclashlabs.rustclash.ui.theme.SettingsGroupContainer
@@ -79,6 +83,7 @@ fun SettingsScreen(
     onSetDemoMode: (Boolean) -> Unit,
     onFlushDns: () -> Unit,
     onSetShowSystemApps: (Boolean) -> Unit = {},
+    onClearSettingsNotice: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var showAppearanceSheet by remember { mutableStateOf(false) }
@@ -151,7 +156,10 @@ fun SettingsScreen(
                 title = "网络与内核",
                 subtitle = "TUN · IPv6 · DNS · Fake-IP",
                 trailingBadge = if (state.enableIpv6) "双栈" else "IPv4",
-                onClick = { showNetworkSheet = true },
+                onClick = {
+                    onClearSettingsNotice()
+                    showNetworkSheet = true
+                },
             )
             SettingsGroupDivider()
 
@@ -160,7 +168,10 @@ fun SettingsScreen(
                 icon = Icons.Rounded.Bolt,
                 title = "连接与性能",
                 subtitle = "并发 · 超时 · 缓存 · 资源限制",
-                onClick = { showPerformanceSheet = true },
+                onClick = {
+                    onClearSettingsNotice()
+                    showPerformanceSheet = true
+                },
             )
             SettingsGroupDivider()
 
@@ -226,7 +237,10 @@ fun SettingsScreen(
             onSetEnableIpv6 = onSetEnableIpv6,
             onSetDemoMode = onSetDemoMode,
             onFlushDns = onFlushDns,
-            onDismiss = { showNetworkSheet = false },
+            onDismiss = {
+                onClearSettingsNotice()
+                showNetworkSheet = false
+            },
         )
     }
 
@@ -234,7 +248,10 @@ fun SettingsScreen(
         PerformanceBottomSheet(
             state = state,
             onFlushDns = onFlushDns,
-            onDismiss = { showPerformanceSheet = false },
+            onDismiss = {
+                onClearSettingsNotice()
+                showPerformanceSheet = false
+            },
         )
     }
 
@@ -320,6 +337,22 @@ private fun NetworkKernelBottomSheet(
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
             )
+            if (!state.settingsSheetNotice.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = extColors.emeraldContainer,
+                    border = BorderStroke(1.dp, extColors.emerald.copy(alpha = 0.35f)),
+                ) {
+                    Text(
+                        text = state.settingsSheetNotice,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = extColors.onEmeraldContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(14.dp))
 
             Row(
@@ -423,6 +456,22 @@ private fun PerformanceBottomSheet(
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
             )
+            if (!state.settingsSheetNotice.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = extColors.emeraldContainer,
+                    border = BorderStroke(1.dp, extColors.emerald.copy(alpha = 0.35f)),
+                ) {
+                    Text(
+                        text = state.settingsSheetNotice,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = extColors.onEmeraldContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(12.dp))
 
             InfoKeyValueRow("活跃连接数", "${state.telemetry.activeConnections}")
@@ -599,7 +648,7 @@ private fun InfoKeyValueRow(label: String, value: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PerAppPickerBottomSheet(
+internal fun PerAppPickerBottomSheet(
     initialMode: PerAppMode,
     initialSelected: Set<String>,
     installedApps: List<io.github.rustclashlabs.rustclash.ui.model.InstalledAppUi>,
@@ -613,6 +662,7 @@ private fun PerAppPickerBottomSheet(
     var selectedMode by remember { mutableStateOf(initialMode) }
     var selectedPkgs by remember { mutableStateOf(initialSelected) }
     var searchQuery by remember { mutableStateOf("") }
+    var validationError by remember { mutableStateOf<String?>(null) }
     // Pin initially-selected apps to the top on sheet open, keeping sort order stable while toggling checkboxes
     val initialPinned = remember(installedApps) { initialSelected }
 
@@ -655,7 +705,14 @@ private fun PerAppPickerBottomSheet(
                     modifier = Modifier.weight(1f),
                 )
                 Button(
-                    onClick = { onSave(selectedMode, selectedPkgs) },
+                    onClick = {
+                        if (selectedMode == PerAppMode.ALLOWLIST && selectedPkgs.isEmpty()) {
+                            validationError = "「仅选中应用」模式下请至少勾选 1 个需要代理的应用，或切换为「全部应用」"
+                            return@Button
+                        }
+                        validationError = null
+                        onSave(selectedMode, selectedPkgs)
+                    },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = extColors.emerald,
                         contentColor = Color.White,
@@ -682,8 +739,19 @@ private fun PerAppPickerBottomSheet(
                         PerAppMode.BLOCKLIST -> "绕过选中"
                     }
                 },
-                onSelect = { selectedMode = it },
+                onSelect = {
+                    selectedMode = it
+                    validationError = null
+                },
             )
+
+            if (!validationError.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                ModalInlineErrorBanner(
+                    message = validationError!!,
+                    onDismiss = { validationError = null },
+                )
+            }
 
             if (selectedMode != PerAppMode.ALL_APPS) {
                 Spacer(modifier = Modifier.height(10.dp))
@@ -735,47 +803,62 @@ private fun PerAppPickerBottomSheet(
 
                 Spacer(modifier = Modifier.height(6.dp))
 
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(320.dp),
-                ) {
-                    items(filteredApps, key = { it.packageName }) { app ->
-                        val checked = app.packageName in selectedPkgs
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    selectedPkgs = if (checked) {
-                                        selectedPkgs - app.packageName
-                                    } else {
-                                        selectedPkgs + app.packageName
+                if (filteredApps.isEmpty()) {
+                    Text(
+                        text = if (searchQuery.isNotBlank()) {
+                            "未找到匹配「$searchQuery」的应用"
+                        } else {
+                            "暂无可显示的已安装应用"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 14.dp),
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 140.dp, max = 260.dp),
+                    ) {
+                        items(filteredApps, key = { it.packageName }) { app ->
+                            val checked = app.packageName in selectedPkgs
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectedPkgs = if (checked) {
+                                            selectedPkgs - app.packageName
+                                        } else {
+                                            selectedPkgs + app.packageName
+                                        }
+                                        validationError = null
                                     }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = checked,
+                                    onCheckedChange = { isChecked ->
+                                        selectedPkgs = if (isChecked) {
+                                            selectedPkgs + app.packageName
+                                        } else {
+                                            selectedPkgs - app.packageName
+                                        }
+                                        validationError = null
+                                    },
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = app.label,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                    Text(
+                                        text = app.packageName,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
                                 }
-                                .padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(
-                                checked = checked,
-                                onCheckedChange = { isChecked ->
-                                    selectedPkgs = if (isChecked) {
-                                        selectedPkgs + app.packageName
-                                    } else {
-                                        selectedPkgs - app.packageName
-                                    }
-                                },
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = app.label,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                                Text(
-                                    text = app.packageName,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
                             }
                         }
                     }
