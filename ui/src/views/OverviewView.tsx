@@ -99,6 +99,13 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     });
   };
 
+  const handleToggleUnifiedDelay = () => {
+    const current = config?.["unified-delay"] ?? true;
+    void runAction("unified-delay", async () => {
+      await clashApi.patchConfigs({ "unified-delay": !current });
+    });
+  };
+
   const handleToggleDemo = (enable: boolean) => {
     void runAction("demo", async () => {
       await clashApi.toggleDemoSandbox(enable);
@@ -512,6 +519,26 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 onClick={handleToggleAutostart}
               >
                 {config?.autostart?.enabled ? "Enabled" : "Enable"}
+              </button>
+            </div>
+
+            <div className="switch-row">
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                  Unified Delay (<code className="mono">unified-delay</code>)
+                </div>
+                <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+                  Measures 1-RTT payload latency excluding cold TLS/DNS setup
+                </div>
+              </div>
+              <button
+                id="toggle-unified-delay-btn"
+                type="button"
+                className={`btn btn-sm ${(config?.["unified-delay"] ?? true) ? "btn-primary" : ""}`}
+                disabled={busyKey === "unified-delay" || !config}
+                onClick={handleToggleUnifiedDelay}
+              >
+                {(config?.["unified-delay"] ?? true) ? "Enabled" : "Enable"}
               </button>
             </div>
 

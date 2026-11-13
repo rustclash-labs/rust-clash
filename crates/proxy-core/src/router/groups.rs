@@ -258,6 +258,19 @@ impl ProxyGroup {
         override_url: Option<&str>,
         timeout: Duration,
     ) -> HashMap<String, Option<u64>> {
+        self.evaluate_health_with_mode(outbounds, delays, override_url, timeout, true)
+            .await
+    }
+
+    /// Run bounded concurrent latency benchmark with explicit `unified_delay` selection.
+    pub async fn evaluate_health_with_mode(
+        &self,
+        outbounds: &HashMap<String, DynOutbound>,
+        delays: &DelayStore,
+        override_url: Option<&str>,
+        timeout: Duration,
+        unified_delay: bool,
+    ) -> HashMap<String, Option<u64>> {
         let probe_url = override_url.unwrap_or(&self.test_url);
         let sem = Arc::new(Semaphore::new(16));
         let futs = self.members.iter().map(|member_name| {
@@ -269,7 +282,10 @@ impl ProxyGroup {
                     return (member, None);
                 };
                 let _permit = sem_clone.acquire().await.ok();
-                match outbound.latency_test(probe_url, timeout).await {
+                match outbound
+                    .latency_test_with_mode(probe_url, timeout, unified_delay)
+                    .await
+                {
                     Ok(ms) => {
                         delays.record(&member, ms);
                         (member, Some(ms))

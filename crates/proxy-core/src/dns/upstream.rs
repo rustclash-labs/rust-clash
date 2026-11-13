@@ -2,23 +2,31 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock, Weak,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use bytes::{BufMut, BytesMut};
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rustls::pki_types::CertificateDer;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    sync::{Mutex as AsyncMutex, mpsc, oneshot},
+    task::AbortHandle,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use url::Url;
 
 use crate::{
     error::{ProxyError, Result},
-    platform::socket_protect::{protected_tcp_connect_addr, protected_udp_bind},
+    platform::socket_protect::{
+        current_protector_epoch, protected_tcp_connect_addr, protected_udp_bind,
+    },
 };
 
 const DNS_IO_TIMEOUT: Duration = Duration::from_secs(3);
@@ -32,12 +40,34 @@ struct TlsDnsPoolKey {
     skip_cert_verify: bool,
     is_doh: bool,
     extra_ca_hash: u64,
+    protector_epoch: u64,
 }
 
 type TlsDnsPoolEntry = (Instant, TlsStream<TcpStream>);
 type TlsDnsPoolMap = HashMap<TlsDnsPoolKey, Vec<TlsDnsPoolEntry>>;
+type H2Slot = Arc<AsyncMutex<Option<Arc<H2DohClient>>>>;
 
 static TLS_DNS_POOL: LazyLock<Mutex<TlsDnsPoolMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static H2_DNS_POOL: LazyLock<Mutex<HashMap<TlsDnsPoolKey, H2Slot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static H2_LIVE_CLIENTS: LazyLock<Mutex<Vec<Weak<H2DohClient>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn get_h2_slot(key: &TlsDnsPoolKey) -> H2Slot {
+    let mut guard = H2_DNS_POOL.lock();
+    if guard.len() > 64 {
+        guard.retain(|_, slot| {
+            slot.try_lock()
+                .map(|g| g.as_ref().is_some_and(|c| c.is_reusable()))
+                .unwrap_or(true)
+        });
+    }
+    Arc::clone(
+        guard
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
+    )
+}
 
 fn hash_extra_ca(extra_ca_der: &[CertificateDer<'static>]) -> u64 {
     if extra_ca_der.is_empty() {
@@ -78,9 +108,20 @@ fn push_idle_tls_stream(key: TlsDnsPoolKey, stream: TlsStream<TcpStream>) {
     }
 }
 
-/// Evict all pooled DoT/DoH TLS upstream sockets (called on network handoff and DNS cache flush).
+/// Evict all pooled DoT/DoH TLS & HTTP/2 upstream sockets (called on network handoff, protector transition, and DNS cache flush).
 pub fn clear_dns_upstream_pools() {
     TLS_DNS_POOL.lock().clear();
+    H2_DNS_POOL.lock().clear();
+    let live: Vec<Arc<H2DohClient>> = {
+        let mut guard = H2_LIVE_CLIENTS.lock();
+        std::mem::take(&mut *guard)
+            .into_iter()
+            .filter_map(|w| w.upgrade())
+            .collect()
+    };
+    for client in live {
+        client.abort();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -559,6 +600,7 @@ pub async fn forward_dot_dns(
         skip_cert_verify,
         is_doh: false,
         extra_ca_hash: hash_extra_ca(extra_ca_der),
+        protector_epoch: current_protector_epoch(),
     };
 
     if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
@@ -659,7 +701,8 @@ async fn exchange_doh_over_stream(
     Ok((wire, false))
 }
 
-/// Forward a DNS query over RFC 8484 DNS-over-HTTPS (`POST` `application/dns-message`) using `SocketProtector` and HTTP/1.1 keep-alive pooling.
+/// Forward a DNS query over RFC 8484 DNS-over-HTTPS (`POST` `application/dns-message`) using
+/// `SocketProtector`, multiplexed HTTP/2 (`h2`) session pooling, and HTTP/1.1 keep-alive fallback.
 pub async fn forward_doh_dns(
     ns: SocketAddr,
     sni: &str,
@@ -685,8 +728,10 @@ pub async fn forward_doh_dns(
         skip_cert_verify,
         is_doh: true,
         extra_ca_hash: hash_extra_ca(extra_ca_der),
+        protector_epoch: current_protector_epoch(),
     };
 
+    // 1. Fast path for HTTP/1.1 keep-alive servers already in `TLS_DNS_POOL`
     if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
         && let Ok(Ok((resp, reusable))) = tokio::time::timeout(
             DNS_IO_TIMEOUT,
@@ -700,30 +745,127 @@ pub async fn forward_doh_dns(
         return Ok(resp);
     }
 
-    let alpn = [b"http/1.1".to_vec(), b"h2".to_vec()];
+    let alpn = [b"h2".to_vec(), b"http/1.1".to_vec()];
     let client_cfg =
         crate::crypto::tls::build_tls_client_config(skip_cert_verify, extra_ca_der, &alpn)?;
     let connector = TlsConnector::from(client_cfg);
     let server_name = crate::crypto::tls::parse_server_name(sni)?;
 
-    tokio::time::timeout(DNS_IO_TIMEOUT, async {
-        let tcp = protected_tcp_connect_addr(ns).await?;
-        let mut tls = connector.connect(server_name, tcp).await?;
+    let h2_slot = get_h2_slot(&pool_key);
+
+    let first_attempt = tokio::time::timeout(DNS_IO_TIMEOUT, async {
+        let mut slot_guard = h2_slot.lock().await;
+        if let Some(existing) = slot_guard.as_ref()
+            && existing.is_reusable()
+        {
+            let client = Arc::clone(existing);
+            drop(slot_guard);
+            return client
+                .exchange(host_header, path_and_query, &doh_wire)
+                .await;
+        }
+        *slot_guard = None;
+
+        // Re-check HTTP/1.1 pool in case a sibling caller just populated it
+        if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
+            && let Ok((resp, reusable)) = exchange_doh_over_stream(
+                &mut pooled,
+                host_header,
+                path_and_query,
+                &doh_wire,
+                orig_id,
+            )
+            .await
+        {
+            drop(slot_guard);
+            if reusable {
+                push_idle_tls_stream(pool_key.clone(), pooled);
+            }
+            let mut raw = resp;
+            raw[0] = 0;
+            raw[1] = 0;
+            return H2DohOutcome::Body(raw);
+        }
+
+        let tcp = match protected_tcp_connect_addr(ns).await {
+            Ok(s) => s,
+            Err(e) => return H2DohOutcome::Fatal(ProxyError::Io(e)),
+        };
+        let mut tls = match connector.connect(server_name.clone(), tcp).await {
+            Ok(s) => s,
+            Err(e) => return H2DohOutcome::Fatal(ProxyError::Io(e)),
+        };
+
         if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
-            exchange_doh_h2_over_stream(&mut tls, host_header, path_and_query, &doh_wire, orig_id)
+            let client = H2DohClient::spawn(tls);
+            *slot_guard = Some(Arc::clone(&client));
+            drop(slot_guard);
+            client
+                .exchange(host_header, path_and_query, &doh_wire)
                 .await
         } else {
-            let (resp, reusable) =
-                exchange_doh_over_stream(&mut tls, host_header, path_and_query, &doh_wire, orig_id)
-                    .await?;
-            if reusable {
-                push_idle_tls_stream(pool_key, tls);
+            drop(slot_guard);
+            match exchange_doh_over_stream(
+                &mut tls,
+                host_header,
+                path_and_query,
+                &doh_wire,
+                orig_id,
+            )
+            .await
+            {
+                Ok((resp, reusable)) => {
+                    if reusable {
+                        push_idle_tls_stream(pool_key.clone(), tls);
+                    }
+                    let mut raw = resp;
+                    raw[0] = 0;
+                    raw[1] = 0;
+                    H2DohOutcome::Body(raw)
+                }
+                Err(e) => H2DohOutcome::Fatal(e),
             }
-            Ok(resp)
         }
     })
     .await
-    .map_err(|_| ProxyError::Timeout)?
+    .map_err(|_| ProxyError::Timeout)?;
+
+    match first_attempt {
+        H2DohOutcome::Body(body) => finalize_doh_body(body, orig_id),
+        H2DohOutcome::Fatal(err) => Err(err),
+        H2DohOutcome::RetryOnFreshConn => {
+            // Reused stream (>1) hit server close / GOAWAY / REFUSED_STREAM: retry once on Stream 1!
+            tokio::time::timeout(DNS_IO_TIMEOUT, async {
+                let tcp = protected_tcp_connect_addr(ns).await?;
+                let mut tls = connector.connect(server_name, tcp).await?;
+                if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                    exchange_doh_h2_over_stream(
+                        &mut tls,
+                        host_header,
+                        path_and_query,
+                        &doh_wire,
+                        orig_id,
+                    )
+                    .await
+                } else {
+                    let (resp, reusable) = exchange_doh_over_stream(
+                        &mut tls,
+                        host_header,
+                        path_and_query,
+                        &doh_wire,
+                        orig_id,
+                    )
+                    .await?;
+                    if reusable {
+                        push_idle_tls_stream(pool_key, tls);
+                    }
+                    Ok(resp)
+                }
+            })
+            .await
+            .map_err(|_| ProxyError::Timeout)?
+        }
+    }
 }
 
 fn finalize_doh_body(mut body: Vec<u8>, orig_id: [u8; 2]) -> Result<Vec<u8>> {
@@ -930,6 +1072,514 @@ fn strip_h2_padding(payload: &[u8], flags: u8) -> Result<&[u8]> {
         return Err(ProxyError::Dns("invalid HTTP/2 frame pad length".into()));
     }
     Ok(&rest[..rest.len() - pad_len])
+}
+
+const H2_MAX_STREAMS_PER_CONN: u32 = 512;
+const H2_CONN_WINDOW_INCREMENT: u32 = 1_048_576;
+
+enum H2DohOutcome {
+    Body(Vec<u8>),
+    RetryOnFreshConn,
+    Fatal(ProxyError),
+}
+
+struct H2StreamAcc {
+    seen_final_status: bool,
+    body: Vec<u8>,
+    tx: oneshot::Sender<H2DohOutcome>,
+}
+
+struct PendingStreamGuard<'a> {
+    map: &'a DashMap<u32, H2StreamAcc>,
+    sid: u32,
+    disarmed: bool,
+}
+
+impl Drop for PendingStreamGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.map.remove(&self.sid);
+        }
+    }
+}
+
+struct H2DohClient {
+    write_tx: mpsc::UnboundedSender<BytesMut>,
+    pending: Arc<DashMap<u32, H2StreamAcc>>,
+    next_stream_id: AtomicU32,
+    max_concurrent: Arc<AtomicU32>,
+    closed: Arc<AtomicBool>,
+    reader_abort: AbortHandle,
+    writer_abort: AbortHandle,
+}
+
+fn encode_doh_h2_request_frames(
+    out: &mut BytesMut,
+    stream_id: u32,
+    host_header: &str,
+    path_and_query: &str,
+    doh_wire: &[u8],
+) {
+    let mut hblock = BytesMut::with_capacity(192);
+    // `:method: POST` (static index 3 -> 0x83), `:scheme: https` (static index 7 -> 0x87)
+    hblock.put_u8(0x83);
+    hblock.put_u8(0x87);
+    // `:authority` (static index 1), `:path` (static index 4)
+    put_hpack_literal_indexed_name(&mut hblock, 1, host_header.as_bytes());
+    put_hpack_literal_indexed_name(&mut hblock, 4, path_and_query.as_bytes());
+    // `user-agent` (static index 58), `accept` (static index 19), `content-type` (static index 31), `content-length` (static index 28)
+    let ua = format!("rust-clash/{}", env!("CARGO_PKG_VERSION"));
+    put_hpack_literal_indexed_name(&mut hblock, 58, ua.as_bytes());
+    put_hpack_literal_indexed_name(&mut hblock, 19, b"application/dns-message");
+    put_hpack_literal_indexed_name(&mut hblock, 31, b"application/dns-message");
+    let cl_str = doh_wire.len().to_string();
+    put_hpack_literal_indexed_name(&mut hblock, 28, cl_str.as_bytes());
+
+    put_h2_frame_header(
+        out,
+        hblock.len(),
+        H2_FRAME_HEADERS,
+        H2_FLAG_END_HEADERS,
+        stream_id,
+    );
+    out.put_slice(&hblock);
+    put_h2_frame_header(
+        out,
+        doh_wire.len(),
+        H2_FRAME_DATA,
+        H2_FLAG_END_STREAM,
+        stream_id,
+    );
+    out.put_slice(doh_wire);
+}
+
+impl H2DohClient {
+    fn spawn(tls: TlsStream<TcpStream>) -> Arc<Self> {
+        let (mut rd, mut wr) = tokio::io::split(tls);
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<BytesMut>();
+        let pending: Arc<DashMap<u32, H2StreamAcc>> = Arc::new(DashMap::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let max_concurrent = Arc::new(AtomicU32::new(100));
+
+        // Enqueue HTTP/2 client preface + SETTINGS (HEADER_TABLE_SIZE=0, ENABLE_PUSH=0) + 1 MiB connection WINDOW_UPDATE first
+        let mut init_buf = BytesMut::with_capacity(64);
+        init_buf.put_slice(H2_CLIENT_PREFACE);
+        put_h2_frame_header(&mut init_buf, 12, H2_FRAME_SETTINGS, 0, 0);
+        init_buf.put_u16(0x0001);
+        init_buf.put_u32(0);
+        init_buf.put_u16(0x0002);
+        init_buf.put_u32(0);
+        put_h2_frame_header(&mut init_buf, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+        init_buf.put_u32(H2_CONN_WINDOW_INCREMENT);
+        let _ = write_tx.send(init_buf);
+
+        let closed_wr = Arc::clone(&closed);
+        let writer_jh = tokio::spawn(async move {
+            while let Some(mut chunk) = write_rx.recv().await {
+                while chunk.len() < 16_384 {
+                    match write_rx.try_recv() {
+                        Ok(more) => chunk.extend_from_slice(&more),
+                        Err(_) => break,
+                    }
+                }
+                if wr.write_all(&chunk).await.is_err() || wr.flush().await.is_err() {
+                    closed_wr.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        });
+        let writer_abort = writer_jh.abort_handle();
+        let writer_abort_rd = writer_abort.clone();
+
+        let pending_rd = Arc::clone(&pending);
+        let closed_rd = Arc::clone(&closed);
+        let max_conc_rd = Arc::clone(&max_concurrent);
+        let write_tx_rd = write_tx.clone();
+
+        let reader_jh = tokio::spawn(async move {
+            let mut dyn_table: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut goaway_seen = false;
+            let fail_err = loop {
+                let read_res = tokio::time::timeout(DNS_TLS_IDLE_TTL, read_h2_frame(&mut rd)).await;
+                let (ftype, flags, stream_id, payload) = match read_res {
+                    Ok(Ok(f)) => f,
+                    Ok(Err(e)) => break e,
+                    Err(_) => {
+                        if pending_rd.is_empty() {
+                            break ProxyError::Timeout;
+                        }
+                        continue;
+                    }
+                };
+
+                match ftype {
+                    H2_FRAME_SETTINGS => {
+                        if (flags & H2_FLAG_ACK) == 0 {
+                            for &[b0, b1, b2, b3, b4, b5] in payload.as_chunks::<6>().0 {
+                                let id = u16::from_be_bytes([b0, b1]);
+                                let val = u32::from_be_bytes([b2, b3, b4, b5]);
+                                if id == 0x0003 {
+                                    if val == 0 {
+                                        closed_rd.store(true, Ordering::Release);
+                                    } else {
+                                        max_conc_rd.store(val.min(256), Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            let mut ack = BytesMut::with_capacity(9);
+                            put_h2_frame_header(&mut ack, 0, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0);
+                            let _ = write_tx_rd.send(ack);
+                        }
+                    }
+                    H2_FRAME_PING => {
+                        if (flags & H2_FLAG_ACK) == 0 && payload.len() == 8 {
+                            let mut ack = BytesMut::with_capacity(17);
+                            put_h2_frame_header(&mut ack, 8, H2_FRAME_PING, H2_FLAG_ACK, 0);
+                            ack.put_slice(&payload);
+                            let _ = write_tx_rd.send(ack);
+                        }
+                    }
+                    H2_FRAME_WINDOW_UPDATE => {}
+                    H2_FRAME_RST_STREAM => {
+                        let code = if payload.len() >= 4 {
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        } else {
+                            0
+                        };
+                        if let Some((sid, acc)) = pending_rd.remove(&stream_id) {
+                            let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                                H2DohOutcome::RetryOnFreshConn
+                            } else {
+                                H2DohOutcome::Fatal(ProxyError::Dns(format!(
+                                    "DoH HTTP/2 stream {sid} reset by peer (error_code={code})"
+                                )))
+                            });
+                        }
+                        if goaway_seen && pending_rd.is_empty() {
+                            break ProxyError::Dns("DoH HTTP/2 session closed after GOAWAY".into());
+                        }
+                    }
+                    H2_FRAME_GOAWAY => {
+                        closed_rd.store(true, Ordering::Release);
+                        goaway_seen = true;
+                        let last_sid = if payload.len() >= 8 {
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                                & 0x7fff_ffff
+                        } else {
+                            0
+                        };
+                        let keys: Vec<u32> = pending_rd
+                            .iter()
+                            .filter_map(|e| (*e.key() > last_sid).then_some(*e.key()))
+                            .collect();
+                        for sid in keys {
+                            if let Some((_, acc)) = pending_rd.remove(&sid) {
+                                let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                                    H2DohOutcome::RetryOnFreshConn
+                                } else {
+                                    H2DohOutcome::Fatal(ProxyError::Dns(format!(
+                                        "DoH HTTP/2 GOAWAY (last_stream_id={last_sid}) before stream {sid}"
+                                    )))
+                                });
+                            }
+                        }
+                        if pending_rd.is_empty() {
+                            break ProxyError::Dns("DoH HTTP/2 session closed by GOAWAY".into());
+                        }
+                    }
+                    H2_FRAME_HEADERS if stream_id > 0 => {
+                        let frag_res = strip_h2_padding(&payload, flags).and_then(|mut frag| {
+                            if (flags & H2_FLAG_PRIORITY) != 0 {
+                                if frag.len() < 5 {
+                                    return Err(ProxyError::Dns(
+                                        "truncated HTTP/2 PRIORITY in HEADERS frame".into(),
+                                    ));
+                                }
+                                frag = &frag[5..];
+                            }
+                            Ok(frag.to_vec())
+                        });
+                        let mut full_hblock = match frag_res {
+                            Ok(v) => v,
+                            Err(e) => break e,
+                        };
+                        let stream_ended = (flags & H2_FLAG_END_STREAM) != 0;
+                        let mut cur_flags = flags;
+                        let mut cont_err = None;
+                        while (cur_flags & H2_FLAG_END_HEADERS) == 0 {
+                            match tokio::time::timeout(DNS_IO_TIMEOUT, read_h2_frame(&mut rd)).await
+                            {
+                                Ok(Ok((cont_type, cont_flags, cont_sid, cont_payload))) => {
+                                    if cont_type != H2_FRAME_CONTINUATION || cont_sid != stream_id {
+                                        cont_err = Some(ProxyError::Dns(
+                                            "expected HTTP/2 CONTINUATION frame".into(),
+                                        ));
+                                        break;
+                                    }
+                                    if full_hblock.len() + cont_payload.len() > 65_536 {
+                                        cont_err = Some(ProxyError::Dns(
+                                            "DoH HTTP/2 header block exceeded 64 KiB".into(),
+                                        ));
+                                        break;
+                                    }
+                                    full_hblock.extend_from_slice(&cont_payload);
+                                    cur_flags = cont_flags;
+                                }
+                                Ok(Err(e)) => {
+                                    cont_err = Some(e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    cont_err = Some(ProxyError::Timeout);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(e) = cont_err {
+                            break e;
+                        }
+
+                        let decoded_status =
+                            match hpack_decode_block_status(&full_hblock, &mut dyn_table) {
+                                Ok(s) => s,
+                                Err(e) => break e,
+                            };
+
+                        let mut finish: Option<H2DohOutcome> = None;
+                        if let Some(mut entry) = pending_rd.get_mut(&stream_id) {
+                            if !entry.seen_final_status {
+                                match decoded_status {
+                                    Some(s) if (100..200).contains(&s) => {}
+                                    Some(200) => {
+                                        entry.seen_final_status = true;
+                                    }
+                                    Some(code) => {
+                                        finish = Some(H2DohOutcome::Fatal(ProxyError::Dns(
+                                            format!("DoH server returned HTTP status {code}"),
+                                        )));
+                                    }
+                                    None => {
+                                        finish = Some(H2DohOutcome::Fatal(ProxyError::Dns(
+                                            "DoH HTTP/2 response missing :status header".into(),
+                                        )));
+                                    }
+                                }
+                            }
+                            if finish.is_none() && stream_ended {
+                                if entry.seen_final_status {
+                                    finish =
+                                        Some(H2DohOutcome::Body(std::mem::take(&mut entry.body)));
+                                } else {
+                                    finish = Some(H2DohOutcome::Fatal(ProxyError::Dns(
+                                        "DoH HTTP/2 stream ended without HTTP 200 headers".into(),
+                                    )));
+                                }
+                            }
+                        }
+                        if let Some(outcome) = finish
+                            && let Some((_, acc)) = pending_rd.remove(&stream_id)
+                        {
+                            let _ = acc.tx.send(outcome);
+                        }
+                        if goaway_seen && pending_rd.is_empty() {
+                            break ProxyError::Dns("DoH HTTP/2 session closed after GOAWAY".into());
+                        }
+                    }
+                    H2_FRAME_DATA if stream_id > 0 => {
+                        let stream_ended = (flags & H2_FLAG_END_STREAM) != 0;
+                        if !payload.is_empty() {
+                            let inc = payload.len() as u32;
+                            let mut wu =
+                                BytesMut::with_capacity(if stream_ended { 13 } else { 26 });
+                            put_h2_frame_header(&mut wu, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+                            wu.put_u32(inc);
+                            if !stream_ended {
+                                put_h2_frame_header(
+                                    &mut wu,
+                                    4,
+                                    H2_FRAME_WINDOW_UPDATE,
+                                    0,
+                                    stream_id,
+                                );
+                                wu.put_u32(inc);
+                            }
+                            let _ = write_tx_rd.send(wu);
+                        }
+
+                        let data_slice = match strip_h2_padding(&payload, flags) {
+                            Ok(s) => s,
+                            Err(e) => break e,
+                        };
+
+                        let mut finish: Option<H2DohOutcome> = None;
+                        if let Some(mut entry) = pending_rd.get_mut(&stream_id) {
+                            if entry.body.len() + data_slice.len() > 65_536 {
+                                finish = Some(H2DohOutcome::Fatal(ProxyError::Dns(
+                                    "DoH HTTP/2 response body exceeded 64 KiB".into(),
+                                )));
+                            } else {
+                                entry.body.extend_from_slice(data_slice);
+                                if stream_ended {
+                                    if entry.seen_final_status {
+                                        finish = Some(H2DohOutcome::Body(std::mem::take(
+                                            &mut entry.body,
+                                        )));
+                                    } else {
+                                        finish = Some(H2DohOutcome::Fatal(ProxyError::Dns(
+                                            "DoH HTTP/2 stream ended without HTTP 200".into(),
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(outcome) = finish
+                            && let Some((_, acc)) = pending_rd.remove(&stream_id)
+                        {
+                            let _ = acc.tx.send(outcome);
+                        }
+                        if goaway_seen && pending_rd.is_empty() {
+                            break ProxyError::Dns("DoH HTTP/2 session closed after GOAWAY".into());
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            closed_rd.store(true, Ordering::Release);
+            writer_abort_rd.abort();
+            let keys: Vec<u32> = pending_rd.iter().map(|e| *e.key()).collect();
+            for sid in keys {
+                if let Some((_, acc)) = pending_rd.remove(&sid) {
+                    let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                        H2DohOutcome::RetryOnFreshConn
+                    } else {
+                        let msg = fail_err.to_string();
+                        H2DohOutcome::Fatal(ProxyError::Dns(format!(
+                            "DoH HTTP/2 connection closed before stream {sid} completed: {msg}"
+                        )))
+                    });
+                }
+            }
+        });
+        let reader_abort = reader_jh.abort_handle();
+
+        let client = Arc::new(Self {
+            write_tx,
+            pending,
+            next_stream_id: AtomicU32::new(1),
+            max_concurrent,
+            closed,
+            reader_abort,
+            writer_abort,
+        });
+        {
+            let mut live = H2_LIVE_CLIENTS.lock();
+            if live.len() > 64 {
+                live.retain(|w| w.strong_count() > 0);
+            }
+            live.push(Arc::downgrade(&client));
+        }
+        client
+    }
+
+    fn is_reusable(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && self.next_stream_id.load(Ordering::Relaxed) <= H2_MAX_STREAMS_PER_CONN * 2
+            && (self.pending.len() as u32) < self.max_concurrent.load(Ordering::Relaxed)
+    }
+
+    async fn exchange(
+        &self,
+        host_header: &str,
+        path_and_query: &str,
+        doh_wire: &[u8],
+    ) -> H2DohOutcome {
+        let sid = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+        if sid > H2_MAX_STREAMS_PER_CONN * 2 + 1 {
+            self.closed.store(true, Ordering::Release);
+            return if sid > 1 {
+                H2DohOutcome::RetryOnFreshConn
+            } else {
+                H2DohOutcome::Fatal(ProxyError::Dns(
+                    "DoH HTTP/2 connection stream budget reached".into(),
+                ))
+            };
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(
+            sid,
+            H2StreamAcc {
+                seen_final_status: false,
+                body: Vec::with_capacity(256),
+                tx,
+            },
+        );
+        let mut guard = PendingStreamGuard {
+            map: &self.pending,
+            sid,
+            disarmed: false,
+        };
+
+        if self.closed.load(Ordering::Acquire) {
+            return if sid > 1 {
+                H2DohOutcome::RetryOnFreshConn
+            } else {
+                H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 session already closed".into()))
+            };
+        }
+
+        let mut req_buf = BytesMut::with_capacity(224 + doh_wire.len());
+        encode_doh_h2_request_frames(&mut req_buf, sid, host_header, path_and_query, doh_wire);
+        if self.write_tx.send(req_buf).is_err() {
+            self.closed.store(true, Ordering::Release);
+            return if sid > 1 {
+                H2DohOutcome::RetryOnFreshConn
+            } else {
+                H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 writer channel closed".into()))
+            };
+        }
+
+        match rx.await {
+            Ok(outcome) => {
+                guard.disarmed = true;
+                outcome
+            }
+            Err(_) => {
+                guard.disarmed = true;
+                if sid > 1 {
+                    H2DohOutcome::RetryOnFreshConn
+                } else {
+                    H2DohOutcome::Fatal(ProxyError::Dns(
+                        "DoH HTTP/2 response channel dropped".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn abort(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.reader_abort.abort();
+        self.writer_abort.abort();
+        let keys: Vec<u32> = self.pending.iter().map(|e| *e.key()).collect();
+        for sid in keys {
+            if let Some((_, acc)) = self.pending.remove(&sid) {
+                let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                    H2DohOutcome::RetryOnFreshConn
+                } else {
+                    H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 pool flushed".into()))
+                });
+            }
+        }
+    }
+}
+
+impl Drop for H2DohClient {
+    fn drop(&mut self) {
+        self.reader_abort.abort();
+        self.writer_abort.abort();
+    }
 }
 
 /// Exchange a single RFC 8484 DNS-over-HTTPS `POST` request over an RFC 9113 HTTP/2 stream (`ALPN = h2`).
@@ -1167,9 +1817,11 @@ fn decode_hpack_str(input: &[u8]) -> Result<(Vec<u8>, usize)> {
     Ok((decoded, hdr_used + slen))
 }
 
-fn hpack_extract_status(mut block: &[u8]) -> Result<u16> {
+fn hpack_decode_block_status(
+    mut block: &[u8],
+    dyn_table: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<Option<u16>> {
     let mut status: Option<u16> = None;
-    let mut dyn_table: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     while !block.is_empty() {
         let b0 = block[0];
@@ -1199,7 +1851,10 @@ fn hpack_extract_status(mut block: &[u8]) -> Result<u16> {
             }
         } else if (b0 & 0xe0) == 0x20 {
             // Dynamic Table Size Update (5-bit prefix)
-            let (_new_max, used) = decode_hpack_int(block, 5)?;
+            let (new_max, used) = decode_hpack_int(block, 5)?;
+            if new_max == 0 {
+                dyn_table.clear();
+            }
             block = &block[used..];
         } else {
             // Literal Header Field:
@@ -1244,7 +1899,13 @@ fn hpack_extract_status(mut block: &[u8]) -> Result<u16> {
         }
     }
 
-    status.ok_or_else(|| ProxyError::Dns("DoH HTTP/2 response missing :status header".into()))
+    Ok(status)
+}
+
+fn hpack_extract_status(block: &[u8]) -> Result<u16> {
+    let mut dyn_table = Vec::new();
+    hpack_decode_block_status(block, &mut dyn_table)?
+        .ok_or_else(|| ProxyError::Dns("DoH HTTP/2 response missing :status header".into()))
 }
 
 #[derive(Clone, Copy)]

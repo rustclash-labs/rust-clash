@@ -466,6 +466,7 @@ impl DemoCluster {
             authentication: Vec::new(),
             lan_allowed_ips: Vec::new(),
             mode: RunMode::Rule,
+            unified_delay: true,
             log_level: "info".to_string(),
             external_controller: "127.0.0.1:9090".to_string(),
             secret: None,
@@ -972,6 +973,7 @@ fn start_tun_service(
     local_dns_addr: Option<SocketAddr>,
     router_slot: Arc<RwLock<Arc<Router>>>,
     hub: Arc<TelemetryHub>,
+    preconnect_wake: Arc<tokio::sync::Notify>,
     state_dir: PathBuf,
 ) -> std::result::Result<(TunService, Option<VirtualTunHandle>), std::io::Error> {
     let (tun_stop_tx, tun_stop_rx) = watch::channel(false);
@@ -1002,9 +1004,11 @@ fn start_tun_service(
 
         let router_for_hook = Arc::clone(&router_slot);
         let hub_for_hook = Arc::clone(&hub);
+        let pc_wake_for_hook = Arc::clone(&preconnect_wake);
         let net_change_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let r = Arc::clone(&router_for_hook.read());
             let _ = execute_network_change_reset(&r, &hub_for_hook);
+            pc_wake_for_hook.notify_one();
         });
 
         let spec = TunLaunchSpec {
@@ -1072,6 +1076,41 @@ fn start_tun_service(
     }
 }
 
+/// Platform-aware preconnection and DNS pre-warming policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreconnectPolicy {
+    /// Desktop (`Windows`, `macOS`, `Linux`): keeps `2` warm multiplexed AnyTLS v2 sessions
+    /// and proactively refreshes proxy server DNS on a 20s replenish loop.
+    Desktop,
+    /// Mobile (`Android`): event-driven one-shot 1-session prewarm ONLY on VPN start,
+    /// manual node switch, network handoff, or screen-on; zero periodic timer (`0 Hz` idle).
+    Mobile,
+    /// Completely disable proactive preconnection.
+    Disabled,
+}
+
+impl PreconnectPolicy {
+    pub fn platform_default() -> Self {
+        #[cfg(target_os = "android")]
+        {
+            Self::Mobile
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Self::Desktop
+        }
+    }
+
+    pub fn target_sessions(self) -> usize {
+        match self {
+            Self::Desktop => 2,
+            Self::Mobile => 1,
+            Self::Disabled => 0,
+        }
+    }
+}
+
 /// Top-level `rust-clash` runtime engine managing Mixed Inbound, Fake-IP DNS,
 /// `smoltcp` Userspace/OS TUN, `Router`, hot-reloadable `ClashConfig`, and `TelemetryHub`.
 pub struct ProxyEngine {
@@ -1094,6 +1133,8 @@ pub struct ProxyEngine {
     geodata_manager: RwLock<Option<Arc<crate::router::geodata::GeoDataManager>>>,
     extra_ca_der: RwLock<Vec<CertificateDer<'static>>>,
     demo_cluster: RwLock<Option<DemoCluster>>,
+    preconnect_policy: RwLock<PreconnectPolicy>,
+    preconnect_wake: Arc<tokio::sync::Notify>,
     low_power_mode: Arc<std::sync::atomic::AtomicBool>,
     low_power_wake: Arc<tokio::sync::Notify>,
     shutdown_tx: watch::Sender<bool>,
@@ -1107,6 +1148,25 @@ impl ProxyEngine {
 
     pub async fn start_with_state_dir(cfg: ClashConfig, state_dir: PathBuf) -> Result<Arc<Self>> {
         Self::start_internal(cfg, None, None, state_dir).await
+    }
+
+    pub async fn start_with_options(
+        cfg: ClashConfig,
+        state_dir: PathBuf,
+        preconnect_policy: PreconnectPolicy,
+        dns_seed: Option<crate::dns::PositiveDnsCacheSeed>,
+        initial_selections: Option<HashMap<String, String>>,
+    ) -> Result<Arc<Self>> {
+        Self::start_internal_with_options(
+            cfg,
+            None,
+            None,
+            state_dir,
+            preconnect_policy,
+            dns_seed,
+            initial_selections,
+        )
+        .await
     }
 
     pub async fn start_with_path(
@@ -1158,7 +1218,7 @@ impl ProxyEngine {
             Some(explicit) => Some(explicit),
             None => geodata_mgr.mmdb_reader(),
         };
-        Ok(Arc::new(Router::with_providers_mmdb_and_state_dir(
+        let router = Router::with_providers_mmdb_and_state_dir(
             cfg.mode,
             outbounds,
             &cfg.proxy_groups,
@@ -1167,14 +1227,37 @@ impl ProxyEngine {
             mmdb,
             Some(&state_dir),
             dns_engine,
-        )?))
+        )?;
+        router.set_unified_delay(cfg.unified_delay);
+        Ok(Arc::new(router))
     }
 
     async fn start_internal(
+        cfg: ClashConfig,
+        demo_cluster: Option<DemoCluster>,
+        config_path: Option<PathBuf>,
+        state_dir: PathBuf,
+    ) -> Result<Arc<Self>> {
+        Self::start_internal_with_options(
+            cfg,
+            demo_cluster,
+            config_path,
+            state_dir,
+            PreconnectPolicy::platform_default(),
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn start_internal_with_options(
         mut cfg: ClashConfig,
         demo_cluster: Option<DemoCluster>,
         config_path: Option<PathBuf>,
         state_dir: PathBuf,
+        preconnect_policy: PreconnectPolicy,
+        dns_seed: Option<crate::dns::PositiveDnsCacheSeed>,
+        initial_selections: Option<HashMap<String, String>>,
     ) -> Result<Arc<Self>> {
         cfg.validate()?;
         let canonical_cfg_path = config_path.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
@@ -1199,6 +1282,9 @@ impl ProxyEngine {
             &cfg.dns_with_merged_hosts(),
             &extra_ca_der,
         )?);
+        if let Some(seed) = dns_seed {
+            dns_engine.seed_positive_proxy_cache(seed);
+        }
         let outbounds =
             build_outbounds_with_dns(&cfg.proxies, &extra_ca_der, Some(Arc::clone(&dns_engine)))?;
         let mmdb = match load_optional_mmdb(&cfg)? {
@@ -1215,12 +1301,17 @@ impl ProxyEngine {
             Some(&state_dir),
             Arc::clone(&dns_engine),
         )?);
+        initial_router.set_unified_delay(cfg.unified_delay);
+        if let Some(ref sel) = initial_selections {
+            initial_router.apply_saved_selections(sel);
+        }
         let router_slot = Arc::new(RwLock::new(Arc::clone(&initial_router)));
         if let Some(ref gm) = geodata_mgr {
             gm.attach_router_slot(Arc::downgrade(&router_slot));
         }
         let hub = Arc::new(TelemetryHub::new());
         hub.set_log_level(&cfg.log_level);
+        let preconnect_wake = Arc::new(tokio::sync::Notify::new());
         let recovered = recover_stale_network_state(&state_dir);
         if !recovered.actions_executed.is_empty() {
             hub.push_log(
@@ -1310,6 +1401,7 @@ impl ProxyEngine {
                 dns_bound_opt,
                 Arc::clone(&router_slot),
                 Arc::clone(&hub),
+                Arc::clone(&preconnect_wake),
                 state_dir.clone(),
             ) {
                 Ok((svc, vtun_opt)) => {
@@ -1410,10 +1502,15 @@ impl ProxyEngine {
         let hub_bg = Arc::clone(&hub);
         let lp_bg = Arc::clone(&low_power_mode);
         let lp_wake_bg = Arc::clone(&low_power_wake);
+        let pc_wake_bg = Arc::clone(&preconnect_wake);
         let mut bg_stop = shutdown_rx.clone();
         bg_tasks.push(tokio::spawn(async move {
             let r0 = Arc::clone(&router_bg.read());
+            let prev_eff = r0.effective_primary_outbound().effective_outbound;
             r0.refresh_auto_groups(Duration::from_secs(3)).await;
+            if r0.effective_primary_outbound().effective_outbound != prev_eff {
+                pc_wake_bg.notify_one();
+            }
             hub_bg.push_log(
                 "info",
                 "Initial URLTest / Fallback / LoadBalance latency probe completed",
@@ -1455,7 +1552,11 @@ impl ProxyEngine {
                             continue;
                         }
                         let r = Arc::clone(&router_bg.read());
+                        let before = r.effective_primary_outbound().effective_outbound;
                         r.refresh_due_auto_groups(Duration::from_secs(4), false).await;
+                        if r.effective_primary_outbound().effective_outbound != before {
+                            pc_wake_bg.notify_one();
+                        }
                     }
                 }
             }
@@ -1494,17 +1595,20 @@ impl ProxyEngine {
             last_tun_error: RwLock::new(last_tun_err),
             virtual_tun: Mutex::new(virtual_tun_opt),
             state_dir: RwLock::new(state_dir),
-            saved_selections: RwLock::new(HashMap::new()),
+            saved_selections: RwLock::new(initial_selections.unwrap_or_default()),
             profile_manager: RwLock::new(None),
             geodata_manager: RwLock::new(geodata_mgr),
             extra_ca_der: RwLock::new(extra_ca_der),
             demo_cluster: RwLock::new(demo_cluster),
+            preconnect_policy: RwLock::new(preconnect_policy),
+            preconnect_wake,
             low_power_mode,
             low_power_wake,
             shutdown_tx,
             _bg_tasks: Mutex::new(bg_tasks),
         });
         Self::spawn_http_rule_providers_task(&engine);
+        Self::spawn_preconnect_task(&engine);
         Ok(engine)
     }
 
@@ -1594,9 +1698,41 @@ impl ProxyEngine {
     /// Perform full session recovery across an OS network handoff (e.g. Android Wi-Fi <-> Cellular,
     /// macOS `NEPacketTunnelProvider.wake()`, or desktop default-gateway change):
     /// synchronously resets UDP NAT tables, evicts pooled AnyTLS/TLS sockets, flushes DNS caches,
-    /// and aborts in-flight TCP streams so applications immediately reconnect over the new path.
+    /// aborts in-flight TCP streams, and triggers primary outbound pre-warming on the new link.
     pub fn notify_network_change(&self) -> NetworkChangeReport {
-        execute_network_change_reset(&self.router(), &self.hub)
+        let report = execute_network_change_reset(&self.router(), &self.hub);
+        self.trigger_preconnect();
+        report
+    }
+
+    pub fn preconnect_policy(&self) -> PreconnectPolicy {
+        *self.preconnect_policy.read()
+    }
+
+    pub fn set_preconnect_policy(&self, policy: PreconnectPolicy) {
+        let mut guard = self.preconnect_policy.write();
+        if *guard != policy {
+            *guard = policy;
+            drop(guard);
+            self.trigger_preconnect();
+        }
+    }
+
+    pub fn trigger_preconnect(&self) {
+        self.preconnect_wake.notify_one();
+    }
+
+    pub fn set_unified_delay(&self, enabled: bool) {
+        {
+            let mut cfg = self.config.write();
+            cfg.unified_delay = enabled;
+            if let Ok(y) = cfg.to_yaml_string() {
+                *self.raw_yaml.write() = y;
+            }
+        }
+        self.router().set_unified_delay(enabled);
+        self.hub
+            .push_log("info", format!("Updated unified-delay to {enabled}"));
     }
 
     pub fn set_mode(&self, mode: RunMode) {
@@ -1608,6 +1744,7 @@ impl ProxyEngine {
             }
         }
         self.router().set_mode(mode);
+        self.trigger_preconnect();
         if self.demo_cluster.read().is_none()
             && let Some(mgr) = self.profile_manager()
         {
@@ -1639,6 +1776,9 @@ impl ProxyEngine {
         } else {
             0
         };
+        if prev_eff != new_eff {
+            self.trigger_preconnect();
+        }
         self.hub.push_log(
             "info",
             format!(
@@ -1646,6 +1786,127 @@ impl ProxyEngine {
             ),
         );
         Ok(())
+    }
+
+    fn spawn_preconnect_task(engine: &Arc<Self>) {
+        let weak_eng = Arc::downgrade(engine);
+        let mut stop_rx = engine.shutdown_tx.subscribe();
+        let lp = Arc::clone(&engine.low_power_mode);
+        let lp_wake = Arc::clone(&engine.low_power_wake);
+        let pc_wake = Arc::clone(&engine.preconnect_wake);
+
+        let handle = tokio::spawn(async move {
+            let mut pending_immediate = true;
+            let mut interval = tokio::time::interval(Duration::from_secs(20));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+
+            loop {
+                let Some(eng) = weak_eng.upgrade() else {
+                    break;
+                };
+                let policy = eng.preconnect_policy();
+                let is_lp = lp.load(std::sync::atomic::Ordering::SeqCst);
+                drop(eng);
+
+                if is_lp || policy == PreconnectPolicy::Disabled {
+                    let wake_lp = lp_wake.notified();
+                    tokio::pin!(wake_lp);
+                    wake_lp.as_mut().enable();
+                    let wake_pc = pc_wake.notified();
+                    tokio::pin!(wake_pc);
+                    wake_pc.as_mut().enable();
+                    let still_parked = weak_eng.upgrade().is_none_or(|e| {
+                        lp.load(std::sync::atomic::Ordering::SeqCst)
+                            || e.preconnect_policy() == PreconnectPolicy::Disabled
+                    });
+                    if still_parked {
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = &mut wake_lp => {
+                                pending_immediate = true;
+                            }
+                            _ = &mut wake_pc => {
+                                pending_immediate = true;
+                            }
+                        }
+                        interval.reset();
+                        continue;
+                    }
+                }
+
+                if pending_immediate {
+                    pending_immediate = false;
+                    if let Some(eng) = weak_eng.upgrade()
+                        && !lp.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let target = eng.preconnect_policy().target_sessions();
+                        if target > 0 {
+                            let router = eng.router();
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(6),
+                                router.preconnect_primary(target),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                let Some(eng) = weak_eng.upgrade() else {
+                    break;
+                };
+                let policy = eng.preconnect_policy();
+                drop(eng);
+
+                match policy {
+                    PreconnectPolicy::Disabled => {
+                        continue;
+                    }
+                    PreconnectPolicy::Mobile => {
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = pc_wake.notified() => {
+                                pending_immediate = true;
+                            }
+                        }
+                    }
+                    PreconnectPolicy::Desktop => {
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = pc_wake.notified() => {
+                                pending_immediate = true;
+                                interval.reset();
+                            }
+                            _ = interval.tick() => {
+                                if !lp.load(std::sync::atomic::Ordering::SeqCst)
+                                    && let Some(eng) = weak_eng.upgrade()
+                                {
+                                    let router = eng.router();
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(6),
+                                        router.preconnect_primary(2),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        engine._bg_tasks.lock().push(handle);
     }
 
     fn spawn_http_rule_providers_task(engine: &Arc<Self>) {
@@ -1737,11 +1998,15 @@ impl ProxyEngine {
     }
 
     pub fn set_low_power_mode(&self, enabled: bool) {
+        self.router().set_low_power_mode(enabled);
         let prev = self
             .low_power_mode
             .swap(enabled, std::sync::atomic::Ordering::SeqCst);
-        if prev && !enabled {
+        if prev != enabled {
             self.low_power_wake.notify_waiters();
+            if prev && !enabled {
+                self.trigger_preconnect();
+            }
         }
     }
 
@@ -1913,10 +2178,23 @@ impl ProxyEngine {
         if self.demo_cluster.read().is_none() {
             let prof_sel = mgr.active_selected_groups();
             if !prof_sel.is_empty() {
+                let prev_eff = self
+                    .router()
+                    .effective_primary_outbound()
+                    .effective_outbound;
                 self.router().apply_saved_selections(&prof_sel);
                 let mut saved = self.saved_selections.write();
                 for (k, v) in prof_sel {
                     saved.insert(k, v);
+                }
+                drop(saved);
+                if self
+                    .router()
+                    .effective_primary_outbound()
+                    .effective_outbound
+                    != prev_eff
+                {
+                    self.trigger_preconnect();
                 }
             }
         }
@@ -2191,6 +2469,7 @@ impl ProxyEngine {
                 local_dns,
                 Arc::clone(&self.router),
                 Arc::clone(&self.hub),
+                Arc::clone(&self.preconnect_wake),
                 self.state_dir(),
             ) {
                 *self.tun_mode.write() = restored.mode;
@@ -2254,6 +2533,8 @@ impl ProxyEngine {
             Some(&cur_state_dir),
             Arc::clone(&new_dns),
         )?);
+        new_router.set_unified_delay(new_cfg.unified_delay);
+        new_router.set_low_power_mode(self.is_low_power_mode());
         new_router.import_delays_from(&prev_router);
 
         let mut carried_selections = prev_router.manual_selections_snapshot();
@@ -2320,6 +2601,7 @@ impl ProxyEngine {
                     local_dns,
                     Arc::clone(&self.router),
                     Arc::clone(&self.hub),
+                    Arc::clone(&self.preconnect_wake),
                     self.state_dir(),
                 ) {
                     Ok(started) => {
@@ -2658,9 +2940,15 @@ impl ProxyEngine {
         *self.raw_yaml.write() = yaml_to_store;
 
         drop(services);
+        self.trigger_preconnect();
 
+        let pc_wake = Arc::clone(&self.preconnect_wake);
         tokio::spawn(async move {
+            let before = new_router.effective_primary_outbound().effective_outbound;
             new_router.refresh_auto_groups(Duration::from_secs(3)).await;
+            if new_router.effective_primary_outbound().effective_outbound != before {
+                pc_wake.notify_one();
+            }
         });
         Ok(())
     }

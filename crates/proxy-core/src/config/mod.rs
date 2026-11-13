@@ -120,6 +120,9 @@ pub struct ClashConfig {
     #[serde(default)]
     pub secret: Option<String>,
 
+    #[serde(default = "default_unified_delay", alias = "unified_delay")]
+    pub unified_delay: bool,
+
     #[serde(default)]
     pub geodata_mode: bool,
 
@@ -168,6 +171,10 @@ fn default_external_controller() -> String {
     "127.0.0.1:9090".to_string()
 }
 
+fn default_unified_delay() -> bool {
+    true
+}
+
 impl Default for ClashConfig {
     fn default() -> Self {
         Self {
@@ -180,6 +187,7 @@ impl Default for ClashConfig {
             log_level: default_log_level(),
             external_controller: default_external_controller(),
             secret: None,
+            unified_delay: default_unified_delay(),
             geodata_mode: false,
             mmdb_path: None,
             dns: DnsConfig::default(),

@@ -471,6 +471,17 @@ impl OutboundHandler for TrojanOutbound {
         self.inner.cfg.udp
     }
 
+    async fn preconnect(&self, target_sessions: usize) -> io::Result<()> {
+        if target_sessions > 0
+            && let Some(dns) = &self.inner.dns
+        {
+            dns.prewarm_proxy_server_ips(&self.inner.cfg.server)
+                .await
+                .map_err(|e| e.into_io())?;
+        }
+        Ok(())
+    }
+
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
         let transport = self.inner.establish_transport().await?;
         let req_hdr = self.inner.build_request_header(TROJAN_CMD_TCP, target)?;

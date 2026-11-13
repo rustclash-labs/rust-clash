@@ -41,7 +41,7 @@ pub trait OutboundUdpSession: Send + Sync {
 }
 
 #[async_trait]
-pub trait OutboundHandler: Send + Sync {
+pub trait OutboundHandler: std::any::Any + Send + Sync {
     fn name(&self) -> &str;
     fn protocol(&self) -> &'static str;
     fn exit_category(&self) -> &'static str {
@@ -58,6 +58,14 @@ pub trait OutboundHandler: Send + Sync {
     /// Returns the number of pooled/multiplexed sessions closed.
     fn on_network_change(&self) -> usize {
         0
+    }
+
+    /// Toggle battery-saving low-power mode (e.g. Android screen-off / Doze) on pooled session reapers.
+    fn set_low_power_mode(&self, _enabled: bool) {}
+
+    /// Proactively pre-warm proxy server DNS and/or multiplexed session pools (`target_sessions`).
+    async fn preconnect(&self, _target_sessions: usize) -> io::Result<()> {
+        Ok(())
     }
 
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream>;
@@ -88,8 +96,23 @@ pub trait OutboundHandler: Send + Sync {
         Ok(resp)
     }
 
-    /// Perform an end-to-end HTTP HEAD/GET latency test through this outbound proxy tunnel.
+    /// Perform an end-to-end HTTP HEAD latency test through this outbound proxy tunnel.
+    /// Defaults to full-handshake measurement (`unified_delay = false`); `Router` invokes
+    /// `latency_test_with_mode(..., self.unified_delay())`.
     async fn latency_test(&self, test_url: &str, timeout: Duration) -> io::Result<u64> {
+        self.latency_test_with_mode(test_url, timeout, false).await
+    }
+
+    /// Perform an HTTP HEAD latency test through this outbound proxy tunnel.
+    /// When `unified_delay` is `true` (Mihomo `unified-delay` semantics), establishes the
+    /// proxy/TLS tunnel and warms end-to-end keep-alive first so cold DNS, TCP, TLS, and
+    /// auth handshakes do not skew node RTT comparisons.
+    async fn latency_test_with_mode(
+        &self,
+        test_url: &str,
+        timeout: Duration,
+        unified_delay: bool,
+    ) -> io::Result<u64> {
         let parsed = Url::parse(test_url).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -114,7 +137,7 @@ pub trait OutboundHandler: Send + Sync {
         };
         let target = TargetAddr::new_domain(host, port)?;
 
-        let started = Instant::now();
+        let connect_started = Instant::now();
         tokio::time::timeout(timeout, async {
             let mut stream = self.connect_tcp(&target).await?;
             if is_https {
@@ -122,39 +145,118 @@ pub trait OutboundHandler: Send + Sync {
                 let sni = crate::crypto::tls::parse_server_name(host)?;
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);
                 let mut tls_stream = connector.connect(sni, stream).await?;
-                let req = format!(
-                    "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/0.1\r\nConnection: close\r\n\r\n"
-                );
-                tls_stream.write_all(req.as_bytes()).await?;
-                tls_stream.flush().await?;
-                let mut resp = [0u8; 32];
-                let n = tls_stream.read(&mut resp).await?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "empty response during TLS latency probe",
-                    ));
-                }
+                measure_http_head_latency(
+                    &mut tls_stream,
+                    host,
+                    &path,
+                    unified_delay,
+                    connect_started,
+                )
+                .await
             } else {
-                let req = format!(
-                    "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/0.1\r\nConnection: close\r\n\r\n"
-                );
-                stream.write_all(req.as_bytes()).await?;
-                stream.flush().await?;
-                let mut resp = [0u8; 32];
-                let n = stream.read(&mut resp).await?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "empty response during HTTP latency probe",
-                    ));
-                }
+                measure_http_head_latency(&mut stream, host, &path, unified_delay, connect_started)
+                    .await
             }
-            Ok::<u64, io::Error>(started.elapsed().as_millis().max(1) as u64)
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "latency probe timed out"))?
     }
+}
+
+async fn measure_http_head_latency<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    unified_delay: bool,
+    connect_started: Instant,
+) -> io::Result<u64>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    if !unified_delay {
+        let req = format!(
+            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        stream.write_all(req.as_bytes()).await?;
+        stream.flush().await?;
+        let mut resp = [0u8; 32];
+        let n = stream.read(&mut resp).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "empty response during HTTP latency probe",
+            ));
+        }
+        return Ok(connect_started.elapsed().as_millis().max(1) as u64);
+    }
+
+    // `unified-delay: true` (Mihomo-compatible):
+    // 1. Warmup HEAD #1 over keep-alive (triggers lazy proxy->origin dial if not yet connected)
+    let req1 = format!(
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/{}\r\nConnection: keep-alive\r\n\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    let t1_started = Instant::now();
+    stream.write_all(req1.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut hdr_buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    let mut t1_ms: Option<u64> = None;
+    let mut hdr_end: Option<usize> = None;
+    while hdr_buf.len() < 8192 {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if t1_ms.is_none() {
+            t1_ms = Some(t1_started.elapsed().as_millis().max(1) as u64);
+        }
+        hdr_buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = hdr_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            hdr_end = Some(pos);
+            break;
+        }
+    }
+
+    let Some(first_rtt_ms) = t1_ms else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "empty response during unified-delay probe",
+        ));
+    };
+
+    let can_reuse_keepalive = if let Some(pos) = hdr_end
+        && pos + 4 == hdr_buf.len()
+        && let Ok(head_text) = std::str::from_utf8(&hdr_buf[..pos])
+    {
+        let lower = head_text.to_ascii_lowercase();
+        lower.starts_with("http/1.1 ") && !lower.contains("connection: close")
+    } else {
+        false
+    };
+
+    if !can_reuse_keepalive {
+        return Ok(first_rtt_ms);
+    }
+
+    // 2. Measured HEAD #2 over the established end-to-end tunnel (pure 1-RTT payload latency)
+    let req2 = format!(
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    let t2_started = Instant::now();
+    if stream.write_all(req2.as_bytes()).await.is_ok() && stream.flush().await.is_ok() {
+        let mut resp2 = [0u8; 32];
+        if let Ok(n) = stream.read(&mut resp2).await
+            && n > 0
+        {
+            return Ok(t2_started.elapsed().as_millis().max(1) as u64);
+        }
+    }
+
+    Ok(first_rtt_ms)
 }
 
 /// Built-in `DIRECT` outbound connecting straight to the target host/IP via `SocketProtector`.
@@ -484,6 +586,15 @@ impl OutboundHandler for RejectOutbound {
             "REJECT outbound cannot pass latency probe",
         ))
     }
+
+    async fn latency_test_with_mode(
+        &self,
+        test_url: &str,
+        timeout: Duration,
+        _unified_delay: bool,
+    ) -> io::Result<u64> {
+        self.latency_test(test_url, timeout).await
+    }
 }
 
 /// Fail-closed synthetic outbound returned when routing encounters an invalid/cyclic proxy chain
@@ -541,6 +652,15 @@ impl OutboundHandler for ErrorOutbound {
 
     async fn latency_test(&self, _test_url: &str, _timeout: Duration) -> io::Result<u64> {
         Err(io::Error::new(self.kind, self.message.clone()))
+    }
+
+    async fn latency_test_with_mode(
+        &self,
+        test_url: &str,
+        timeout: Duration,
+        _unified_delay: bool,
+    ) -> io::Result<u64> {
+        self.latency_test(test_url, timeout).await
     }
 }
 

@@ -384,10 +384,18 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
 }
 
 static CUSTOM_PROTECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PROTECTOR_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 fn protector_slot() -> &'static RwLock<Arc<dyn SocketProtector>> {
     static SLOT: OnceLock<RwLock<Arc<dyn SocketProtector>>> = OnceLock::new();
     SLOT.get_or_init(|| RwLock::new(Arc::new(NoopSocketProtector)))
+}
+
+/// Return the monotonic generation counter of the global `SocketProtector`.
+/// Connection pools key on this epoch so sockets opened before TUN/VPN activation
+/// are never reused after `VpnService.protect` / `SO_MARK` / `IP_BOUND_IF` is installed.
+pub fn current_protector_epoch() -> u64 {
+    PROTECTOR_EPOCH.load(Ordering::Acquire)
 }
 
 /// Install an active process-wide `SocketProtector` (e.g. when OS TUN or Android `VpnService` starts).
@@ -395,12 +403,16 @@ pub fn set_global_socket_protector(protector: Arc<dyn SocketProtector>) {
     let is_custom = protector.description() != "noop";
     *protector_slot().write() = protector;
     CUSTOM_PROTECTOR_ACTIVE.store(is_custom, Ordering::Release);
+    PROTECTOR_EPOCH.fetch_add(1, Ordering::AcqRel);
+    crate::dns::upstream::clear_dns_upstream_pools();
 }
 
 /// Reset the global `SocketProtector` back to `NoopSocketProtector` when TUN/VPN stops.
 pub fn clear_global_socket_protector() {
     *protector_slot().write() = Arc::new(NoopSocketProtector);
     CUSTOM_PROTECTOR_ACTIVE.store(false, Ordering::Release);
+    PROTECTOR_EPOCH.fetch_add(1, Ordering::AcqRel);
+    crate::dns::upstream::clear_dns_upstream_pools();
 }
 
 /// Return `true` when a non-noop `SocketProtector` (such as Android `VpnService.protect`,

@@ -59,6 +59,18 @@ pub struct FakeIpEntry {
     pub domain: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PositiveDnsCacheSeed {
+    pub(crate) proxy_entries: Vec<(String, Instant, Vec<IpAddr>)>,
+    pub(crate) bootstrap_entries: Vec<(String, Instant, Vec<IpAddr>)>,
+}
+
+impl PositiveDnsCacheSeed {
+    pub fn is_empty(&self) -> bool {
+        self.proxy_entries.is_empty() && self.bootstrap_entries.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 enum CachedIpResolution {
     Positive {
@@ -419,6 +431,7 @@ pub struct FakeIpDnsEngine {
     inflight_real: DashMap<String, watch::Sender<bool>>,
     inflight_direct: DashMap<String, watch::Sender<bool>>,
     inflight_proxy: DashMap<String, watch::Sender<bool>>,
+    inflight_bootstrap: DashMap<String, watch::Sender<bool>>,
 }
 
 impl FakeIpDnsEngine {
@@ -649,6 +662,7 @@ impl FakeIpDnsEngine {
             inflight_real: DashMap::new(),
             inflight_direct: DashMap::new(),
             inflight_proxy: DashMap::new(),
+            inflight_bootstrap: DashMap::new(),
         })
     }
 
@@ -664,6 +678,139 @@ impl FakeIpDnsEngine {
                 && !self.should_bypass_fake_ip(&entry.domain)
             {
                 guard.insert_preserved(v4, &entry.domain, self.net);
+            }
+        }
+    }
+
+    /// Export non-expired positive `proxy_ip_cache` and `bootstrap_cache` entries (e.g. from an offline
+    /// Android latency-test router right before starting the VPN engine with identical DNS config).
+    pub fn export_positive_proxy_cache_seed(&self) -> PositiveDnsCacheSeed {
+        let now = Instant::now();
+        let proxy_entries = self
+            .proxy_ip_cache
+            .lock()
+            .iter()
+            .filter_map(|(k, v)| match v {
+                CachedIpResolution::Positive { expires_at, ips }
+                    if *expires_at > now && !ips.is_empty() =>
+                {
+                    Some((k.clone(), *expires_at, ips.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let bootstrap_entries = self
+            .bootstrap_cache
+            .lock()
+            .iter()
+            .filter(|(_, (expires_at, ips))| *expires_at > now && !ips.is_empty())
+            .map(|(k, (expires_at, ips))| (k.clone(), *expires_at, ips.clone()))
+            .collect();
+        PositiveDnsCacheSeed {
+            proxy_entries,
+            bootstrap_entries,
+        }
+    }
+
+    /// Seed non-expired positive `proxy_ip_cache` and `bootstrap_cache` entries from a prior verified engine.
+    pub fn seed_positive_proxy_cache(&self, seed: PositiveDnsCacheSeed) {
+        let now = Instant::now();
+        if !seed.bootstrap_entries.is_empty() {
+            let mut bguard = self.bootstrap_cache.lock();
+            for (domain, expires_at, ips) in seed.bootstrap_entries.into_iter().rev() {
+                if expires_at <= now || bguard.contains(&domain) {
+                    continue;
+                }
+                let valid: Vec<IpAddr> = ips
+                    .into_iter()
+                    .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+                    .collect();
+                if !valid.is_empty() {
+                    bguard.put(domain, (expires_at, valid));
+                }
+            }
+        }
+        if !seed.proxy_entries.is_empty() {
+            let mut pguard = self.proxy_ip_cache.lock();
+            for (domain, expires_at, ips) in seed.proxy_entries.into_iter().rev() {
+                if expires_at <= now || pguard.contains(&domain) {
+                    continue;
+                }
+                let mut valid: Vec<IpAddr> = ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+                    .collect();
+                if valid.is_empty() {
+                    valid = ips.into_iter().filter(|ip| !self.is_fake_ip(*ip)).collect();
+                }
+                if !valid.is_empty() {
+                    pguard.put(
+                        domain,
+                        CachedIpResolution::Positive {
+                            expires_at,
+                            ips: valid,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Proactively warm or refresh `proxy_ip_cache` for a proxy server hostname when missing or `< 25s` TTL remains.
+    /// Preserves any still-unexpired positive entry if a proactive refresh encounters a transient network error.
+    pub async fn prewarm_proxy_server_ips(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let clean = host
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if clean.is_empty()
+            || clean.parse::<IpAddr>().is_ok()
+            || clean == "localhost"
+            || self.lookup_static_hosts_for_endpoint(&clean).is_some()
+        {
+            return self.resolve_proxy_server_ips(host).await;
+        }
+
+        let now = Instant::now();
+        let fallback_entry = {
+            let mut guard = self.proxy_ip_cache.lock();
+            match guard.get(&clean).cloned() {
+                Some(CachedIpResolution::Positive { expires_at, ips }) => {
+                    if expires_at.saturating_duration_since(now) > Duration::from_secs(25) {
+                        return Ok(ips);
+                    }
+                    guard.pop(&clean);
+                    (expires_at > now).then_some((expires_at, ips))
+                }
+                Some(CachedIpResolution::Negative { .. }) => {
+                    guard.pop(&clean);
+                    None
+                }
+                None => None,
+            }
+        };
+
+        match self.resolve_proxy_server_ips(host).await {
+            Ok(ips) => Ok(ips),
+            Err(e) => {
+                if let Some((expires_at, ips)) = fallback_entry
+                    && Instant::now() < expires_at
+                {
+                    let mut guard = self.proxy_ip_cache.lock();
+                    if !guard.contains(&clean) {
+                        guard.put(
+                            clean,
+                            CachedIpResolution::Positive {
+                                expires_at,
+                                ips: ips.clone(),
+                            },
+                        );
+                    }
+                    return Ok(ips);
+                }
+                Err(e)
             }
         }
     }
@@ -959,6 +1106,44 @@ impl FakeIpDnsEngine {
                 if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&norm) {
                     return Ok(static_ips);
                 }
+                if let Some((expires_at, ips)) = self.bootstrap_cache.lock().get(&norm).cloned()
+                    && Instant::now() < expires_at
+                {
+                    return Ok(ips);
+                }
+
+                let _inflight_guard = {
+                    let waiter = match self.inflight_bootstrap.entry(norm.clone()) {
+                        Entry::Occupied(occ) => Err(occ.get().subscribe()),
+                        Entry::Vacant(vac) => {
+                            let (tx, _rx) = watch::channel(false);
+                            vac.insert(tx.clone());
+                            Ok(InflightLookupGuard {
+                                map: &self.inflight_bootstrap,
+                                key: norm.clone(),
+                                tx,
+                            })
+                        }
+                    };
+                    match waiter {
+                        Ok(guard) => Some(guard),
+                        Err(mut rx) => {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(4),
+                                rx.wait_for(|&done| done),
+                            )
+                            .await;
+                            if let Some((expires_at, ips)) =
+                                self.bootstrap_cache.lock().get(&norm).cloned()
+                                && Instant::now() < expires_at
+                            {
+                                return Ok(ips);
+                            }
+                            None
+                        }
+                    }
+                };
+
                 if let Some((expires_at, ips)) = self.bootstrap_cache.lock().get(&norm).cloned()
                     && Instant::now() < expires_at
                 {

@@ -340,6 +340,7 @@ export const clashApi = {
   getConfigs: () => apiFetch<ConfigSnapshot>("/configs"),
   patchConfigs: (patch: {
     mode?: RunMode;
+    "unified-delay"?: boolean;
     "allow-lan"?: boolean;
     "log-level"?: string;
     tun?: {

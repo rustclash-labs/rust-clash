@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::AbortHandle,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -61,6 +61,7 @@ pub struct AnyTlsClientSession {
     tx: mpsc::UnboundedSender<OutgoingReq>,
     streams: Arc<DashMap<u32, mpsc::UnboundedSender<io::Result<Bytes>>>>,
     synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>>,
+    preconnect_pong: Mutex<Option<oneshot::Sender<io::Result<()>>>>,
     pool_return: Arc<Mutex<Vec<IdleSessionEntry>>>,
     io_aborts: Mutex<(Option<AbortHandle>, Option<AbortHandle>)>,
 }
@@ -181,6 +182,7 @@ impl AnyTlsClientSession {
             tx: tx.clone(),
             streams: Arc::clone(&streams),
             synack_waiters: Arc::clone(&synack_waiters),
+            preconnect_pong: Mutex::new(None),
             pool_return: Arc::clone(&pool_ctx.idle),
             io_aborts: Mutex::new((None, None)),
         });
@@ -248,7 +250,12 @@ impl AnyTlsClientSession {
             loop {
                 match Frame::read_from(&mut rd).await {
                     Ok(frame) => match frame.cmd {
-                        Command::Waste | Command::HeartResponse => {}
+                        Command::Waste => {}
+                        Command::HeartResponse => {
+                            if let Some(waiter) = session_rd.preconnect_pong.lock().take() {
+                                let _ = waiter.send(Ok(()));
+                            }
+                        }
                         Command::HeartRequest => {
                             let _ = tx_pong.send(OutgoingReq::Frame(Frame::empty(
                                 Command::HeartResponse,
@@ -379,6 +386,260 @@ impl AnyTlsClientSession {
         }
     }
 
+    /// Pre-warm a wire-authentic AnyTLS v2 session (`Packet 0` auth + `Packet 1 [cmdSettings + cmdHeartRequest]`)
+    /// without opening any target stream yet, verifying `HeartResponse` (and settling `ServerSettings` /
+    /// `UpdatePaddingScheme`) before inserting into the idle `AnyTlsSessionPool`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn preconnect_idle(
+        seq: u64,
+        server_host: &str,
+        server_port: u16,
+        sni: &str,
+        password: &str,
+        tls_connector: &TlsConnector,
+        shared_scheme: Arc<RwLock<PaddingScheme>>,
+        pool_ctx: SessionPoolContext,
+        dns: Option<&crate::dns::FakeIpDnsEngine>,
+    ) -> io::Result<Arc<Self>> {
+        let tcp = crate::platform::socket_protect::protected_tcp_connect_host_with_dns(
+            server_host,
+            server_port,
+            dns,
+        )
+        .await?;
+        let server_name = crate::crypto::tls::parse_server_name(sni)?;
+        let mut tls_stream: TlsStream<TcpStream> = tls_connector.connect(server_name, tcp).await?;
+
+        let scheme_snapshot = shared_scheme.read().clone();
+
+        // Packet 0: Authentication `sha256(password) [32B] | padding0_len [u16 BE] | padding0`
+        let pw_hash = digest(&SHA256, password.as_bytes());
+        let pad0_len = scheme_snapshot.sample_padding0_len();
+        let mut auth_pkt = BytesMut::with_capacity(34 + pad0_len as usize);
+        auth_pkt.put_slice(pw_hash.as_ref());
+        auth_pkt.put_u16(pad0_len);
+        auth_pkt.put_bytes(0, pad0_len as usize);
+        tls_stream.write_all(&auth_pkt).await?;
+        tls_stream.flush().await?;
+
+        let (mut rd, mut wr) = tokio::io::split(tls_stream);
+        let (tx, mut rx) = mpsc::unbounded_channel::<OutgoingReq>();
+        let streams: Arc<DashMap<u32, mpsc::UnboundedSender<io::Result<Bytes>>>> =
+            Arc::new(DashMap::new());
+        let synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>> =
+            Arc::new(DashMap::new());
+        let (pong_tx, pong_rx) = oneshot::channel();
+
+        let session = Arc::new(Self {
+            seq,
+            session_epoch: pool_ctx.session_epoch,
+            pool_epoch: Arc::clone(&pool_ctx.pool_epoch),
+            next_stream_id: AtomicU32::new(1),
+            active_streams: AtomicU32::new(0),
+            healthy: AtomicBool::new(true),
+            negotiated_v2: AtomicBool::new(false),
+            tx: tx.clone(),
+            streams: Arc::clone(&streams),
+            synack_waiters: Arc::clone(&synack_waiters),
+            preconnect_pong: Mutex::new(Some(pong_tx)),
+            pool_return: Arc::clone(&pool_ctx.idle),
+            io_aborts: Mutex::new((None, None)),
+        });
+
+        {
+            let mut live_guard = pool_ctx.live.lock();
+            live_guard.retain(|w| w.strong_count() > 0);
+            live_guard.push(Arc::downgrade(&session));
+        }
+
+        let session_wr = Arc::clone(&session);
+        let wr_join = tokio::spawn(async move {
+            let mut pkt_idx = 1u32;
+            while let Some(req) = rx.recv().await {
+                let mut batch = BytesMut::new();
+                match req {
+                    OutgoingReq::RawBatch(b) => batch.extend_from_slice(&b),
+                    OutgoingReq::Frame(f) => {
+                        if f.encode_into(&mut batch).is_err() {
+                            break;
+                        }
+                    }
+                }
+                while let Ok(more) = rx.try_recv() {
+                    match more {
+                        OutgoingReq::RawBatch(b) => batch.extend_from_slice(&b),
+                        OutgoingReq::Frame(f) => {
+                            let _ = f.encode_into(&mut batch);
+                        }
+                    }
+                    if batch.len() >= 32 * 1024 {
+                        break;
+                    }
+                }
+                let chunks = scheme_snapshot.shape_tls_writes(&mut pkt_idx, batch);
+                let mut write_failed = false;
+                for chunk in chunks {
+                    if wr.write_all(&chunk).await.is_err() {
+                        write_failed = true;
+                        break;
+                    }
+                }
+                if write_failed || wr.flush().await.is_err() {
+                    session_wr.mark_unhealthy("TLS write error");
+                    break;
+                }
+            }
+            let _ = wr.shutdown().await;
+        });
+
+        let session_rd = Arc::clone(&session);
+        let scheme_rd = Arc::clone(&shared_scheme);
+        let tx_pong = tx.clone();
+        let rd_join = tokio::spawn(async move {
+            loop {
+                match Frame::read_from(&mut rd).await {
+                    Ok(frame) => match frame.cmd {
+                        Command::Waste => {}
+                        Command::HeartResponse => {
+                            if let Some(waiter) = session_rd.preconnect_pong.lock().take() {
+                                let _ = waiter.send(Ok(()));
+                            }
+                        }
+                        Command::HeartRequest => {
+                            let _ = tx_pong.send(OutgoingReq::Frame(Frame::empty(
+                                Command::HeartResponse,
+                                frame.stream_id,
+                            )));
+                        }
+                        Command::ServerSettings => {
+                            let text = String::from_utf8_lossy(&frame.data);
+                            if text.lines().any(|l| l.trim() == "v=2") {
+                                session_rd.negotiated_v2.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Command::UpdatePaddingScheme => {
+                            let text = String::from_utf8_lossy(&frame.data);
+                            if let Ok(new_scheme) = PaddingScheme::parse(&text) {
+                                *scheme_rd.write() = new_scheme;
+                            }
+                        }
+                        Command::Alert => {
+                            let msg = String::from_utf8_lossy(&frame.data).into_owned();
+                            tracing::warn!("AnyTLS server alert on session #{seq}: {msg}");
+                            session_rd.mark_unhealthy(&format!("AnyTLS server alert: {msg}"));
+                            break;
+                        }
+                        Command::SynAck => {
+                            if let Some((_, waiter)) =
+                                session_rd.synack_waiters.remove(&frame.stream_id)
+                            {
+                                if frame.data.is_empty() {
+                                    let _ = waiter.send(Ok(()));
+                                } else {
+                                    let err_msg = String::from_utf8_lossy(&frame.data).into_owned();
+                                    session_rd.streams.remove(&frame.stream_id);
+                                    let _ = waiter.send(Err(io::Error::new(
+                                        io::ErrorKind::ConnectionRefused,
+                                        format!("AnyTLS SYNACK error: {err_msg}"),
+                                    )));
+                                }
+                            }
+                        }
+                        Command::Psh => {
+                            if let Some((_, waiter)) =
+                                session_rd.synack_waiters.remove(&frame.stream_id)
+                            {
+                                let _ = waiter.send(Ok(()));
+                            }
+                            if !frame.data.is_empty()
+                                && let Some(stx) = session_rd.streams.get(&frame.stream_id)
+                            {
+                                let _ = stx.send(Ok(frame.data));
+                            }
+                        }
+                        Command::Fin => {
+                            if let Some((_, waiter)) =
+                                session_rd.synack_waiters.remove(&frame.stream_id)
+                            {
+                                let _ = waiter.send(Ok(()));
+                            }
+                            session_rd.streams.remove(&frame.stream_id);
+                        }
+                        Command::Syn | Command::Settings => {}
+                    },
+                    Err(err) => {
+                        session_rd.mark_unhealthy(&format!("session read closed: {err}"));
+                        break;
+                    }
+                }
+            }
+        });
+        *session.io_aborts.lock() = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+
+        // Packet 1: `cmdSettings` + `cmdHeartRequest(0)`.
+        // Server processes `cmdSettings` (pushing `ServerSettings` + optional `UpdatePaddingScheme`)
+        // strictly before replying with `cmdHeartResponse`, so awaiting `pong_rx` guarantees
+        // authentication, v2 negotiation, and padding scheme synchronization are settled.
+        let settings_payload = format!(
+            "v=2\nclient=rust-clash/{}\npadding-md5={}",
+            env!("CARGO_PKG_VERSION"),
+            shared_scheme.read().md5_hex()
+        );
+        let mut pkt1 = BytesMut::with_capacity(128);
+        Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
+        Frame::empty(Command::HeartRequest, 0).encode_into(&mut pkt1)?;
+
+        if tx.send(OutgoingReq::RawBatch(pkt1)).is_err() {
+            session.abort_for_network_change();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AnyTLS session closed before preconnect handshake",
+            ));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), pong_rx).await {
+            Ok(Ok(Ok(()))) => {
+                if session.is_healthy()
+                    && session.session_epoch == pool_ctx.pool_epoch.load(Ordering::SeqCst)
+                {
+                    let mut idle = pool_ctx.idle.lock();
+                    if session.is_healthy()
+                        && session.session_epoch == pool_ctx.pool_epoch.load(Ordering::SeqCst)
+                    {
+                        idle.push(IdleSessionEntry {
+                            session: Arc::clone(&session),
+                            idle_since: Instant::now(),
+                        });
+                        return Ok(session);
+                    }
+                }
+                session.abort_for_network_change();
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "AnyTLS preconnect session invalidated by epoch change",
+                ))
+            }
+            Ok(Ok(Err(e))) => {
+                session.abort_for_network_change();
+                Err(e)
+            }
+            Ok(Err(_)) => {
+                session.abort_for_network_change();
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "AnyTLS preconnect session closed before HeartResponse",
+                ))
+            }
+            Err(_) => {
+                session.abort_for_network_change();
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "AnyTLS preconnect HeartResponse timed out",
+                ))
+            }
+        }
+    }
+
     /// Open a new stream on an existing warm session (`cmdSYN + cmdPSH(SocksAddr)`).
     pub async fn open_stream(self: &Arc<Self>, target: &TargetAddr) -> io::Result<AnyTlsStream> {
         self.open_stream_with_payload(target, &[]).await
@@ -451,6 +712,10 @@ impl AnyTlsClientSession {
         self.healthy.load(Ordering::Relaxed)
     }
 
+    pub fn is_v2_negotiated(&self) -> bool {
+        self.negotiated_v2.load(Ordering::Relaxed)
+    }
+
     pub fn send_ping(&self) -> bool {
         self.tx
             .send(OutgoingReq::Frame(Frame::empty(Command::HeartRequest, 0)))
@@ -459,6 +724,12 @@ impl AnyTlsClientSession {
 
     fn mark_unhealthy_inner(&self, reason: &str) -> bool {
         if self.healthy.swap(false, Ordering::SeqCst) {
+            if let Some(waiter) = self.preconnect_pong.lock().take() {
+                let _ = waiter.send(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    reason.to_string(),
+                )));
+            }
             let err_keys: Vec<u32> = self.synack_waiters.iter().map(|e| *e.key()).collect();
             for k in err_keys {
                 if let Some((_, w)) = self.synack_waiters.remove(&k) {
@@ -513,15 +784,21 @@ impl AnyTlsClientSession {
                 .send(OutgoingReq::Frame(Frame::empty(Command::Fin, stream_id)));
         }
         let prev = self.active_streams.fetch_sub(1, Ordering::SeqCst);
-        let same_epoch = self.session_epoch == self.pool_epoch.load(Ordering::SeqCst);
-        if prev == 1 && self.is_healthy() && same_epoch {
-            let mut idle = self.pool_return.lock();
-            if self.session_epoch == self.pool_epoch.load(Ordering::SeqCst) && self.is_healthy() {
-                idle.push(IdleSessionEntry {
-                    session: Arc::clone(self),
-                    idle_since: Instant::now(),
-                });
+        if prev == 1 {
+            let same_epoch = self.session_epoch == self.pool_epoch.load(Ordering::SeqCst);
+            if self.is_healthy() && same_epoch {
+                let mut idle = self.pool_return.lock();
+                if self.session_epoch == self.pool_epoch.load(Ordering::SeqCst) && self.is_healthy()
+                {
+                    idle.push(IdleSessionEntry {
+                        session: Arc::clone(self),
+                        idle_since: Instant::now(),
+                    });
+                    return;
+                }
             }
+            // Session invalidated or pool dropped after last stream closed: release background tasks.
+            self.abort_for_network_change();
         }
     }
 }
@@ -620,6 +897,7 @@ impl AsyncWrite for AnyTlsStream {
 
 /// LIFO `SessionPool`: always reuses the healthy idle session with the highest `seq`
 /// and periodically reaps sessions older than `idle_timeout` (preserving `min_idle_session`).
+/// Parks at true `0 Hz` (zero periodic wakeups or `HeartRequest` radio frames) when `low_power_mode` is set.
 pub struct AnyTlsSessionPool {
     next_seq: AtomicU64,
     epoch: Arc<AtomicU64>,
@@ -629,6 +907,10 @@ pub struct AnyTlsSessionPool {
     check_interval: Duration,
     idle_timeout: Duration,
     min_idle_session: usize,
+    dynamic_min_idle: Arc<AtomicUsize>,
+    low_power_mode: Arc<AtomicBool>,
+    low_power_wake: Arc<Notify>,
+    shutdown: Arc<AtomicBool>,
     reaper_spawned: AtomicBool,
 }
 
@@ -650,10 +932,29 @@ impl AnyTlsSessionPool {
             check_interval,
             idle_timeout,
             min_idle_session,
+            dynamic_min_idle: Arc::new(AtomicUsize::new(0)),
+            low_power_mode: Arc::new(AtomicBool::new(false)),
+            low_power_wake: Arc::new(Notify::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
             reaper_spawned: AtomicBool::new(false),
         });
         pool.ensure_reaper_spawned();
         pool
+    }
+
+    pub fn set_dynamic_min_idle(&self, min_idle: usize) {
+        self.dynamic_min_idle.store(min_idle, Ordering::Relaxed);
+    }
+
+    pub fn set_low_power_mode(&self, enabled: bool) {
+        let prev = self.low_power_mode.swap(enabled, Ordering::AcqRel);
+        if prev != enabled {
+            self.low_power_wake.notify_waiters();
+        }
+    }
+
+    pub fn is_low_power_mode(&self) -> bool {
+        self.low_power_mode.load(Ordering::Acquire)
     }
 
     fn ensure_reaper_spawned(&self) {
@@ -668,24 +969,63 @@ impl AnyTlsSessionPool {
         let check_interval = self.check_interval;
         let idle_timeout = self.idle_timeout;
         let min_idle_session = self.min_idle_session;
+        let dynamic_min_idle = Arc::clone(&self.dynamic_min_idle);
+        let low_power_mode = Arc::clone(&self.low_power_mode);
+        let low_power_wake = Arc::clone(&self.low_power_wake);
+        let shutdown = Arc::clone(&self.shutdown);
 
         handle.spawn(async move {
             let mut ticker = tokio::time::interval(check_interval.max(Duration::from_secs(5)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
+                while low_power_mode.load(Ordering::Acquire) {
+                    if shutdown.load(Ordering::Acquire) || weak_idle.strong_count() == 0 {
+                        return;
+                    }
+                    let notified = low_power_wake.notified();
+                    if !low_power_mode.load(Ordering::Acquire)
+                        || shutdown.load(Ordering::Acquire)
+                        || weak_idle.strong_count() == 0
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
+                if shutdown.load(Ordering::Acquire) || weak_idle.strong_count() == 0 {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = low_power_wake.notified() => {
+                        if shutdown.load(Ordering::Acquire) || weak_idle.strong_count() == 0 {
+                            break;
+                        }
+                        if low_power_mode.load(Ordering::Acquire) {
+                            continue;
+                        }
+                    }
+                }
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                if low_power_mode.load(Ordering::Acquire) {
+                    continue;
+                }
                 let Some(idle_arc) = weak_idle.upgrade() else {
                     break;
                 };
                 let cur_epoch = epoch.load(Ordering::SeqCst);
+                let effective_min_idle =
+                    min_idle_session.max(dynamic_min_idle.load(Ordering::Relaxed));
                 let mut guard = idle_arc.lock();
                 guard.retain(|e| e.session.is_healthy() && e.session.session_epoch == cur_epoch);
-                // Sort descending by `seq` so index 0..min_idle_session are the newest sessions
+                // Sort descending by `seq` so index 0..effective_min_idle are the newest sessions
                 guard.sort_by_key(|a| std::cmp::Reverse(a.session.seq));
                 let now = Instant::now();
                 let mut idx = 0usize;
                 guard.retain(|entry| {
-                    let keep = idx < min_idle_session
+                    let keep = idx < effective_min_idle
                         || now.duration_since(entry.idle_since) < idle_timeout;
                     idx += 1;
                     if keep {
@@ -767,6 +1107,16 @@ impl AnyTlsSessionPool {
         guard.len()
     }
 
+    pub fn healthy_session_count(&self) -> usize {
+        let cur_epoch = self.epoch.load(Ordering::SeqCst);
+        let mut live_guard = self.live.lock();
+        live_guard.retain(|w| {
+            w.upgrade()
+                .is_some_and(|s| s.is_healthy() && s.session_epoch == cur_epoch)
+        });
+        live_guard.len()
+    }
+
     pub fn reuse_count(&self) -> u64 {
         self.total_reuses.load(Ordering::Relaxed)
     }
@@ -776,5 +1126,17 @@ impl AnyTlsSessionPool {
         m.insert("idle_sessions", self.idle_count() as u64);
         m.insert("reused_streams", self.reuse_count());
         m
+    }
+}
+
+impl Drop for AnyTlsSessionPool {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.low_power_wake.notify_waiters();
+        let drained_idle: Vec<IdleSessionEntry> = std::mem::take(&mut *self.idle.lock());
+        for entry in drained_idle {
+            entry.session.abort_for_network_change();
+        }
     }
 }

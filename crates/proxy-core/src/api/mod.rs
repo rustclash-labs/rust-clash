@@ -631,6 +631,7 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
         "secret-configured": cfg.secret.as_ref().is_some_and(|s| !s.is_empty()),
         "bind-address": cfg.bind_address,
         "mode": cfg.mode.as_str(),
+        "unified-delay": cfg.unified_delay,
         "log-level": cfg.log_level,
         "ipv6": cfg.dns.ipv6,
         "tun": {
@@ -665,6 +666,8 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
 #[derive(Deserialize)]
 struct PatchConfigReq {
     mode: Option<RunMode>,
+    #[serde(rename = "unified-delay", alias = "unified_delay")]
+    unified_delay: Option<bool>,
     #[serde(rename = "allow-lan")]
     allow_lan: Option<bool>,
     #[serde(rename = "log-level")]
@@ -686,6 +689,9 @@ async fn patch_configs(
 ) -> Response {
     if let Some(mode) = patch.mode {
         engine.set_mode(mode);
+    }
+    if let Some(unified_delay) = patch.unified_delay {
+        engine.set_unified_delay(unified_delay);
     }
     if let Some(level) = patch.log_level {
         engine.set_log_level(level);

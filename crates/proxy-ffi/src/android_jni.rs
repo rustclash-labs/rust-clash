@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Once,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -31,8 +31,8 @@ use proxy_core::{
         ClashConfig, ProxyGroupType, ProxyNodeConfig, REDACTED_SECRET, RunMode,
         uri::redact_sensitive_text,
     },
-    dns::FakeIpDnsEngine,
-    engine::{NetworkChangeReport, ProxyEngine, build_outbounds_with_dns},
+    dns::{FakeIpDnsEngine, PositiveDnsCacheSeed},
+    engine::{NetworkChangeReport, PreconnectPolicy, ProxyEngine, build_outbounds_with_dns},
     platform::socket_protect::{clear_global_socket_protector, set_global_socket_protector},
     profile::{
         NodeMutationReport, ProfileManager, RoutingPresetChoice, default_selected_groups_for_config,
@@ -48,6 +48,37 @@ use crate::fd_bridge::UnixPacketFdBridge;
 static INIT_LOG: Once = Once::new();
 static OFFLINE_DELAY_CACHE: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct CachedOfflineRouter {
+    state_dir: Option<PathBuf>,
+    config_fp: u64,
+    dns_fp: u64,
+    geodata_status: proxy_core::router::geodata::GeoDataStatus,
+    router: Option<Arc<Router>>,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+impl Drop for CachedOfflineRouter {
+    fn drop(&mut self) {
+        if let Some(r) = self.router.take() {
+            r.set_low_power_mode(true);
+            drop(r);
+        }
+        if let Some(rt_arc) = self.runtime.take()
+            && let Ok(rt) = Arc::try_unwrap(rt_arc)
+        {
+            rt.shutdown_timeout(Duration::from_millis(150));
+        }
+    }
+}
+
+static OFFLINE_ROUTER_CACHE: LazyLock<Mutex<Option<CachedOfflineRouter>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn clear_offline_router_cache() {
+    let prev = OFFLINE_ROUTER_CACHE.lock().take();
+    drop(prev);
+}
 
 fn ensure_tracing_initialized() {
     INIT_LOG.call_once(|| {
@@ -241,6 +272,65 @@ fn stop_existing_locked(slot: &mut Option<AndroidVpnRuntime>) {
     }
 }
 
+fn hash_canonical_json(val: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match val {
+        serde_json::Value::Null => 0u8.hash(hasher),
+        serde_json::Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        serde_json::Value::Number(n) => {
+            2u8.hash(hasher);
+            n.to_string().hash(hasher);
+        }
+        serde_json::Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        serde_json::Value::Array(arr) => {
+            4u8.hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_canonical_json(item, hasher);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for k in keys {
+                k.hash(hasher);
+                if let Some(v) = map.get(k) {
+                    hash_canonical_json(v, hasher);
+                }
+            }
+        }
+    }
+}
+
+fn dns_config_fingerprint(cfg: &ClashConfig) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut dns = cfg.dns_with_merged_hosts();
+    dns.listen.clear();
+    if let Ok(val) = serde_json::to_value(&dns) {
+        hash_canonical_json(&val, &mut hasher);
+    }
+    hasher.finish()
+}
+
+fn offline_config_fingerprint(cfg: &ClashConfig, state_dir: Option<&Path>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    state_dir.hash(&mut hasher);
+    if let Ok(val) = serde_json::to_value(cfg) {
+        hash_canonical_json(&val, &mut hasher);
+    }
+    hasher.finish()
+}
+
 fn build_offline_router(
     cfg: &ClashConfig,
     saved_selections: &HashMap<String, String>,
@@ -270,9 +360,77 @@ fn build_offline_router(
         dns,
     )
     .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    router.set_unified_delay(cfg.unified_delay);
+    router.set_low_power_mode(true);
     router.apply_saved_selections(&normalized);
     seed_delays_into_router(&router);
     Ok((router, geo_status))
+}
+
+fn get_or_build_offline_router(
+    cfg: &ClashConfig,
+    saved_selections: &HashMap<String, String>,
+    state_dir: Option<&Path>,
+) -> Result<
+    (
+        Arc<Router>,
+        proxy_core::router::geodata::GeoDataStatus,
+        Arc<tokio::runtime::Runtime>,
+    ),
+    String,
+> {
+    let normalized = default_selected_groups_for_config(cfg, saved_selections);
+    let config_fp = offline_config_fingerprint(cfg, state_dir);
+    let state_dir_buf = state_dir.map(Path::to_path_buf);
+
+    {
+        let guard = OFFLINE_ROUTER_CACHE.lock();
+        if let Some(cached) = guard.as_ref()
+            && cached.state_dir == state_dir_buf
+            && cached.config_fp == config_fp
+            && let (Some(router), Some(runtime)) = (&cached.router, &cached.runtime)
+        {
+            router.set_mode(cfg.mode);
+            router.set_unified_delay(cfg.unified_delay);
+            router.apply_saved_selections(&normalized);
+            seed_delays_into_router(router);
+            return Ok((
+                Arc::clone(router),
+                cached.geodata_status.clone(),
+                Arc::clone(runtime),
+            ));
+        }
+    }
+
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("rc-android-offline")
+            .build()
+            .map_err(|e| format!("Tokio init failed: {e}"))?,
+    );
+    let (router_raw, geo_status) = {
+        let _enter = runtime.enter();
+        build_offline_router(cfg, &normalized, state_dir)?
+    };
+    let router = Arc::new(router_raw);
+    let dns_fp = dns_config_fingerprint(cfg);
+
+    let prev = {
+        let mut guard = OFFLINE_ROUTER_CACHE.lock();
+        guard.replace(CachedOfflineRouter {
+            state_dir: state_dir_buf,
+            config_fp,
+            dns_fp,
+            geodata_status: geo_status.clone(),
+            router: Some(Arc::clone(&router)),
+            runtime: Some(Arc::clone(&runtime)),
+        })
+    };
+    drop(prev);
+
+    Ok((router, geo_status, runtime))
 }
 
 fn compute_offline_effective_summary(
@@ -280,7 +438,7 @@ fn compute_offline_effective_summary(
     saved_selections: &HashMap<String, String>,
     state_dir: Option<&Path>,
 ) -> EffectiveOutboundSummary {
-    if let Ok((router, _)) = build_offline_router(cfg, saved_selections, state_dir) {
+    if let Ok((router, _, _)) = get_or_build_offline_router(cfg, saved_selections, state_dir) {
         return router.effective_primary_outbound();
     }
     EffectiveOutboundSummary {
@@ -393,6 +551,22 @@ fn start_android_vpn_with_state_dir_and_jvm(
     let mut guard = ANDROID_RUNTIME.lock();
     stop_existing_locked(&mut guard);
 
+    // Harvest any verified positive proxy/bootstrap DNS cache entries from offline latency testing,
+    // and drop the offline router + runtime BEFORE installing the new global SocketProtector so
+    // any unprotected offline sockets close cleanly.
+    let cached_offline = OFFLINE_ROUTER_CACHE.lock().take();
+    let offline_dns_seed: Option<(Option<PathBuf>, u64, PositiveDnsCacheSeed)> =
+        cached_offline.as_ref().and_then(|c| {
+            c.router.as_ref().map(|r| {
+                (
+                    c.state_dir.clone(),
+                    c.dns_fp,
+                    r.dns().export_positive_proxy_cache_seed(),
+                )
+            })
+        });
+    drop(cached_offline);
+
     // 1. Install `VpnService.protect(fd)` global SocketProtector BEFORE starting ProxyEngine!
     set_global_socket_protector(Arc::clone(&protector) as _);
 
@@ -427,6 +601,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             )
             .await
             .map_err(|e| format!("start_demo failed: {e}"))?;
+            e.set_preconnect_policy(PreconnectPolicy::Mobile);
             let mut cfg = e.config_snapshot();
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
@@ -474,9 +649,22 @@ fn start_android_vpn_with_state_dir_and_jvm(
                 cfg.secret = Some(ephemeral_secret.clone());
             }
 
-            let e = ProxyEngine::start_with_state_dir(cfg, dir.to_path_buf())
-                .await
-                .map_err(|e| redact_sensitive_text(&format!("ProxyEngine start failed: {e}")))?;
+            let target_dns_fp = dns_config_fingerprint(&cfg);
+            let matched_seed = offline_dns_seed.and_then(|(s_dir, s_fp, seed)| {
+                (s_dir.as_deref() == Some(dir) && s_fp == target_dns_fp).then_some(seed)
+            });
+            let saved_sel = mgr.active_selected_groups();
+            let normalized_sel = default_selected_groups_for_config(&cfg, &saved_sel);
+
+            let e = ProxyEngine::start_with_options(
+                cfg,
+                dir.to_path_buf(),
+                PreconnectPolicy::Mobile,
+                matched_seed,
+                Some(normalized_sel),
+            )
+            .await
+            .map_err(|e| redact_sensitive_text(&format!("ProxyEngine start failed: {e}")))?;
             e.attach_profile_manager(mgr);
             e
         } else {
@@ -493,9 +681,19 @@ fn start_android_vpn_with_state_dir_and_jvm(
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
                 cfg.secret = Some(ephemeral_secret.clone());
             }
-            ProxyEngine::start(cfg)
+            let target_dns_fp = dns_config_fingerprint(&cfg);
+            let e = ProxyEngine::start(cfg)
                 .await
-                .map_err(|e| redact_sensitive_text(&format!("ProxyEngine start failed: {e}")))?
+                .map_err(|e| redact_sensitive_text(&format!("ProxyEngine start failed: {e}")))?;
+            e.set_preconnect_policy(PreconnectPolicy::Mobile);
+            if let Some((s_dir, s_fp, seed)) = offline_dns_seed
+                && s_dir.is_none()
+                && s_fp == target_dns_fp
+            {
+                e.router().dns().seed_positive_proxy_cache(seed);
+                e.trigger_preconnect();
+            }
+            e
         };
 
         let sec = eng
@@ -595,7 +793,12 @@ pub fn notify_android_network_changed_core(
     is_wifi: bool,
 ) -> Option<NetworkChangeReport> {
     let guard = ANDROID_RUNTIME.lock();
-    let rt = guard.as_ref()?;
+    let Some(rt) = guard.as_ref() else {
+        drop(guard);
+        clear_offline_router_cache();
+        proxy_core::dns::upstream::clear_dns_upstream_pools();
+        return None;
+    };
 
     let had_baseline = rt.has_network_baseline.swap(true, Ordering::AcqRel);
     let prev_handle = rt
@@ -781,8 +984,8 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
     let routing = mgr.routing_snapshot().ok();
 
     let (eff, groups, delays, rules, geodata) =
-        match build_offline_router(&cfg, &normalized_sel, Some(state_dir)) {
-            Ok((router, geo)) => {
+        match get_or_build_offline_router(&cfg, &normalized_sel, Some(state_dir)) {
+            Ok((router, geo, _)) => {
                 let eff = router.effective_primary_outbound();
                 let groups = build_ordered_groups_json(&cfg, &router);
                 let delays = collect_delays_map_from_router(&router);
@@ -1407,13 +1610,23 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     rust_to_jstring(&mut env, &out)
 }
 
+pub fn android_flush_dns_core() -> bool {
+    clear_offline_router_cache();
+    proxy_core::dns::upstream::clear_dns_upstream_pools();
+    if let Some((_, engine)) = live_handle_and_engine() {
+        engine.router().dns().flush_cache();
+        true
+    } else {
+        false
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeFlushDns(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jboolean {
-    if let Some((_, engine)) = live_handle_and_engine() {
-        engine.router().dns().flush_cache();
+    if android_flush_dns_core() {
         JNI_TRUE
     } else {
         JNI_FALSE
@@ -1638,6 +1851,7 @@ pub fn android_update_geodata_core(state_dir: &Path) -> Result<serde_json::Value
     let st = temp_rt
         .block_on(gm.update_default_mirrors())
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    clear_offline_router_cache();
     Ok(serde_json::json!({
         "ok": true,
         "geodata": st,
@@ -1676,12 +1890,8 @@ pub fn android_explain_rule_with_state_dir_core(
         .load_active_config()
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let saved_sel = mgr.active_selected_groups();
-    let (router, _) = build_offline_router(&cfg, &saved_sel, Some(state_dir))?;
-    let temp_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Tokio init failed: {e}"))?;
-    let decision = temp_rt.block_on(router.route_async(None, &target));
+    let (router, _, runtime) = get_or_build_offline_router(&cfg, &saved_sel, Some(state_dir))?;
+    let decision = runtime.block_on(router.route_async(None, &target));
     Ok(serde_json::json!({
         "ok": true,
         "vpnRunning": false,
@@ -1780,8 +1990,7 @@ pub fn android_test_latency_core(
         .load_active_config()
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let saved_sel = mgr.active_selected_groups();
-    let (router_raw, _) = build_offline_router(&cfg, &saved_sel, Some(state_dir))?;
-    let router = Arc::new(router_raw);
+    let (router, _, runtime) = get_or_build_offline_router(&cfg, &saved_sel, Some(state_dir))?;
     let node_names: Vec<String> = cfg.proxies.iter().map(|p| p.name().to_string()).collect();
     let url = probe_url
         .map(str::trim)
@@ -1789,12 +1998,7 @@ pub fn android_test_latency_core(
         .unwrap_or("http://www.gstatic.com/generate_204")
         .to_string();
 
-    let temp_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Tokio init failed: {e}"))?;
-    let tested = temp_rt.block_on(run_router_latency_probe(
+    let tested = runtime.block_on(run_router_latency_probe(
         Arc::clone(&router),
         node_names,
         clean_target,

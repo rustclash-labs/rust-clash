@@ -289,6 +289,7 @@ pub async fn run_tun_benchmark(args: BenchTunArgs) -> Result<()> {
         log_level: "error".into(),
         external_controller: "127.0.0.1:0".into(),
         secret: None,
+        unified_delay: true,
         geodata_mode: false,
         mmdb_path: None,
         hosts: std::collections::HashMap::new(),
