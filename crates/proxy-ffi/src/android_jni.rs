@@ -3063,6 +3063,7 @@ struct WindowDiagnosticSections {
     window_fake_ip_restored: usize,
     outbound_stats_json: Vec<serde_json::Value>,
     top_domains_json: Vec<serde_json::Value>,
+    carry_over_connections_json: Vec<serde_json::Value>,
     failed_connections_json: Vec<serde_json::Value>,
     slow_connections_json: Vec<serde_json::Value>,
     recent_connections_json: Vec<serde_json::Value>,
@@ -3075,14 +3076,59 @@ fn build_window_diagnostic_sections(
     delays_map: &HashMap<String, u64>,
 ) -> WindowDiagnosticSections {
     let mut carry_over_count = 0usize;
+    let mut carry_over_conns = Vec::new();
     let mut window_conns = Vec::with_capacity(conns.len());
     for c in conns {
         if c.start_epoch_ms < since_epoch_ms {
-            carry_over_count += 1;
+            if c.status == "active" || c.end_epoch_ms.is_none_or(|end| end >= since_epoch_ms) {
+                carry_over_count += 1;
+                carry_over_conns.push(c);
+            }
         } else if c.start_epoch_ms <= until_epoch_ms {
             window_conns.push(c);
         }
     }
+
+    carry_over_conns.sort_by(|a, b| {
+        let a_total = a.upload.saturating_add(a.download);
+        let b_total = b.upload.saturating_add(b.download);
+        b_total
+            .cmp(&a_total)
+            .then_with(|| a.start_epoch_ms.cmp(&b.start_epoch_ms))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let age_ref_ms = if until_epoch_ms == u64::MAX {
+        proxy_core::tracker::TelemetryHub::now_ms()
+    } else {
+        until_epoch_ms
+    };
+    let carry_over_connections_json: Vec<serde_json::Value> = carry_over_conns
+        .into_iter()
+        .take(10)
+        .map(|c| {
+            let safe_host = redact_sensitive_text(&c.metadata.host);
+            let safe_rule = if c.rule_payload.is_empty() {
+                redact_sensitive_text(&c.rule)
+            } else {
+                format!(
+                    "{},{}",
+                    redact_sensitive_text(&c.rule),
+                    redact_sensitive_text(&c.rule_payload)
+                )
+            };
+            serde_json::json!({
+                "host": safe_host,
+                "port": c.metadata.destination_port,
+                "network": c.metadata.network,
+                "status": c.status,
+                "rule": safe_rule,
+                "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                "uploadBytes": c.upload,
+                "downloadBytes": c.download,
+                "ageMs": age_ref_ms.saturating_sub(c.start_epoch_ms),
+            })
+        })
+        .collect();
 
     let mut window_connections_total = 0usize;
     let mut window_tcp = 0usize;
@@ -3166,9 +3212,13 @@ fn build_window_diagnostic_sections(
         dom_entry.download_bytes = dom_entry.download_bytes.saturating_add(c.download);
         if dom_entry.primary_rule.is_empty() {
             dom_entry.primary_rule = if c.rule_payload.is_empty() {
-                c.rule.clone()
+                redact_sensitive_text(&c.rule)
             } else {
-                format!("{},{}", c.rule, redact_sensitive_text(&c.rule_payload))
+                format!(
+                    "{},{}",
+                    redact_sensitive_text(&c.rule),
+                    redact_sensitive_text(&c.rule_payload)
+                )
             };
             dom_entry.primary_outbound.clone_from(&c.effective_outbound);
         }
@@ -3207,26 +3257,52 @@ fn build_window_diagnostic_sections(
     let outbound_stats_json: Vec<serde_json::Value> =
         outbound_stats.into_iter().map(|(_, v)| v).collect();
 
-    let mut top_domains: Vec<(usize, serde_json::Value)> = by_domain
+    struct DomainRanked {
+        host: String,
+        connections: usize,
+        total_bytes: u64,
+        json: serde_json::Value,
+    }
+    let mut ranked_domains: Vec<DomainRanked> = by_domain
         .into_iter()
         .map(|(host, agg)| {
-            (
-                agg.connections,
-                serde_json::json!({
-                    "host": host,
-                    "connections": agg.connections,
-                    "failures": agg.failures,
-                    "uploadBytes": agg.upload_bytes,
-                    "downloadBytes": agg.download_bytes,
-                    "primaryRule": agg.primary_rule,
-                    "primaryOutbound": redact_sensitive_text(&agg.primary_outbound),
-                }),
-            )
+            let total_bytes = agg.upload_bytes.saturating_add(agg.download_bytes);
+            let json = serde_json::json!({
+                "host": host,
+                "connections": agg.connections,
+                "failures": agg.failures,
+                "uploadBytes": agg.upload_bytes,
+                "downloadBytes": agg.download_bytes,
+                "primaryRule": agg.primary_rule,
+                "primaryOutbound": redact_sensitive_text(&agg.primary_outbound),
+            });
+            DomainRanked {
+                host,
+                connections: agg.connections,
+                total_bytes,
+                json,
+            }
         })
         .collect();
-    top_domains.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
+    ranked_domains.sort_by(|a, b| {
+        b.connections
+            .cmp(&a.connections)
+            .then_with(|| b.total_bytes.cmp(&a.total_bytes))
+            .then_with(|| a.host.cmp(&b.host))
+    });
+    if ranked_domains.len() > 20 {
+        let mut remainder = ranked_domains.split_off(20);
+        remainder.retain(|d| d.total_bytes > 0);
+        remainder.sort_by(|a, b| {
+            b.total_bytes
+                .cmp(&a.total_bytes)
+                .then_with(|| b.connections.cmp(&a.connections))
+                .then_with(|| a.host.cmp(&b.host))
+        });
+        ranked_domains.extend(remainder.into_iter().take(10));
+    }
     let top_domains_json: Vec<serde_json::Value> =
-        top_domains.into_iter().take(25).map(|(_, v)| v).collect();
+        ranked_domains.into_iter().map(|d| d.json).collect();
 
     let failed_in_window: Vec<_> = conns
         .iter()
@@ -3331,6 +3407,7 @@ fn build_window_diagnostic_sections(
         window_fake_ip_restored,
         outbound_stats_json,
         top_domains_json,
+        carry_over_connections_json,
         failed_connections_json,
         slow_connections_json,
         recent_connections_json,
@@ -3534,6 +3611,7 @@ pub fn android_collect_debug_snapshot_window_core(
             "dns": dns_json,
             "outboundStats": sections.outbound_stats_json,
             "topDomains": sections.top_domains_json,
+            "carryOverConnections": sections.carry_over_connections_json,
             "topRules": top_rules_json,
             "failedConnections": sections.failed_connections_json,
             "slowConnections": sections.slow_connections_json,
@@ -3574,6 +3652,7 @@ pub fn android_collect_debug_snapshot_window_core(
         "geodata": geodata,
         "outboundStats": [],
         "topDomains": [],
+        "carryOverConnections": [],
         "topRules": [],
         "failedConnections": [],
         "slowConnections": [],
@@ -4252,5 +4331,175 @@ mod tests {
         drop(engine);
         assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn window_diagnostic_sections_preserves_high_bandwidth_single_conn_domain_and_reports_carry_over_streams()
+     {
+        let since_ms = 10_000u64;
+        let until_ms = 20_000u64;
+        let mut conns = Vec::new();
+
+        // 25 chatty 100-byte domains (conns = 5..=29)
+        for i in 0..25usize {
+            let host = format!("chatty-{i:02}.example.com");
+            let mut c = sample_conn(
+                &format!("chatty-{i:02}"),
+                "tcp",
+                &host,
+                "Node-HK",
+                since_ms + 100 + i as u64,
+                Some(since_ms + 500 + i as u64),
+                Some(42),
+                60,
+                40,
+                None,
+                "closed",
+                None,
+            );
+            c.coalesced_count = (29 - i) as u64;
+            conns.push(c);
+        }
+
+        // 8 additional tiny single-connection domains so total unique window domains > 30 (34 total)
+        for i in 0..8usize {
+            let host = format!("tiny-{i:02}.example.net");
+            conns.push(sample_conn(
+                &format!("tiny-{i:02}"),
+                "tcp",
+                &host,
+                "DIRECT",
+                since_ms + 2_000 + i as u64,
+                Some(since_ms + 2_100 + i as u64),
+                Some(15),
+                10,
+                10,
+                None,
+                "closed",
+                None,
+            ));
+        }
+
+        // 1 single-connection (conns=1) 80 MB heavy upload domain on DIRECT
+        let upload_80mb = 80u64 * 1024 * 1024;
+        let mut heavy_upload = sample_conn(
+            "heavy-upload-1",
+            "tcp",
+            "upos-sz-upcdn.bilivideo.com",
+            "DIRECT",
+            since_ms + 3_000,
+            Some(since_ms + 8_000),
+            Some(28),
+            upload_80mb,
+            4_096,
+            None,
+            "closed",
+            None,
+        );
+        heavy_upload.rule = "GeoSite".to_string();
+        heavy_upload.rule_payload = "cn".to_string();
+        conns.push(heavy_upload);
+
+        // 2 carry-over (start_epoch_ms < since_epoch_ms) high-traffic streams + 1 pre-window already-closed stream
+        let mut carry_dl = sample_conn(
+            "carry-heavy-dl",
+            "tcp",
+            "rr1---sn-video.googlevideo.com?token=SECRET_CARRY_HOST_TOKEN",
+            "Sub (203.0.113.124)",
+            2_000,
+            None,
+            Some(55),
+            512 * 1024,
+            38 * 1024 * 1024,
+            None,
+            "active",
+            None,
+        );
+        carry_dl.rule = "GeoSite".to_string();
+        carry_dl.rule_payload = "password=SECRET_RULE_PASS_999".to_string();
+        conns.push(carry_dl);
+
+        let mut carry_ul = sample_conn(
+            "carry-heavy-ul",
+            "udp",
+            "live-push.bilivideo.com",
+            "DIRECT",
+            4_500,
+            Some(since_ms + 1_200),
+            None,
+            15 * 1024 * 1024,
+            2 * 1024 * 1024,
+            None,
+            "closed",
+            None,
+        );
+        carry_ul.rule = "GeoSite".to_string();
+        carry_ul.rule_payload = "cn".to_string();
+        conns.push(carry_ul);
+
+        // Pre-window closed connection (end < since_ms) should NOT be counted in carryOverConnections
+        conns.push(sample_conn(
+            "pre-window-expired",
+            "tcp",
+            "expired.example.org",
+            "DIRECT",
+            1_000,
+            Some(since_ms - 500),
+            Some(20),
+            99 * 1024 * 1024,
+            0,
+            None,
+            "closed",
+            None,
+        ));
+
+        let sec = build_window_diagnostic_sections(&conns, since_ms, until_ms, &HashMap::new());
+
+        // 1. Verify topDomains caps at 30 max and includes the conns=1 80 MB upload domain
+        assert_eq!(sec.top_domains_json.len(), 30);
+        let heavy_dom = sec
+            .top_domains_json
+            .iter()
+            .find(|d| d["host"] == "upos-sz-upcdn.bilivideo.com")
+            .expect("80 MB conns=1 upload domain must appear in topDomains");
+        assert_eq!(heavy_dom["connections"], 1);
+        assert_eq!(heavy_dom["uploadBytes"], upload_80mb);
+        assert_eq!(heavy_dom["downloadBytes"], 4_096);
+        assert_eq!(heavy_dom["primaryOutbound"], "DIRECT");
+        assert_eq!(heavy_dom["primaryRule"], "GeoSite,cn");
+        // And it should be the very first entry (#21, index 20) among the top-10-by-bytes additions!
+        assert_eq!(
+            sec.top_domains_json[20]["host"],
+            "upos-sz-upcdn.bilivideo.com"
+        );
+
+        // 2. Verify carryOverConnections reports the 2 overlapping carry-over streams sorted by total bytes desc, with redaction
+        assert_eq!(sec.carry_over_count, 2);
+        assert_eq!(sec.carry_over_connections_json.len(), 2);
+
+        let first_carry = &sec.carry_over_connections_json[0];
+        assert_eq!(first_carry["port"], 443);
+        assert_eq!(first_carry["network"], "tcp");
+        assert_eq!(first_carry["status"], "active");
+        assert_eq!(first_carry["uploadBytes"], 512 * 1024);
+        assert_eq!(first_carry["downloadBytes"], 38 * 1024 * 1024);
+        assert_eq!(first_carry["ageMs"], until_ms - 2_000);
+        assert_eq!(first_carry["effectiveOutbound"], "Sub (***REDACTED***)");
+        let first_host = first_carry["host"].as_str().unwrap_or_default();
+        let first_rule = first_carry["rule"].as_str().unwrap_or_default();
+        assert!(!first_host.contains("SECRET_CARRY_HOST_TOKEN"));
+        assert!(!first_rule.contains("SECRET_RULE_PASS_999"));
+        assert!(first_rule.contains("***REDACTED***"));
+
+        let second_carry = &sec.carry_over_connections_json[1];
+        assert_eq!(second_carry["host"], "live-push.bilivideo.com");
+        assert_eq!(second_carry["port"], 443);
+        assert_eq!(second_carry["network"], "udp");
+        assert_eq!(second_carry["status"], "closed");
+        assert_eq!(second_carry["rule"], "GeoSite,cn");
+        assert_eq!(second_carry["effectiveOutbound"], "DIRECT");
+        assert_eq!(second_carry["uploadBytes"], 15 * 1024 * 1024);
+        assert_eq!(second_carry["downloadBytes"], 2 * 1024 * 1024);
+        assert_eq!(second_carry["ageMs"], until_ms - 4_500);
     }
 }

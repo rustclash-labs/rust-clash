@@ -11,7 +11,6 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
-import android.net.IpPrefix
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -22,7 +21,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -300,40 +298,22 @@ class RustClashVpnService : VpnService() {
             val cm = getSystemService(ConnectivityManager::class.java)
             val initialPhysicalSnapshot = captureInitialPhysicalNetworkSnapshot(cm)
 
-            val builder = Builder()
-                .setSession(sessionCfg.sessionName)
-                .setMtu(sessionCfg.mtu)
-                .addAddress(sessionCfg.ipv4Address, sessionCfg.ipv4PrefixLength)
-                .addDnsServer(sessionCfg.dnsIpv4)
-
-            if (sessionCfg.enableIpv6) {
-                builder.addAddress(sessionCfg.ipv6Address, sessionCfg.ipv6PrefixLength)
-            }
-            applyVpnRoutes(builder, sessionCfg)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setMetered(false)
-            }
-            if (initialPhysicalSnapshot != null) {
-                runCatching { builder.setUnderlyingNetworks(arrayOf(initialPhysicalSnapshot.network)) }
-            }
-
-            for (pkg in perAppPlan.allowedPackages) {
-                try {
-                    builder.addAllowedApplication(pkg)
-                } catch (_: PackageManager.NameNotFoundException) {
-                    // Ignore uninstalled stale package entries
-                }
-            }
-            for (pkg in perAppPlan.disallowedPackages) {
-                try {
-                    builder.addDisallowedApplication(pkg)
-                } catch (_: PackageManager.NameNotFoundException) {
-                    // Ignore uninstalled stale package entries
-                }
-            }
-
-            val established = builder.establish()
-                ?: throw IllegalStateException("无法建立系统 VPN 隧道：连接授权缺失或被其他 VPN 应用抢占")
+            val underlyingNetwork = initialPhysicalSnapshot?.network
+            val established = try {
+                createConfiguredVpnBuilder(
+                    sessionCfg = sessionCfg,
+                    underlyingNetwork = underlyingNetwork,
+                    perAppPlan = perAppPlan,
+                    useSplitRoutes = true,
+                ).establish()
+            } catch (_: IllegalArgumentException) {
+                createConfiguredVpnBuilder(
+                    sessionCfg = sessionCfg,
+                    underlyingNetwork = underlyingNetwork,
+                    perAppPlan = perAppPlan,
+                    useSplitRoutes = false,
+                ).establish()
+            } ?: throw IllegalStateException("无法建立系统 VPN 隧道：连接授权缺失或被其他 VPN 应用抢占")
             pendingPfd = established
 
             // Atomically transfer exclusive FD ownership to Rust (`OwnedFd::from_raw_fd(tun_fd)`).
@@ -878,41 +858,63 @@ class RustClashVpnService : VpnService() {
         nm.createNotificationChannel(channel)
     }
 
+    private fun createConfiguredVpnBuilder(
+        sessionCfg: VpnSessionConfig,
+        underlyingNetwork: Network?,
+        perAppPlan: EffectivePerAppPlan,
+        useSplitRoutes: Boolean,
+    ): Builder {
+        val builder = Builder()
+            .setSession(sessionCfg.sessionName)
+            .setMtu(sessionCfg.mtu)
+            .addAddress(sessionCfg.ipv4Address, sessionCfg.ipv4PrefixLength)
+            .addDnsServer(sessionCfg.dnsIpv4)
+
+        if (sessionCfg.enableIpv6) {
+            builder.addAddress(sessionCfg.ipv6Address, sessionCfg.ipv6PrefixLength)
+        }
+        if (useSplitRoutes) {
+            applyVpnRoutes(builder, sessionCfg)
+        } else {
+            builder.addRoute("0.0.0.0", 0)
+            if (sessionCfg.enableIpv6) {
+                builder.addRoute("::", 0)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setMetered(false)
+        }
+        if (underlyingNetwork != null) {
+            runCatching { builder.setUnderlyingNetworks(arrayOf(underlyingNetwork)) }
+        }
+
+        for (pkg in perAppPlan.allowedPackages) {
+            try {
+                builder.addAllowedApplication(pkg)
+            } catch (_: PackageManager.NameNotFoundException) {
+                // Ignore uninstalled stale package entries
+            }
+        }
+        for (pkg in perAppPlan.disallowedPackages) {
+            try {
+                builder.addDisallowedApplication(pkg)
+            } catch (_: PackageManager.NameNotFoundException) {
+                // Ignore uninstalled stale package entries
+            }
+        }
+        return builder
+    }
+
     private fun applyVpnRoutes(builder: Builder, sessionCfg: VpnSessionConfig) {
         val routePlan = VpnRoutePlanner.buildPlan(
             sessionCfg = sessionCfg,
             sdkInt = Build.VERSION.SDK_INT,
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && routePlan.useExcludeRoutes) {
-            Api33VpnRouteHelper.applyRoutesWithExclusions(builder, routePlan)
-        } else {
-            for (route in routePlan.includedIpv4) {
-                builder.addRoute(route.address, route.prefixLength)
-            }
-            for (route in routePlan.includedIpv6) {
-                builder.addRoute(route.address, route.prefixLength)
-            }
+        for (route in routePlan.includedIpv4) {
+            builder.addRoute(route.address, route.prefixLength)
         }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    private object Api33VpnRouteHelper {
-        fun applyRoutesWithExclusions(
-            builder: VpnService.Builder,
-            routePlan: VpnRoutePlan,
-        ) {
-            for (route in routePlan.includedIpv4) {
-                builder.addRoute(route.address, route.prefixLength)
-            }
-            for (route in routePlan.excludedIpv4) {
-                builder.excludeRoute(IpPrefix(InetAddress.getByName(route.address), route.prefixLength))
-            }
-            for (route in routePlan.includedIpv6) {
-                builder.addRoute(route.address, route.prefixLength)
-            }
-            for (route in routePlan.excludedIpv6) {
-                builder.excludeRoute(IpPrefix(InetAddress.getByName(route.address), route.prefixLength))
-            }
+        for (route in routePlan.includedIpv6) {
+            builder.addRoute(route.address, route.prefixLength)
         }
     }
 

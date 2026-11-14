@@ -659,5 +659,164 @@ class DebugLogManagerTest {
         assertTrue(report.contains("status=`failed` (x4)"))
         assertTrue(report.contains("**LOG_CLEARED**: logs reset while state=running"))
     }
-}
 
+    @Test
+    fun formatSliceReportRendersCarryOverConnectionsWhenPresentAndOmitsWhenAbsentOrEmpty() {
+        val t0 = 1_763_200_000_000L
+        val t1 = t0 + 900_000L
+        val window = DebugLogManager.WindowTelemetryState(
+            windowStartMs = t0,
+            capturedAtMs = t1,
+            sessionStartMs = t0 - 1_800_000L,
+            screenOnMs = 900_000L,
+            screenOffMs = 0L,
+            startBatteryPct = 90,
+            events = emptyList(),
+        )
+        val sysMeta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "Google",
+            deviceModel = "Pixel 9",
+            androidRelease = "15",
+            sdkInt = 35,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.4.6",
+            appVersionCode = 22,
+            battery = DebugLogManager.BatterySnapshot(levelPct = 88, isCharging = false, temperatureCelsius = 33.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 20L * 1024L * 1024L,
+            jvmMaxBytes = 256L * 1024L * 1024L,
+            nativeHeapBytes = 22L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+
+        // 1. Present & non-empty carryOverConnections -> renders Carry-Over Streams section cleanly
+        val withCarryOverJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 2700,
+              "mode": "rule",
+              "routingPreset": "smart-cn",
+              "effectiveOutbound": "HK-IPLC-01",
+              "effectiveProtocol": "VLESS",
+              "effectiveDelayMs": 29,
+              "isWifi": true,
+              "traffic": {
+                "upTotal": 5242880,
+                "downTotal": 62914560,
+                "activeConnections": 8,
+                "carryOverActiveConnections": 2,
+                "totalConnections": 90,
+                "establishedConnections": 88,
+                "failedConnections": 2,
+                "zeroRxClosedConnections": 0
+              },
+              "topDomains": [
+                {
+                  "host": "upos-sz-upcdn.bilivideo.com",
+                  "connections": 1,
+                  "failures": 0,
+                  "uploadBytes": 82375475,
+                  "downloadBytes": 4096,
+                  "primaryRule": "GeoSite,cn",
+                  "primaryOutbound": "DIRECT"
+                }
+              ],
+              "carryOverConnections": [
+                {
+                  "host": "upos-sz-mirrorcos.bilivideo.com",
+                  "port": 443,
+                  "network": "tcp",
+                  "status": "active",
+                  "rule": "GeoSite,cn",
+                  "effectiveOutbound": "DIRECT",
+                  "uploadBytes": 1048576,
+                  "downloadBytes": 40579891,
+                  "ageMs": 1245000
+                },
+                {
+                  "host": "240e:97c:2f::1",
+                  "port": 443,
+                  "network": "udp",
+                  "status": "active",
+                  "rule": "GeoSite,geolocation-!cn",
+                  "effectiveOutbound": "Sub (203.0.113.124)",
+                  "uploadBytes": 524288,
+                  "downloadBytes": 12582912,
+                  "ageMs": 750
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val reportWithCarry = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = withCarryOverJson,
+            crashBreadcrumb = null,
+        )
+        assertTrue(reportWithCarry.contains("#### Carry-Over Streams (2)"))
+        assertTrue(
+            reportWithCarry.contains(
+                "- `upos-sz-mirrorcos.bilivideo.com:443` (tcp, active) -> `DIRECT` [GeoSite,cn] " +
+                    "totalUp=`1.00 MB` totalDown=`38.70 MB` age=`1245s`",
+            ),
+        )
+        assertTrue(
+            reportWithCarry.contains(
+                "- `[240e:97c:2f::1]:443` (udp, active) -> `Sub (***REDACTED***)` [GeoSite,geolocation-!cn] " +
+                    "totalUp=`512.0 KB` totalDown=`12.00 MB` age=`750ms`",
+            ),
+        )
+        assertFalse(reportWithCarry.contains("203.0.113.124"))
+
+        // 2. Empty carryOverConnections array -> omits Carry-Over Streams section cleanly
+        val emptyCarryJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 900,
+              "mode": "rule",
+              "effectiveOutbound": "DIRECT",
+              "effectiveProtocol": "DIRECT",
+              "carryOverConnections": []
+            }
+        """.trimIndent()
+        val reportEmptyCarry = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = emptyCarryJson,
+            crashBreadcrumb = null,
+        )
+        assertFalse(reportEmptyCarry.contains("Carry-Over Streams"))
+
+        // 3. Absent carryOverConnections key -> omits Carry-Over Streams section cleanly
+        val absentCarryJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 900,
+              "mode": "rule",
+              "effectiveOutbound": "DIRECT",
+              "effectiveProtocol": "DIRECT"
+            }
+        """.trimIndent()
+        val reportAbsentCarry = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = absentCarryJson,
+            crashBreadcrumb = null,
+        )
+        assertFalse(reportAbsentCarry.contains("Carry-Over Streams"))
+    }
+}

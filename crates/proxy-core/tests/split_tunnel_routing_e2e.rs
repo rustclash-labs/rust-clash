@@ -1392,3 +1392,137 @@ rules:
     let _ = geo_stop_tx.send(true);
     install_live_geodata(Arc::new(GeoDataset::builtin_only()));
 }
+
+#[tokio::test]
+async fn smart_cn_routes_google_via_proxy_even_when_geosite_cn_lists_gstatic_or_gvt2_and_migrates_v045_profile()
+ {
+    let _serial = SPLIT_TUNNEL_E2E_LOCK.lock().await;
+    clear_global_socket_protector();
+    install_live_geodata(Arc::new(GeoDataset::builtin_only()));
+
+    let dir = TempTestDir::new("v045-google-smartcn");
+    let profiles_dir = dir.path().join("profiles");
+    fs::create_dir_all(&profiles_dir).unwrap();
+
+    let node_uuid = Uuid::new_v4();
+    let v045_yaml = format!(
+        r#"mixed-port: 0
+mode: rule
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  listen: 127.0.0.1:0
+  nameserver:
+    - 223.5.5.5:53
+proxies:
+  - name: Node-HK
+    type: vless
+    server: 127.0.0.1
+    port: 1
+    uuid: "{node_uuid}"
+    tls: false
+    udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - Node-HK
+      - DIRECT
+rules:
+  - DOMAIN-SUFFIX,local,DIRECT
+  - DOMAIN-SUFFIX,lan,DIRECT
+  - DOMAIN-SUFFIX,home.arpa,DIRECT
+  - GEOIP,PRIVATE,DIRECT,no-resolve
+  - GEOSITE,geolocation-!cn,PROXY
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,PROXY
+"#
+    );
+    fs::write(profiles_dir.join("starter-default.yaml"), &v045_yaml).unwrap();
+    fs::write(
+        profiles_dir.join("profiles_index.json"),
+        serde_json::json!({
+            "active_profile_id": "starter-default",
+            "onboarding_completed": true,
+            "selection_defaults_v2": true,
+            "profiles": [{
+                "id": "starter-default",
+                "name": "Starter Profile (Smart CN)",
+                "kind": "share-uris",
+                "last_updated_ms": 1700000000000u64,
+                "proxy_count": 1,
+                "group_count": 1,
+                "rule_count": 8,
+                "selected_groups": {"PROXY": "Node-HK"},
+                "rule_preset": "smart-cn"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 1. Verify v0.4.5 8-rule `smart-cn` profile auto-upgrades to 9-rule template on `open_or_init`
+    let mgr = ProfileManager::open_or_init(dir.path()).unwrap();
+    let snap = mgr.routing_snapshot().unwrap();
+    assert_eq!(snap.rule_preset, RulePreset::SmartCn);
+    assert_eq!(snap.rule_count, 9);
+    let (mut cfg, _) = mgr.load_active_config().unwrap();
+    assert_eq!(cfg.rules, ClashConfig::smart_cn_rules_for_group("PROXY"));
+
+    // 2. Simulate Loyalsoldier `direct.txt` (`geosite_cn`) containing `gstatic.com`, `gvt2.com`,
+    //    `googleapis.com`, and `doubleclick.net` in `LIVE_GEODATA`
+    let base = GeoDataset::builtin_only();
+    let direct_override = proxy_core::router::geosite_data::GeoSiteMatcher::from_rule_text(
+        "payload:\n  - '+.gstatic.com'\n  - '+.gvt2.com'\n  - '+.googleapis.com'\n  - '+.doubleclick.net'\n  - '+.baidu.com'\n  - '+.qq.com'\n",
+    );
+    let poisoned_geodata = Arc::new(GeoDataset {
+        geosite_cn: base.geosite_cn.merged_with(&direct_override),
+        geosite_non_cn: base.geosite_non_cn,
+        geoip_cn: base.geoip_cn,
+        mmdb: None,
+        using_persisted_data: true,
+    });
+
+    cfg.mixed_port = 0;
+    cfg.external_controller = "127.0.0.1:0".into();
+    cfg.dns.listen = "127.0.0.1:0".into();
+    let engine = ProxyEngine::start_with_state_dir(cfg, dir.path().to_path_buf())
+        .await
+        .unwrap();
+    engine.attach_profile_manager(Arc::clone(&mgr));
+    let _ = engine.select_group_and_persist("PROXY", "Node-HK");
+    // Install AFTER `start_with_state_dir` (which initializes `GeoDataManager` from `state_dir`)
+    install_live_geodata(poisoned_geodata);
+
+    let router = engine.router();
+    for google_host in [
+        "beacons.gcp.gvt2.com",
+        "www.gstatic.com",
+        "clientservices.googleapis.com",
+        "googleads.g.doubleclick.net",
+    ] {
+        let decision = router
+            .route_async(None, &TargetAddr::new_domain(google_host, 443).unwrap())
+            .await;
+        assert_eq!(
+            decision.outbound.name(),
+            "Node-HK",
+            "Google ecosystem domain '{google_host}' MUST route via PROXY even when geosite_cn lists it"
+        );
+    }
+
+    for cn_host in ["www.baidu.com", "www.qq.com"] {
+        let decision = router
+            .route_async(None, &TargetAddr::new_domain(cn_host, 443).unwrap())
+            .await;
+        assert_eq!(
+            decision.outbound.name(),
+            "DIRECT",
+            "Domestic CN domain '{cn_host}' MUST continue routing DIRECT"
+        );
+    }
+
+    engine.shutdown();
+    install_live_geodata(Arc::new(GeoDataset::builtin_only()));
+}

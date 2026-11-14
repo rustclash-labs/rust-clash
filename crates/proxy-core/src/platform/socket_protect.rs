@@ -1,13 +1,15 @@
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
@@ -399,10 +401,38 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
 
 static CUSTOM_PROTECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PROTECTOR_EPOCH: AtomicU64 = AtomicU64::new(1);
+static NETWORK_GENERATION: AtomicU64 = AtomicU64::new(1);
+static RECENT_FAILED_CACHE_GEN: AtomicU64 = AtomicU64::new(1);
 /// `0 = Unknown`, `1 = Unavailable`, `2 = Available`.
 static OS_UNDERLYING_IPV6_AVAILABLE: AtomicU8 = AtomicU8::new(0);
 static DIRECT_IPV6_UNREACHABLE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 const DIRECT_IPV6_CIRCUIT_BREAKER_MS: u64 = 45_000;
+const RECENT_FAILED_ADDR_TTL: Duration = Duration::from_secs(90);
+const RECENT_FAILED_ADDR_MAX_ENTRIES: usize = 256;
+
+static RECENT_FAILED_ADDRS: LazyLock<Mutex<HashMap<SocketAddr, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Return the monotonic network generation counter, which advances on OS network handoffs
+/// (`notify_network_change` / `reset_direct_ipv6_reachability`) and `SocketProtector` transitions.
+pub fn network_generation() -> u64 {
+    NETWORK_GENERATION.load(Ordering::Acquire)
+}
+
+/// Advance the network generation counter and clear `RECENT_FAILED_ADDRS` so a fresh network
+/// link starts without stale connect-failure demotions.
+pub fn advance_network_generation() -> u64 {
+    let next = NETWORK_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut map = RECENT_FAILED_ADDRS.lock();
+    map.clear();
+    RECENT_FAILED_CACHE_GEN.store(next, Ordering::Release);
+    next
+}
+
+/// Clear all cached recent connect-failure demotions.
+pub fn clear_recent_failed_addrs() {
+    RECENT_FAILED_ADDRS.lock().clear();
+}
 
 /// Return `true` when `v6` is an RFC 4291 global unicast IPv6 address (`2000::/3`),
 /// excluding the RFC 3849 documentation prefix (`2001:db8::/32`).
@@ -434,9 +464,11 @@ pub fn os_underlying_ipv6_available() -> Option<bool> {
     }
 }
 
-/// Clear any active `ENETUNREACH` / `EADDRNOTAVAIL` direct IPv6 circuit-breaker cooldown.
+/// Clear any active `ENETUNREACH` / `EADDRNOTAVAIL` direct IPv6 circuit-breaker cooldown
+/// and reset recent connect-failure demotions for the new network generation.
 pub fn reset_direct_ipv6_reachability() {
     DIRECT_IPV6_UNREACHABLE_UNTIL_MS.store(0, Ordering::Release);
+    let _ = advance_network_generation();
 }
 
 /// Return `true` when `err` indicates immediate local kernel IPv6 unreachability
@@ -544,10 +576,84 @@ pub fn global_socket_protector() -> Arc<dyn SocketProtector> {
     Arc::clone(&protector_slot().read())
 }
 
-const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
-const HAPPY_EYEBALLS_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const MAX_HAPPY_EYEBALLS_CANDIDATES: usize = 6;
-const HAPPY_EYEBALLS_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const HAPPY_EYEBALLS_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn sync_recent_failed_generation(map: &mut HashMap<SocketAddr, Instant>) {
+    let gen_now = network_generation();
+    if RECENT_FAILED_CACHE_GEN.swap(gen_now, Ordering::AcqRel) != gen_now {
+        map.clear();
+    }
+}
+
+fn is_demotable_connect_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::AddrNotAvailable
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        return matches!(
+            code,
+            libc::ETIMEDOUT
+                | libc::ECONNREFUSED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::EADDRNOTAVAIL
+        );
+    }
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error() {
+        return matches!(code, 10060 | 10061 | 10065 | 10051 | 10049);
+    }
+    false
+}
+
+fn record_recent_failed_addr_at(addr: SocketAddr, now: Instant) {
+    let mut map = RECENT_FAILED_ADDRS.lock();
+    sync_recent_failed_generation(&mut map);
+    if let Some(slot) = map.get_mut(&addr) {
+        *slot = now;
+        return;
+    }
+    if map.len() >= RECENT_FAILED_ADDR_MAX_ENTRIES {
+        map.retain(|_, &mut failed_at| {
+            now.checked_duration_since(failed_at)
+                .is_none_or(|age| age < RECENT_FAILED_ADDR_TTL)
+        });
+        if map.len() >= RECENT_FAILED_ADDR_MAX_ENTRIES
+            && let Some(oldest_addr) = map
+                .iter()
+                .min_by_key(|(_, failed_at)| **failed_at)
+                .map(|(k, _)| *k)
+        {
+            map.remove(&oldest_addr);
+        }
+    }
+    map.insert(addr, now);
+}
+
+fn clear_recent_failed_addr(addr: SocketAddr) {
+    let mut map = RECENT_FAILED_ADDRS.lock();
+    sync_recent_failed_generation(&mut map);
+    map.remove(&addr);
+}
+
+fn note_tcp_connect_outcome_at(addr: SocketAddr, res: Result<(), &io::Error>, now: Instant) {
+    match res {
+        Ok(()) => clear_recent_failed_addr(addr),
+        Err(err) if is_demotable_connect_error(err) => record_recent_failed_addr_at(addr, now),
+        Err(_) => {}
+    }
+}
 
 /// Open a protected non-blocking TCP connection to a resolved `SocketAddr` with connect timeout and TCP keepalive.
 pub async fn protected_tcp_connect_addr(remote: SocketAddr) -> io::Result<TcpStream> {
@@ -560,20 +666,35 @@ pub async fn protected_tcp_connect_addr(remote: SocketAddr) -> io::Result<TcpStr
     sock.set_nonblocking(true)?;
     let _ = sock.set_nodelay(true);
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(45))
-        .with_interval(std::time::Duration::from_secs(15));
+        .with_time(Duration::from_secs(45))
+        .with_interval(Duration::from_secs(15));
     let _ = sock.set_tcp_keepalive(&keepalive);
     let std_stream: std::net::TcpStream = sock.into();
     let tcp_sock = TcpSocket::from_std_stream(std_stream);
-    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
+    let connect_res = match tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
         let res = tcp_sock.connect(remote).await;
         note_direct_addr_connect_result(remote, res.as_ref().map(|_| ()));
         res
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    {
+        Ok(res) => res,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TCP connect timed out",
+        )),
+    };
+    match connect_res {
+        Ok(stream) => {
+            note_tcp_connect_outcome_at(remote, Ok(()), Instant::now());
+            let _ = stream.set_nodelay(true);
+            Ok(stream)
+        }
+        Err(err) => {
+            note_tcp_connect_outcome_at(remote, Err(&err), Instant::now());
+            Err(err)
+        }
+    }
 }
 
 fn interleave_happy_eyeballs_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
@@ -621,6 +742,62 @@ fn interleave_happy_eyeballs_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     out
 }
 
+fn prioritize_healthy_happy_eyeballs_addrs_at(
+    addrs: &[SocketAddr],
+    now: Instant,
+) -> Vec<SocketAddr> {
+    if addrs.is_empty() {
+        return Vec::new();
+    }
+    let mut healthy = Vec::with_capacity(addrs.len());
+    let mut recently_failed = Vec::new();
+    {
+        let mut map = RECENT_FAILED_ADDRS.lock();
+        sync_recent_failed_generation(&mut map);
+        if map.is_empty() {
+            drop(map);
+            return interleave_happy_eyeballs_addrs(addrs);
+        }
+        for &addr in addrs {
+            let is_failed = match map.get(&addr).copied() {
+                Some(failed_at) => {
+                    if now
+                        .checked_duration_since(failed_at)
+                        .is_none_or(|age| age < RECENT_FAILED_ADDR_TTL)
+                    {
+                        true
+                    } else {
+                        map.remove(&addr);
+                        false
+                    }
+                }
+                None => false,
+            };
+            if is_failed {
+                recently_failed.push(addr);
+            } else {
+                healthy.push(addr);
+            }
+        }
+    }
+    if recently_failed.is_empty() {
+        return interleave_happy_eyeballs_addrs(&healthy);
+    }
+    if healthy.is_empty() {
+        return interleave_happy_eyeballs_addrs(&recently_failed);
+    }
+    let mut out = interleave_happy_eyeballs_addrs(&healthy);
+    out.extend(interleave_happy_eyeballs_addrs(&recently_failed));
+    out
+}
+
+/// Partition candidate `SocketAddr`s into `(healthy, recently_failed)`, interleave `healthy`
+/// according to RFC 8305 Happy Eyeballs first, and append interleaved `recently_failed`
+/// candidates afterward so dead CDN edge IPs are demoted without ever dropping fallback IPs.
+pub fn prioritize_healthy_happy_eyeballs_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    prioritize_healthy_happy_eyeballs_addrs_at(addrs, Instant::now())
+}
+
 /// Connect across candidate `SocketAddr`s using RFC 8305 Happy Eyeballs (250ms staggered IPv6/IPv4 race).
 pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     match addrs {
@@ -634,8 +811,9 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
         _ => {}
     }
 
-    let mut ordered = interleave_happy_eyeballs_addrs(addrs);
+    let mut ordered = prioritize_healthy_happy_eyeballs_addrs(addrs);
     ordered.truncate(MAX_HAPPY_EYEBALLS_CANDIDATES);
+    let primary_candidate = ordered[0];
 
     tokio::time::timeout(HAPPY_EYEBALLS_TOTAL_TIMEOUT, async move {
         let mut join_set = tokio::task::JoinSet::new();
@@ -690,10 +868,9 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
     })
     .await
     .unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "TCP connect timed out",
-        ))
+        let err = io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out");
+        note_tcp_connect_outcome_at(primary_candidate, Err(&err), Instant::now());
+        Err(err)
     })
 }
 
@@ -912,5 +1089,165 @@ mod tests {
             interleave_happy_eyeballs_addrs(&[doc_v6, loop_v4]),
             vec![doc_v6, loop_v4]
         );
+    }
+
+    #[test]
+    fn recent_connect_failure_demotes_ipv4_and_ipv6_while_preserving_healthy_interleaving_and_fallbacks()
+     {
+        let _guard = lock_ipv6_reachability_for_test();
+        let t0 = Instant::now();
+
+        let v6_a: SocketAddr = "[2409:8c1e::1]:443".parse().unwrap();
+        let v6_b: SocketAddr = "[2409:8c1e::2]:443".parse().unwrap();
+        let v6_c: SocketAddr = "[2409:8c1e::3]:443".parse().unwrap();
+        let v4_a: SocketAddr = "150.138.180.132:443".parse().unwrap();
+        let v4_b: SocketAddr = "150.138.180.133:443".parse().unwrap();
+        let candidates = [v6_a, v6_b, v6_c, v4_a, v4_b];
+
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&candidates, t0),
+            vec![v6_a, v4_a, v6_b, v4_b, v6_c]
+        );
+
+        let err_timeout = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+        let err_refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        let err_perm = io::Error::new(io::ErrorKind::PermissionDenied, "perm");
+
+        // Non-demotable errors (e.g. PermissionDenied) must not pollute RECENT_FAILED_ADDRS.
+        note_tcp_connect_outcome_at(v6_b, Err(&err_perm), t0);
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&candidates, t0),
+            vec![v6_a, v4_a, v6_b, v4_b, v6_c]
+        );
+
+        // Demoting v6_a and v4_a leaves healthy = [v6_b, v6_c, v4_b], interleaved as [v6_b, v4_b, v6_c],
+        // followed by demoted [v6_a, v4_a] interleaved after healthy candidates.
+        note_tcp_connect_outcome_at(v6_a, Err(&err_timeout), t0);
+        note_tcp_connect_outcome_at(v4_a, Err(&err_refused), t0);
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&candidates, t0 + Duration::from_secs(5)),
+            vec![v6_b, v4_b, v6_c, v6_a, v4_a]
+        );
+
+        // Verify remaining demotable ErrorKinds (HostUnreachable, NetworkUnreachable, AddrNotAvailable)
+        // and verify fallback candidates are NEVER dropped even if ALL candidates failed recently.
+        note_tcp_connect_outcome_at(
+            v6_b,
+            Err(&io::Error::new(io::ErrorKind::HostUnreachable, "host")),
+            t0,
+        );
+        note_tcp_connect_outcome_at(
+            v6_c,
+            Err(&io::Error::new(io::ErrorKind::NetworkUnreachable, "net")),
+            t0,
+        );
+        note_tcp_connect_outcome_at(
+            v4_b,
+            Err(&io::Error::new(io::ErrorKind::AddrNotAvailable, "addr")),
+            t0,
+        );
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&candidates, t0 + Duration::from_secs(10)),
+            vec![v6_a, v4_a, v6_b, v4_b, v6_c],
+            "all candidates must remain present as fallback when every IP recently failed"
+        );
+
+        // Verify max capacity (256) with oldest-entry eviction.
+        clear_recent_failed_addrs();
+        for i in 0..300u16 {
+            let sa: SocketAddr = format!("198.51.100.{}:{}", (i % 250) + 1, 1000 + i)
+                .parse()
+                .unwrap();
+            record_recent_failed_addr_at(sa, t0 + Duration::from_millis(u64::from(i)));
+        }
+        let map_len = RECENT_FAILED_ADDRS.lock().len();
+        assert_eq!(map_len, RECENT_FAILED_ADDR_MAX_ENTRIES);
+        let first_evicted: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+        let newest_kept: SocketAddr = "198.51.100.50:1299".parse().unwrap();
+        assert!(!RECENT_FAILED_ADDRS.lock().contains_key(&first_evicted));
+        assert!(RECENT_FAILED_ADDRS.lock().contains_key(&newest_kept));
+    }
+
+    #[test]
+    fn subsequent_success_ttl_expiry_and_network_generation_restore_normal_priority() {
+        let _guard = lock_ipv6_reachability_for_test();
+        let t0 = Instant::now();
+
+        let dead_cdn: SocketAddr = "150.138.180.132:443".parse().unwrap();
+        let healthy_1: SocketAddr = "150.138.180.133:443".parse().unwrap();
+        let healthy_2: SocketAddr = "120.41.1.10:443".parse().unwrap();
+        let addrs = [dead_cdn, healthy_1, healthy_2];
+        let err_timeout = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+
+        // 1. Demoted before TTL, restored immediately upon subsequent connect success.
+        note_tcp_connect_outcome_at(dead_cdn, Err(&err_timeout), t0);
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&addrs, t0 + Duration::from_secs(89)),
+            vec![healthy_1, healthy_2, dead_cdn]
+        );
+        note_tcp_connect_outcome_at(dead_cdn, Ok(()), t0 + Duration::from_secs(15));
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&addrs, t0 + Duration::from_secs(15)),
+            vec![dead_cdn, healthy_1, healthy_2]
+        );
+
+        // 2. Demoted before 90s TTL, restored automatically once 90s TTL expires.
+        note_tcp_connect_outcome_at(dead_cdn, Err(&err_timeout), t0);
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&addrs, t0 + Duration::from_secs(89)),
+            vec![healthy_1, healthy_2, dead_cdn]
+        );
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&addrs, t0 + RECENT_FAILED_ADDR_TTL),
+            vec![dead_cdn, healthy_1, healthy_2]
+        );
+        assert!(!RECENT_FAILED_ADDRS.lock().contains_key(&dead_cdn));
+
+        // 3. Advancing network generation (notify_network_change / reset_direct_ipv6_reachability)
+        //    clears stale demotions immediately.
+        note_tcp_connect_outcome_at(dead_cdn, Err(&err_timeout), t0);
+        let gen_before = network_generation();
+        reset_direct_ipv6_reachability();
+        assert!(network_generation() > gen_before);
+        assert_eq!(
+            prioritize_healthy_happy_eyeballs_addrs_at(&addrs, t0 + Duration::from_secs(1)),
+            vec![dead_cdn, healthy_1, healthy_2]
+        );
+
+        // 4. End-to-end loopback check via `protected_tcp_connect_addr`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_loopback = closed_listener.local_addr().unwrap();
+            drop(closed_listener);
+
+            let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let live_loopback = live_listener.local_addr().unwrap();
+            let accept_task = tokio::spawn(async move {
+                let _ = live_listener.accept().await;
+            });
+
+            assert!(protected_tcp_connect_addr(dead_loopback).await.is_err());
+            assert_eq!(
+                prioritize_healthy_happy_eyeballs_addrs(&[dead_loopback, live_loopback]),
+                vec![live_loopback, dead_loopback]
+            );
+
+            // Mark live_loopback failed first, then connect successfully and verify it clears!
+            record_recent_failed_addr_at(live_loopback, Instant::now());
+            let stream = protected_tcp_connect_addr(live_loopback)
+                .await
+                .expect("live loopback connect must succeed");
+            drop(stream);
+            let _ = accept_task.await;
+            assert!(!RECENT_FAILED_ADDRS.lock().contains_key(&live_loopback));
+            assert_eq!(
+                prioritize_healthy_happy_eyeballs_addrs(&[live_loopback, dead_loopback]),
+                vec![live_loopback, dead_loopback]
+            );
+        });
     }
 }
