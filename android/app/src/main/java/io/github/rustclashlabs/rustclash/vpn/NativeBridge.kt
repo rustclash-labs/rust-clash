@@ -156,4 +156,9 @@ object NativeBridge {
         stateDir: String,
         sinceEpochMs: Long,
     ): String
+
+    external fun nativeDiagnoseSiteJson(
+        stateDir: String,
+        target: String,
+    ): String
 }

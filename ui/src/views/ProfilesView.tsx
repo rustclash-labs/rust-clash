@@ -6,6 +6,8 @@ import {
   updateProfileSettings,
 } from "../api";
 import {
+  ChevronDownIcon,
+  ChevronRightIcon,
   CloseIcon,
   PlusIcon,
   RefreshIcon,
@@ -16,13 +18,40 @@ import type {
   ConfigDiffSummary,
   ProfileMetadata,
   ProfilesSnapshot,
+  SkippedProxyEntry,
 } from "../types";
 import { formatBytes, formatRelativeTime } from "../utils/format";
+import {
+  summarizeSkippedUnsupported,
+  type SkippedProtocolGroup,
+} from "../utils/statusModel.mjs";
 
 interface ProfilesViewProps {
   profilesSnapshot: ProfilesSnapshot | null;
   onReloaded: () => Promise<void>;
 }
+
+type ProfileOperationReport =
+  | {
+      kind: "import";
+      profileName: string;
+      addedNodes: number;
+      totalNodes: number;
+      skippedDuplicates: number;
+      skippedTotal: number;
+      skippedGroups: SkippedProtocolGroup[];
+      protocolsSummaryZh: string;
+      protocolsSummaryEn: string;
+    }
+  | {
+      kind: "refresh";
+      profileName: string;
+      proxyCount: number;
+      manualCount: number;
+      auditScore?: number;
+      auditGrade?: string;
+      diff?: ConfigDiffSummary | null;
+    };
 
 const INTERVAL_OPTIONS: Array<{
   value: number;
@@ -55,6 +84,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
   const [autoIntervalSecs, setAutoIntervalSecs] = useState<number>(86400);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  const [opReport, setOpReport] = useState<ProfileOperationReport | null>(null);
+  const [showSkippedDetail, setShowSkippedDetail] = useState(false);
 
   // YAML Editor Modal state
   const [yamlModalOpen, setYamlModalOpen] = useState(false);
@@ -103,27 +134,48 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
     setBusyId("import");
     setToast(null);
     try {
+      const requestedName = profileName.trim();
       const intervalArg = autoIntervalSecs > 0 ? autoIntervalSecs : null;
       const res = await importProfile(
         trimmed,
-        profileName.trim() || undefined,
+        requestedName || undefined,
         true,
         intervalArg,
       );
       setProfileName("");
       setImportInput("");
       await onReloaded();
-      setToast({
-        ok: true,
-        text: tr(
-          `成功导入并启用配置（共 ${res["total-nodes"] ?? res.count} 个节点）`,
-          `Imported and enabled profile (${res["total-nodes"] ?? res.count} nodes)`,
-        ),
+
+      const addedNodes = Array.isArray(res["added-nodes"])
+        ? res["added-nodes"].length
+        : (res.count ?? 0);
+      const totalNodes = res["total-nodes"] ?? res.count ?? addedNodes;
+      const skippedDuplicates = res["skipped-duplicates"] ?? 0;
+      const rawUnsupported: SkippedProxyEntry[] =
+        res["skipped-unsupported"] ?? [];
+      const skippedSummary = summarizeSkippedUnsupported(rawUnsupported);
+
+      setShowSkippedDetail(false);
+      setOpReport({
+        kind: "import",
+        profileName:
+          requestedName ||
+          tr("新导入订阅配置", "Imported Subscription"),
+        addedNodes,
+        totalNodes,
+        skippedDuplicates,
+        skippedTotal: skippedSummary.total,
+        skippedGroups: skippedSummary.groups,
+        protocolsSummaryZh: skippedSummary.protocolsSummaryZh,
+        protocolsSummaryEn: skippedSummary.protocolsSummaryEn,
       });
     } catch (err) {
       setToast({
         ok: false,
-        text: err instanceof Error ? err.message : String(err),
+        text: tr(
+          `导入未成功（原有配置未受影响）：${err instanceof Error ? err.message : String(err)}`,
+          `Import failed (existing profile preserved): ${err instanceof Error ? err.message : String(err)}`,
+        ),
       });
     } finally {
       setBusyId(null);
@@ -202,24 +254,22 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
       const res = await clashApi.refreshProfile(p.id);
       await onReloaded();
       const manualCount = res.profile.manual_proxy_count ?? 0;
-      const protectedNote =
-        manualCount > 0
-          ? tr(
-              `，已自动保留 ${manualCount} 个手动节点`,
-              `, ${manualCount} manual node(s) preserved`,
-            )
-          : "";
-      setToast({
-        ok: true,
-        text: tr(
-          `已更新订阅「${res.profile.name}」（${res.profile.proxy_count} 个节点${protectedNote}）`,
-          `Updated '${res.profile.name}' (${res.profile.proxy_count} nodes${protectedNote})`,
-        ),
+      setOpReport({
+        kind: "refresh",
+        profileName: res.profile.name,
+        proxyCount: res.profile.proxy_count,
+        manualCount,
+        auditScore: res.audit_score,
+        auditGrade: res.audit_grade,
+        diff: res.diff ?? null,
       });
     } catch (err) {
       setToast({
         ok: false,
-        text: err instanceof Error ? err.message : String(err),
+        text: tr(
+          `订阅更新失败（已安全保留上一份可用配置与手动节点）：${err instanceof Error ? err.message : String(err)}`,
+          `Subscription refresh failed (previous working configuration preserved): ${err instanceof Error ? err.message : String(err)}`,
+        ),
       });
     } finally {
       setBusyId(null);
@@ -305,6 +355,29 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
     }
   };
 
+  const handleDownloadRedactedYaml = () => {
+    if (!yamlText.trim()) return;
+    const blob = new Blob([yamlText], { type: "text/yaml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const safeSlug = (yamlTargetName || "profile")
+      .replace(/[^a-zA-Z0-9_-]+/g, "-")
+      .replace(/^-|-$/g, "");
+    a.download = `rustclash-${safeSlug || "profile"}-redacted.yaml`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setYamlMsg({
+      ok: true,
+      text: tr(
+        "已导出脱敏 YAML（密码与 UUID 已隐去为 ***REDACTED***，适合安全分享排障，不可直接作为跨设备含密钥完整备份）",
+        "Exported redacted YAML (secrets masked as ***REDACTED*** — safe for sharing/editing, not a full credential backup)",
+      ),
+    });
+  };
+
   const handleAuditDraft = async () => {
     if (!yamlText.trim()) return;
     setYamlBusy("audit");
@@ -372,6 +445,252 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
         </div>
       )}
 
+      {/* Structured Import / Refresh Result Report Card */}
+      {opReport && opReport.kind === "import" && (
+        <section
+          className="bento-card"
+          style={{
+            borderColor:
+              opReport.skippedTotal > 0
+                ? "var(--accent-amber)"
+                : "var(--accent-emerald)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 11,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <strong style={{ fontSize: 15 }}>
+                {tr("订阅导入结果报告", "Subscription Import Report")}
+              </strong>
+              <span
+                className={`badge ${
+                  opReport.skippedTotal > 0 ? "badge-amber" : "badge-emerald"
+                }`}
+              >
+                {opReport.skippedTotal > 0
+                  ? tr("部分成功", "Partial Success")
+                  : tr("全部成功", "Imported")}
+              </span>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                {opReport.profileName}
+              </span>
+            </div>
+
+            <button
+              type="button"
+              className="bento-icon-action"
+              onClick={() => setOpReport(null)}
+              title={tr("关闭报告", "Close report")}
+            >
+              <CloseIcon size={15} />
+            </button>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+              gap: 10,
+            }}
+          >
+            <div className="sub-pill-box">
+              <div
+                className="tabular"
+                style={{
+                  fontSize: 22,
+                  fontWeight: 750,
+                  color: "var(--accent-emerald)",
+                }}
+              >
+                {opReport.addedNodes}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                {tr("成功导入可用节点", "Compatible Nodes Imported")}
+              </div>
+            </div>
+
+            <div className="sub-pill-box">
+              <div className="tabular" style={{ fontSize: 22, fontWeight: 750 }}>
+                {opReport.skippedDuplicates}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                {tr("重复节点自动跳过", "Duplicates Skipped")}
+              </div>
+            </div>
+
+            <div className="sub-pill-box">
+              <div
+                className="tabular"
+                style={{
+                  fontSize: 22,
+                  fontWeight: 750,
+                  color:
+                    opReport.skippedTotal > 0
+                      ? "var(--accent-amber)"
+                      : "var(--text-primary)",
+                }}
+              >
+                {opReport.skippedTotal}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                {tr("暂不支持已忽略", "Unsupported Skipped")}
+              </div>
+            </div>
+          </div>
+
+          {opReport.skippedTotal > 0 && (
+            <div
+              className="sub-pill-box"
+              style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}
+            >
+              <div>
+                {tr(
+                  `不兼容节点主要使用 ${opReport.protocolsSummaryZh} 等暂未支持的协议或传输参数。当前配置已启用全部 ${opReport.totalNodes} 个可用兼容节点，现有手动节点已安全保留。`,
+                  `Skipped nodes primarily use ${opReport.protocolsSummaryEn}. All ${opReport.totalNodes} compatible node(s) are active and existing manual nodes remain intact.`,
+                )}
+              </div>
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 5,
+                  cursor: "pointer",
+                  color: "var(--accent-blue)",
+                  fontWeight: 600,
+                  fontSize: 12,
+                }}
+                onClick={() => setShowSkippedDetail((v) => !v)}
+              >
+                {showSkippedDetail ? (
+                  <ChevronDownIcon size={14} />
+                ) : (
+                  <ChevronRightIcon size={14} />
+                )}
+                <span>
+                  {showSkippedDetail
+                    ? tr("收起不兼容节点原因明细", "Hide skipped node details")
+                    : tr("查看不兼容节点原因明细", "View skipped node reasons")}
+                </span>
+              </div>
+
+              {showSkippedDetail && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 2 }}>
+                  {opReport.skippedGroups.map((g) => (
+                    <div
+                      key={g.protocol}
+                      style={{ fontSize: 12, color: "var(--text-secondary)" }}
+                    >
+                      • <strong>{g.label}</strong> × {g.count}
+                      {g.sampleNames.length > 0
+                        ? ` (${g.sampleNames.join(", ")}${g.count > g.sampleNames.length ? "…" : ""})`
+                        : ""}
+                      {g.sampleReason ? ` — ${g.sampleReason}` : ""}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {opReport && opReport.kind === "refresh" && (
+        <section
+          className="bento-card"
+          style={{
+            borderColor:
+              (opReport.diff?.newly_insecure_nodes.length ?? 0) > 0
+                ? "var(--accent-amber)"
+                : "var(--accent-emerald)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <strong style={{ fontSize: 15 }}>
+                {tr(
+                  `订阅更新完成：${opReport.profileName}`,
+                  `Subscription Refreshed: ${opReport.profileName}`,
+                )}
+              </strong>
+              {opReport.auditGrade && (
+                <span className="badge badge-emerald tabular">
+                  {tr("安全评级 ", "Audit ")}
+                  {opReport.auditGrade}
+                  {opReport.auditScore != null ? ` (${opReport.auditScore}/100)` : ""}
+                </span>
+              )}
+              {opReport.manualCount > 0 && (
+                <span className="badge badge-sky tabular">
+                  🛡 {tr(`已保留 ${opReport.manualCount} 个手动节点`, `${opReport.manualCount} manual kept`)}
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              className="bento-icon-action"
+              onClick={() => setOpReport(null)}
+            >
+              <CloseIcon size={15} />
+            </button>
+          </div>
+
+          {opReport.diff ? (
+            <div className="sub-pill-box" style={{ fontSize: 12.5, display: "flex", flexDirection: "column", gap: 4 }}>
+              <div className="tabular">
+                {tr(
+                  `当前共 ${opReport.proxyCount} 个可用节点 · 新增 +${opReport.diff.added_proxies.length} · 移除 -${opReport.diff.removed_proxies.length} · 参数变更 ${opReport.diff.changed_proxies.length} · 规则数 ${opReport.diff.rules_prev_count} → ${opReport.diff.rules_next_count}`,
+                  `Total ${opReport.proxyCount} nodes · +${opReport.diff.added_proxies.length} added · -${opReport.diff.removed_proxies.length} removed · ${opReport.diff.changed_proxies.length} changed · Rules ${opReport.diff.rules_prev_count} → ${opReport.diff.rules_next_count}`,
+                )}
+              </div>
+              {opReport.diff.removed_proxies.length > 0 && (
+                <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                  {tr("本次下线节点：", "Removed nodes: ")}
+                  {opReport.diff.removed_proxies.slice(0, 5).join("、")}
+                  {opReport.diff.removed_proxies.length > 5 ? "…" : ""}
+                </div>
+              )}
+              {opReport.diff.newly_insecure_nodes.length > 0 && (
+                <div style={{ fontSize: 12, color: "var(--accent-amber)", fontWeight: 600 }}>
+                  ⚠{" "}
+                  {tr(
+                    `发现 ${opReport.diff.newly_insecure_nodes.length} 个开启跳过证书校验 (skip-cert-verify) 的风险节点：${opReport.diff.newly_insecure_nodes.slice(0, 3).join("、")}`,
+                    `${opReport.diff.newly_insecure_nodes.length} node(s) enable skip-cert-verify: ${opReport.diff.newly_insecure_nodes.slice(0, 3).join(", ")}`,
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
+              {tr(
+                `订阅已同步最新内容，当前共 ${opReport.proxyCount} 个可用节点。`,
+                `Subscription synced — ${opReport.proxyCount} active nodes available.`,
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Top Quick-Import Card */}
       <section className="bento-card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <div
@@ -389,8 +708,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
             </div>
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
               {tr(
-                "粘贴机场 https:// 订阅链接、节点分享链接或 YAML 即可一键导入启用",
-                "Paste an https:// subscription URL, share links, or Clash YAML to import in one click",
+                "粘贴机场 https:// 订阅链接、节点分享链接或 YAML 即可一键导入启用，并自动生成兼容性报告",
+                "Paste an https:// subscription URL, share links, or Clash YAML to import with a detailed compatibility report",
               )}
             </div>
           </div>
@@ -479,8 +798,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
           <span>
             🛡{" "}
             {tr(
-              "已启用手动节点保护：在此配置中手动导入或新建的节点会独立保存，订阅自动更新时不会丢失。",
-              "Manual Node Protection Enabled: Manually imported or created nodes are stored independently and never lost on subscription auto-update.",
+              "已启用手动节点保护与失败安全回滚：手动添加节点独立保存，订阅更新失败时自动保留上一份可用配置。",
+              "Manual Node Protection & Fail-Safe Rollback: Manual nodes are preserved independently, and failed refreshes keep your previous working config.",
             )}
           </span>
         </div>
@@ -720,7 +1039,7 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                     disabled={busyId === `yaml:${p.id}`}
                     onClick={() => void handleOpenEditYaml(p)}
                   >
-                    {tr("编辑 YAML", "Edit YAML")}
+                    {tr("查看/编辑 YAML", "Edit YAML")}
                   </button>
 
                   {!isActive && p.kind !== "starter" && (
@@ -741,7 +1060,7 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
         </div>
       )}
 
-      {/* YAML Editor Modal with Audit / Diff Support */}
+      {/* YAML Editor Modal with Audit / Diff & Redacted Export Warning */}
       {yamlModalOpen && (
         <div
           className="modal-backdrop"
@@ -764,12 +1083,15 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
             >
               <div>
                 <div style={{ fontSize: 16, fontWeight: 650 }}>
-                  {tr(`编辑 YAML：${yamlTargetName}`, `Edit YAML: ${yamlTargetName}`)}
+                  {tr(
+                    `查看 / 编辑脱敏 YAML：${yamlTargetName}`,
+                    `Edit Redacted YAML: ${yamlTargetName}`,
+                  )}
                 </div>
                 <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
                   {tr(
-                    "支持配置安全检查与差异对比，保存后零停机热重载",
-                    "Supports static security audit & diff check with zero-downtime hot reload",
+                    "密码与 UUID 已隐去为 ***REDACTED***：本机保存时自动还原未改动的原始密钥，但导出的脱敏 YAML 不可作为跨设备含密钥完整备份",
+                    "Secrets are masked as ***REDACTED***: unchanged credentials auto-restore locally on save, but exported YAML is not a full credential backup",
                   )}
                 </div>
               </div>
@@ -839,16 +1161,26 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                 flexWrap: "wrap",
               }}
             >
-              <button
-                type="button"
-                className="btn"
-                disabled={Boolean(yamlBusy)}
-                onClick={() => void handleAuditDraft()}
-              >
-                {yamlBusy === "audit"
-                  ? tr("检查中...", "Auditing...")
-                  : tr("语法与安全检查", "Audit & Diff")}
-              </button>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={Boolean(yamlBusy)}
+                  onClick={() => void handleAuditDraft()}
+                >
+                  {yamlBusy === "audit"
+                    ? tr("检查中...", "Auditing...")
+                    : tr("语法与安全检查", "Audit & Diff")}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={Boolean(yamlBusy)}
+                  onClick={handleDownloadRedactedYaml}
+                >
+                  {tr("导出脱敏 YAML", "Export Redacted YAML")}
+                </button>
+              </div>
 
               <div style={{ display: "flex", gap: 8 }}>
                 <button

@@ -42,7 +42,7 @@ import { ConnectionsView } from "./views/ConnectionsView";
 import { DashboardView } from "./views/DashboardView";
 import { ProfilesView } from "./views/ProfilesView";
 import { ProxiesView } from "./views/ProxiesView";
-import { ToolsView } from "./views/ToolsView";
+import { ToolsView, type ToolsSubTab } from "./views/ToolsView";
 
 type NavTab = "dashboard" | "proxies" | "profiles" | "connections" | "tools";
 
@@ -66,6 +66,8 @@ export const App: React.FC = () => {
     loadInitialSidebarCollapsed(),
   );
   const [focusGroup, setFocusGroup] = useState<string | null>(null);
+  const [toolsSubTab, setToolsSubTab] = useState<ToolsSubTab>("settings");
+  const [siteDoctorTarget, setSiteDoctorTarget] = useState<string>("chatgpt.com");
   const [healthOpen, setHealthOpen] = useState(false);
   const healthWrapRef = useRef<HTMLDivElement | null>(null);
 
@@ -851,6 +853,7 @@ export const App: React.FC = () => {
                     className="btn btn-sm"
                     onClick={() => {
                       setHealthOpen(false);
+                      setToolsSubTab("settings");
                       setTab("tools");
                     }}
                   >
@@ -960,7 +963,15 @@ export const App: React.FC = () => {
                 setFocusGroup(groupName ?? null);
                 setTab("proxies");
               }}
-              onOpenTools={() => setTab("tools")}
+              onOpenTools={() => {
+                setToolsSubTab("settings");
+                setTab("tools");
+              }}
+              onOpenSiteDoctor={(target) => {
+                setSiteDoctorTarget(target ?? "chatgpt.com");
+                setToolsSubTab("diagnostics");
+                setTab("tools");
+              }}
             />
           )}
 
@@ -1008,6 +1019,13 @@ export const App: React.FC = () => {
                 setWsEpoch((n) => n + 1);
                 void refreshCore();
               }}
+              initialSubTab={toolsSubTab}
+              initialSiteTarget={siteDoctorTarget}
+              onOpenProxies={() => {
+                setFocusGroup(null);
+                setTab("proxies");
+              }}
+              onOpenProfiles={() => setTab("profiles")}
             />
           )}
         </main>

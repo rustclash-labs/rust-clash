@@ -230,6 +230,62 @@ data class ExplainResultUi(
         get() = if (rulePayload.isBlank()) ruleType else "$ruleType, $rulePayload"
 }
 
+data class SiteStageCheckUi(
+    val stage: String,
+    val labelZh: String,
+    val status: String,
+    val latencyMs: Long?,
+    val detailZh: String,
+)
+
+data class SiteDiagnosisUi(
+    val input: String,
+    val normalizedUrl: String,
+    val targetHost: String,
+    val targetPort: Int,
+    val mode: String,
+    val matchedRule: String,
+    val routeFlow: List<String>,
+    val effectiveOutbound: String,
+    val effectiveProtocol: String,
+    val exitType: String,
+    val diagnosisCode: String,
+    val severity: String,
+    val headlineZh: String,
+    val summaryZh: String,
+    val routeSummaryZh: String,
+    val actionsZh: List<String>,
+    val suggestedActionKind: String?,
+    val stageChecks: List<SiteStageCheckUi>,
+    val vpnRunning: Boolean,
+)
+
+data class SkippedProtocolGroupUi(
+    val protocolLabel: String,
+    val count: Int,
+    val sampleNames: List<String>,
+    val sampleReason: String,
+)
+
+data class ProfileOpSummaryUi(
+    val isRefresh: Boolean,
+    val profileName: String,
+    val addedNodes: Int = 0,
+    val totalNodes: Int = 0,
+    val skippedDuplicates: Int = 0,
+    val skippedUnsupportedTotal: Int = 0,
+    val skippedGroups: List<SkippedProtocolGroupUi> = emptyList(),
+    val diffAddedCount: Int = 0,
+    val diffRemovedCount: Int = 0,
+    val diffChangedCount: Int = 0,
+    val rulesPrevCount: Int = 0,
+    val rulesNextCount: Int = 0,
+    val auditGrade: String? = null,
+    val auditScore: Int? = null,
+    val newlyInsecureCount: Int = 0,
+    val manualProtectedCount: Int = 0,
+)
+
 data class ProfileUiItem(
     val id: String,
     val name: String,
@@ -299,6 +355,7 @@ data class AppUiState(
     val diagnostics: List<DiagnosticEntryUi> = emptyList(),
     val diagnosticsFilter: DiagnosticsFilter = DiagnosticsFilter.ALL,
     val explainResult: ExplainResultUi? = null,
+    val siteDiagnosis: SiteDiagnosisUi? = null,
     val nodeSearchQuery: String = "",
     val sortNodesByDelay: Boolean = false,
     val ruleSearchQuery: String = "",
@@ -318,6 +375,8 @@ data class AppUiState(
     val testingNodeName: String? = null,
     val isUpdatingGeoData: Boolean = false,
     val isExplaining: Boolean = false,
+    val isDiagnosingSite: Boolean = false,
+    val lastProfileOpSummary: ProfileOpSummaryUi? = null,
     val refreshingProfileId: String? = null,
     val activeYamlRedacted: String = "",
     val editableRulesText: String = "",
@@ -844,5 +903,187 @@ object UiJsonParsers {
             cleaned = cleaned.substring(prefix.length).trim()
         }
         return cleaned.ifEmpty { fallback }
+    }
+
+    private fun prettyProtocolLabel(rawProto: String): String =
+        when (rawProto.trim().lowercase(Locale.ROOT)) {
+            "vmess" -> "VMess"
+            "hysteria2", "hy2" -> "Hysteria2"
+            "hysteria" -> "Hysteria"
+            "tuic" -> "TUIC"
+            "wireguard", "wg" -> "WireGuard"
+            "ssr", "shadowsocksr" -> "ShadowsocksR"
+            "snell" -> "Snell"
+            "ss", "shadowsocks" -> "Shadowsocks"
+            "vless" -> "VLESS"
+            "trojan" -> "Trojan"
+            "anytls" -> "AnyTLS"
+            "" -> "未知协议"
+            else -> rawProto.trim().uppercase(Locale.ROOT)
+        }
+
+    fun parseSiteDiagnosisResponse(rawJson: String): Result<SiteDiagnosisUi> {
+        val root = runCatching { JSONObject(rawJson) }.getOrNull()
+            ?: return Result.failure(IllegalArgumentException("无法解析网站诊断响应"))
+        if (!root.optBoolean("ok", false)) {
+            val err = formatCleanBackendError(root.optString("error"), "网站连通性诊断失败")
+            return Result.failure(IllegalStateException(err))
+        }
+        val d = root.optJSONObject("diagnosis") ?: root
+        val routeFlow = mutableListOf<String>()
+        val rfArr = d.optJSONArray("route_flow") ?: JSONArray()
+        for (i in 0 until rfArr.length()) {
+            val item = rfArr.optString(i).trim()
+            if (item.isNotEmpty()) routeFlow.add(item)
+        }
+        val actions = mutableListOf<String>()
+        val actArr = d.optJSONArray("actions_zh") ?: JSONArray()
+        for (i in 0 until actArr.length()) {
+            val item = actArr.optString(i).trim()
+            if (item.isNotEmpty()) actions.add(NodeImportSupport.redactSecretsForUi(item))
+        }
+        val stages = mutableListOf<SiteStageCheckUi>()
+        val stArr = d.optJSONArray("stage_checks") ?: JSONArray()
+        for (i in 0 until stArr.length()) {
+            val st = stArr.optJSONObject(i) ?: continue
+            val lat = if (st.has("latency_ms") && !st.isNull("latency_ms")) {
+                st.optLong("latency_ms", -1L).takeIf { it >= 0L }
+            } else {
+                null
+            }
+            stages.add(
+                SiteStageCheckUi(
+                    stage = st.optString("stage", ""),
+                    labelZh = st.optString("label_zh", st.optString("stage", "")),
+                    status = st.optString("status", "skipped"),
+                    latencyMs = lat,
+                    detailZh = NodeImportSupport.redactSecretsForUi(st.optString("detail_zh", "")),
+                ),
+            )
+        }
+        val suggestedAction = if (d.has("suggested_action_kind") && !d.isNull("suggested_action_kind")) {
+            d.optString("suggested_action_kind").trim().takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+        return Result.success(
+            SiteDiagnosisUi(
+                input = d.optString("input", ""),
+                normalizedUrl = d.optString("normalized_url", ""),
+                targetHost = d.optString("target_host", ""),
+                targetPort = d.optInt("target_port", 443),
+                mode = d.optString("mode", "rule"),
+                matchedRule = d.optString("matched_rule", ""),
+                routeFlow = routeFlow,
+                effectiveOutbound = d.optString("effective_outbound", "DIRECT"),
+                effectiveProtocol = d.optString("effective_protocol", "DIRECT"),
+                exitType = d.optString("exit_type", "DIRECT"),
+                diagnosisCode = d.optString("diagnosis_code", "ok"),
+                severity = d.optString("severity", "ok"),
+                headlineZh = NodeImportSupport.redactSecretsForUi(d.optString("headline_zh", "")),
+                summaryZh = NodeImportSupport.redactSecretsForUi(d.optString("summary_zh", "")),
+                routeSummaryZh = NodeImportSupport.redactSecretsForUi(d.optString("route_summary_zh", "")),
+                actionsZh = actions,
+                suggestedActionKind = suggestedAction,
+                stageChecks = stages,
+                vpnRunning = root.optBoolean("vpnRunning", false),
+            ),
+        )
+    }
+
+    fun parseImportSummary(rawJson: String, profileName: String): ProfileOpSummaryUi? {
+        val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: return null
+        if (!obj.optBoolean("ok", false)) return null
+        val added = obj.optJSONArray("addedNodes")?.length() ?: obj.optInt("count", 0)
+        val total = obj.optInt("totalNodes", added)
+        val skippedDups = obj.optInt("skippedDuplicates", 0)
+        val skippedArr = obj.optJSONArray("skippedUnsupported")
+        val grouped = LinkedHashMap<String, Triple<Int, MutableList<String>, String>>()
+        var skippedTotal = 0
+        if (skippedArr != null) {
+            skippedTotal = skippedArr.length()
+            for (i in 0 until skippedArr.length()) {
+                val item = skippedArr.optJSONObject(i) ?: continue
+                val protoKey = item.optString("protocol", "unknown").trim().lowercase(Locale.ROOT).ifEmpty { "unknown" }
+                val rawName = if (item.has("name") && !item.isNull("name")) item.optString("name").trim() else ""
+                val reason = NodeImportSupport.redactSecretsForUi(item.optString("reason", "当前版本暂不支持该协议"))
+                val current = grouped[protoKey]
+                if (current == null) {
+                    val names = mutableListOf<String>()
+                    if (rawName.isNotEmpty()) names.add(rawName)
+                    grouped[protoKey] = Triple(1, names, reason)
+                } else {
+                    if (rawName.isNotEmpty() && current.second.size < 3 && rawName !in current.second) {
+                        current.second.add(rawName)
+                    }
+                    grouped[protoKey] = Triple(current.first + 1, current.second, current.third.ifEmpty { reason })
+                }
+            }
+        } else {
+            skippedTotal = obj.optInt("skippedUnsupported", 0)
+        }
+
+        val groupsUi = grouped.entries
+            .map { (protoKey, triple) ->
+                SkippedProtocolGroupUi(
+                    protocolLabel = prettyProtocolLabel(protoKey),
+                    count = triple.first,
+                    sampleNames = triple.second.toList(),
+                    sampleReason = triple.third,
+                )
+            }
+            .sortedWith(compareByDescending<SkippedProtocolGroupUi> { it.count }.thenBy { it.protocolLabel })
+
+        return ProfileOpSummaryUi(
+            isRefresh = false,
+            profileName = profileName.ifBlank { "当前配置" },
+            addedNodes = added,
+            totalNodes = total,
+            skippedDuplicates = skippedDups,
+            skippedUnsupportedTotal = skippedTotal,
+            skippedGroups = groupsUi,
+        )
+    }
+
+    fun parseRefreshSummary(rawJson: String, fallbackProfileName: String = "订阅配置"): ProfileOpSummaryUi? {
+        val root = runCatching { JSONObject(rawJson) }.getOrNull() ?: return null
+        if (!root.optBoolean("ok", false)) return null
+        val meta = root.optJSONObject("refreshedProfile")
+        val diff = root.optJSONObject("diff")
+        val profileName = meta?.optString("name")?.trim()?.takeIf { it.isNotEmpty() } ?: fallbackProfileName
+        val proxyCount = meta?.optInt("proxy_count", 0) ?: 0
+        val ruleCount = meta?.optInt("rule_count", 0) ?: 0
+        val manualCount = meta?.optInt("manual_proxy_count", 0) ?: 0
+        val auditGrade = if (root.has("auditGrade") && !root.isNull("auditGrade")) {
+            root.optString("auditGrade").trim().takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+        val auditScore = if (root.has("auditScore") && !root.isNull("auditScore")) {
+            root.optInt("auditScore", -1).takeIf { it >= 0 }
+        } else {
+            null
+        }
+        val diffAdded = diff?.optJSONArray("added_proxies")?.length() ?: 0
+        val diffRemoved = diff?.optJSONArray("removed_proxies")?.length() ?: 0
+        val diffChanged = diff?.optJSONArray("changed_proxies")?.length() ?: 0
+        val rulesPrev = diff?.optInt("rules_prev_count", ruleCount) ?: ruleCount
+        val rulesNext = diff?.optInt("rules_next_count", ruleCount) ?: ruleCount
+        val newlyInsecure = diff?.optJSONArray("newly_insecure_nodes")?.length() ?: 0
+
+        return ProfileOpSummaryUi(
+            isRefresh = true,
+            profileName = profileName,
+            totalNodes = proxyCount,
+            diffAddedCount = diffAdded,
+            diffRemovedCount = diffRemoved,
+            diffChangedCount = diffChanged,
+            rulesPrevCount = rulesPrev,
+            rulesNextCount = rulesNext,
+            auditGrade = auditGrade,
+            auditScore = auditScore,
+            newlyInsecureCount = newlyInsecure,
+            manualProtectedCount = manualCount,
+        )
     }
 }

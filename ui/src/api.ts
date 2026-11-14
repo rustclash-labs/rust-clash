@@ -28,6 +28,7 @@ import type {
   RuleExplainResponse,
   RuleItem,
   RunMode,
+  SiteDiagnosisReport,
   SkippedProxyEntry,
   SysProxyStatus,
   TrafficPoint,
@@ -713,6 +714,18 @@ export const clashApi = {
       },
     ),
   probeWaterfall: runDiagnosticsWaterfall,
+  diagnoseSite: (
+    target: string,
+    opts?: { checkUdp?: boolean; timeoutMs?: number },
+  ) =>
+    apiFetch<SiteDiagnosisReport>("/diagnostics/site-check", {
+      method: "POST",
+      body: JSON.stringify({
+        target,
+        check_udp: opts?.checkUdp ?? true,
+        timeout: opts?.timeoutMs ?? 5000,
+      }),
+    }),
   probeEndpointMatrix: (name: string, timeoutMs = 4500) =>
     apiFetch<EndpointMatrixReport>(
       `/proxies/${encodeURIComponent(name)}/matrix`,

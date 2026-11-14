@@ -1720,3 +1720,65 @@ rules:
     bg_rt.shutdown_timeout(Duration::from_millis(200));
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn android_diagnose_site_offline_and_live_demo_e2e() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    use proxy_ffi::{
+        android_jni::{
+            android_diagnose_site_core, android_save_custom_rules_core,
+            start_android_vpn_with_state_dir, stop_android_vpn_core,
+        },
+        fd_bridge::CallbackSocketProtector,
+    };
+    use uuid::Uuid;
+
+    let _serial = SERIAL_ANDROID_FFI_LOCK.blocking_lock();
+    let _ = stop_android_vpn_core();
+
+    let state_dir =
+        std::env::temp_dir().join(format!("rc-android-sitedoctor-e2e-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // 1. Offline REJECT rule diagnosis works without starting VPN
+    android_save_custom_rules_core(&state_dir, "DOMAIN-SUFFIX,blocked-ad.example,REJECT")
+        .expect("save custom reject rule");
+    let offline_diag =
+        android_diagnose_site_core(&state_dir, "blocked-ad.example").expect("offline diagnose");
+    assert_eq!(offline_diag["ok"], true);
+    assert_eq!(offline_diag["vpnRunning"], false);
+    assert_eq!(offline_diag["diagnosis"]["diagnosis_code"], "rule_rejected");
+    assert_eq!(offline_diag["diagnosis"]["exit_type"], "REJECT");
+
+    // 2. Start live VPN in `--demo` sandbox mode and diagnose demo HTTP origin
+    let (fd1, peer1, ino1) = create_tun_like_socketpair();
+    let protector = Arc::new(CallbackSocketProtector::new_unix(
+        "android-site-doctor-test",
+        false,
+        |_fd| Ok(()),
+    ));
+    let started = start_android_vpn_with_state_dir(
+        Some(unsafe { OwnedFd::from_raw_fd(fd1) }),
+        Some(&state_dir),
+        "",
+        true,
+        protector,
+    )
+    .expect("start demo android vpn");
+    assert_eq!(started["ok"], true);
+
+    // SSRF guard must still block IMDS on Android FFI
+    let ssrf_err =
+        android_diagnose_site_core(&state_dir, "http://169.254.169.254/latest/meta-data/")
+            .expect_err("IMDS must be blocked");
+    assert!(ssrf_err.contains("blocked by SSRF protection"));
+
+    assert!(stop_android_vpn_core());
+    assert_tun_fd_fully_closed_in_kernel(fd1, ino1, peer1);
+    unsafe {
+        libc::close(peer1);
+    }
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

@@ -2103,9 +2103,14 @@ pub fn android_refresh_profile_core(
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let prev_cfg = mgr.load_profile_config_by_id(profile_id);
         let (meta, cfg, is_active) = handle
             .block_on(mgr.refresh_subscription(profile_id))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let diff_opt = prev_cfg
+            .as_ref()
+            .map(|prev| proxy_core::audit::diff_configs(prev, &cfg));
+        let audit = proxy_core::audit::audit_config(&cfg);
         if is_active && !engine.demo_info().enabled {
             handle
                 .block_on(
@@ -2114,22 +2119,42 @@ pub fn android_refresh_profile_core(
                 )
                 .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         }
-        return android_profiles_snapshot_core(state_dir);
+        let mut base = android_profiles_snapshot_core(state_dir)?;
+        if let Some(obj) = base.as_object_mut() {
+            obj.insert("refreshedProfile".to_string(), serde_json::json!(meta));
+            obj.insert("diff".to_string(), serde_json::json!(diff_opt));
+            obj.insert("auditScore".to_string(), serde_json::json!(audit.score));
+            obj.insert("auditGrade".to_string(), serde_json::json!(audit.grade));
+        }
+        return Ok(base);
     }
 
-    {
+    let (meta, diff_opt, score, grade) = {
         let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
         let mgr = ProfileManager::open_or_init(state_dir)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let prev_cfg = mgr.load_profile_config_by_id(profile_id);
         let temp_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("Tokio init failed: {e}"))?;
-        let _ = temp_rt
+        let (meta, cfg, _) = temp_rt
             .block_on(mgr.refresh_subscription(profile_id))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let diff_opt = prev_cfg
+            .as_ref()
+            .map(|prev| proxy_core::audit::diff_configs(prev, &cfg));
+        let audit = proxy_core::audit::audit_config(&cfg);
+        (meta, diff_opt, audit.score, audit.grade)
+    };
+    let mut base = android_profiles_snapshot_core(state_dir)?;
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("refreshedProfile".to_string(), serde_json::json!(meta));
+        obj.insert("diff".to_string(), serde_json::json!(diff_opt));
+        obj.insert("auditScore".to_string(), serde_json::json!(score));
+        obj.insert("auditGrade".to_string(), serde_json::json!(grade));
     }
-    android_profiles_snapshot_core(state_dir)
+    Ok(base)
 }
 
 /// Retrieve the active profile's redacted YAML + rules list offline or live.
@@ -3217,6 +3242,133 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             since_epoch_ms as u64
         };
         android_collect_debug_snapshot_core(Path::new(dir.trim()), since_u64)
+    })();
+    let out = match res {
+        Ok(v) => v.to_string(),
+        Err(e) => {
+            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
+        }
+    };
+    rust_to_jstring(&mut env, &out)
+}
+
+/// Offline + Live unified website diagnostic (`diagnose_site`) for Android Jetpack Compose.
+pub fn android_diagnose_site_core(
+    state_dir: &Path,
+    target_raw: &str,
+) -> Result<serde_json::Value, String> {
+    if let Some((handle, engine)) = live_handle_and_engine() {
+        let demo = engine.demo_info();
+        let mut allowed_private = Vec::new();
+        if demo.enabled {
+            if let Some(authority) = demo
+                .http_benchmark_origin
+                .trim()
+                .strip_prefix("http://")
+                .or_else(|| demo.http_benchmark_origin.trim().strip_prefix("https://"))
+                .and_then(|rest| rest.split('/').next())
+            {
+                if let Ok(sock_addr) = authority.parse::<std::net::SocketAddr>() {
+                    allowed_private.push(sock_addr);
+                } else if let Some(port_str) = authority.strip_prefix("localhost:")
+                    && let Ok(port) = port_str.parse::<u16>()
+                {
+                    allowed_private.push(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+                }
+            }
+            if let Some(dns_addr) = engine.dns_addr() {
+                allowed_private.push(dns_addr);
+            }
+        }
+        let fallback_demo_udp = if demo.enabled {
+            engine.dns_addr().map(|a| a.to_string())
+        } else {
+            None
+        };
+        let router = engine.router();
+        let cfg = engine.config_snapshot();
+        let extra_ca = engine.extra_ca_der();
+        let takeover = proxy_core::probe::SiteTakeoverContext {
+            core_running: true,
+            sysproxy_enabled: false,
+            tun_enabled: engine.is_tun_active() || engine.is_virtual_tun_active(),
+            platform_hint: "android".to_string(),
+        };
+        let report = handle
+            .block_on(proxy_core::probe::diagnose_site(
+                &router,
+                &cfg,
+                target_raw,
+                takeover,
+                proxy_core::probe::ProbeOptions {
+                    extra_ca_der: &extra_ca,
+                    check_udp: true,
+                    udp_dns_target: fallback_demo_udp.as_deref(),
+                    timeout: Duration::from_secs(5),
+                    allow_private_targets: false,
+                    allowed_private_addrs: &allowed_private,
+                },
+            ))
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        sync_delays_from_router(&router);
+        return Ok(serde_json::json!({
+            "ok": true,
+            "vpnRunning": true,
+            "diagnosis": report,
+        }));
+    }
+
+    let mgr = ProfileManager::open_or_init(state_dir)
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    let (cfg, _) = mgr
+        .load_active_config()
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    let saved_sel = mgr.active_selected_groups();
+    let (router, _, runtime) = get_or_build_offline_router(&cfg, &saved_sel, Some(state_dir))?;
+    let takeover = proxy_core::probe::SiteTakeoverContext {
+        core_running: false,
+        sysproxy_enabled: false,
+        tun_enabled: false,
+        platform_hint: "android".to_string(),
+    };
+    let report = runtime
+        .block_on(proxy_core::probe::diagnose_site(
+            &router,
+            &cfg,
+            target_raw,
+            takeover,
+            proxy_core::probe::ProbeOptions {
+                extra_ca_der: &[],
+                check_udp: true,
+                udp_dns_target: None,
+                timeout: Duration::from_secs(5),
+                allow_private_targets: false,
+                allowed_private_addrs: &[],
+            },
+        ))
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    sync_delays_from_router(&router);
+    Ok(serde_json::json!({
+        "ok": true,
+        "vpnRunning": false,
+        "diagnosis": report,
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeDiagnoseSiteJson<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    state_dir_jstr: JString<'local>,
+    target_jstr: JString<'local>,
+) -> jstring {
+    ensure_tracing_initialized();
+    let res = (|| -> Result<serde_json::Value, String> {
+        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+        let target = jstring_to_rust(&mut env, &target_jstr)?;
+        android_diagnose_site_core(Path::new(dir.trim()), &target)
     })();
     let out = match res {
         Ok(v) => v.to_string(),

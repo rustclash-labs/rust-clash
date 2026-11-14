@@ -146,6 +146,10 @@ pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAd
             "/diagnostics/audit",
             get(get_diagnostics_audit_api).post(post_diagnostics_audit_api),
         )
+        .route(
+            "/diagnostics/site-check",
+            post(post_diagnostics_site_check_api),
+        )
         .route("/tools/ip", get(get_exit_ip_api))
         .route("/tools/vless-keypair", post(post_vless_keypair))
         .route("/tools/benchmark", post(post_live_benchmark))
@@ -609,6 +613,7 @@ async fn get_version() -> impl IntoResponse {
             "config-firewall-audit",
             "waterfall-probe",
             "ai-endpoint-matrix",
+            "site-doctor",
             "mcp-stdio-server"
         ]
     }))
@@ -650,6 +655,7 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
         None
     };
     let lan_ip = detect_primary_lan_ipv4();
+    let rss_bytes = read_process_rss_bytes();
     Json(serde_json::json!({
         "port": 0,
         "socks-port": 0,
@@ -675,6 +681,7 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
         "rule-count": router.rules_snapshot().len(),
         "proxy-count": cfg.proxies.len(),
         "group-count": cfg.proxy_groups.len(),
+        "process-rss-bytes": (rss_bytes > 0).then_some(rss_bytes),
         "tun": {
             "enable": engine.is_tun_active(),
             "virtual-enable": engine.is_virtual_tun_active(),
@@ -1890,13 +1897,38 @@ async fn stream_logs_ws(mut socket: WebSocket, engine: Arc<ProxyEngine>) {
 }
 
 pub fn read_process_rss_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
             && let Some(rss_pages_str) = statm.split_whitespace().nth(1)
             && let Ok(pages) = rss_pages_str.parse::<u64>()
         {
-            return pages.saturating_mul(4096);
+            // SAFETY: `sysconf(_SC_PAGESIZE)` has no memory-safety preconditions.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let page_bytes = if page_size > 0 {
+                page_size as u64
+            } else {
+                4096
+            };
+            return pages.saturating_mul(page_bytes);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `info` is zero-initialized and passed with its exact byte size to `proc_pidinfo`.
+        unsafe {
+            let mut info: libc::proc_taskinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+            let ret = libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&raw mut info).cast::<libc::c_void>(),
+                size,
+            );
+            if ret == size {
+                return info.pti_resident_size;
+            }
         }
     }
     #[cfg(windows)]
@@ -2480,10 +2512,10 @@ fn extract_http_response_body_str(raw: &[u8]) -> Option<String> {
     }
 }
 
-async fn fetch_via_outbound_http_text(
+async fn fetch_via_outbound_https_text(
     outbound: &dyn crate::outbound::OutboundHandler,
     target: &crate::addr::TargetAddr,
-    tls_sni: Option<&str>,
+    tls_sni: &str,
     host_header: &str,
     path_and_query: &str,
 ) -> Option<String> {
@@ -2492,39 +2524,27 @@ async fn fetch_via_outbound_http_text(
         "GET {path_and_query} HTTP/1.0\r\nHost: {host_header}\r\nUser-Agent: curl/8.7.1\r\nAccept: application/json, text/plain\r\nConnection: close\r\n\r\n"
     );
     let mut raw_buf = Vec::with_capacity(2048);
-    if let Some(sni) = tls_sni {
-        let tls_cfg =
-            crate::crypto::tls::build_tls_client_config(false, &[], &[b"http/1.1".to_vec()])
-                .ok()?;
-        let connector = tokio_rustls::TlsConnector::from(tls_cfg);
-        let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).ok()?;
-        let mut tls_stream = connector.connect(server_name, stream).await.ok()?;
-        tls_stream.write_all(req.as_bytes()).await.ok()?;
-        let _ = (&mut tls_stream)
-            .take(65_536)
-            .read_to_end(&mut raw_buf)
-            .await;
-    } else {
-        let mut plain = stream;
-        plain.write_all(req.as_bytes()).await.ok()?;
-        let _ = (&mut plain).take(65_536).read_to_end(&mut raw_buf).await;
-    }
+    let tls_cfg =
+        crate::crypto::tls::build_tls_client_config(false, &[], &[b"http/1.1".to_vec()]).ok()?;
+    let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+    let server_name = rustls::pki_types::ServerName::try_from(tls_sni.to_string()).ok()?;
+    let mut tls_stream = connector.connect(server_name, stream).await.ok()?;
+    tls_stream.write_all(req.as_bytes()).await.ok()?;
+    let _ = (&mut tls_stream)
+        .take(65_536)
+        .read_to_end(&mut raw_buf)
+        .await;
     extract_http_response_body_str(&raw_buf)
 }
 
 async fn probe_exit_ip_via_outbound(
     outbound: &dyn crate::outbound::OutboundHandler,
 ) -> Option<ExitIpProbeData> {
-    // 1. Primary: https://api.ip.sb/geoip
+    // 1. Primary (HTTPS :443): https://api.ip.sb/geoip
     if let Ok(target) = crate::addr::TargetAddr::new_domain("api.ip.sb", 443)
-        && let Some(body) = fetch_via_outbound_http_text(
-            outbound,
-            &target,
-            Some("api.ip.sb"),
-            "api.ip.sb",
-            "/geoip",
-        )
-        .await
+        && let Some(body) =
+            fetch_via_outbound_https_text(outbound, &target, "api.ip.sb", "api.ip.sb", "/geoip")
+                .await
         && let Ok(val) = serde_json::from_str::<serde_json::Value>(body.trim())
         && let Some(ip) = val
             .get("ip")
@@ -2570,59 +2590,13 @@ async fn probe_exit_ip_via_outbound(
         });
     }
 
-    // 2. Fallback: http://ip-api.com/json/?fields=status,country,countryCode,isp,org,as,hosting,query
-    if let Ok(target) = crate::addr::TargetAddr::new_domain("ip-api.com", 80)
-        && let Some(body) = fetch_via_outbound_http_text(
-            outbound,
-            &target,
-            None,
-            "ip-api.com",
-            "/json/?fields=status,country,countryCode,isp,org,as,hosting,query",
-        )
-        .await
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(body.trim())
-        && val.get("status").and_then(|v| v.as_str()) == Some("success")
-        && let Some(ip) = val
-            .get("query")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-    {
-        let country = val
-            .get("country")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
-        let country_code = val
-            .get("countryCode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let isp = val
-            .get("isp")
-            .or_else(|| val.get("org"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let asn_full = val.get("as").and_then(|v| v.as_str()).unwrap_or("");
-        let asn = asn_full.split_whitespace().next().unwrap_or("").to_string();
-        let hosting = val.get("hosting").and_then(|v| v.as_bool());
-        let ip_type = classify_exit_ip_type(hosting, &isp, asn_full).to_string();
-        return Some(ExitIpProbeData {
-            ip: ip.to_string(),
-            country,
-            country_code,
-            isp,
-            asn,
-            ip_type,
-        });
-    }
-
-    // 3. Fallback: https://1.1.1.1/cdn-cgi/trace
+    // 2. Fallback (HTTPS :443 only — plaintext HTTP :80 GeoIP endpoints are never used):
+    //    https://1.1.1.1/cdn-cgi/trace
     let cf_target = crate::addr::TargetAddr::new_ip(IpAddr::from([1, 1, 1, 1]), 443);
-    if let Some(body) = fetch_via_outbound_http_text(
+    if let Some(body) = fetch_via_outbound_https_text(
         outbound,
         &cf_target,
-        Some("cloudflare-dns.com"),
+        "cloudflare-dns.com",
         "1.1.1.1",
         "/cdn-cgi/trace",
     )
@@ -2685,7 +2659,7 @@ async fn get_exit_ip_api(
                 "asn": "AS64512",
                 "ip_type": "Sandbox",
                 "node_type": "Sandbox",
-                "quality": "Normal",
+                "quality": "Sandbox",
                 "latency_ms": 18,
                 "outbound": eff.effective_outbound,
                 "via_outbound": eff.effective_outbound,
@@ -2712,6 +2686,7 @@ async fn get_exit_ip_api(
                 "asn": "",
                 "ip_type": "Blocked",
                 "node_type": "Blocked",
+                "quality": serde_json::Value::Null,
                 "outbound": eff.effective_outbound,
                 "via_outbound": eff.effective_outbound,
                 "protocol": eff.effective_protocol,
@@ -2754,7 +2729,7 @@ async fn get_exit_ip_api(
             "asn": probe.asn,
             "ip_type": probe.ip_type,
             "node_type": probe.ip_type,
-            "quality": "Normal",
+            "quality": serde_json::Value::Null,
             "latency_ms": latency_ms,
             "outbound": eff.effective_outbound,
             "via_outbound": eff.effective_outbound,
@@ -3314,6 +3289,83 @@ async fn post_proxy_endpoint_matrix_api(
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&err.to_string()) })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SiteCheckReq {
+    target: String,
+    #[serde(default = "default_true_bool")]
+    check_udp: bool,
+    udp_dns_target: Option<String>,
+    #[serde(default = "default_delay_timeout_ms", alias = "timeout_ms")]
+    timeout: u64,
+}
+
+async fn post_diagnostics_site_check_api(
+    State(engine): State<Arc<ProxyEngine>>,
+    Json(req): Json<SiteCheckReq>,
+) -> Response {
+    let Ok(_permit) = PROBE_API_SEMAPHORE.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "message": "Too many concurrent diagnostic probes in flight (max 4); retry shortly."
+            })),
+        )
+            .into_response();
+    };
+
+    let demo = engine.demo_info();
+    let fallback_demo_udp = if demo.enabled {
+        engine.dns_addr().map(|a| a.to_string())
+    } else {
+        None
+    };
+    let udp_target_ref = req
+        .udp_dns_target
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(fallback_demo_udp.as_deref());
+
+    let sysproxy = query_sysproxy_status(&engine.state_dir());
+    let takeover = crate::probe::SiteTakeoverContext {
+        core_running: true,
+        sysproxy_enabled: sysproxy.enabled,
+        tun_enabled: engine.is_tun_active() || engine.is_virtual_tun_active(),
+        platform_hint: "desktop".to_string(),
+    };
+
+    let allowed_private = demo_allowed_private_addrs(&engine);
+    let router = engine.router();
+    let cfg = engine.config_snapshot();
+    let extra_ca = engine.extra_ca_der();
+    let timeout = Duration::from_millis(req.timeout.clamp(300, 15_000));
+
+    match crate::probe::diagnose_site(
+        &router,
+        &cfg,
+        &req.target,
+        takeover,
+        crate::probe::ProbeOptions {
+            extra_ca_der: &extra_ca,
+            check_udp: req.check_udp,
+            udp_dns_target: udp_target_ref,
+            timeout,
+            allow_private_targets: false,
+            allowed_private_addrs: &allowed_private,
+        },
+    )
+    .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&err.to_string())
+            })),
         )
             .into_response(),
     }

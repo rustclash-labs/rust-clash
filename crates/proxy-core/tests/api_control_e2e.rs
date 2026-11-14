@@ -484,6 +484,58 @@ async fn control_plane_audit_diff_waterfall_and_matrix_e2e() {
         );
     }
 
+    // 6. POST /diagnostics/site-check (Site Doctor) + GET /configs real RSS
+    let (_, cfgs_body) = raw_http_request(api_addr, "GET", "/configs", None, None).await;
+    let cfgs_val: serde_json::Value = serde_json::from_str(&cfgs_body).unwrap();
+    assert!(
+        cfgs_val["process-rss-bytes"].as_u64().unwrap_or(0) > 0,
+        "GET /configs must expose real process-rss-bytes"
+    );
+
+    let site_ok_payload = serde_json::json!({
+        "target": format!("{demo_origin}/generate_204"),
+        "check_udp": true,
+        "timeout_ms": 4000
+    });
+    let (site_code, site_body) = raw_http_request(
+        api_addr,
+        "POST",
+        "/diagnostics/site-check",
+        None,
+        Some(&site_ok_payload.to_string()),
+    )
+    .await;
+    assert_eq!(
+        site_code, 200,
+        "POST /diagnostics/site-check body: {site_body}"
+    );
+    let site_val: serde_json::Value = serde_json::from_str(&site_body).unwrap();
+    assert!(
+        matches!(
+            site_val["diagnosis_code"].as_str(),
+            Some("reachable" | "reachable_takeover_off")
+        ),
+        "unexpected site diagnosis_code: {site_val}"
+    );
+    assert!(!site_val["headline_zh"].as_str().unwrap_or("").is_empty());
+    assert!(!site_val["stage_checks"].as_array().unwrap().is_empty());
+
+    let site_ssrf_payload = serde_json::json!({
+        "target": "http://169.254.169.254/latest/meta-data/",
+        "check_udp": false,
+        "timeout_ms": 1500
+    });
+    let (site_bad_code, site_bad_body) = raw_http_request(
+        api_addr,
+        "POST",
+        "/diagnostics/site-check",
+        None,
+        Some(&site_ssrf_payload.to_string()),
+    )
+    .await;
+    assert_eq!(site_bad_code, 400);
+    assert!(site_bad_body.contains("blocked by SSRF protection"));
+
     let _ = shutdown_tx.send(true);
     engine.shutdown();
 }

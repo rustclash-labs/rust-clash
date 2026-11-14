@@ -26,6 +26,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DriveFileRenameOutline
@@ -67,6 +68,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
+import io.github.rustclashlabs.rustclash.ui.model.ProfileOpSummaryUi
 import io.github.rustclashlabs.rustclash.ui.model.ProfileUiItem
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
@@ -81,6 +83,7 @@ fun ProfilesScreen(
     onDeleteProfile: (String) -> Unit,
     onRenameProfile: (String, String) -> Unit = { _, _ -> },
     onUpdateProfileAutoUpdate: (String, Long) -> Unit = { _, _ -> },
+    onDismissOpSummary: () -> Unit = {},
     onOpenCustomRulesEditor: () -> Unit,
     onOpenYamlEditor: () -> Unit,
     onImportYamlFile: () -> Unit = {},
@@ -248,6 +251,15 @@ fun ProfilesScreen(
         }
 
         Spacer(modifier = Modifier.height(14.dp))
+
+        val opSummary = state.lastProfileOpSummary
+        if (opSummary != null) {
+            ProfileOpSummaryCard(
+                summary = opSummary,
+                onDismiss = onDismissOpSummary,
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+        }
 
         if (state.profiles.isEmpty()) {
             Surface(
@@ -863,7 +875,7 @@ fun ActiveYamlEditorDialog(
                     .verticalScroll(scrollState),
             ) {
                 Text(
-                    text = "节点密码与密钥以 ***REDACTED*** 保护显示；直接修改规则、端口或节点参数并保存时，未改动节点的原始密钥会自动从安全存储恢复。",
+                    text = "节点密码与密钥以 ***REDACTED*** 保护显示；本机编辑规则/端口并保存时未改动节点的原始密钥会自动恢复。注意：导出的脱敏 YAML 适合排障分享，不能作为跨设备恢复完整密钥的备份。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -918,4 +930,153 @@ fun ActiveYamlEditorDialog(
             }
         },
     )
+}
+
+@Composable
+private fun ProfileOpSummaryCard(
+    summary: ProfileOpSummaryUi,
+    onDismiss: () -> Unit,
+) {
+    val extColors = LocalRustClashColors.current
+    val hasWarn = summary.skippedUnsupportedTotal > 0 || summary.newlyInsecureCount > 0
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(15.dp),
+        color = extColors.cardSurface,
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (hasWarn) extColors.amber.copy(alpha = 0.65f) else extColors.selectedCardBorder,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = if (summary.isRefresh) {
+                        "订阅更新摘要 · ${summary.profileName}"
+                    } else if (summary.skippedUnsupportedTotal > 0) {
+                        "导入结果（部分兼容） · ${summary.profileName}"
+                    } else {
+                        "导入结果报告 · ${summary.profileName}"
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.size(26.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Clear,
+                        contentDescription = "关闭摘要",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            if (!summary.isRefresh) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OpMetricPill(
+                        label = "成功导入",
+                        value = "${summary.addedNodes}",
+                        accent = extColors.emerald,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OpMetricPill(
+                        label = "重复跳过",
+                        value = "${summary.skippedDuplicates}",
+                        accent = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OpMetricPill(
+                        label = "暂不支持",
+                        value = "${summary.skippedUnsupportedTotal}",
+                        accent = if (summary.skippedUnsupportedTotal > 0) extColors.amber else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+
+                if (summary.skippedGroups.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val protoBreakdown = summary.skippedGroups.joinToString(" · ") {
+                        "${it.protocolLabel} × ${it.count}"
+                    }
+                    Text(
+                        text = "不兼容节点主要使用：$protoBreakdown（当前版本暂未内置，现有可用节点已完整保留）。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = extColors.amber,
+                    )
+                }
+            } else {
+                val gradeText = summary.auditGrade?.let { " · 安全评级 $it" } ?: ""
+                Text(
+                    text = "节点变动：+${summary.diffAddedCount} 新增 / -${summary.diffRemovedCount} 移除 / ${summary.diffChangedCount} 变更（当前共 ${summary.totalNodes} 节点）$gradeText",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(modifier = Modifier.height(3.dp))
+                val manualNote = if (summary.manualProtectedCount > 0) {
+                    " · 已保留 ${summary.manualProtectedCount} 个自建节点"
+                } else {
+                    ""
+                }
+                Text(
+                    text = "分流规则：${summary.rulesPrevCount} → ${summary.rulesNextCount} 条$manualNote",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (summary.newlyInsecureCount > 0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "安全提醒：本次订阅新增了 ${summary.newlyInsecureCount} 个跳过 TLS 证书校验 (skip-cert-verify) 的高风险节点。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = extColors.amber,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OpMetricPill(
+    label: String,
+    value: String,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
+    val extColors = LocalRustClashColors.current
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        color = extColors.cardSubtle,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = accent,
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+        }
+    }
 }

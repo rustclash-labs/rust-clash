@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.3.4)"
+        description: "Release tag to publish (e.g. v0.4.0)"
         required: true
         type: string
-        default: "v0.3.4"
+        default: "v0.4.0"
       target_platforms:
         description: "Platforms to build & publish (saves private-repo Actions minutes)"
         required: false
@@ -87,7 +87,7 @@ jobs:
           TAG="$(echo -n "$TAG" | xargs)"
 
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Invalid release tag '$TAG'. Expected format like 'v0.3.4'." >&2
+            echo "::error::Invalid release tag '$TAG'. Expected format like 'v0.4.0'." >&2
             exit 1
           fi
 
@@ -95,7 +95,7 @@ jobs:
           BASE_VERSION="${VERSION%%-*}"
 
           python3 - "$BASE_VERSION" <<'PY'
-          import json, pathlib, re, subprocess, sys, tomllib
+          import json, pathlib, plistlib, re, subprocess, sys, tomllib
 
           allowed_emails = {"rustclash.labs@proton.me", "noreply@github.com"}
           for role, fmt in [("author", "%ae"), ("committer", "%ce")]:
@@ -110,11 +110,13 @@ jobs:
           cargo_ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
           tauri_ver = json.loads(pathlib.Path("crates/tauri-app/tauri.conf.json").read_text())["version"]
           ui_ver = json.loads(pathlib.Path("ui/package.json").read_text())["version"]
+          plist_ver = plistlib.loads(pathlib.Path("platforms/macos-ne/Info.plist").read_bytes()).get("CFBundleShortVersionString", "")
           gradle_txt = pathlib.Path("android/app/build.gradle.kts").read_text()
           m_name = re.search(r'versionName\s*=\s*"([^"]+)"', gradle_txt)
           m_code = re.search(r'versionCode\s*=\s*(\d+)', gradle_txt)
           android_ver = m_name.group(1) if m_name else ""
           android_code = int(m_code.group(1)) if m_code else 0
+          readme_txt = pathlib.Path("README.md").read_text()
 
           mismatches = []
           for label, actual in [
@@ -122,9 +124,13 @@ jobs:
               ("crates/tauri-app/tauri.conf.json", tauri_ver),
               ("ui/package.json", ui_ver),
               ("android/app/build.gradle.kts (versionName)", android_ver),
+              ("platforms/macos-ne/Info.plist (CFBundleShortVersionString)", plist_ver),
           ]:
               if actual != expected:
                   mismatches.append(f"{label}={actual} (expected {expected})")
+
+          if f"`v{expected}` Latest Release" not in readme_txt:
+              mismatches.append(f"README.md missing '`v{expected}` Latest Release' link")
 
           if mismatches:
               raise SystemExit("Version mismatch against release tag: " + ", ".join(mismatches))

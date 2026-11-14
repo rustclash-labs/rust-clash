@@ -10,6 +10,7 @@ import {
   runBenchmark,
   runDiagnosticsWaterfall,
   saveControllerSettings,
+  setSysProxy,
   toggleDemoMode,
   updateDesktopPrefs,
 } from "../api";
@@ -25,6 +26,7 @@ import type {
   RoutingPresetChoice,
   RoutingPresetSnapshot,
   RuleItem,
+  SiteDiagnosisReport,
   VersionInfo,
   VlessKeypairResponse,
   WaterfallProbeReport,
@@ -52,7 +54,18 @@ interface ToolsViewProps {
   onClearLogs: () => void;
   onControllerUpdated: () => void;
   initialSubTab?: ToolsSubTab;
+  initialSiteTarget?: string;
+  onOpenProxies?: () => void;
+  onOpenProfiles?: () => void;
 }
+
+const SITE_PRESETS = [
+  "chatgpt.com",
+  "claude.ai",
+  "github.com",
+  "www.google.com",
+  "www.bilibili.com",
+];
 
 export const ToolsView: React.FC<ToolsViewProps> = ({
   version,
@@ -66,12 +79,19 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
   onClearLogs,
   onControllerUpdated,
   initialSubTab = "settings",
+  initialSiteTarget = "chatgpt.com",
+  onOpenProxies,
+  onOpenProfiles,
 }) => {
   const { lang, setLang, tr } = useI18n();
 
   const [subTab, setSubTab] = useState<ToolsSubTab>(initialSubTab);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+
+  useEffect(() => {
+    setSubTab(initialSubTab);
+  }, [initialSubTab]);
 
   // Settings tab state
   const desktopMode = isTauriDesktop();
@@ -88,7 +108,18 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
     () => loadControllerSettings().secret,
   );
 
-  // Diagnostics tab state
+  // Site Connectivity Doctor state
+  const [siteTarget, setSiteTarget] = useState<string>(initialSiteTarget);
+  const [siteDiag, setSiteDiag] = useState<SiteDiagnosisReport | null>(null);
+  const [siteRawOpen, setSiteRawOpen] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (initialSiteTarget) {
+      setSiteTarget(initialSiteTarget);
+    }
+  }, [initialSiteTarget]);
+
+  // Node-level Diagnostics tab state
   const [probeProxy, setProbeProxy] = useState<string>("");
   const [probeUrl, setProbeUrl] = useState<string>("https://api.github.com/");
   const [waterfallRes, setWaterfallRes] = useState<WaterfallProbeReport | null>(
@@ -229,6 +260,94 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
         "Controller API settings saved",
       ),
     });
+  };
+
+  // Site Connectivity Doctor actions
+  const runSiteDiagnosis = async (rawTarget?: string) => {
+    const cleaned = (rawTarget ?? siteTarget).trim();
+    if (!cleaned) {
+      setToast({
+        ok: false,
+        text: tr(
+          "请输入需要诊断的域名或网址，例如 chatgpt.com",
+          "Please enter a domain or URL to diagnose, e.g. chatgpt.com",
+        ),
+      });
+      return;
+    }
+    setBusyKey("site-doctor");
+    setToast(null);
+    try {
+      const rep = await clashApi.diagnoseSite(cleaned, {
+        checkUdp: true,
+        timeoutMs: 5500,
+      });
+      setSiteDiag(rep);
+    } catch (err) {
+      setToast({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleSiteDoctorSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    void runSiteDiagnosis();
+  };
+
+  const handleQuickSuggestedFix = async (kind: string) => {
+    if (kind === "switch_node") {
+      onOpenProxies?.();
+      return;
+    }
+    if (kind === "import_profile") {
+      onOpenProfiles?.();
+      return;
+    }
+    if (kind === "edit_rules") {
+      setSubTab("rules-dns");
+      return;
+    }
+    if (kind === "enable_takeover") {
+      setBusyKey("site-fix");
+      setToast(null);
+      try {
+        if (config?.sysproxy?.supported !== false) {
+          await setSysProxy(true);
+        } else {
+          await patchConfig({ tun: { enable: true } });
+        }
+        await onRefreshCore();
+        await runSiteDiagnosis();
+      } catch (err) {
+        setToast({
+          ok: false,
+          text: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        setBusyKey(null);
+      }
+      return;
+    }
+    if (kind === "switch_mode_rule") {
+      setBusyKey("site-fix");
+      setToast(null);
+      try {
+        await patchConfig({ mode: "rule" });
+        await onRefreshCore();
+        await runSiteDiagnosis();
+      } catch (err) {
+        setToast({
+          ok: false,
+          text: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        setBusyKey(null);
+      }
+    }
   };
 
   // Diagnostics actions
@@ -380,6 +499,40 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
     } finally {
       setBusyKey(null);
     }
+  };
+
+  const renderSuggestedFixButton = (diag: SiteDiagnosisReport) => {
+    const kind = diag.suggested_action_kind;
+    if (!kind) return null;
+    const labelMap: Record<string, { zh: string; en: string }> = {
+      switch_node: { zh: "去切换代理节点", en: "Switch Proxy Node" },
+      enable_takeover: {
+        zh: "一键开启系统接管并复测",
+        en: "Enable Takeover & Re-test",
+      },
+      switch_mode_rule: {
+        zh: "切换为规则分流并复测",
+        en: "Switch to Rule Mode & Re-test",
+      },
+      import_profile: { zh: "前往导入订阅", en: "Import Subscription" },
+      edit_rules: { zh: "检查分流规则", en: "Inspect Rules" },
+    };
+    const lbl = labelMap[kind];
+    if (!lbl) return null;
+    return (
+      <button
+        type="button"
+        className="btn btn-primary btn-sm"
+        disabled={busyKey === "site-fix" || busyKey === "site-doctor"}
+        onClick={() => void handleQuickSuggestedFix(kind)}
+      >
+        {busyKey === "site-fix"
+          ? tr("处理中…", "Applying...")
+          : lang === "zh"
+            ? lbl.zh
+            : lbl.en}
+      </button>
+    );
   };
 
   return (
@@ -812,24 +965,31 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
       {/* SUB-TAB 3: DIAGNOSTICS */}
       {subTab === "diagnostics" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 13 }}>
-          <section className="bento-card" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* Flagship Plain-Language Site Connectivity Doctor */}
+          <section
+            className="bento-card"
+            style={{ display: "flex", flexDirection: "column", gap: 12 }}
+          >
             <div
               style={{
                 display: "flex",
-                alignItems: "center",
+                alignItems: "flex-start",
                 justifyContent: "space-between",
                 gap: 10,
                 flexWrap: "wrap",
               }}
             >
               <div>
-                <div style={{ fontSize: 15, fontWeight: 650 }}>
-                  {tr("连通性瀑布流与全球服务探测", "Connectivity Waterfall & Endpoint Matrix")}
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                <div style={{ fontSize: 15.5, fontWeight: 700 }}>
                   {tr(
-                    "分段检测 DNS 解析、代理隧道握手、TLS 协商、HTTP 首字节与 UDP QUIC 状态",
-                    "Inspect DNS, tunnel connect, TLS handshake, HTTP TTFB, and UDP reachability",
+                    "为什么这个网站打不开？（按网站诊断分流与连通性）",
+                    "Why Won't This Website Open? (Site Route & Connectivity Doctor)",
+                  )}
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                  {tr(
+                    "输入任意域名或网址，自动检查分流规则去向、系统代理接管、DNS 解析、TLS 握手与出口风控原因",
+                    "Enter any domain or URL to inspect its rule path, system takeover, DNS, TLS handshake, and WAF/Geo blocks",
                   )}
                 </div>
               </div>
@@ -842,7 +1002,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                   onClick={() => void handleRunSecurityAudit()}
                 >
                   {busyKey === "audit"
-                    ? tr("体检中...", "Auditing...")
+                    ? tr("体检中…", "Auditing...")
                     : tr("配置安全体检", "Security Audit")}
                 </button>
                 <button
@@ -852,9 +1012,383 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                   onClick={() => void handleExportDiag()}
                 >
                   {busyKey === "export-diag"
-                    ? tr("导出中...", "Exporting...")
+                    ? tr("导出中…", "Exporting...")
                     : tr("导出脱敏诊断包", "Export Diagnostics")}
                 </button>
+              </div>
+            </div>
+
+            <form
+              onSubmit={handleSiteDoctorSubmit}
+              style={{ display: "flex", gap: 8, flexWrap: "wrap" }}
+            >
+              <input
+                id="site-doctor-input"
+                className="input"
+                style={{ flex: "1 1 260px" }}
+                placeholder={tr(
+                  "输入打不开的域名或网址，例如 chatgpt.com、claude.ai、github.com…",
+                  "Enter domain or URL, e.g. chatgpt.com, claude.ai, github.com...",
+                )}
+                value={siteTarget}
+                onChange={(e) => setSiteTarget(e.target.value)}
+              />
+              <button
+                id="site-doctor-submit-btn"
+                type="submit"
+                className="btn btn-primary"
+                disabled={busyKey === "site-doctor"}
+              >
+                {busyKey === "site-doctor"
+                  ? tr("正在诊断…", "Diagnosing...")
+                  : tr("开始诊断", "Diagnose Site")}
+              </button>
+            </form>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+                {tr("常见示例：", "Examples:")}
+              </span>
+              {SITE_PRESETS.map((sample) => (
+                <button
+                  key={sample}
+                  type="button"
+                  className="btn btn-sm"
+                  style={{ padding: "3px 10px", fontSize: 11.5 }}
+                  disabled={busyKey === "site-doctor"}
+                  onClick={() => {
+                    setSiteTarget(sample);
+                    void runSiteDiagnosis(sample);
+                  }}
+                >
+                  {sample}
+                </button>
+              ))}
+            </div>
+
+            {siteDiag && (
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 10,
+                  marginTop: 2,
+                }}
+              >
+                {/* Part 1: Verdict Headline & Actionable Advice */}
+                <div
+                  className="sub-pill-box"
+                  style={{
+                    border: `1px solid ${
+                      siteDiag.severity === "ok"
+                        ? "var(--accent-emerald)"
+                        : siteDiag.severity === "warning"
+                          ? "var(--accent-amber)"
+                          : "var(--accent-rose)"
+                    }`,
+                    background:
+                      siteDiag.severity === "ok"
+                        ? "var(--accent-emerald-soft)"
+                        : siteDiag.severity === "warning"
+                          ? "var(--accent-amber-soft)"
+                          : "var(--accent-rose-soft)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                    padding: "12px 14px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ fontSize: 14.5, fontWeight: 700 }}>
+                      {lang === "zh" ? siteDiag.headline_zh : siteDiag.headline_en}
+                    </div>
+                    {renderSuggestedFixButton(siteDiag)}
+                  </div>
+
+                  <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+                    {lang === "zh" ? siteDiag.summary_zh : siteDiag.summary_en}
+                  </div>
+
+                  {(lang === "zh" ? siteDiag.actions_zh : siteDiag.actions_en)
+                    .length > 0 && (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 3,
+                        fontSize: 12,
+                        paddingTop: 4,
+                      }}
+                    >
+                      <strong>{tr("建议操作：", "Recommended actions:")}</strong>
+                      {(lang === "zh"
+                        ? siteDiag.actions_zh
+                        : siteDiag.actions_en
+                      ).map((act, idx) => (
+                        <div key={idx}>• {act}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Part 2: Expected Routing Path */}
+                <div
+                  className="sub-pill-box"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                    padding: "11px 14px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <strong style={{ fontSize: 12.5 }}>
+                      {tr("预计分流路径", "Expected Routing Path")}
+                    </strong>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      <span
+                        className={`badge ${
+                          siteDiag.exit_type === "PROXY"
+                            ? "badge-sky"
+                            : siteDiag.exit_type === "DIRECT"
+                              ? "badge-emerald"
+                              : "badge-rose"
+                        }`}
+                      >
+                        {siteDiag.exit_type} · {siteDiag.effective_outbound} (
+                        {siteDiag.effective_protocol})
+                      </span>
+                      <span
+                        className={`badge ${
+                          siteDiag.takeover.sysproxy_enabled ||
+                          siteDiag.takeover.tun_enabled
+                            ? "badge-emerald"
+                            : "badge-amber"
+                        }`}
+                      >
+                        {siteDiag.takeover.sysproxy_enabled &&
+                        siteDiag.takeover.tun_enabled
+                          ? tr("系统代理 + TUN 已启用", "SysProxy + TUN On")
+                          : siteDiag.takeover.tun_enabled
+                            ? tr("TUN 已启用", "TUN On")
+                            : siteDiag.takeover.sysproxy_enabled
+                              ? tr("系统代理已启用", "SysProxy On")
+                              : tr("未开启系统接管", "Takeover Off")}
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
+                    {lang === "zh"
+                      ? siteDiag.route_summary_zh
+                      : siteDiag.route_summary_en}
+                  </div>
+                </div>
+
+                {/* Part 3: Stage-by-Stage Check Cards */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))",
+                    gap: 8,
+                  }}
+                >
+                  {siteDiag.stage_checks.map((st) => {
+                    const badgeCls =
+                      st.status === "ok"
+                        ? "badge-emerald"
+                        : st.status === "warning"
+                          ? "badge-amber"
+                          : st.status === "failed"
+                            ? "badge-rose"
+                            : "badge-neutral";
+                    const statusText =
+                      st.status === "ok"
+                        ? st.latency_ms != null
+                          ? `${st.latency_ms} ms`
+                          : tr("正常", "OK")
+                        : st.status === "warning"
+                          ? tr("注意", "Warn")
+                          : st.status === "failed"
+                            ? tr("失败", "Failed")
+                            : tr("跳过", "Skipped");
+                    return (
+                      <div
+                        key={st.stage}
+                        className="sub-pill-box"
+                        style={{
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 4,
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 6,
+                          }}
+                        >
+                          <strong style={{ fontSize: 12 }}>
+                            {lang === "zh" ? st.label_zh : st.label_en}
+                          </strong>
+                          <span className={`badge tabular ${badgeCls}`}>
+                            {statusText}
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 11.5,
+                            color: "var(--text-secondary)",
+                            lineHeight: 1.4,
+                          }}
+                        >
+                          {lang === "zh" ? st.detail_zh : st.detail_en}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Part 4: Collapsible Technical Waterfall Details */}
+                {siteDiag.waterfall && (
+                  <div className="sub-pill-box" style={{ padding: "9px 13px" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        cursor: "pointer",
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                        fontWeight: 600,
+                      }}
+                      onClick={() => setSiteRawOpen((v) => !v)}
+                    >
+                      <span>
+                        {tr(
+                          "展开底层协议与耗时瀑布详情（高级排障）",
+                          "Technical Waterfall & TLS Details (Advanced)",
+                        )}
+                      </span>
+                      {siteRawOpen ? (
+                        <ChevronDownIcon size={15} />
+                      ) : (
+                        <ChevronRightIcon size={15} />
+                      )}
+                    </div>
+
+                    {siteRawOpen && (
+                      <div
+                        className="tabular mono"
+                        style={{
+                          marginTop: 8,
+                          fontSize: 11.5,
+                          color: "var(--text-secondary)",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 4,
+                        }}
+                      >
+                        <div>
+                          URL: {siteDiag.normalized_url} · Rule:{" "}
+                          {siteDiag.matched_rule} · Endpoint:{" "}
+                          {siteDiag.remote_endpoint}
+                        </div>
+                        <div>
+                          DNS ({siteDiag.waterfall.dns_mode}):{" "}
+                          {siteDiag.waterfall.dns_resolve_ms ?? "—"} ms | Tunnel:{" "}
+                          {siteDiag.waterfall.tunnel_connect_ms ?? "—"} ms | TLS (
+                          {siteDiag.waterfall.tls_version ?? "—"} / ALPN{" "}
+                          {siteDiag.waterfall.alpn ?? "—"}):{" "}
+                          {siteDiag.waterfall.tls_handshake_ms ?? "—"} ms | TTFB:{" "}
+                          {siteDiag.waterfall.http_ttfb_ms ?? "—"} ms | HTTP:{" "}
+                          {siteDiag.waterfall.http_status ?? "—"}
+                        </div>
+                        {siteDiag.waterfall.error && (
+                          <div style={{ color: "var(--accent-rose)" }}>
+                            Raw Error: {siteDiag.waterfall.error}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {auditRes && (
+              <div className="sub-pill-box" style={{ fontSize: 12.5 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: auditRes.findings.length > 0 ? 6 : 0,
+                  }}
+                >
+                  <strong>
+                    {tr("配置安全体检得分：", "Security Audit Score: ")}
+                    {auditRes.score}/100 ({auditRes.grade})
+                  </strong>
+                  <span className="badge badge-emerald">
+                    {auditRes.findings.length === 0
+                      ? tr("全部通过", "All Passed")
+                      : tr(
+                          `${auditRes.findings.length} 项提示`,
+                          `${auditRes.findings.length} findings`,
+                        )}
+                  </span>
+                </div>
+                {auditRes.findings.slice(0, 5).map((f, idx) => (
+                  <div
+                    key={`${f.code}-${idx}`}
+                    style={{
+                      fontSize: 12,
+                      color: "var(--text-secondary)",
+                      marginTop: 3,
+                    }}
+                  >
+                    • <strong>{f.title}:</strong> {f.detail}
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* Secondary Engineering Card: Specific Node Waterfall & Endpoint Matrix */}
+          <section
+            className="bento-card"
+            style={{ display: "flex", flexDirection: "column", gap: 12 }}
+          >
+            <div>
+              <div style={{ fontSize: 14.5, fontWeight: 650 }}>
+                {tr(
+                  "指定节点耗时瀑布与全球服务连通矩阵（进阶）",
+                  "Per-Node Waterfall Probe & Global Endpoint Matrix (Advanced)",
+                )}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                {tr(
+                  "绕过分流规则直接指定任意节点或策略组，对比各阶段握手延迟与常见服务解锁状态",
+                  "Test a specific proxy or group directly across DNS, TCP, TLS, TTFB, UDP, and global endpoints",
+                )}
               </div>
             </div>
 
@@ -884,12 +1418,12 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
 
               <button
                 type="submit"
-                className="btn btn-primary"
+                className="btn"
                 disabled={busyKey === "waterfall"}
               >
                 {busyKey === "waterfall"
-                  ? tr("探测中...", "Probing...")
-                  : tr("瀑布流探测", "Waterfall Probe")}
+                  ? tr("探测中…", "Probing...")
+                  : tr("单节点瀑布探测", "Waterfall Probe")}
               </button>
 
               <button
@@ -899,7 +1433,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                 onClick={() => void handleRunMatrix()}
               >
                 {busyKey === "matrix"
-                  ? tr("检测中...", "Checking...")
+                  ? tr("检测中…", "Checking...")
                   : tr("常见网站连通矩阵", "Endpoint Matrix")}
               </button>
             </form>
@@ -947,21 +1481,37 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                 >
                   <div>
                     <span style={{ color: "var(--text-muted)" }}>DNS: </span>
-                    <strong>{waterfallRes.dns_resolve_ms ?? 0} ms</strong>
+                    <strong>
+                      {waterfallRes.dns_resolve_ms != null
+                        ? `${waterfallRes.dns_resolve_ms} ms`
+                        : "—"}
+                    </strong>
                   </div>
                   <div>
                     <span style={{ color: "var(--text-muted)" }}>
                       {tr("隧道连接: ", "Tunnel: ")}
                     </span>
-                    <strong>{waterfallRes.tunnel_connect_ms ?? 0} ms</strong>
+                    <strong>
+                      {waterfallRes.tunnel_connect_ms != null
+                        ? `${waterfallRes.tunnel_connect_ms} ms`
+                        : "—"}
+                    </strong>
                   </div>
                   <div>
                     <span style={{ color: "var(--text-muted)" }}>TLS: </span>
-                    <strong>{waterfallRes.tls_handshake_ms ?? 0} ms</strong>
+                    <strong>
+                      {waterfallRes.tls_handshake_ms != null
+                        ? `${waterfallRes.tls_handshake_ms} ms`
+                        : "—"}
+                    </strong>
                   </div>
                   <div>
                     <span style={{ color: "var(--text-muted)" }}>HTTP TTFB: </span>
-                    <strong>{waterfallRes.http_ttfb_ms ?? 0} ms</strong>
+                    <strong>
+                      {waterfallRes.http_ttfb_ms != null
+                        ? `${waterfallRes.http_ttfb_ms} ms`
+                        : "—"}
+                    </strong>
                   </div>
                   {waterfallRes.udp_probe && (
                     <div>
@@ -1020,37 +1570,6 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                     </div>
                   );
                 })}
-              </div>
-            )}
-
-            {auditRes && (
-              <div className="sub-pill-box" style={{ fontSize: 12.5 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    marginBottom: auditRes.findings.length > 0 ? 6 : 0,
-                  }}
-                >
-                  <strong>
-                    {tr("配置安全体检得分：", "Security Audit Score: ")}
-                    {auditRes.score}/100 ({auditRes.grade})
-                  </strong>
-                  <span className="badge badge-emerald">
-                    {auditRes.findings.length === 0
-                      ? tr("全部通过", "All Passed")
-                      : tr(`${auditRes.findings.length} 项提示`, `${auditRes.findings.length} findings`)}
-                  </span>
-                </div>
-                {auditRes.findings.slice(0, 5).map((f, idx) => (
-                  <div
-                    key={`${f.code}-${idx}`}
-                    style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 3 }}
-                  >
-                    • <strong>{f.title}:</strong> {f.detail}
-                  </div>
-                ))}
               </div>
             )}
           </section>
