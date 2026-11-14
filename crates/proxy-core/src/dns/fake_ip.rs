@@ -842,6 +842,7 @@ impl FakeIpDnsEngine {
     /// Seed non-expired positive `proxy_ip_cache` and `bootstrap_cache` entries from a prior verified engine.
     pub fn seed_positive_proxy_cache(&self, seed: PositiveDnsCacheSeed) {
         let now = Instant::now();
+        let want_ipv6 = self.direct_ipv6_enabled();
         if !seed.bootstrap_entries.is_empty() {
             let mut bguard = self.bootstrap_cache.lock();
             for (domain, expires_at, ips) in seed.bootstrap_entries.into_iter().rev() {
@@ -850,7 +851,7 @@ impl FakeIpDnsEngine {
                 }
                 let valid: Vec<IpAddr> = ips
                     .into_iter()
-                    .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+                    .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
                     .collect();
                 if !valid.is_empty() {
                     bguard.put(domain, (expires_at, valid));
@@ -866,7 +867,7 @@ impl FakeIpDnsEngine {
                 let mut valid: Vec<IpAddr> = ips
                     .iter()
                     .copied()
-                    .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+                    .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
                     .collect();
                 if valid.is_empty() {
                     valid = ips.into_iter().filter(|ip| !self.is_fake_ip(*ip)).collect();
@@ -887,6 +888,7 @@ impl FakeIpDnsEngine {
     /// Proactively warm or refresh `proxy_ip_cache` for a proxy server hostname when missing or `< 25s` TTL remains.
     /// Preserves any still-unexpired positive entry if a proactive refresh encounters a transient network error.
     pub async fn prewarm_proxy_server_ips(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let want_ipv6 = self.direct_ipv6_enabled();
         let clean = host
             .trim()
             .trim_matches(|c| c == '[' || c == ']')
@@ -895,7 +897,9 @@ impl FakeIpDnsEngine {
         if clean.is_empty()
             || clean.parse::<IpAddr>().is_ok()
             || clean == "localhost"
-            || self.lookup_static_hosts_for_endpoint(&clean).is_some()
+            || self
+                .lookup_static_hosts_for_endpoint(&clean, want_ipv6)
+                .is_some()
         {
             return self.resolve_proxy_server_ips(host).await;
         }
@@ -906,7 +910,14 @@ impl FakeIpDnsEngine {
             match guard.get(&clean).cloned() {
                 Some(CachedIpResolution::Positive { expires_at, ips }) => {
                     if expires_at.saturating_duration_since(now) > Duration::from_secs(25) {
-                        return Ok(ips);
+                        if want_ipv6 {
+                            return Ok(ips);
+                        }
+                        let v4_only: Vec<IpAddr> =
+                            ips.iter().copied().filter(IpAddr::is_ipv4).collect();
+                        if !v4_only.is_empty() {
+                            return Ok(v4_only);
+                        }
                     }
                     guard.pop(&clean);
                     (expires_at > now).then_some((expires_at, ips))
@@ -973,6 +984,11 @@ impl FakeIpDnsEngine {
 
     pub fn ipv6_enabled(&self) -> bool {
         self.ipv6
+    }
+
+    #[inline]
+    fn direct_ipv6_enabled(&self) -> bool {
+        self.ipv6 && crate::platform::socket_protect::is_direct_ipv6_reachable()
     }
 
     pub fn enhanced_mode(&self) -> &str {
@@ -1045,12 +1061,16 @@ impl FakeIpDnsEngine {
         best.map(|(_, _, ips)| ips)
     }
 
-    fn lookup_static_hosts_filtered(&self, normalized: &str) -> Option<Vec<IpAddr>> {
+    fn lookup_static_hosts_filtered(
+        &self,
+        normalized: &str,
+        want_ipv6: bool,
+    ) -> Option<Vec<IpAddr>> {
         let raw = self.lookup_static_hosts_raw(normalized)?;
         let filtered: Vec<IpAddr> = raw
             .iter()
             .copied()
-            .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+            .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
             .collect();
         if filtered.is_empty() {
             None
@@ -1059,12 +1079,16 @@ impl FakeIpDnsEngine {
         }
     }
 
-    fn lookup_static_hosts_for_endpoint(&self, normalized: &str) -> Option<Vec<IpAddr>> {
+    fn lookup_static_hosts_for_endpoint(
+        &self,
+        normalized: &str,
+        want_ipv6: bool,
+    ) -> Option<Vec<IpAddr>> {
         let raw = self.lookup_static_hosts_raw(normalized)?;
         let mut preferred: Vec<IpAddr> = raw
             .iter()
             .copied()
-            .filter(|ip| (!ip.is_ipv6() || self.ipv6) && !self.is_fake_ip(*ip))
+            .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
             .collect();
         if preferred.is_empty() {
             preferred = raw
@@ -1174,11 +1198,21 @@ impl FakeIpDnsEngine {
     fn lookup_cached_ips(
         cache: &Mutex<LruCache<String, CachedIpResolution>>,
         normalized: &str,
+        want_ipv6: bool,
     ) -> Option<Result<Vec<IpAddr>>> {
         let cached = cache.lock().get(normalized).cloned()?;
         match cached {
             CachedIpResolution::Positive { expires_at, ips } if Instant::now() < expires_at => {
-                Some(Ok(ips))
+                if want_ipv6 {
+                    Some(Ok(ips))
+                } else {
+                    let v4_only: Vec<IpAddr> = ips.into_iter().filter(IpAddr::is_ipv4).collect();
+                    if v4_only.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(v4_only))
+                    }
+                }
             }
             CachedIpResolution::Negative {
                 expires_at,
@@ -1246,17 +1280,26 @@ impl FakeIpDnsEngine {
                 Ok(vec![*ip])
             }
             DnsEndpointHost::Domain(domain) => {
+                let want_ipv6 = self.direct_ipv6_enabled();
                 let norm = domain.trim().trim_end_matches('.').to_ascii_lowercase();
                 if norm == "localhost" {
                     return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
                 }
-                if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&norm) {
+                if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&norm, want_ipv6) {
                     return Ok(static_ips);
                 }
+                let filter_bootstrap_ips = |ips: Vec<IpAddr>| -> Option<Vec<IpAddr>> {
+                    if want_ipv6 {
+                        return (!ips.is_empty()).then_some(ips);
+                    }
+                    let v4_only: Vec<IpAddr> = ips.into_iter().filter(IpAddr::is_ipv4).collect();
+                    (!v4_only.is_empty()).then_some(v4_only)
+                };
                 if let Some((expires_at, ips)) = self.bootstrap_cache.lock().get(&norm).cloned()
                     && Instant::now() < expires_at
+                    && let Some(valid) = filter_bootstrap_ips(ips)
                 {
-                    return Ok(ips);
+                    return Ok(valid);
                 }
 
                 let _inflight_guard = {
@@ -1283,8 +1326,9 @@ impl FakeIpDnsEngine {
                             if let Some((expires_at, ips)) =
                                 self.bootstrap_cache.lock().get(&norm).cloned()
                                 && Instant::now() < expires_at
+                                && let Some(valid) = filter_bootstrap_ips(ips)
                             {
-                                return Ok(ips);
+                                return Ok(valid);
                             }
                             None
                         }
@@ -1293,11 +1337,12 @@ impl FakeIpDnsEngine {
 
                 if let Some((expires_at, ips)) = self.bootstrap_cache.lock().get(&norm).cloned()
                     && Instant::now() < expires_at
+                    && let Some(valid) = filter_bootstrap_ips(ips)
                 {
-                    return Ok(ips);
+                    return Ok(valid);
                 }
 
-                let (res_a, res_aaaa) = if self.ipv6 {
+                let (res_a, res_aaaa) = if want_ipv6 {
                     tokio::join!(
                         self.query_bootstrap_qtype(&norm, QTYPE_A),
                         self.query_bootstrap_qtype(&norm, QTYPE_AAAA)
@@ -1311,7 +1356,7 @@ impl FakeIpDnsEngine {
                 for (ttl, list) in [res_a, res_aaaa].into_iter().flatten() {
                     min_ttl = min_ttl.min(ttl);
                     for ip in list {
-                        if !ips.contains(&ip) {
+                        if (!ip.is_ipv6() || want_ipv6) && !ips.contains(&ip) {
                             ips.push(ip);
                         }
                     }
@@ -1457,6 +1502,7 @@ impl FakeIpDnsEngine {
     fn collect_ips_from_metas(
         &self,
         metas: [Option<crate::dns::wire::DnsResponseMeta>; 2],
+        want_ipv6: bool,
     ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
         let mut resolved = Vec::new();
         let mut saw_nxdomain = false;
@@ -1491,7 +1537,7 @@ impl FakeIpDnsEngine {
                                     resolved.push(ip);
                                 }
                             }
-                            DnsAnswerData::Aaaa(v6) if self.ipv6 => {
+                            DnsAnswerData::Aaaa(v6) if want_ipv6 => {
                                 let ip = IpAddr::V6(v6);
                                 if !self.is_fake_ip(ip) && !resolved.contains(&ip) {
                                     resolved.push(ip);
@@ -1510,8 +1556,9 @@ impl FakeIpDnsEngine {
         &self,
         slice: &[DnsUpstream],
         normalized: &str,
+        want_ipv6: bool,
     ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
-        let metas = if self.ipv6 {
+        let metas = if want_ipv6 {
             let (m_a, m_aaaa) = tokio::join!(
                 self.query_slice_qtype(slice, normalized, QTYPE_A),
                 self.query_slice_qtype(slice, normalized, QTYPE_AAAA)
@@ -1523,14 +1570,19 @@ impl FakeIpDnsEngine {
                 None,
             ]
         };
-        self.collect_ips_from_metas(metas)
+        self.collect_ips_from_metas(metas, want_ipv6)
     }
 
-    /// Resolve a domain name to real IPv4 (and IPv6 if `dns.ipv6: true`) addresses via static `hosts`,
-    /// `nameserver-policy`, or configured `nameserver` / `fallback` upstreams with TTL-aware positive
-    /// and negative caching and singleflight coalescing.
+    /// Resolve a domain name to real IPv4 (and IPv6 if `dns.ipv6: true` and direct IPv6 is reachable)
+    /// addresses via static `hosts`, `nameserver-policy`, or configured `nameserver` / `fallback`
+    /// upstreams with TTL-aware positive and negative caching and singleflight coalescing.
     /// Never falls back to OS `lookup_host` when `nameserver`s are configured.
     pub async fn resolve_real_ips(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        self.resolve_real_ips_inner(domain, self.direct_ipv6_enabled())
+            .await
+    }
+
+    async fn resolve_real_ips_inner(&self, domain: &str, want_ipv6: bool) -> Result<Vec<IpAddr>> {
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized.is_empty() {
             return Err(ProxyError::Dns("cannot resolve empty domain".into()));
@@ -1544,7 +1596,7 @@ impl FakeIpDnsEngine {
             return Ok(vec![ip]);
         }
         if normalized == "localhost" {
-            return if self.ipv6 {
+            return if want_ipv6 {
                 Ok(vec![
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
                     IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -1553,11 +1605,11 @@ impl FakeIpDnsEngine {
                 Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
             };
         }
-        if let Some(static_ips) = self.lookup_static_hosts_filtered(&normalized) {
+        if let Some(static_ips) = self.lookup_static_hosts_filtered(&normalized, want_ipv6) {
             return Ok(static_ips);
         }
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6) {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
@@ -1580,7 +1632,8 @@ impl FakeIpDnsEngine {
                 Err(mut rx) => {
                     let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
                         .await;
-                    if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized)
+                    if let Some(cached) =
+                        Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6)
                     {
                         return cached;
                     }
@@ -1589,7 +1642,7 @@ impl FakeIpDnsEngine {
             }
         };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6) {
             return cached;
         }
 
@@ -1597,9 +1650,10 @@ impl FakeIpDnsEngine {
             if let Some(policy_ups) =
                 Self::matching_policy_upstreams(&self.policy_rules, &normalized)
             {
-                self.query_slice_ips(policy_ups, &normalized).await
+                self.query_slice_ips(policy_ups, &normalized, want_ipv6)
+                    .await
             } else if !self.upstreams.is_empty() || !self.fallbacks.is_empty() {
-                let metas = if self.ipv6 {
+                let metas = if want_ipv6 {
                     let (m_a, m_aaaa) = tokio::join!(
                         self.query_upstream_qtype(&normalized, QTYPE_A),
                         self.query_upstream_qtype(&normalized, QTYPE_AAAA)
@@ -1608,7 +1662,7 @@ impl FakeIpDnsEngine {
                 } else {
                     [self.query_upstream_qtype(&normalized, QTYPE_A).await, None]
                 };
-                self.collect_ips_from_metas(metas)
+                self.collect_ips_from_metas(metas, want_ipv6)
             } else {
                 (Vec::new(), None, None, false, false)
             };
@@ -1629,7 +1683,7 @@ impl FakeIpDnsEngine {
             {
                 for sa in iter {
                     let ip = sa.ip();
-                    if (!ip.is_ipv6() || self.ipv6)
+                    if (!ip.is_ipv6() || want_ipv6)
                         && !self.is_fake_ip(ip)
                         && !resolved.contains(&ip)
                     {
@@ -1674,6 +1728,7 @@ impl FakeIpDnsEngine {
     /// Honors static `hosts` and (when `direct-nameserver-follow-policy: true`, the default)
     /// `nameserver-policy` before `dns.direct-nameserver`, falling back cleanly to `resolve_real_ips`.
     pub async fn resolve_direct_ips(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        let want_ipv6 = self.direct_ipv6_enabled();
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized.is_empty() {
             return Err(ProxyError::Dns("cannot resolve empty domain".into()));
@@ -1687,7 +1742,7 @@ impl FakeIpDnsEngine {
             return Ok(vec![ip]);
         }
         if normalized == "localhost" {
-            return if self.ipv6 {
+            return if want_ipv6 {
                 Ok(vec![
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
                     IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -1696,17 +1751,18 @@ impl FakeIpDnsEngine {
                 Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
             };
         }
-        if let Some(static_ips) = self.lookup_static_hosts_filtered(&normalized) {
+        if let Some(static_ips) = self.lookup_static_hosts_filtered(&normalized, want_ipv6) {
             return Ok(static_ips);
         }
         if self.direct_upstreams.is_empty()
             || (self.direct_nameserver_follow_policy
                 && Self::matching_policy_upstreams(&self.policy_rules, &normalized).is_some())
         {
-            return self.resolve_real_ips(domain).await;
+            return self.resolve_real_ips_inner(domain, want_ipv6).await;
         }
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6)
+        {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
@@ -1730,21 +1786,22 @@ impl FakeIpDnsEngine {
                     let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
                         .await;
                     if let Some(cached) =
-                        Self::lookup_cached_ips(&self.direct_ip_cache, &normalized)
+                        Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6)
                     {
                         return cached;
                     }
-                    return self.resolve_real_ips(domain).await;
+                    return self.resolve_real_ips_inner(domain, want_ipv6).await;
                 }
             }
         };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6)
+        {
             return cached;
         }
 
         let (resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata) = self
-            .query_slice_ips(&self.direct_upstreams, &normalized)
+            .query_slice_ips(&self.direct_upstreams, &normalized, want_ipv6)
             .await;
 
         if !resolved.is_empty() {
@@ -1778,7 +1835,7 @@ impl FakeIpDnsEngine {
         }
 
         drop(inflight_guard);
-        self.resolve_real_ips(domain).await
+        self.resolve_real_ips_inner(domain, want_ipv6).await
     }
 
     /// Resolve a domain-based proxy node server hostname (`server: hk01.example.com`)
@@ -1790,6 +1847,7 @@ impl FakeIpDnsEngine {
     /// 5. `nameserver` / `fallback` & `direct-nameserver`
     /// 6. `default-nameserver` -> OS fallback (while strictly rejecting Fake-IPs)
     pub async fn resolve_proxy_server_ips(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let want_ipv6 = self.direct_ipv6_enabled();
         let clean = host
             .trim()
             .trim_start_matches('[')
@@ -1811,11 +1869,11 @@ impl FakeIpDnsEngine {
         if clean == "localhost" {
             return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         }
-        if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&clean) {
+        if let Some(static_ips) = self.lookup_static_hosts_for_endpoint(&clean, want_ipv6) {
             return Ok(static_ips);
         }
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6) {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
@@ -1838,7 +1896,9 @@ impl FakeIpDnsEngine {
                 Err(mut rx) => {
                     let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
                         .await;
-                    if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+                    if let Some(cached) =
+                        Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6)
+                    {
                         return cached;
                     }
                     None
@@ -1846,7 +1906,7 @@ impl FakeIpDnsEngine {
             }
         };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6) {
             return cached;
         }
 
@@ -1865,7 +1925,7 @@ impl FakeIpDnsEngine {
         // 1. Dedicated `proxy-server-nameserver-policy`
         if let Some(ps_pol) = Self::matching_policy_upstreams(&self.proxy_policy_rules, &clean) {
             let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
-                self.query_slice_ips(ps_pol, &clean).await;
+                self.query_slice_ips(ps_pol, &clean, want_ipv6).await;
             if !ips.is_empty() {
                 return cache_and_return(ips, pos_ttl);
             }
@@ -1887,8 +1947,9 @@ impl FakeIpDnsEngine {
 
         // 2. Dedicated `proxy-server-nameserver`
         if !self.proxy_upstreams.is_empty() {
-            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
-                self.query_slice_ips(&self.proxy_upstreams, &clean).await;
+            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) = self
+                .query_slice_ips(&self.proxy_upstreams, &clean, want_ipv6)
+                .await;
             if !ips.is_empty() {
                 return cache_and_return(ips, pos_ttl);
             }
@@ -1911,7 +1972,7 @@ impl FakeIpDnsEngine {
         // 3. Domain-scoped `nameserver-policy` (used by subscriptions with self-hosted DoH/DoT!)
         if let Some(pol) = Self::matching_policy_upstreams(&self.policy_rules, &clean) {
             let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
-                self.query_slice_ips(pol, &clean).await;
+                self.query_slice_ips(pol, &clean, want_ipv6).await;
             if !ips.is_empty() {
                 return cache_and_return(ips, pos_ttl);
             }
@@ -1932,7 +1993,7 @@ impl FakeIpDnsEngine {
         }
 
         // 4. Configured `nameserver` / `fallback` & `direct-nameserver`
-        if let Ok(ips) = self.resolve_real_ips(&clean).await
+        if let Ok(ips) = self.resolve_real_ips_inner(&clean, want_ipv6).await
             && !ips.is_empty()
         {
             return cache_and_return(ips, Some(60));
@@ -1954,11 +2015,18 @@ impl FakeIpDnsEngine {
         }
 
         let addrs = crate::router::geodata::resolve_host_bypassing_fake_ip(&clean, 0).await?;
-        let ips: Vec<IpAddr> = addrs
-            .into_iter()
+        let mut ips: Vec<IpAddr> = addrs
+            .iter()
             .map(|sa| sa.ip())
-            .filter(|ip| !self.is_fake_ip(*ip))
+            .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
             .collect();
+        if ips.is_empty() {
+            ips = addrs
+                .into_iter()
+                .map(|sa| sa.ip())
+                .filter(|ip| !self.is_fake_ip(*ip))
+                .collect();
+        }
         if ips.is_empty() {
             return Err(ProxyError::Dns(
                 "unable to resolve real IP for proxy server".into(),
@@ -2167,7 +2235,9 @@ impl FakeIpDnsEngine {
             return Ok(query.build_response(raw_query, 3, 1, &[]));
         }
 
-        if self.enabled && self.fake_ip_mode && !self.should_bypass_fake_ip(&normalized) {
+        let bypass_fake =
+            !self.enabled || !self.fake_ip_mode || self.should_bypass_fake_ip(&normalized);
+        if !bypass_fake {
             match query.question.qtype {
                 QTYPE_A | QTYPE_AAAA | QTYPE_SVCB | QTYPE_HTTPS
                     if self.has_cached_nxdomain(&normalized) =>
@@ -2192,6 +2262,14 @@ impl FakeIpDnsEngine {
                 }
                 _ => {}
             }
+        } else if query.question.qtype == QTYPE_AAAA
+            && !crate::platform::socket_protect::is_direct_ipv6_reachable()
+        {
+            // Suppress real-IP AAAA queries (fake-ip-filter bypassed domains or redir-host/normal
+            // modes) when direct physical IPv6 egress is unreachable so apps never receive
+            // unreachable global IPv6 addresses or stall on upstream AAAA lookups.
+            self.suppressed_queries.fetch_add(1, Ordering::Relaxed);
+            return Ok(query.build_response(raw_query, 0, 5, &[]));
         }
 
         // Check TTL-aware wire packet cache (`redir-host` / `normal` / bypassed domains)
@@ -3120,5 +3198,177 @@ mod tests {
         assert!(engine3.has_unpersisted_entries());
 
         let _ = std::fs::remove_file(&persist_path);
+    }
+
+    #[test]
+    fn ipv4_only_underlying_network_uses_single_stack_a_fast_path_and_suppresses_bypass_aaaa() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(false));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let upstream_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let upstream_addr = upstream_sock.local_addr().unwrap();
+            let a_queries = Arc::new(AtomicU64::new(0));
+            let aaaa_queries = Arc::new(AtomicU64::new(0));
+
+            let sock_bg = Arc::clone(&upstream_sock);
+            let a_bg = Arc::clone(&a_queries);
+            let aaaa_bg = Arc::clone(&aaaa_queries);
+            let upstream_task = tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok((n, peer)) = sock_bg.recv_from(&mut buf).await {
+                    let req = buf[..n].to_vec();
+                    let parsed = DnsQueryPacket::parse(&req).unwrap();
+                    match parsed.question.qtype {
+                        QTYPE_A => {
+                            a_bg.fetch_add(1, Ordering::Relaxed);
+                            let resp = parsed.build_response(
+                                &req,
+                                0,
+                                60,
+                                &[DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 88))],
+                            );
+                            let _ = sock_bg.send_to(&resp, peer).await;
+                        }
+                        QTYPE_AAAA => {
+                            aaaa_bg.fetch_add(1, Ordering::Relaxed);
+                            let sock_slow = Arc::clone(&sock_bg);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(1200)).await;
+                                let resp = parsed.build_response(
+                                    &req,
+                                    0,
+                                    60,
+                                    &[DnsAnswerData::Aaaa("2409:8c1e:75b0::88".parse().unwrap())],
+                                );
+                                let _ = sock_slow.send_to(&resp, peer).await;
+                            });
+                        }
+                        _ => {
+                            let resp = parsed.build_response(&req, 0, 60, &[]);
+                            let _ = sock_bg.send_to(&resp, peer).await;
+                        }
+                    }
+                }
+            });
+
+            let mut filters = DnsConfig::default().fake_ip_filter;
+            filters.push("+.cn".to_string());
+            let cfg = DnsConfig {
+                ipv6: true,
+                fake_ip_filter: filters,
+                direct_nameserver: vec![upstream_addr.to_string()],
+                nameserver: vec![upstream_addr.to_string()],
+                proxy_server_nameserver: vec![upstream_addr.to_string()],
+                fallback: Vec::new(),
+                ..DnsConfig::default()
+            };
+            let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+            // 1. Direct, proxy-server, and real-IP resolvers send ONLY QTYPE_A (0 QTYPE_AAAA) without stalling
+            let t0 = Instant::now();
+            let direct_ips = engine.resolve_direct_ips("ws.xiaoheihe.cn").await.unwrap();
+            assert!(
+                t0.elapsed() < Duration::from_millis(500),
+                "resolve_direct_ips stalled on IPv4-only network: {:?}",
+                t0.elapsed()
+            );
+            assert_eq!(direct_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88))]);
+            assert_eq!(a_queries.load(Ordering::Relaxed), 1);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            let t1 = Instant::now();
+            let proxy_ips = engine
+                .resolve_proxy_server_ips("hk01.node.example.test")
+                .await
+                .unwrap();
+            assert!(t1.elapsed() < Duration::from_millis(500));
+            assert_eq!(proxy_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88))]);
+            assert_eq!(a_queries.load(Ordering::Relaxed), 2);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            let real_ips = engine.resolve_real_ips("geo.example.test").await.unwrap();
+            assert_eq!(real_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88))]);
+            assert_eq!(a_queries.load(Ordering::Relaxed), 3);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            // Empty direct_nameserver delegation into resolve_real_ips_inner also stays single-stack QTYPE_A
+            let delegated_cfg = DnsConfig {
+                ipv6: true,
+                direct_nameserver: Vec::new(),
+                nameserver: vec![upstream_addr.to_string()],
+                fallback: Vec::new(),
+                ..DnsConfig::default()
+            };
+            let delegated_engine = FakeIpDnsEngine::new(&delegated_cfg).unwrap();
+            let delegated_ips = delegated_engine
+                .resolve_direct_ips("delegated.cn")
+                .await
+                .unwrap();
+            assert_eq!(
+                delegated_ips,
+                vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88))]
+            );
+            assert_eq!(a_queries.load(Ordering::Relaxed), 4);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            // Pre-existing dual-stack positive cache entry filters out unreachable IPv6 when !want_ipv6
+            engine.direct_ip_cache.lock().put(
+                "dual-cached.cn".to_string(),
+                CachedIpResolution::Positive {
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                    ips: vec![
+                        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88)),
+                        IpAddr::V6("2409:8c1e:75b0::88".parse().unwrap()),
+                    ],
+                },
+            );
+            let cached_ips = engine.resolve_direct_ips("dual-cached.cn").await.unwrap();
+            assert_eq!(cached_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88))]);
+            assert_eq!(a_queries.load(Ordering::Relaxed), 4);
+
+            // 2. Client AAAA query for fake-ip-filter bypassed domain is suppressed locally (NOERROR, 0 upstream queries)
+            let q_bypass_aaaa = build_dns_query(0x5101, "ws.xiaoheihe.cn", QTYPE_AAAA);
+            let r_bypass_aaaa = engine.handle_dns_packet(&q_bypass_aaaa).await.unwrap();
+            assert_eq!(dns_response_rcode(&r_bypass_aaaa).unwrap(), 0);
+            assert!(extract_ip_answers(&r_bypass_aaaa).unwrap().is_empty());
+            assert_eq!(engine.telemetry_snapshot().suppressed_queries, 1);
+            assert_eq!(a_queries.load(Ordering::Relaxed), 4);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            // Bypassed QTYPE_A still resolves real IPv4 upstream normally
+            let q_bypass_a = build_dns_query(0x5102, "ws.xiaoheihe.cn", QTYPE_A);
+            let r_bypass_a = engine.handle_dns_packet(&q_bypass_a).await.unwrap();
+            assert_eq!(
+                extract_ip_answers(&r_bypass_a).unwrap(),
+                vec![DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 88))]
+            );
+            assert_eq!(a_queries.load(Ordering::Relaxed), 5);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            // Non-bypassed proxied domain still receives normal Fake-IP synthesis without incrementing suppressed_queries
+            let q_proxy_a = build_dns_query(0x5103, "www.google.com", QTYPE_A);
+            let r_proxy_a = engine.handle_dns_packet(&q_proxy_a).await.unwrap();
+            assert_eq!(
+                extract_ip_answers(&r_proxy_a).unwrap(),
+                vec![DnsAnswerData::A(Ipv4Addr::new(198, 18, 0, 2))]
+            );
+            let q_proxy_aaaa = build_dns_query(0x5104, "www.google.com", QTYPE_AAAA);
+            let r_proxy_aaaa = engine.handle_dns_packet(&q_proxy_aaaa).await.unwrap();
+            assert_eq!(dns_response_rcode(&r_proxy_aaaa).unwrap(), 0);
+            assert!(extract_ip_answers(&r_proxy_aaaa).unwrap().is_empty());
+
+            let snap = engine.telemetry_snapshot();
+            assert_eq!(snap.fake_ip_hits, 2);
+            assert_eq!(snap.suppressed_queries, 1);
+            assert_eq!(a_queries.load(Ordering::Relaxed), 5);
+            assert_eq!(aaaa_queries.load(Ordering::Relaxed), 0);
+
+            upstream_task.abort();
+        });
     }
 }

@@ -1,5 +1,8 @@
 package io.github.rustclashlabs.rustclash.vpn
 
+import java.net.Inet6Address
+import java.net.InetAddress
+
 enum class VpnLifecycleState {
     DISCONNECTED,
     PREPARING,
@@ -35,6 +38,336 @@ data class VpnSessionConfig(
         )
     }
 }
+
+data class CidrRoute(
+    val address: String,
+    val prefixLength: Int,
+) {
+    val cidr: String
+        get() = "$address/$prefixLength"
+}
+
+data class VpnRoutePlan(
+    val useExcludeRoutes: Boolean,
+    val includedIpv4: List<CidrRoute>,
+    val excludedIpv4: List<CidrRoute>,
+    val includedIpv6: List<CidrRoute>,
+    val excludedIpv6: List<CidrRoute>,
+) {
+    fun matchesTun(ip: String): Boolean = VpnRoutePlanner.matchesTun(ip, this)
+}
+
+/**
+ * Pure-Kotlin VPN route planner that excludes private LAN, loopback, link-local, multicast,
+ * and limited-broadcast traffic from `tun0` while preserving Fake-IP (`198.18.0.0/15`),
+ * TUN DNS (`198.19.255.254/32`), CGNAT (`100.64.0.0/10`), and TUN IPv6 (`fdfe:dcba:9876::/126`).
+ *
+ * - On Android 13+ (API 33 / `TIRAMISU`), routes `0.0.0.0/0` (and `::/0`) with `excludeRoute(...)`.
+ * - On Android 8.0–12L (API 26–32), computes the minimal exact bitwise CIDR cover of
+ *   `0.0.0.0/0 \ excluded` via binary prefix-trie splitting (and `2000::/3` + `fc00::/7` for IPv6).
+ */
+object VpnRoutePlanner {
+    const val API_TIRAMISU = 33
+
+    val EXCLUDED_IPV4_PREFIXES: List<CidrRoute> = listOf(
+        CidrRoute("0.0.0.0", 8),
+        CidrRoute("10.0.0.0", 8),
+        CidrRoute("127.0.0.0", 8),
+        CidrRoute("169.254.0.0", 16),
+        CidrRoute("172.16.0.0", 12),
+        CidrRoute("192.168.0.0", 16),
+        CidrRoute("224.0.0.0", 4),
+        CidrRoute("255.255.255.255", 32),
+    )
+
+    val EXCLUDED_IPV6_PREFIXES: List<CidrRoute> = listOf(
+        CidrRoute("::", 128),
+        CidrRoute("::1", 128),
+        CidrRoute("fe80::", 10),
+        CidrRoute("ff00::", 8),
+    )
+
+    val LEGACY_INCLUDED_IPV6_PREFIXES: List<CidrRoute> = listOf(
+        CidrRoute("2000::", 3),
+        CidrRoute("fc00::", 7),
+    )
+
+    fun buildPlan(
+        sessionCfg: VpnSessionConfig,
+        sdkInt: Int,
+    ): VpnRoutePlan {
+        val cfg = sessionCfg.validated()
+        val protectedIpv4 = buildList {
+            canonicalizeIpv4Cidr(cfg.ipv4Address, cfg.ipv4PrefixLength)?.let { add(it) }
+            canonicalizeIpv4Cidr(cfg.dnsIpv4, 32)?.let { add(it) }
+        }
+        val effectiveExcludedIpv4 = if (protectedIpv4.isEmpty()) {
+            EXCLUDED_IPV4_PREFIXES
+        } else {
+            subtractIpv4Cidrs(EXCLUDED_IPV4_PREFIXES, protectedIpv4)
+        }
+
+        val tunIpv6 = if (cfg.enableIpv6) {
+            canonicalizeIpv6Cidr(cfg.ipv6Address, cfg.ipv6PrefixLength)
+        } else {
+            null
+        }
+
+        return if (sdkInt >= API_TIRAMISU) {
+            val effectiveExcludedIpv6 = if (cfg.enableIpv6) {
+                EXCLUDED_IPV6_PREFIXES.filterNot { ex ->
+                    tunIpv6 != null && ipv6CidrsOverlap(ex, tunIpv6)
+                }
+            } else {
+                emptyList()
+            }
+            VpnRoutePlan(
+                useExcludeRoutes = true,
+                includedIpv4 = listOf(CidrRoute("0.0.0.0", 0)),
+                excludedIpv4 = effectiveExcludedIpv4,
+                includedIpv6 = if (cfg.enableIpv6) listOf(CidrRoute("::", 0)) else emptyList(),
+                excludedIpv6 = effectiveExcludedIpv6,
+            )
+        } else {
+            val includedIpv4 = computeIpv4IncludedRoutesExcluding(effectiveExcludedIpv4)
+            val includedIpv6 = if (cfg.enableIpv6) {
+                buildList {
+                    addAll(LEGACY_INCLUDED_IPV6_PREFIXES)
+                    if (tunIpv6 != null && none { inc ->
+                            inc.prefixLength <= tunIpv6.prefixLength && ipv6CidrsOverlap(inc, tunIpv6)
+                        }
+                    ) {
+                        add(tunIpv6)
+                    }
+                }
+            } else {
+                emptyList()
+            }
+            VpnRoutePlan(
+                useExcludeRoutes = false,
+                includedIpv4 = includedIpv4,
+                excludedIpv4 = emptyList(),
+                includedIpv6 = includedIpv6,
+                excludedIpv6 = emptyList(),
+            )
+        }
+    }
+
+    fun computeIpv4IncludedRoutesExcluding(excluded: List<CidrRoute>): List<CidrRoute> =
+        subtractIpv4Cidrs(listOf(CidrRoute("0.0.0.0", 0)), excluded)
+
+    fun subtractIpv4Cidrs(
+        base: List<CidrRoute>,
+        excluded: List<CidrRoute>,
+    ): List<CidrRoute> {
+        val excludedRanges = mergeIpv4Ranges(
+            excluded.mapNotNull { cidrToIpv4Range(it) },
+        )
+        val out = ArrayList<CidrRoute>(32)
+        for (route in base) {
+            val addr = parseIpv4ToUInt(route.address) ?: continue
+            val prefixLen = route.prefixLength.coerceIn(0, 32)
+            val netStart = ipv4NetworkStart(addr, prefixLen)
+            subtractIpv4Trie(
+                nodeAddr = netStart,
+                prefixLen = prefixLen,
+                excludedRanges = excludedRanges,
+                out = out,
+            )
+        }
+        return out
+    }
+
+    fun matchesTun(ip: String, plan: VpnRoutePlan): Boolean {
+        val trimmed = ip.trim()
+        val v4 = parseIpv4ToUInt(trimmed)
+        if (v4 != null) {
+            val bestIncluded = plan.includedIpv4
+                .filter { ipv4MatchesCidr(v4, it) }
+                .maxOfOrNull { it.prefixLength }
+                ?: return false
+            val bestExcluded = plan.excludedIpv4
+                .filter { ipv4MatchesCidr(v4, it) }
+                .maxOfOrNull { it.prefixLength }
+                ?: return true
+            return bestIncluded > bestExcluded
+        }
+
+        val v6Bytes = parseIpv6Bytes(trimmed) ?: return false
+        val bestIncluded = plan.includedIpv6
+            .filter { ipv6MatchesCidr(v6Bytes, it) }
+            .maxOfOrNull { it.prefixLength }
+            ?: return false
+        val bestExcluded = plan.excludedIpv6
+            .filter { ipv6MatchesCidr(v6Bytes, it) }
+            .maxOfOrNull { it.prefixLength }
+            ?: return true
+        return bestIncluded > bestExcluded
+    }
+
+    private fun subtractIpv4Trie(
+        nodeAddr: UInt,
+        prefixLen: Int,
+        excludedRanges: List<UIntRange>,
+        out: MutableList<CidrRoute>,
+    ) {
+        val nodeStart = nodeAddr
+        val nodeEnd = if (prefixLen == 0) {
+            0xFFFF_FFFFu
+        } else {
+            nodeAddr or ((1u shl (32 - prefixLen)) - 1u)
+        }
+        if (excludedRanges.any { it.first <= nodeStart && nodeEnd <= it.last }) {
+            return
+        }
+        if (excludedRanges.none { it.first <= nodeEnd && nodeStart <= it.last }) {
+            out.add(CidrRoute(uintToIpv4(nodeStart), prefixLen))
+            return
+        }
+        if (prefixLen < 32) {
+            val nextPrefix = prefixLen + 1
+            val rightBit = 1u shl (31 - prefixLen)
+            subtractIpv4Trie(nodeStart, nextPrefix, excludedRanges, out)
+            subtractIpv4Trie(nodeStart or rightBit, nextPrefix, excludedRanges, out)
+        }
+    }
+
+    private fun mergeIpv4Ranges(ranges: List<UIntRange>): List<UIntRange> {
+        if (ranges.size <= 1) return ranges
+        val sorted = ranges.sortedBy { it.first }
+        val merged = ArrayList<UIntRange>(sorted.size)
+        var curStart = sorted[0].first
+        var curEnd = sorted[0].last
+        for (i in 1 until sorted.size) {
+            val next = sorted[i]
+            if (next.first <= curEnd || (curEnd < 0xFFFF_FFFFu && next.first == curEnd + 1u)) {
+                if (next.last > curEnd) {
+                    curEnd = next.last
+                }
+            } else {
+                merged.add(curStart..curEnd)
+                curStart = next.first
+                curEnd = next.last
+            }
+        }
+        merged.add(curStart..curEnd)
+        return merged
+    }
+
+    internal fun canonicalizeIpv4Cidr(address: String, prefixLength: Int): CidrRoute? {
+        val addr = parseIpv4ToUInt(address) ?: return null
+        val clamped = prefixLength.coerceIn(0, 32)
+        return CidrRoute(uintToIpv4(ipv4NetworkStart(addr, clamped)), clamped)
+    }
+
+    internal fun cidrToIpv4Range(route: CidrRoute): UIntRange? {
+        val addr = parseIpv4ToUInt(route.address) ?: return null
+        val clamped = route.prefixLength.coerceIn(0, 32)
+        if (clamped == 0) {
+            return 0u..0xFFFF_FFFFu
+        }
+        val hostMask = (1u shl (32 - clamped)) - 1u
+        val start = addr and hostMask.inv()
+        val end = start or hostMask
+        return start..end
+    }
+
+    internal fun ipv4NetworkStart(addr: UInt, prefixLength: Int): UInt {
+        val clamped = prefixLength.coerceIn(0, 32)
+        if (clamped == 0) return 0u
+        val hostMask = (1u shl (32 - clamped)) - 1u
+        return addr and hostMask.inv()
+    }
+
+    internal fun ipv4MatchesCidr(addr: UInt, route: CidrRoute): Boolean {
+        val range = cidrToIpv4Range(route) ?: return false
+        return addr in range
+    }
+
+    internal fun parseIpv4ToUInt(ip: String): UInt? {
+        val trimmed = ip.trim()
+        if (trimmed.isEmpty() || ':' in trimmed) return null
+        val parts = trimmed.split('.')
+        if (parts.size != 4) return null
+        var acc = 0u
+        for (part in parts) {
+            if (part.isEmpty() || part.length > 3 || !part.all { it in '0'..'9' }) {
+                return null
+            }
+            val octet = part.toIntOrNull() ?: return null
+            if (octet !in 0..255) return null
+            acc = (acc shl 8) or octet.toUInt()
+        }
+        return acc
+    }
+
+    internal fun uintToIpv4(value: UInt): String {
+        val b0 = (value shr 24) and 0xFFu
+        val b1 = (value shr 16) and 0xFFu
+        val b2 = (value shr 8) and 0xFFu
+        val b3 = value and 0xFFu
+        return "$b0.$b1.$b2.$b3"
+    }
+
+    internal fun canonicalizeIpv6Cidr(address: String, prefixLength: Int): CidrRoute? {
+        val raw = parseIpv6Bytes(address)?.copyOf() ?: return null
+        val clamped = prefixLength.coerceIn(0, 128)
+        val fullBytes = clamped / 8
+        val remBits = clamped % 8
+        if (fullBytes < raw.size) {
+            if (remBits > 0) {
+                val mask = (0xFF shl (8 - remBits)) and 0xFF
+                raw[fullBytes] = (raw[fullBytes].toInt() and mask).toByte()
+                for (i in (fullBytes + 1) until raw.size) {
+                    raw[i] = 0
+                }
+            } else {
+                for (i in fullBytes until raw.size) {
+                    raw[i] = 0
+                }
+            }
+        }
+        val masked = runCatching { InetAddress.getByAddress(null, raw) }.getOrNull() ?: return null
+        return CidrRoute(masked.hostAddress ?: address.trim(), clamped)
+    }
+
+    internal fun parseIpv6Bytes(ip: String): ByteArray? {
+        val clean = ip.trim().removeSurrounding("[", "]")
+        if (!clean.contains(':')) return null
+        val parsed = runCatching { InetAddress.getByName(clean) }.getOrNull() as? Inet6Address ?: return null
+        val bytes = parsed.address
+        return if (bytes.size == 16) bytes else null
+    }
+
+    internal fun ipv6MatchesCidr(addrBytes: ByteArray, route: CidrRoute): Boolean {
+        val routeBytes = parseIpv6Bytes(route.address) ?: return false
+        return ipv6PrefixEquals(addrBytes, routeBytes, route.prefixLength.coerceIn(0, 128))
+    }
+
+    internal fun ipv6CidrsOverlap(a: CidrRoute, b: CidrRoute): Boolean {
+        val aBytes = parseIpv6Bytes(a.address) ?: return false
+        val bBytes = parseIpv6Bytes(b.address) ?: return false
+        val commonBits = minOf(a.prefixLength.coerceIn(0, 128), b.prefixLength.coerceIn(0, 128))
+        return ipv6PrefixEquals(aBytes, bBytes, commonBits)
+    }
+
+    private fun ipv6PrefixEquals(a: ByteArray, b: ByteArray, prefixBits: Int): Boolean {
+        if (a.size != 16 || b.size != 16) return false
+        val fullBytes = prefixBits / 8
+        for (i in 0 until fullBytes) {
+            if (a[i] != b[i]) return false
+        }
+        val remBits = prefixBits % 8
+        if (remBits > 0) {
+            val mask = (0xFF shl (8 - remBits)) and 0xFF
+            if ((a[fullBytes].toInt() and mask) != (b[fullBytes].toInt() and mask)) {
+                return false
+            }
+        }
+        return true
+    }
+}
+
 
 data class NetworkTransitionDecision(
     val updateUnderlyingNetworks: Boolean,

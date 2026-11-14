@@ -11,6 +11,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.IpPrefix
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -21,6 +22,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -302,13 +304,12 @@ class RustClashVpnService : VpnService() {
                 .setSession(sessionCfg.sessionName)
                 .setMtu(sessionCfg.mtu)
                 .addAddress(sessionCfg.ipv4Address, sessionCfg.ipv4PrefixLength)
-                .addRoute("0.0.0.0", 0)
                 .addDnsServer(sessionCfg.dnsIpv4)
 
             if (sessionCfg.enableIpv6) {
                 builder.addAddress(sessionCfg.ipv6Address, sessionCfg.ipv6PrefixLength)
-                builder.addRoute("::", 0)
             }
+            applyVpnRoutes(builder, sessionCfg)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
             }
@@ -875,6 +876,44 @@ class RustClashVpnService : VpnService() {
             setShowBadge(false)
         }
         nm.createNotificationChannel(channel)
+    }
+
+    private fun applyVpnRoutes(builder: Builder, sessionCfg: VpnSessionConfig) {
+        val routePlan = VpnRoutePlanner.buildPlan(
+            sessionCfg = sessionCfg,
+            sdkInt = Build.VERSION.SDK_INT,
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && routePlan.useExcludeRoutes) {
+            Api33VpnRouteHelper.applyRoutesWithExclusions(builder, routePlan)
+        } else {
+            for (route in routePlan.includedIpv4) {
+                builder.addRoute(route.address, route.prefixLength)
+            }
+            for (route in routePlan.includedIpv6) {
+                builder.addRoute(route.address, route.prefixLength)
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private object Api33VpnRouteHelper {
+        fun applyRoutesWithExclusions(
+            builder: VpnService.Builder,
+            routePlan: VpnRoutePlan,
+        ) {
+            for (route in routePlan.includedIpv4) {
+                builder.addRoute(route.address, route.prefixLength)
+            }
+            for (route in routePlan.excludedIpv4) {
+                builder.excludeRoute(IpPrefix(InetAddress.getByName(route.address), route.prefixLength))
+            }
+            for (route in routePlan.includedIpv6) {
+                builder.addRoute(route.address, route.prefixLength)
+            }
+            for (route in routePlan.excludedIpv6) {
+                builder.excludeRoute(IpPrefix(InetAddress.getByName(route.address), route.prefixLength))
+            }
+        }
     }
 
     private fun buildNotification(title: String, body: String): Notification {

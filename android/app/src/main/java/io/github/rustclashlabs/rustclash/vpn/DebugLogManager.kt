@@ -574,18 +574,47 @@ object DebugLogManager {
             exportDir.listFiles()?.forEach { runCatching { it.delete() } }
         }
         val now = System.currentTimeMillis()
-        synchronized(lock) {
-            timelineEvents.clear()
-            windowStartMs = now
-            screenOnAccumMs = 0L
-            screenOffAccumMs = 0L
-            lastScreenTransitionMs = now
-            lastCumulativeRuleHits = emptyMap()
-        }
+        val batteryNow = readBatterySnapshot(context).levelPct
+        resetTimelineWindowOnClear(
+            nowMs = now,
+            batteryPct = batteryNow,
+            vpnState = RustClashVpnService.stateTracker.state,
+            activeNode = RustClashVpnService.activeOutboundLabel,
+        )
         if (NativeBridge.isNativeLoaded) {
             runCatching { NativeBridge.nativeClearDiagnostics() }
         }
     }
+
+    internal fun resetTimelineWindowOnClear(
+        nowMs: Long,
+        batteryPct: Int? = null,
+        vpnState: VpnLifecycleState = RustClashVpnService.stateTracker.state,
+        activeNode: String = RustClashVpnService.activeOutboundLabel,
+    ): List<MobileTimelineEvent> = synchronized(lock) {
+        timelineEvents.clear()
+        windowStartMs = nowMs
+        screenOnAccumMs = 0L
+        screenOffAccumMs = 0L
+        lastScreenTransitionMs = nowMs
+        if (batteryPct != null) {
+            windowStartBatteryPct = batteryPct
+        }
+        lastNetStateFingerprint = ""
+        lastCumulativeRuleHits = emptyMap()
+        if (vpnState != VpnLifecycleState.DISCONNECTED) {
+            pushEventLocked(
+                nowMs,
+                "LOG_CLEARED",
+                "logs reset while state=${vpnState.name.lowercase(Locale.ROOT)} interactive=$currentScreenInteractive" +
+                    if (activeNode.isNotBlank()) " node=$activeNode" else "",
+            )
+        }
+        timelineEvents.toList()
+    }
+
+    internal fun snapshotTimelineEventsForTest(): List<MobileTimelineEvent> =
+        synchronized(lock) { timelineEvents.toList() }
 
     internal fun listSliceFilesNewestFirst(dir: File): List<File> {
         if (!dir.isDirectory) return emptyList()
@@ -906,10 +935,11 @@ object DebugLogManager {
             }
 
             nativeObj.optJSONObject("dns")?.let { dns ->
-                val cacheHits = if (dns.has("cache_hits")) {
-                    dns.optLong("cache_hits", 0L)
-                } else {
-                    dns.optLong("cacheHits", 0L)
+                val cacheHits = when {
+                    dns.has("wireCacheHits") -> dns.optLong("wireCacheHits", 0L)
+                    dns.has("wire_cache_hits") -> dns.optLong("wire_cache_hits", 0L)
+                    dns.has("cache_hits") -> dns.optLong("cache_hits", 0L)
+                    else -> dns.optLong("cacheHits", 0L)
                 }
                 val resolverCacheHits = if (dns.has("resolverCacheHits")) {
                     dns.optLong("resolverCacheHits", 0L)
@@ -920,7 +950,7 @@ object DebugLogManager {
                 val nxdomainPart = if (nxdomainHits > 0L) " nxdomainCached=`$nxdomainHits`" else ""
                 sb.appendLine(
                     "- DNS & Fake-IP: queries=`${dns.optLong("total_queries")}` fakeIpHits=`${dns.optLong("fake_ip_hits")}` " +
-                        "cacheHits=`$cacheHits` resolverCacheHits=`$resolverCacheHits` " +
+                        "wireCacheHits=`$cacheHits` resolverCacheHits=`$resolverCacheHits` " +
                         "aaaaSuppressed=`${dns.optLong("suppressed_queries", 0L)}`$nxdomainPart " +
                         "upstreamQueries=`${dns.optLong("upstream_queries")}` " +
                         "upstreamErrors=`${dns.optLong("upstream_errors")}` " +
@@ -1054,12 +1084,32 @@ object DebugLogManager {
         }
     }
 
+    private fun readCoalescedCount(c: JSONObject): Long {
+        val raw = if (c.has("coalescedCount")) {
+            c.optLong("coalescedCount", 1L)
+        } else {
+            c.optLong("coalesced_count", 1L)
+        }
+        return raw.coerceAtLeast(1L)
+    }
+
     private fun appendFailedConnectionsSection(sb: StringBuilder, arr: JSONArray?) {
         if (arr == null || arr.length() == 0) return
-        sb.appendLine()
-        sb.appendLine("#### Failed Connections (${arr.length()})")
+        var totalFailedCount = 0L
         for (i in 0 until arr.length()) {
             val c = arr.optJSONObject(i) ?: continue
+            totalFailedCount += readCoalescedCount(c)
+        }
+        sb.appendLine()
+        if (totalFailedCount > arr.length().toLong()) {
+            sb.appendLine("#### Failed Connections (${arr.length()} entries, $totalFailedCount total)")
+        } else {
+            sb.appendLine("#### Failed Connections (${arr.length()})")
+        }
+        for (i in 0 until arr.length()) {
+            val c = arr.optJSONObject(i) ?: continue
+            val coalesced = readCoalescedCount(c)
+            val coalescedSuffix = if (coalesced > 1L) " (x$coalesced)" else ""
             val rulePayload = c.optString("rulePayload")
             val ruleDesc = if (rulePayload.isEmpty()) c.optString("rule") else "${c.optString("rule")}($rulePayload)"
             val fakeNote = c.optString("fakeIp").takeIf { it.isNotEmpty() && it != "null" }?.let { " fakeIp=$it" } ?: ""
@@ -1068,7 +1118,7 @@ object DebugLogManager {
                 "- `[${formatShortTime(c.optLong("startEpochMs"))}]` `${c.optString("network").uppercase(Locale.ROOT)}` " +
                     "`$hostPort`$fakeNote · rule=`$ruleDesc` -> " +
                     "`${c.optString("effectiveOutbound")}` (${c.optString("effectiveProtocol")}) · " +
-                    "error=`${c.optString("error", "unknown")}`",
+                    "error=`${c.optString("error", "unknown")}`$coalescedSuffix",
             )
         }
     }
@@ -1098,6 +1148,8 @@ object DebugLogManager {
         sb.appendLine("#### Recent Connections Sample (${minOf(arr.length(), 50)})")
         for (i in 0 until minOf(arr.length(), 50)) {
             val c = arr.optJSONObject(i) ?: continue
+            val coalesced = readCoalescedCount(c)
+            val coalescedSuffix = if (coalesced > 1L) " (x$coalesced)" else ""
             val hs = if (c.isNull("connectDurationMs")) "-" else "${c.optLong("connectDurationMs")}ms"
             val rulePayload = c.optString("rulePayload")
             val ruleDesc = if (rulePayload.isEmpty()) c.optString("rule") else "${c.optString("rule")}($rulePayload)"
@@ -1105,7 +1157,7 @@ object DebugLogManager {
             sb.appendLine(
                 "- `[${formatShortTime(c.optLong("startEpochMs"))}]` `${c.optString("network").uppercase(Locale.ROOT)}` " +
                     "`$hostPort` · `$ruleDesc` -> `${c.optString("effectiveOutbound")}` · " +
-                    "hs=`$hs` up=`${formatBytesCompact(c.optLong("upload"))}` down=`${formatBytesCompact(c.optLong("download"))}` status=`${c.optString("status")}`",
+                    "hs=`$hs` up=`${formatBytesCompact(c.optLong("upload"))}` down=`${formatBytesCompact(c.optLong("download"))}` status=`${c.optString("status")}`$coalescedSuffix",
             )
         }
     }

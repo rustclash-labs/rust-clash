@@ -63,6 +63,48 @@ fn is_important_log(level: &str, payload: &str) -> bool {
     sev >= 2 || !is_routine_connection_log(payload)
 }
 
+fn split_tun_coalesce_suffix(s: &str) -> (&str, u64) {
+    if let Some(without_close) = s.strip_suffix(')')
+        && let Some((base, count_str)) = without_close.rsplit_once(" (x")
+        && !count_str.is_empty()
+        && count_str.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(count) = count_str.parse::<u64>()
+        && count >= 2
+    {
+        return (base, count);
+    }
+    (s, 1)
+}
+
+fn tun_log_coalesce_key<'a>(level: &str, payload: &'a str) -> Option<(&'a str, &'a str)> {
+    if !level.trim().eq_ignore_ascii_case("info") {
+        return None;
+    }
+    let after_tun = payload.strip_prefix("[TUN] ")?;
+    let (clean, _) = split_tun_coalesce_suffix(after_tun);
+    let (src_part, rest) = clean.split_once(" -> ")?;
+    let (proto_prefix, client_addr) = if let Some(addr) = src_part.strip_prefix("TCP ") {
+        ("TCP", addr)
+    } else if let Some(addr) = src_part.strip_prefix("UDP ") {
+        ("UDP", addr)
+    } else {
+        ("", src_part)
+    };
+    if client_addr.is_empty()
+        || client_addr.bytes().any(|b| b.is_ascii_whitespace())
+        || !client_addr.contains(':')
+        || rest.is_empty()
+        || rest.contains(" failed")
+    {
+        return None;
+    }
+    Some((proto_prefix, rest))
+}
+
+fn default_coalesced_count() -> u64 {
+    1
+}
+
 /// Hook implemented by stateful session managers (such as `UdpNatManager`) so
 /// `TelemetryHub` / `ProxyEngine::notify_network_change()` can synchronously evict
 /// sockets bound to a stale network interface.
@@ -122,6 +164,8 @@ pub struct ConnectionSnapshot {
     /// Outbound TCP/TLS/protocol handshake duration in milliseconds once established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_duration_ms: Option<u64>,
+    #[serde(default = "default_coalesced_count")]
+    pub coalesced_count: u64,
 }
 
 pub type DiagnosticEntry = ConnectionSnapshot;
@@ -201,6 +245,7 @@ impl ActiveConnection {
             error: None,
             end_epoch_ms: None,
             connect_duration_ms,
+            coalesced_count: 1,
         }
     }
 
@@ -577,6 +622,9 @@ impl TelemetryHub {
             && snap.start_epoch_ms.saturating_sub(back.start_epoch_ms) < 1_000
         {
             back.end_epoch_ms = snap.end_epoch_ms;
+            back.coalesced_count = back
+                .coalesced_count
+                .saturating_add(snap.coalesced_count.max(1));
             return;
         }
         while ring.len() >= max_cap {
@@ -656,6 +704,7 @@ impl TelemetryHub {
             error: Some(safe_reason),
             end_epoch_ms: Some(now),
             connect_duration_ms: None,
+            coalesced_count: 1,
         };
         self.archive_diagnostic(snap);
     }
@@ -921,6 +970,10 @@ impl TelemetryHub {
     }
 
     pub fn push_log(&self, level: impl Into<String>, payload: impl Into<String>) {
+        self.push_log_at(Self::now_ms(), level, payload);
+    }
+
+    fn push_log_at(&self, timestamp_ms: u64, level: impl Into<String>, payload: impl Into<String>) {
         let level_str = level.into();
         if log_level_severity(&level_str) < self.min_log_severity.load(Ordering::Relaxed) {
             return;
@@ -931,13 +984,24 @@ impl TelemetryHub {
             MAX_RECENT_LOGS
         };
         let entry = LogEntry {
-            timestamp_ms: Self::now_ms(),
+            timestamp_ms,
             level: level_str,
             payload: payload.into(),
         };
         let important = is_important_log(&entry.level, &entry.payload);
         {
             let mut logs = self.recent_logs.lock();
+            if let Some(key) = tun_log_coalesce_key(&entry.level, &entry.payload)
+                && let Some(back) = logs.back_mut()
+                && tun_log_coalesce_key(&back.level, &back.payload) == Some(key)
+                && timestamp_ms.saturating_sub(back.timestamp_ms) < 1_000
+            {
+                let (base_payload, prev_count) = split_tun_coalesce_suffix(&back.payload);
+                let new_count = prev_count.saturating_add(1);
+                back.timestamp_ms = timestamp_ms;
+                back.payload = format!("{base_payload} (x{new_count})");
+                return;
+            }
             while logs.len() >= max_logs {
                 logs.pop_front();
             }
@@ -1266,7 +1330,7 @@ mod tests {
             hub.push_log(
                 "info",
                 format!(
-                    "[TUN] 198.18.0.1:{} -> example.com:443 (raw 198.18.0.10:443) [MATCH] via Node-A (PROXY)",
+                    "[TUN] 198.18.0.1:{} -> host-{i}.example.com:443 (raw 198.18.0.10:443) [MATCH] via Node-A (PROXY)",
                     30_000 + (i % 20_000)
                 ),
             );
@@ -1348,5 +1412,112 @@ mod tests {
             "unexpected handshake duration {dur}ms"
         );
         hub.unregister_connection(&conn.id);
+    }
+
+    #[test]
+    fn consecutive_identical_failures_coalesce_count_within_one_second_only() {
+        let hub = TelemetryHub::new();
+        let make_failed = |id: &str, start_ms: u64, end_ms: u64| ConnectionSnapshot {
+            id: id.to_string(),
+            metadata: ConnectionMetadata {
+                id: id.to_string(),
+                network: "tcp".to_string(),
+                inbound_type: "TUN(smoltcp)".to_string(),
+                source: "198.18.0.1:50101".to_string(),
+                destination_ip: None,
+                destination_port: 443,
+                host: "api.openai.com".to_string(),
+                fake_ip: Some("198.18.0.42".to_string()),
+                process: None,
+            },
+            upload: 0,
+            download: 0,
+            start_epoch_ms: start_ms,
+            chains: vec!["Node-SG".to_string(), "PROXY".to_string()],
+            rule: "GEOSITE".to_string(),
+            rule_payload: "openai".to_string(),
+            effective_outbound: "Node-SG".to_string(),
+            effective_protocol: "vless".to_string(),
+            exit_type: "PROXY".to_string(),
+            remote_endpoint: "example.net:443".to_string(),
+            status: "failed".to_string(),
+            error: Some("connection reset by peer".to_string()),
+            end_epoch_ms: Some(end_ms),
+            connect_duration_ms: None,
+            coalesced_count: 1,
+        };
+
+        hub.archive_diagnostic(make_failed("f1", 1_000, 1_040));
+        hub.archive_diagnostic(make_failed("f2", 1_300, 1_340));
+        hub.archive_diagnostic(make_failed("f3", 1_850, 1_890));
+
+        let snap1 = hub.diagnostics_snapshot(10);
+        assert_eq!(snap1.len(), 1);
+        assert_eq!(snap1[0].coalesced_count, 3);
+        assert_eq!(snap1[0].end_epoch_ms, Some(1_890));
+
+        // Failure >= 1000ms after the initial burst start_epoch_ms (2_000 - 1_000 == 1_000) stays separate.
+        hub.archive_diagnostic(make_failed("f4", 2_000, 2_050));
+        hub.archive_diagnostic(make_failed("f5", 3_100, 3_150));
+
+        let snap2 = hub.diagnostics_snapshot(10);
+        assert_eq!(snap2.len(), 3);
+        assert_eq!(snap2[0].start_epoch_ms, 3_100);
+        assert_eq!(snap2[0].coalesced_count, 1);
+        assert_eq!(snap2[1].start_epoch_ms, 2_000);
+        assert_eq!(snap2[1].coalesced_count, 1);
+        assert_eq!(snap2[2].start_epoch_ms, 1_000);
+        assert_eq!(snap2[2].coalesced_count, 3);
+        assert_eq!(hub.failed_connections_total(), 5);
+    }
+
+    #[test]
+    fn tun_routine_info_logs_coalesce_within_one_second_by_protocol_and_destination() {
+        let hub = TelemetryHub::new();
+
+        hub.push_log_at(
+            5_000,
+            "info",
+            "[TUN] TCP 198.18.0.1:50101 -> ws.xiaoheihe.cn:443 (198.18.0.42) [DomainSuffix(xiaoheihe.cn) -> DIRECT]",
+        );
+        hub.push_log_at(
+            5_350,
+            "info",
+            "[TUN] TCP 198.18.0.1:50102 -> ws.xiaoheihe.cn:443 (198.18.0.42) [DomainSuffix(xiaoheihe.cn) -> DIRECT]",
+        );
+
+        let logs_after_burst = hub.recent_logs();
+        assert_eq!(logs_after_burst.len(), 1);
+        assert_eq!(logs_after_burst[0].timestamp_ms, 5_350);
+        assert_eq!(
+            logs_after_burst[0].payload,
+            "[TUN] TCP 198.18.0.1:50101 -> ws.xiaoheihe.cn:443 (198.18.0.42) [DomainSuffix(xiaoheihe.cn) -> DIRECT] (x2)"
+        );
+
+        // Different protocol (UDP vs TCP) must not coalesce.
+        hub.push_log_at(
+            5_500,
+            "info",
+            "[TUN] UDP 198.18.0.1:50103 -> ws.xiaoheihe.cn:443 (198.18.0.42) [DomainSuffix(xiaoheihe.cn) -> DIRECT]",
+        );
+        // Different destination must not coalesce.
+        hub.push_log_at(
+            5_600,
+            "info",
+            "[TUN] TCP 198.18.0.1:50104 -> api.xiaoheihe.cn:443 (198.18.0.43) [DomainSuffix(xiaoheihe.cn) -> DIRECT]",
+        );
+        // Same destination >= 1000ms apart (6_600 - 5_600 == 1_000) must not coalesce.
+        hub.push_log_at(
+            6_600,
+            "info",
+            "[TUN] TCP 198.18.0.1:50105 -> api.xiaoheihe.cn:443 (198.18.0.43) [DomainSuffix(xiaoheihe.cn) -> DIRECT]",
+        );
+
+        let logs = hub.recent_logs();
+        assert_eq!(logs.len(), 4);
+        assert!(logs[0].payload.ends_with(" (x2)"));
+        assert!(!logs[1].payload.ends_with(" (x2)"));
+        assert!(!logs[2].payload.ends_with(" (x2)"));
+        assert!(!logs[3].payload.ends_with(" (x2)"));
     }
 }
