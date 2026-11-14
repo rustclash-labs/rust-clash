@@ -453,9 +453,32 @@ pub async fn spawn_ss_server(
     let kind = SsCipherKind::parse(cipher_str)?;
     let master_key = kind.master_key(password)?;
 
-    let tcp_listener = TcpListener::bind(listen_addr).await?;
-    let bound_addr = tcp_listener.local_addr()?;
-    let udp_socket = Arc::new(UdpSocket::bind(bound_addr).await?);
+    let is_ephemeral = listen_addr
+        .parse::<SocketAddr>()
+        .is_ok_and(|addr| addr.port() == 0);
+    let max_attempts = if is_ephemeral { 16 } else { 1 };
+    let mut held_tcp = Vec::new();
+    let mut bound_pair = None;
+    let mut last_udp_err = None;
+    for _ in 0..max_attempts {
+        let candidate_tcp = TcpListener::bind(listen_addr).await?;
+        let candidate_addr = candidate_tcp.local_addr()?;
+        match UdpSocket::bind(candidate_addr).await {
+            Ok(udp) => {
+                bound_pair = Some((candidate_tcp, candidate_addr, Arc::new(udp)));
+                break;
+            }
+            Err(e) => {
+                last_udp_err = Some(e);
+                held_tcp.push(candidate_tcp);
+            }
+        }
+    }
+    drop(held_tcp);
+    let (tcp_listener, bound_addr, udp_socket) = match bound_pair {
+        Some(pair) => pair,
+        None => return Err(last_udp_err.expect("at least one SS UDP bind attempt ran")),
+    };
 
     let replay_cache: Arc<Mutex<HashMap<Vec<u8>, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 

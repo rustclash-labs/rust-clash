@@ -218,10 +218,21 @@ async fn dns_doh_dot_tcp_truncation_bootstrap_and_caching_e2e() {
         }
     });
 
-    // 3. UDP `TC=1` + TCP DNS server on identical port proving RFC 1035 automatic UDP truncation retry over TCP!
-    let trunc_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let trunc_addr = trunc_tcp.local_addr().unwrap();
-    let trunc_udp = Arc::new(UdpSocket::bind(trunc_addr).await.unwrap());
+    let (trunc_tcp, trunc_addr, trunc_udp) = {
+        let mut held = Vec::new();
+        let mut pair = None;
+        for _ in 0..16 {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+            if let Ok(udp) = UdpSocket::bind(addr).await {
+                pair = Some((tcp, addr, Arc::new(udp)));
+                break;
+            }
+            held.push(tcp);
+        }
+        drop(held);
+        pair.expect("bind matching TCP+UDP ephemeral port for truncation server")
+    };
     let trunc_udp_hits = Arc::new(AtomicUsize::new(0));
     let trunc_tcp_hits = Arc::new(AtomicUsize::new(0));
 
