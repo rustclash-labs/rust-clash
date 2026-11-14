@@ -1,9 +1,9 @@
 use std::{
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -399,6 +399,107 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
 
 static CUSTOM_PROTECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PROTECTOR_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// `0 = Unknown`, `1 = Unavailable`, `2 = Available`.
+static OS_UNDERLYING_IPV6_AVAILABLE: AtomicU8 = AtomicU8::new(0);
+static DIRECT_IPV6_UNREACHABLE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+const DIRECT_IPV6_CIRCUIT_BREAKER_MS: u64 = 45_000;
+
+/// Return `true` when `v6` is an RFC 4291 global unicast IPv6 address (`2000::/3`),
+/// excluding the RFC 3849 documentation prefix (`2001:db8::/32`).
+pub fn is_global_unicast_ipv6(v6: Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    (seg[0] & 0xe000) == 0x2000 && !(seg[0] == 0x2001 && seg[1] == 0x0db8)
+}
+
+/// Update the OS-reported physical underlying network IPv6 availability (`None` = unknown,
+/// `Some(false)` = IPv4-only physical link, `Some(true)` = physical global IPv6 route present).
+pub fn set_os_underlying_ipv6_available(available: Option<bool>) {
+    let state = match available {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    OS_UNDERLYING_IPV6_AVAILABLE.store(state, Ordering::Release);
+    if available != Some(false) {
+        DIRECT_IPV6_UNREACHABLE_UNTIL_MS.store(0, Ordering::Release);
+    }
+}
+
+/// Read the OS-reported physical underlying network IPv6 availability, if known.
+pub fn os_underlying_ipv6_available() -> Option<bool> {
+    match OS_UNDERLYING_IPV6_AVAILABLE.load(Ordering::Acquire) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Clear any active `ENETUNREACH` / `EADDRNOTAVAIL` direct IPv6 circuit-breaker cooldown.
+pub fn reset_direct_ipv6_reachability() {
+    DIRECT_IPV6_UNREACHABLE_UNTIL_MS.store(0, Ordering::Release);
+}
+
+/// Return `true` when `err` indicates immediate local kernel IPv6 unreachability
+/// (`ENETUNREACH` / `NetworkUnreachable` or `EADDRNOTAVAIL` / `AddrNotAvailable`).
+pub fn is_local_ipv6_unreachable_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::NetworkUnreachable | io::ErrorKind::AddrNotAvailable
+    ) {
+        return true;
+    }
+    let Some(code) = err.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        code == libc::ENETUNREACH || code == libc::EADDRNOTAVAIL
+    }
+    #[cfg(windows)]
+    {
+        code == 10051 || code == 10049
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
+/// Record the outcome of a direct protected TCP/UDP dial or send to `remote` so immediate
+/// local IPv6 `ENETUNREACH` / `EADDRNOTAVAIL` failures open the 45-second IPv6 circuit-breaker
+/// and a subsequent global-unicast IPv6 success immediately closes it.
+pub fn note_direct_addr_connect_result(remote: SocketAddr, res: Result<(), &io::Error>) {
+    let SocketAddr::V6(v6) = remote else {
+        return;
+    };
+    if !is_global_unicast_ipv6(*v6.ip()) {
+        return;
+    }
+    match res {
+        Ok(()) => {
+            DIRECT_IPV6_UNREACHABLE_UNTIL_MS.store(0, Ordering::Release);
+        }
+        Err(err) if is_local_ipv6_unreachable_error(err) => {
+            let now_ms = crate::tracker::TelemetryHub::now_ms();
+            DIRECT_IPV6_UNREACHABLE_UNTIL_MS.store(
+                now_ms.saturating_add(DIRECT_IPV6_CIRCUIT_BREAKER_MS),
+                Ordering::Release,
+            );
+        }
+        Err(_) => {}
+    }
+}
+
+/// Return `true` when direct global-unicast IPv6 egress is currently considered reachable
+/// (neither disabled by OS physical link state nor tripped by the `ENETUNREACH` circuit-breaker).
+pub fn is_direct_ipv6_reachable() -> bool {
+    if OS_UNDERLYING_IPV6_AVAILABLE.load(Ordering::Acquire) == 1 {
+        return false;
+    }
+    let until = DIRECT_IPV6_UNREACHABLE_UNTIL_MS.load(Ordering::Acquire);
+    until == 0 || crate::tracker::TelemetryHub::now_ms() >= until
+}
 
 fn protector_slot() -> &'static RwLock<Arc<dyn SocketProtector>> {
     static SLOT: OnceLock<RwLock<Arc<dyn SocketProtector>>> = OnceLock::new();
@@ -418,6 +519,7 @@ pub fn set_global_socket_protector(protector: Arc<dyn SocketProtector>) {
     *protector_slot().write() = protector;
     CUSTOM_PROTECTOR_ACTIVE.store(is_custom, Ordering::Release);
     PROTECTOR_EPOCH.fetch_add(1, Ordering::AcqRel);
+    reset_direct_ipv6_reachability();
     crate::dns::upstream::clear_dns_upstream_pools();
 }
 
@@ -426,6 +528,8 @@ pub fn clear_global_socket_protector() {
     *protector_slot().write() = Arc::new(NoopSocketProtector);
     CUSTOM_PROTECTOR_ACTIVE.store(false, Ordering::Release);
     PROTECTOR_EPOCH.fetch_add(1, Ordering::AcqRel);
+    set_os_underlying_ipv6_available(None);
+    reset_direct_ipv6_reachability();
     crate::dns::upstream::clear_dns_upstream_pools();
 }
 
@@ -461,9 +565,13 @@ pub async fn protected_tcp_connect_addr(remote: SocketAddr) -> io::Result<TcpStr
     let _ = sock.set_tcp_keepalive(&keepalive);
     let std_stream: std::net::TcpStream = sock.into();
     let tcp_sock = TcpSocket::from_std_stream(std_stream);
-    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, tcp_sock.connect(remote))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
+    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
+        let res = tcp_sock.connect(remote).await;
+        note_direct_addr_connect_result(remote, res.as_ref().map(|_| ()));
+        res
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
@@ -480,6 +588,13 @@ fn interleave_happy_eyeballs_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     }
     if v6.is_empty() || v4.is_empty() {
         return addrs.to_vec();
+    }
+    if !is_direct_ipv6_reachable()
+        && v6
+            .iter()
+            .any(|a| matches!(a, SocketAddr::V6(s6) if is_global_unicast_ipv6(*s6.ip())))
+    {
+        return v4.into_iter().chain(v6).collect();
     }
     let mut out = Vec::with_capacity(addrs.len());
     let mut i6 = v6.into_iter();
@@ -653,4 +768,149 @@ pub fn protected_udp_bind(
     sock.bind(&bind_addr.into())?;
     let std_udp: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_udp)
+}
+
+#[cfg(test)]
+pub(crate) struct Ipv6ReachabilityTestGuard {
+    _guard: parking_lot::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for Ipv6ReachabilityTestGuard {
+    fn drop(&mut self) {
+        set_os_underlying_ipv6_available(None);
+        reset_direct_ipv6_reachability();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_ipv6_reachability_for_test() -> Ipv6ReachabilityTestGuard {
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let guard = TEST_LOCK.lock();
+    set_os_underlying_ipv6_available(None);
+    reset_direct_ipv6_reachability();
+    Ipv6ReachabilityTestGuard { _guard: guard }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_unicast_ipv6_classifier_distinguishes_rfc4291_from_special_ranges() {
+        assert!(is_global_unicast_ipv6(
+            "2409:8c1e:75b0:1123::101".parse().unwrap()
+        ));
+        assert!(is_global_unicast_ipv6(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+        assert!(is_global_unicast_ipv6(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
+        assert!(is_global_unicast_ipv6("2000::1".parse().unwrap()));
+        assert!(is_global_unicast_ipv6("3fff:ffff::1".parse().unwrap()));
+
+        // RFC 3849 documentation prefix (`2001:db8::/32`) must be excluded for synthetic E2E tests.
+        assert!(!is_global_unicast_ipv6("2001:db8::1".parse().unwrap()));
+        assert!(!is_global_unicast_ipv6(
+            "2001:0db8:abcd::42".parse().unwrap()
+        ));
+
+        // Loopback, unspecified, link-local, ULA, multicast, and IPv4-mapped IPv6 are not global unicast.
+        assert!(!is_global_unicast_ipv6(Ipv6Addr::LOCALHOST));
+        assert!(!is_global_unicast_ipv6(Ipv6Addr::UNSPECIFIED));
+        assert!(!is_global_unicast_ipv6("fe80::1".parse().unwrap()));
+        assert!(!is_global_unicast_ipv6("fd00::1".parse().unwrap()));
+        assert!(!is_global_unicast_ipv6("ff02::1".parse().unwrap()));
+        assert!(!is_global_unicast_ipv6("::ffff:192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn os_flag_and_enetunreach_circuit_breaker_state_transitions() {
+        let _guard = lock_ipv6_reachability_for_test();
+        assert_eq!(os_underlying_ipv6_available(), None);
+        assert!(is_direct_ipv6_reachable());
+
+        set_os_underlying_ipv6_available(Some(false));
+        assert_eq!(os_underlying_ipv6_available(), Some(false));
+        assert!(!is_direct_ipv6_reachable());
+
+        set_os_underlying_ipv6_available(Some(true));
+        assert_eq!(os_underlying_ipv6_available(), Some(true));
+        assert!(is_direct_ipv6_reachable());
+
+        let global_v6: SocketAddr = "[2409:8c1e:75b0:1123::101]:443".parse().unwrap();
+        let doc_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let loopback_v6: SocketAddr = "[::1]:443".parse().unwrap();
+        let net_unreach = io::Error::new(io::ErrorKind::NetworkUnreachable, "ENETUNREACH");
+        let addr_unavail = io::Error::new(io::ErrorKind::AddrNotAvailable, "EADDRNOTAVAIL");
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+
+        assert!(is_local_ipv6_unreachable_error(&net_unreach));
+        assert!(is_local_ipv6_unreachable_error(&addr_unavail));
+        assert!(!is_local_ipv6_unreachable_error(&timed_out));
+        #[cfg(unix)]
+        {
+            assert!(is_local_ipv6_unreachable_error(
+                &io::Error::from_raw_os_error(libc::ENETUNREACH)
+            ));
+            assert!(is_local_ipv6_unreachable_error(
+                &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)
+            ));
+        }
+
+        // Non-global / documentation IPv6 or generic timeouts do not trip the circuit-breaker.
+        note_direct_addr_connect_result(doc_v6, Err(&net_unreach));
+        note_direct_addr_connect_result(loopback_v6, Err(&net_unreach));
+        note_direct_addr_connect_result(global_v6, Err(&timed_out));
+        assert!(is_direct_ipv6_reachable());
+
+        // Global unicast ENETUNREACH trips the 45s circuit-breaker, and a later Ok(()) clears it.
+        note_direct_addr_connect_result(global_v6, Err(&net_unreach));
+        assert!(!is_direct_ipv6_reachable());
+
+        note_direct_addr_connect_result(global_v6, Ok(()));
+        assert!(is_direct_ipv6_reachable());
+
+        // EADDRNOTAVAIL also trips the circuit-breaker, and reset_direct_ipv6_reachability clears it.
+        note_direct_addr_connect_result(global_v6, Err(&addr_unavail));
+        assert!(!is_direct_ipv6_reachable());
+        reset_direct_ipv6_reachability();
+        assert!(is_direct_ipv6_reachable());
+
+        // set_os_underlying_ipv6_available(Some(true)) or None also clears circuit-breaker cooldown.
+        note_direct_addr_connect_result(global_v6, Err(&net_unreach));
+        assert!(!is_direct_ipv6_reachable());
+        set_os_underlying_ipv6_available(None);
+        assert_eq!(os_underlying_ipv6_available(), None);
+        assert!(is_direct_ipv6_reachable());
+    }
+
+    #[test]
+    fn interleave_happy_eyeballs_orders_ipv4_first_when_direct_ipv6_unreachable() {
+        let _guard = lock_ipv6_reachability_for_test();
+        let v6_a: SocketAddr = "[2409:8c1e::1]:443".parse().unwrap();
+        let v6_b: SocketAddr = "[2409:8c1e::2]:443".parse().unwrap();
+        let v4_a: SocketAddr = "223.5.5.5:443".parse().unwrap();
+        let v4_b: SocketAddr = "119.29.29.29:443".parse().unwrap();
+
+        assert_eq!(
+            interleave_happy_eyeballs_addrs(&[v6_a, v6_b, v4_a, v4_b]),
+            vec![v6_a, v4_a, v6_b, v4_b]
+        );
+
+        set_os_underlying_ipv6_available(Some(false));
+        assert_eq!(
+            interleave_happy_eyeballs_addrs(&[v6_a, v6_b, v4_a, v4_b]),
+            vec![v4_a, v4_b, v6_a, v6_b]
+        );
+
+        // RFC 3849 documentation IPv6 remains interleaved so synthetic dual-stack tests are unaffected.
+        let doc_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let loop_v4: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert_eq!(
+            interleave_happy_eyeballs_addrs(&[doc_v6, loop_v4]),
+            vec![doc_v6, loop_v4]
+        );
+    }
 }

@@ -395,18 +395,65 @@ impl DirectUdpSession {
     }
 }
 
+fn order_direct_udp_addrs(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    if addrs.len() > 1
+        && !crate::platform::socket_protect::is_direct_ipv6_reachable()
+        && addrs.iter().any(SocketAddr::is_ipv4)
+    {
+        addrs.sort_by_key(|addr| match addr {
+            SocketAddr::V6(v6)
+                if crate::platform::socket_protect::is_global_unicast_ipv6(*v6.ip()) =>
+            {
+                1u8
+            }
+            _ => 0u8,
+        });
+    }
+    addrs
+}
+
 #[async_trait]
 impl OutboundUdpSession for DirectUdpSession {
     async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
-        let remote = *self
-            .direct
-            .resolve_target_addrs(target)
-            .await?
-            .first()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::HostUnreachable, "DNS lookup empty"))?;
-        let sock = self.socket_for(remote).await?;
-        sock.send_to(payload, remote).await?;
-        Ok(())
+        let addrs = order_direct_udp_addrs(self.direct.resolve_target_addrs(target).await?);
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                "DNS lookup empty",
+            ));
+        }
+        let total = addrs.len();
+        let mut last_err: Option<io::Error> = None;
+        for (idx, remote_addr) in addrs.into_iter().enumerate() {
+            let send_res = match self.socket_for(remote_addr).await {
+                Ok(sock) => sock.send_to(payload, remote_addr).await.map(|_| ()),
+                Err(err) => Err(err),
+            };
+            match send_res {
+                Ok(()) => {
+                    crate::platform::socket_protect::note_direct_addr_connect_result(
+                        remote_addr,
+                        Ok(()),
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    crate::platform::socket_protect::note_direct_addr_connect_result(
+                        remote_addr,
+                        Err(&err),
+                    );
+                    if idx + 1 < total
+                        && crate::platform::socket_protect::is_local_ipv6_unreachable_error(&err)
+                    {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::HostUnreachable, "DNS lookup empty")))
     }
 
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
@@ -516,19 +563,58 @@ impl OutboundHandler for DirectOutbound {
         payload: &[u8],
         timeout: Duration,
     ) -> io::Result<Vec<u8>> {
-        let remote = *self
-            .resolve_target_addrs(target)
-            .await?
-            .first()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::HostUnreachable, "DNS lookup empty"))?;
-        let bind_addr = if remote.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        let addrs = order_direct_udp_addrs(self.resolve_target_addrs(target).await?);
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                "DNS lookup empty",
+            ));
+        }
+        let total = addrs.len();
+        let mut connected_sock: Option<UdpSocket> = None;
+        let mut last_err: Option<io::Error> = None;
+        for (idx, remote_addr) in addrs.into_iter().enumerate() {
+            let bind_addr = if remote_addr.is_ipv4() {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            } else {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+            };
+            let attempt: io::Result<UdpSocket> = async {
+                let sock = protected_udp_bind(bind_addr, Some(remote_addr))?;
+                sock.connect(remote_addr).await?;
+                sock.send(payload).await?;
+                Ok(sock)
+            }
+            .await;
+            match attempt {
+                Ok(sock) => {
+                    crate::platform::socket_protect::note_direct_addr_connect_result(
+                        remote_addr,
+                        Ok(()),
+                    );
+                    connected_sock = Some(sock);
+                    break;
+                }
+                Err(err) => {
+                    crate::platform::socket_protect::note_direct_addr_connect_result(
+                        remote_addr,
+                        Err(&err),
+                    );
+                    if idx + 1 < total
+                        && crate::platform::socket_protect::is_local_ipv6_unreachable_error(&err)
+                    {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        let Some(sock) = connected_sock else {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::HostUnreachable, "DNS lookup empty")
+            }));
         };
-        let sock = protected_udp_bind(bind_addr, Some(remote))?;
-        sock.connect(remote).await?;
-        sock.send(payload).await?;
         let mut buf = vec![0u8; 65535];
         let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
             .await

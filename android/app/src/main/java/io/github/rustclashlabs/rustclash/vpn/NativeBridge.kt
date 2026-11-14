@@ -41,6 +41,12 @@ object NativeBridge {
         isWifi: Boolean,
     ): Boolean
 
+    external fun nativeNotifyNetworkChangedWithCaps(
+        networkHandle: Long,
+        isWifi: Boolean,
+        hasIpv6: Boolean,
+    ): Boolean
+
     external fun nativeGetStatusJson(): String
 
     external fun nativeGetNodeManagerSnapshot(stateDir: String): String

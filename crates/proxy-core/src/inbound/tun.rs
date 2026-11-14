@@ -31,6 +31,7 @@ use tokio::{
 use crate::{
     addr::{HostName, TargetAddr},
     inbound::udp_nat::UdpNatManager,
+    platform::process::SocketTransport,
     router::Router,
     tracker::{SessionResetter, TelemetryHub},
 };
@@ -598,12 +599,24 @@ fn handle_ingress_packet(
             let dst_v6: Ipv6Addr = ip6.dst_addr();
             match ip6.next_header() {
                 IpProtocol::Udp => {
-                    if let Ok(udp) = UdpPacket::new_checked(ip6.payload()) {
-                        let src_port = udp.src_port();
-                        let dst_port = udp.dst_port();
+                    let Ok(udp) = UdpPacket::new_checked(ip6.payload()) else {
+                        return;
+                    };
+                    let src_port = udp.src_port();
+                    let dst_port = udp.dst_port();
+                    let src_addr = SocketAddr::new(IpAddr::V6(src_v6), src_port);
+                    if dst_port == 53
+                        || !should_fast_reject_unreachable_direct_ipv6(
+                            src_addr,
+                            dst_v6,
+                            dst_port,
+                            SocketTransport::Udp,
+                            router,
+                        )
+                    {
                         let payload = udp.payload().to_vec();
                         spawn_tun_udp_handler(
-                            SocketAddr::new(IpAddr::V6(src_v6), src_port),
+                            src_addr,
                             SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
                             payload,
                             egress_tx,
@@ -611,27 +624,44 @@ fn handle_ingress_packet(
                             udp_nat,
                             router,
                         );
+                        return;
                     }
-                    return;
+                    // Unreachable global-unicast DIRECT IPv6 UDP (non-53): fall through to
+                    // `device.rx_queue` so `smoltcp` `iface.poll()` immediately emits
+                    // `ICMPv6 Destination Unreachable (PortUnreachable)` back to `egress_tx`!
                 }
                 IpProtocol::Tcp => {
                     if let Ok(tcp_pkt) = TcpPacket::new_checked(ip6.payload())
                         && tcp_pkt.syn()
                         && !tcp_pkt.ack()
                     {
-                        let tuple = FourTuple {
-                            src: SocketAddr::new(IpAddr::V6(src_v6), tcp_pkt.src_port()),
-                            dst: SocketAddr::new(IpAddr::V6(dst_v6), tcp_pkt.dst_port()),
-                        };
-                        register_syn_flow(
-                            tuple,
-                            IpAddress::Ipv6(dst_v6),
-                            sockets,
-                            flows,
-                            wake_notify,
+                        let src_addr = SocketAddr::new(IpAddr::V6(src_v6), tcp_pkt.src_port());
+                        let dst_port = tcp_pkt.dst_port();
+                        if !should_fast_reject_unreachable_direct_ipv6(
+                            src_addr,
+                            dst_v6,
+                            dst_port,
+                            SocketTransport::Tcp,
                             router,
-                            hub,
-                        );
+                        ) {
+                            let tuple = FourTuple {
+                                src: src_addr,
+                                dst: SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
+                            };
+                            register_syn_flow(
+                                tuple,
+                                IpAddress::Ipv6(dst_v6),
+                                sockets,
+                                flows,
+                                wake_notify,
+                                router,
+                                hub,
+                            );
+                        }
+                        // When `should_fast_reject_unreachable_direct_ipv6` is `true`, skip
+                        // `register_syn_flow` and fall through to `device.rx_queue` so `smoltcp`
+                        // `iface.poll()` immediately emits `TCP RST|ACK` with zero socket allocation
+                        // and zero `TelemetryHub` failed-connection noise!
                     }
                 }
                 _ => {}
@@ -643,6 +673,30 @@ fn handle_ingress_packet(
     if device.rx_queue.len() < TUN_DEVICE_RX_MAX_PACKETS {
         device.rx_queue.push_back(pkt);
     }
+}
+
+fn should_fast_reject_unreachable_direct_ipv6(
+    src_addr: SocketAddr,
+    dst_v6: Ipv6Addr,
+    dst_port: u16,
+    transport: SocketTransport,
+    router_slot: &RwLock<Arc<Router>>,
+) -> bool {
+    if dst_port == 53
+        || !crate::platform::socket_protect::is_global_unicast_ipv6(dst_v6)
+        || crate::platform::socket_protect::is_direct_ipv6_reachable()
+    {
+        return false;
+    }
+    let current_router = Arc::clone(&router_slot.read());
+    if current_router.dns().is_fake_ip(IpAddr::V6(dst_v6)) {
+        return false;
+    }
+    current_router.will_route_ip_direct(
+        src_addr,
+        transport,
+        SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
+    )
 }
 
 fn spawn_tun_udp_handler(
@@ -1223,5 +1277,210 @@ mod tests {
         flow.fin_started_wall_ms = None;
         assert!(!flow.is_timed_out(mono_now, base_wall + 14_000));
         assert!(flow.is_timed_out(mono_now, base_wall + 16_000));
+    }
+
+    struct MockProxyOutbound;
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundHandler for MockProxyOutbound {
+        fn name(&self) -> &str {
+            "ProxyNode"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "MockProxy"
+        }
+
+        fn exit_category(&self) -> &'static str {
+            "PROXY"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(
+            &self,
+            _target: &TargetAddr,
+        ) -> io::Result<crate::outbound::BoxedStream> {
+            let (client_half, server_half) = tokio::io::duplex(256);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                drop(server_half);
+            });
+            Ok(Box::new(client_half))
+        }
+    }
+
+    fn build_ipv6_split_router() -> Arc<RwLock<Arc<Router>>> {
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert("ProxyNode".to_string(), Arc::new(MockProxyOutbound));
+        let rules = vec![
+            "IP-CIDR6,2409:8c1e::/32,DIRECT".to_string(),
+            "MATCH,ProxyNode".to_string(),
+        ];
+        let router = Arc::new(
+            Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+        );
+        Arc::new(RwLock::new(router))
+    }
+
+    fn build_ipv6_tcp_syn_packet(
+        src_ip: Ipv6Addr,
+        src_port: u16,
+        dst_ip: Ipv6Addr,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let checksum_caps = ChecksumCapabilities::default();
+        let src_v6: Ipv6Address = src_ip;
+        let dst_v6: Ipv6Address = dst_ip;
+        let tcp_repr = smoltcp::wire::TcpRepr {
+            src_port,
+            dst_port,
+            control: smoltcp::wire::TcpControl::Syn,
+            seq_number: smoltcp::wire::TcpSeqNumber(1000),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: Some(7),
+            max_seg_size: Some(1440),
+            sack_permitted: true,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let tcp_len = tcp_repr.buffer_len();
+        let ip_repr = Ipv6Repr {
+            src_addr: src_v6,
+            dst_addr: dst_v6,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp_len,
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0u8; ip_repr.buffer_len() + tcp_len];
+        let mut ip_pkt = Ipv6Packet::new_unchecked(&mut bytes);
+        ip_repr.emit(&mut ip_pkt);
+        let mut tcp_pkt = TcpPacket::new_unchecked(ip_pkt.payload_mut());
+        tcp_repr.emit(
+            &mut tcp_pkt,
+            &IpAddress::Ipv6(src_v6),
+            &IpAddress::Ipv6(dst_v6),
+            &checksum_caps,
+        );
+        bytes
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tun_fast_rejects_unreachable_direct_ipv6_tcp_syn_without_affecting_proxy_ipv6() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(false));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let router_slot = build_ipv6_split_router();
+        let hub = Arc::new(TelemetryHub::new());
+        let (mut vtun, _tun_task) =
+            spawn_userspace_tun(1500, router_slot, Arc::clone(&hub), shutdown_rx);
+
+        let client_v6: Ipv6Addr = "fd00::2".parse().unwrap();
+        let direct_v6: Ipv6Addr = "2409:8c1e:75b0:1123::101".parse().unwrap();
+        let proxy_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+
+        // 1. DIRECT-routed global unicast IPv6 SYN gets immediate smoltcp TCP RST|ACK with 0 failed connections!
+        let syn_direct = build_ipv6_tcp_syn_packet(client_v6, 51001, direct_v6, 443);
+        vtun.ingress_tx.send(syn_direct).await.unwrap();
+
+        let rst_pkt = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected immediate IPv6 TCP RST")
+            .expect("egress packet");
+        let ip6_rst = Ipv6Packet::new_checked(&rst_pkt).unwrap();
+        assert_eq!(ip6_rst.src_addr(), direct_v6);
+        assert_eq!(ip6_rst.dst_addr(), client_v6);
+        assert_eq!(ip6_rst.next_header(), IpProtocol::Tcp);
+        let tcp_rst = TcpPacket::new_checked(ip6_rst.payload()).unwrap();
+        assert!(tcp_rst.rst() && !tcp_rst.syn());
+        assert_eq!(hub.failed_connections_total(), 0);
+        assert_eq!(hub.total_connections(), 0);
+
+        // 2. PROXY-routed global unicast IPv6 SYN is NOT fast-rejected and still receives TCP SYN-ACK!
+        let syn_proxy = build_ipv6_tcp_syn_packet(client_v6, 51002, proxy_v6, 443);
+        vtun.ingress_tx.send(syn_proxy).await.unwrap();
+
+        let syn_ack_pkt = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected IPv6 TCP SYN-ACK for PROXY-routed target")
+            .expect("egress packet");
+        let ip6_sa = Ipv6Packet::new_checked(&syn_ack_pkt).unwrap();
+        assert_eq!(ip6_sa.src_addr(), proxy_v6);
+        assert_eq!(ip6_sa.dst_addr(), client_v6);
+        assert_eq!(ip6_sa.next_header(), IpProtocol::Tcp);
+        let tcp_sa = TcpPacket::new_checked(ip6_sa.payload()).unwrap();
+        assert!(tcp_sa.syn() && tcp_sa.ack() && !tcp_sa.rst());
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tun_fast_rejects_unreachable_direct_ipv6_udp_while_preserving_dns_hijack() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(false));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let router_slot = build_ipv6_split_router();
+        let hub = Arc::new(TelemetryHub::new());
+        let (mut vtun, _tun_task) = spawn_userspace_tun(1500, router_slot, hub, shutdown_rx);
+
+        let client_v6: Ipv6Addr = "fd00::2".parse().unwrap();
+        let direct_v6: Ipv6Addr = "2409:8c1e:75b0:1123::101".parse().unwrap();
+        let dns_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+
+        // 1. Non-53 IPv6 UDP datagram to DIRECT target gets immediate ICMPv6 Port Unreachable!
+        let quic_pkt = build_ipv6_udp_packet(client_v6, 52001, direct_v6, 443, b"quic-chlo")
+            .expect("valid IPv6 UDP packet");
+        vtun.ingress_tx.send(quic_pkt).await.unwrap();
+
+        let icmp_pkt = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected immediate ICMPv6 Destination Unreachable")
+            .expect("egress packet");
+        let ip6_icmp = Ipv6Packet::new_checked(&icmp_pkt).unwrap();
+        assert_eq!(ip6_icmp.dst_addr(), client_v6);
+        assert_eq!(ip6_icmp.next_header(), IpProtocol::Icmpv6);
+        let icmp6 = smoltcp::wire::Icmpv6Packet::new_checked(ip6_icmp.payload()).unwrap();
+        assert_eq!(
+            icmp6.msg_type(),
+            smoltcp::wire::Icmpv6Message::DstUnreachable
+        );
+        assert_eq!(
+            smoltcp::wire::Icmpv6DstUnreachable::from(icmp6.msg_code()),
+            smoltcp::wire::Icmpv6DstUnreachable::PortUnreachable
+        );
+
+        // 2. IPv6 :53 DNS query still receives a hijacked UDP :53 DNS reply!
+        let dns_query =
+            crate::dns::wire::build_dns_query(0x4242, "example.com", crate::dns::wire::QTYPE_A);
+        let dns_pkt = build_ipv6_udp_packet(client_v6, 52002, dns_v6, 53, &dns_query)
+            .expect("valid IPv6 DNS UDP packet");
+        vtun.ingress_tx.send(dns_pkt).await.unwrap();
+
+        let dns_reply = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected hijacked IPv6 :53 DNS reply")
+            .expect("egress packet");
+        let ip6_dns = Ipv6Packet::new_checked(&dns_reply).unwrap();
+        assert_eq!(ip6_dns.src_addr(), dns_v6);
+        assert_eq!(ip6_dns.dst_addr(), client_v6);
+        assert_eq!(ip6_dns.next_header(), IpProtocol::Udp);
+        let udp_dns = UdpPacket::new_checked(ip6_dns.payload()).unwrap();
+        assert_eq!(udp_dns.src_port(), 53);
+        assert_eq!(udp_dns.dst_port(), 52002);
+        let answers = crate::dns::wire::extract_ip_answers(udp_dns.payload()).unwrap();
+        assert!(!answers.is_empty());
+
+        let _ = shutdown_tx.send(true);
     }
 }

@@ -365,9 +365,60 @@ impl Router {
     /// Flush DNS positive/negative caches and notify all concrete outbounds to evict
     /// pooled/multiplexed sockets bound to a previous network interface.
     pub fn notify_network_change(&self) -> usize {
+        crate::platform::socket_protect::reset_direct_ipv6_reachability();
         self.dns.flush_cache();
         self.bump_epoch();
         self.outbounds.values().map(|o| o.on_network_change()).sum()
+    }
+
+    /// Synchronously evaluate whether raw IP target `dst` routes to an outbound whose
+    /// `exit_category() == "DIRECT"` without mutating rule hit counters or performing async I/O.
+    pub fn will_route_ip_direct(
+        &self,
+        src_addr: SocketAddr,
+        transport: SocketTransport,
+        dst: SocketAddr,
+    ) -> bool {
+        let raw_target = TargetAddr::from(dst);
+        if self.dns.is_unmapped_fake_ip(&raw_target) {
+            return false;
+        }
+        let (target, _) = self.dns.restore_target(&raw_target);
+        let entry_target: &str = match self.mode() {
+            RunMode::Direct => "DIRECT",
+            RunMode::Global => "GLOBAL",
+            RunMode::Rule => {
+                let mut best_idx = target
+                    .host
+                    .as_domain()
+                    .and_then(|d| self.rule_index.earliest_domain_match(d));
+
+                for &idx in &self.rule_index.non_indexed_rules {
+                    if best_idx.is_some_and(|b| idx >= b) {
+                        break;
+                    }
+                    if self.rules[idx].matches_full(
+                        Some(src_addr.ip()),
+                        Some(src_addr),
+                        transport,
+                        &target,
+                        &[],
+                    ) {
+                        best_idx = Some(idx);
+                        break;
+                    }
+                }
+
+                if let Some(winner_idx) = best_idx {
+                    self.rules[winner_idx].target.as_str()
+                } else {
+                    "REJECT"
+                }
+            }
+        };
+
+        let (outbound, _) = self.resolve_chain(entry_target, &target);
+        outbound.exit_category() == "DIRECT"
     }
 
     /// Synchronous routing path (evaluates using O(1)/O(labels) domain index without blocking DNS lookups).

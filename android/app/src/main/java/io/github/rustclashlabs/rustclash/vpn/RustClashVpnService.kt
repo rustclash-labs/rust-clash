@@ -11,10 +11,14 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -34,6 +38,35 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
+
+internal fun isGlobalUnicastIpv6Address(addr: InetAddress?): Boolean {
+    val v6 = addr as? Inet6Address ?: return false
+    if (v6.isAnyLocalAddress ||
+        v6.isLoopbackAddress ||
+        v6.isLinkLocalAddress ||
+        v6.isMulticastAddress ||
+        v6.isSiteLocalAddress
+    ) {
+        return false
+    }
+    val raw = v6.address
+    return raw.size == 16 && (raw[0].toInt() and 0xE0) == 0x20
+}
+
+internal fun hasGlobalUnicastIpv6Link(linkProperties: LinkProperties?): Boolean {
+    if (linkProperties == null) return false
+    val hasGlobalAddr = linkProperties.linkAddresses.any { la ->
+        isGlobalUnicastIpv6Address(la.address)
+    }
+    if (!hasGlobalAddr) return false
+    val hasIpv6DefaultRoute = linkProperties.routes.any { route ->
+        route.destination.address is Inet6Address && route.destination.prefixLength == 0
+    }
+    return hasIpv6DefaultRoute
+}
 
 class RustClashVpnService : VpnService() {
     private val sessionMutex = Mutex()
@@ -43,6 +76,7 @@ class RustClashVpnService : VpnService() {
     private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
     private var screenStateReceiver: BroadcastReceiver? = null
     private val underlyingNetworkTracker = UnderlyingNetworkTracker()
+    private val livePhysicalNetworks = ConcurrentHashMap<Long, Network>()
 
     @Volatile
     private var isScreenInteractive: Boolean = true
@@ -176,6 +210,29 @@ class RustClashVpnService : VpnService() {
         }
     }
 
+    private data class InitialPhysicalNetworkSnapshot(
+        val network: Network,
+        val caps: NetworkCapabilities,
+        val linkProperties: LinkProperties?,
+    )
+
+    private fun captureInitialPhysicalNetworkSnapshot(
+        cm: ConnectivityManager?,
+    ): InitialPhysicalNetworkSnapshot? {
+        if (cm == null) return null
+        val active = runCatching { cm.activeNetwork }.getOrNull() ?: return null
+        val caps = runCatching { cm.getNetworkCapabilities(active) }.getOrNull() ?: return null
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            return null
+        }
+        val lp = runCatching { cm.getLinkProperties(active) }.getOrNull()
+        return InitialPhysicalNetworkSnapshot(
+            network = active,
+            caps = caps,
+            linkProperties = lp,
+        )
+    }
+
     private fun startVpnSessionInternal(demoMode: Boolean) {
         // Clean up any prior ticker/network/screen observer on duplicate start before re-establishing
         telemetryJob?.cancel()
@@ -185,6 +242,8 @@ class RustClashVpnService : VpnService() {
         unregisterNetworkHandoffObserver()
         unregisterScreenStateObserver()
         underlyingNetworkTracker.reset()
+        underlyingNetworkTracker.setSingleBestMatchingMode(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        livePhysicalNetworks.clear()
 
         if (!serviceScope.isActive || serviceDestroyedOrRevoked) {
             return
@@ -235,6 +294,10 @@ class RustClashVpnService : VpnService() {
                 return
             }
 
+            // Capture physical NOT_VPN network BEFORE `builder.establish()` switches `cm.activeNetwork` to `tun0`.
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val initialPhysicalSnapshot = captureInitialPhysicalNetworkSnapshot(cm)
+
             val builder = Builder()
                 .setSession(sessionCfg.sessionName)
                 .setMtu(sessionCfg.mtu)
@@ -248,6 +311,9 @@ class RustClashVpnService : VpnService() {
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
+            }
+            if (initialPhysicalSnapshot != null) {
+                runCatching { builder.setUnderlyingNetworks(arrayOf(initialPhysicalSnapshot.network)) }
             }
 
             for (pkg in perAppPlan.allowedPackages) {
@@ -325,6 +391,15 @@ class RustClashVpnService : VpnService() {
                 enableIpv6 = sessionCfg.enableIpv6,
             )
 
+            if (initialPhysicalSnapshot != null) {
+                applyCapabilitiesTransition(
+                    network = initialPhysicalSnapshot.network,
+                    caps = initialPhysicalSnapshot.caps,
+                    lp = initialPhysicalSnapshot.linkProperties,
+                    eventType = "NET_AVAILABLE",
+                )
+            }
+
             registerScreenStateObserver()
             registerNetworkHandoffObserver()
             if (isScreenInteractive) {
@@ -339,6 +414,7 @@ class RustClashVpnService : VpnService() {
             debugSliceJob = null
             unregisterNetworkHandoffObserver()
             unregisterScreenStateObserver()
+            livePhysicalNetworks.clear()
             engineRunningNative = false
             val errMsg = NodeImportSupport.redactSecretsForUi(t.message ?: t.javaClass.simpleName)
             DebugLogManager.onVpnSessionError(errMsg)
@@ -431,84 +507,163 @@ class RustClashVpnService : VpnService() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                cm.getNetworkCapabilities(network)?.let { caps ->
-                    applyCapabilitiesTransition(network, caps, eventType = "NET_AVAILABLE")
-                }
+                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull() ?: return
+                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
+                applyCapabilitiesTransition(network, caps, lp, eventType = "NET_AVAILABLE")
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                applyCapabilitiesTransition(network, caps, eventType = "NET_CAPS")
+                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
+                applyCapabilitiesTransition(network, caps, lp, eventType = "NET_CAPS")
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    return
+                }
+                if (caps != null) {
+                    livePhysicalNetworks[network.networkHandle] = network
+                }
+                val hasIpv6 = hasGlobalUnicastIpv6Link(linkProperties)
+                val decision = underlyingNetworkTracker.onLinkPropertiesIpv6Changed(
+                    networkHandle = network.networkHandle,
+                    hasIpv6 = hasIpv6,
+                )
+                if (decision.notifyNative) {
+                    val transport = when {
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "WIFI"
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "CELLULAR"
+                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "ETHERNET"
+                        else -> if (decision.isWifi) "WIFI" else "CELLULAR"
+                    }
+                    DebugLogManager.onNetworkLinkIpv6Changed(
+                        context = this@RustClashVpnService,
+                        networkHandle = network.networkHandle,
+                        transportLabel = transport,
+                        hasIpv6 = hasIpv6,
+                        handoffTriggered = decision.triggerSessionRecovery,
+                    )
+                }
+                applyNetworkDecision(networkForHandle = network, decision = decision)
             }
 
             override fun onLost(network: Network) {
+                livePhysicalNetworks.remove(network.networkHandle)
                 val decision = underlyingNetworkTracker.onUnderlyingLost(network.networkHandle)
                 DebugLogManager.onNetworkLostObserved(
                     networkHandle = network.networkHandle,
                     lostActiveUnderlying = decision.triggerSessionRecovery,
+                    fallbackHandle = decision.effectiveHandle,
                 )
-                if (decision.updateUnderlyingNetworks) {
-                    runCatching { setUnderlyingNetworks(null) }
-                }
-                if (decision.triggerSessionRecovery) {
-                    stateTracker.onUnderlyingLost()
-                }
-                if (decision.notifyNative && NativeBridge.isNativeLoaded) {
-                    NativeBridge.nativeNotifyNetworkChanged(decision.effectiveHandle, decision.isWifi)
-                }
+                applyNetworkDecision(networkForHandle = null, decision = decision)
             }
         }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val mainHandler = Handler(Looper.getMainLooper())
         try {
-            cm.registerDefaultNetworkCallback(cb)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                cm.registerBestMatchingNetworkCallback(request, cb, mainHandler)
+            } else {
+                cm.registerNetworkCallback(request, cb, mainHandler)
+            }
             connectivityCallback = cb
         } catch (_: SecurityException) {
             // Best-effort if OS restricts callback registration
+        } catch (_: RuntimeException) {
+            // Guard against ConnectivityService callback limit / Binder edge cases
         }
     }
 
     private fun applyCapabilitiesTransition(
         network: Network,
         caps: NetworkCapabilities,
+        lp: LinkProperties?,
         eventType: String,
     ) {
-        val isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            return
+        }
+        livePhysicalNetworks[network.networkHandle] = network
         val isWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         val isCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
         val isEthernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+        val isValidated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val hasIpv6 = if (lp != null) {
+            hasGlobalUnicastIpv6Link(lp)
+        } else {
+            underlyingNetworkTracker.knownHasIpv6(network.networkHandle) ?: false
+        }
         val decision = underlyingNetworkTracker.onUnderlyingCandidate(
             networkHandle = network.networkHandle,
-            isVpnTransport = isVpn,
+            isVpnTransport = false,
             isWifi = isWifi,
             isCellular = isCellular,
             isEthernet = isEthernet,
+            isValidated = isValidated,
+            hasIpv6 = hasIpv6,
         )
-        if (!isVpn) {
-            DebugLogManager.onNetworkCandidateObserved(
-                eventType = eventType,
-                networkHandle = network.networkHandle,
-                isWifi = isWifi,
-                isCellular = isCellular,
-                isEthernet = isEthernet,
-                isValidated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
-                isNotMetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
-                downBandwidthKbps = caps.linkDownstreamBandwidthKbps,
-                upBandwidthKbps = caps.linkUpstreamBandwidthKbps,
-                triggeredHandoff = decision.triggerSessionRecovery,
-            )
-        }
+        DebugLogManager.onNetworkCandidateObserved(
+            eventType = eventType,
+            networkHandle = network.networkHandle,
+            isWifi = isWifi,
+            isCellular = isCellular,
+            isEthernet = isEthernet,
+            isValidated = isValidated,
+            isNotMetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+            downBandwidthKbps = caps.linkDownstreamBandwidthKbps,
+            upBandwidthKbps = caps.linkUpstreamBandwidthKbps,
+            triggeredHandoff = decision.triggerSessionRecovery,
+            hasIpv6 = hasIpv6,
+        )
+        applyNetworkDecision(networkForHandle = network, decision = decision)
+    }
+
+    private fun applyNetworkDecision(
+        networkForHandle: Network?,
+        decision: NetworkTransitionDecision,
+    ) {
         if (decision.updateUnderlyingNetworks) {
-            runCatching { setUnderlyingNetworks(arrayOf(network)) }
+            if (decision.effectiveHandle == 0L) {
+                runCatching { setUnderlyingNetworks(emptyArray()) }
+            } else {
+                val resolvedNet = livePhysicalNetworks[decision.effectiveHandle]
+                    ?: networkForHandle?.takeIf { it.networkHandle == decision.effectiveHandle }
+                if (resolvedNet != null) {
+                    runCatching { setUnderlyingNetworks(arrayOf(resolvedNet)) }
+                }
+            }
+        }
+        if ((decision.notifyNative || decision.syncInitialBaselineToNative) && NativeBridge.isNativeLoaded) {
+            runCatching {
+                NativeBridge.nativeNotifyNetworkChangedWithCaps(
+                    decision.effectiveHandle,
+                    decision.isWifi,
+                    decision.hasIpv6,
+                )
+            }
         }
         if (decision.triggerSessionRecovery) {
-            stateTracker.onNetworkHandoff()
+            triggerPostWakeupOrHandoffRecovery("network-handoff", decision.effectiveHandle)
         }
-        if (decision.notifyNative && NativeBridge.isNativeLoaded) {
-            NativeBridge.nativeNotifyNetworkChanged(decision.effectiveHandle, decision.isWifi)
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    private fun triggerPostWakeupOrHandoffRecovery(reason: String, effectiveHandle: Long) {
+        if (effectiveHandle == 0L) {
+            stateTracker.onUnderlyingLost()
+        } else {
+            stateTracker.onNetworkHandoff()
         }
     }
 
     private fun unregisterNetworkHandoffObserver() {
         val cb = connectivityCallback ?: return
         connectivityCallback = null
+        livePhysicalNetworks.clear()
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         try {
             cm.unregisterNetworkCallback(cb)
@@ -625,6 +780,7 @@ class RustClashVpnService : VpnService() {
         unregisterNetworkHandoffObserver()
         unregisterScreenStateObserver()
         underlyingNetworkTracker.reset()
+        livePhysicalNetworks.clear()
         val wasRunning = engineRunningNative
         engineRunningNative = false
         activeOutboundLabel = ""
@@ -670,6 +826,7 @@ class RustClashVpnService : VpnService() {
         unregisterNetworkHandoffObserver()
         unregisterScreenStateObserver()
         underlyingNetworkTracker.reset()
+        livePhysicalNetworks.clear()
         // Capture disconnect diagnostic slice BEFORE stopping native runtime so session stats are preserved!
         if (engineRunningNative && DebugLogManager.isEnabled(this)) {
             DebugLogManager.onVpnSessionStopping(revokedBySystem)

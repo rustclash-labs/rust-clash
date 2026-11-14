@@ -13,12 +13,14 @@ import io.github.rustclashlabs.rustclash.vpn.UnderlyingNetworkTracker
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 import io.github.rustclashlabs.rustclash.vpn.VpnSessionConfig
 import io.github.rustclashlabs.rustclash.vpn.VpnStateTracker
+import io.github.rustclashlabs.rustclash.vpn.isGlobalUnicastIpv6Address
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.InetAddress
 
 class VpnConfigAndLifecycleTest {
 
@@ -1279,5 +1281,172 @@ class VpnConfigAndLifecycleTest {
             "Expected snake_case resolver_cache_hits fallback to render accurately: $snakeOnlyReport",
             snakeOnlyReport.contains("cacheHits=`3` resolverCacheHits=`7` aaaaSuppressed=`0`"),
         )
+    }
+
+    @Test
+    fun underlyingNetworkTrackerHandlesConcurrentCellularWifiHandoffRssiAndFallback() {
+        val netTracker = UnderlyingNetworkTracker()
+
+        // 1. Initial Cellular baseline (handle=101, isCellular=true, isValidated=true, hasIpv6=true)
+        val initCell = netTracker.onUnderlyingCandidate(
+            networkHandle = 101L,
+            isVpnTransport = false,
+            isWifi = false,
+            isCellular = true,
+            isEthernet = false,
+            isValidated = true,
+            hasIpv6 = true,
+        )
+        assertTrue(initCell.updateUnderlyingNetworks)
+        assertFalse(initCell.triggerSessionRecovery)
+        assertTrue(initCell.notifyNative)
+        assertTrue(initCell.syncInitialBaselineToNative)
+        assertEquals(101L, initCell.effectiveHandle)
+        assertFalse(initCell.isWifi)
+        assertTrue(initCell.hasIpv6)
+
+        // 2. Concurrent IPv4-only Wi-Fi (handle=202) connects while Cellular (101) remains in candidates
+        val wifiHandoff = netTracker.onUnderlyingCandidate(
+            networkHandle = 202L,
+            isVpnTransport = false,
+            isWifi = true,
+            isCellular = false,
+            isEthernet = false,
+            isValidated = true,
+            hasIpv6 = false,
+        )
+        assertTrue(wifiHandoff.updateUnderlyingNetworks)
+        assertTrue(wifiHandoff.triggerSessionRecovery)
+        assertTrue(wifiHandoff.notifyNative)
+        assertFalse(wifiHandoff.syncInitialBaselineToNative)
+        assertEquals(202L, wifiHandoff.effectiveHandle)
+        assertTrue(wifiHandoff.isWifi)
+        assertFalse(wifiHandoff.hasIpv6)
+
+        // 3. Background Cellular RSSI onCapabilitiesChanged(101) must NOT steal active handle from Wi-Fi (202)
+        val cellRssi = netTracker.onUnderlyingCandidate(
+            networkHandle = 101L,
+            isVpnTransport = false,
+            isWifi = false,
+            isCellular = true,
+            isEthernet = false,
+            isValidated = true,
+            hasIpv6 = true,
+        )
+        assertFalse(cellRssi.updateUnderlyingNetworks)
+        assertFalse(cellRssi.triggerSessionRecovery)
+        assertFalse(cellRssi.notifyNative)
+        assertEquals(202L, cellRssi.effectiveHandle)
+        assertTrue(cellRssi.isWifi)
+        assertFalse(cellRssi.hasIpv6)
+
+        // 4. Losing Wi-Fi (202) immediately promotes still-connected Cellular (101) without dropping to 0L
+        val fallbackCell = netTracker.onNetworkLost(202L)
+        assertTrue(fallbackCell.updateUnderlyingNetworks)
+        assertTrue(fallbackCell.triggerSessionRecovery)
+        assertTrue(fallbackCell.notifyNative)
+        assertEquals(101L, fallbackCell.effectiveHandle)
+        assertFalse(fallbackCell.isWifi)
+        assertTrue(fallbackCell.hasIpv6)
+    }
+
+    @Test
+    fun underlyingNetworkTrackerUnvalidatedCaptivePortalWifiDoesNotClobberValidatedCellular() {
+        val netTracker = UnderlyingNetworkTracker()
+
+        // Validated Cellular (101) establishes baseline
+        val initCell = netTracker.onUnderlyingCandidate(
+            networkHandle = 101L,
+            isVpnTransport = false,
+            isWifi = false,
+            isCellular = true,
+            isEthernet = false,
+            isValidated = true,
+            hasIpv6 = true,
+        )
+        assertEquals(101L, initCell.effectiveHandle)
+        assertFalse(initCell.isWifi)
+
+        // Unvalidated captive-portal Wi-Fi (202, isValidated=false) must NOT clobber working Cellular (101)
+        val captiveWifi = netTracker.onUnderlyingCandidate(
+            networkHandle = 202L,
+            isVpnTransport = false,
+            isWifi = true,
+            isCellular = false,
+            isEthernet = false,
+            isValidated = false,
+            hasIpv6 = false,
+        )
+        assertFalse(captiveWifi.updateUnderlyingNetworks)
+        assertFalse(captiveWifi.triggerSessionRecovery)
+        assertFalse(captiveWifi.notifyNative)
+        assertEquals(101L, captiveWifi.effectiveHandle)
+        assertFalse(captiveWifi.isWifi)
+        assertTrue(captiveWifi.hasIpv6)
+
+        // Once captive portal completes login and Wi-Fi becomes validated, Wi-Fi (202) wins cleanly
+        val validatedWifi = netTracker.onUnderlyingCandidate(
+            networkHandle = 202L,
+            isVpnTransport = false,
+            isWifi = true,
+            isCellular = false,
+            isEthernet = false,
+            isValidated = true,
+            hasIpv6 = false,
+        )
+        assertTrue(validatedWifi.updateUnderlyingNetworks)
+        assertTrue(validatedWifi.triggerSessionRecovery)
+        assertTrue(validatedWifi.notifyNative)
+        assertEquals(202L, validatedWifi.effectiveHandle)
+        assertTrue(validatedWifi.isWifi)
+        assertFalse(validatedWifi.hasIpv6)
+    }
+
+    @Test
+    fun underlyingNetworkTrackerLinkPropertiesIpv6LossAndGainAndGlobalUnicastCheck() {
+        val netTracker = UnderlyingNetworkTracker()
+
+        val initWifi = netTracker.onUnderlyingCandidate(
+            networkHandle = 202L,
+            isVpnTransport = false,
+            isWifi = true,
+            isCellular = false,
+            isEthernet = false,
+            isValidated = true,
+            hasIpv6 = true,
+        )
+        assertEquals(202L, initWifi.effectiveHandle)
+        assertTrue(initWifi.hasIpv6)
+
+        // Losing global IPv6 (true -> false) on active handle notifies native AND triggers session recovery
+        val lostV6 = netTracker.onLinkPropertiesIpv6Changed(networkHandle = 202L, hasIpv6 = false)
+        assertFalse(lostV6.updateUnderlyingNetworks)
+        assertTrue(lostV6.notifyNative)
+        assertTrue(lostV6.triggerSessionRecovery)
+        assertEquals(202L, lostV6.effectiveHandle)
+        assertFalse(lostV6.hasIpv6)
+
+        // Duplicate false is ignored
+        val dupFalse = netTracker.onLinkPropertiesIpv6Changed(networkHandle = 202L, hasIpv6 = false)
+        assertFalse(dupFalse.notifyNative)
+        assertFalse(dupFalse.triggerSessionRecovery)
+
+        // Gaining global IPv6 (false -> true) notifies native WITHOUT tearing down healthy IPv4 sessions
+        val gainedV6 = netTracker.onLinkPropertiesIpv6Changed(networkHandle = 202L, hasIpv6 = true)
+        assertFalse(gainedV6.updateUnderlyingNetworks)
+        assertTrue(gainedV6.notifyNative)
+        assertFalse(gainedV6.triggerSessionRecovery)
+        assertEquals(202L, gainedV6.effectiveHandle)
+        assertTrue(gainedV6.hasIpv6)
+
+        // RFC 4291 2000::/3 Global Unicast classifier accepts public IPv6 and rejects link-local / ULA / v4
+        assertTrue(isGlobalUnicastIpv6Address(InetAddress.getByName("2408:8207:1234::1")))
+        assertTrue(isGlobalUnicastIpv6Address(InetAddress.getByName("2001:4860:4860::8888")))
+        assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("fe80::1")))
+        assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("fd00::1")))
+        assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("fc00::1")))
+        assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("::1")))
+        assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("::")))
+        assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("198.18.0.1")))
     }
 }
