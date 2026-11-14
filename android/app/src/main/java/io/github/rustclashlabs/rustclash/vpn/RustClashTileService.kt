@@ -12,11 +12,20 @@ import android.service.quicksettings.TileService
 import androidx.core.content.ContextCompat
 import io.github.rustclashlabs.rustclash.MainActivity
 import io.github.rustclashlabs.rustclash.R
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Android Quick Settings Tile allowing 1-tap VPN connect/disconnect from the system notification shade.
  */
 class RustClashTileService : TileService() {
+    private val tileScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var clickJob: Job? = null
 
     companion object {
         fun requestTileSync(context: Context) {
@@ -32,6 +41,11 @@ class RustClashTileService : TileService() {
     override fun onStartListening() {
         super.onStartListening()
         syncTileUi()
+    }
+
+    override fun onDestroy() {
+        tileScope.cancel()
+        super.onDestroy()
     }
 
     override fun onClick() {
@@ -52,39 +66,56 @@ class RustClashTileService : TileService() {
             syncTileUi()
             return
         }
+        if (clickJob?.isActive == true) {
+            return
+        }
 
         val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
         val demoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
-        if (!demoMode && NativeBridge.ensureLoaded()) {
-            val snap = io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.parseNodeManagerSnapshot(
-                NativeBridge.nativeGetNodeManagerSnapshot(filesDir.absolutePath),
-            )
-            if (snap.ok &&
-                snap.nodes.isEmpty() &&
-                snap.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
-            ) {
-                val openIntent = Intent(this, MainActivity::class.java).apply {
+        val appContext = applicationContext
+        val stateDirPath = filesDir.absolutePath
+
+        clickJob = tileScope.launch {
+            val shouldOpenAppForEmptyNodes = if (demoMode) {
+                false
+            } else {
+                withContext(Dispatchers.IO) {
+                    if (!NativeBridge.ensureLoaded()) {
+                        false
+                    } else {
+                        val snap = io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.parseNodeManagerSnapshot(
+                            NativeBridge.nativeGetNodeManagerSnapshot(stateDirPath),
+                        )
+                        snap.ok &&
+                            snap.nodes.isEmpty() &&
+                            snap.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
+                    }
+                }
+            }
+
+            if (shouldOpenAppForEmptyNodes) {
+                val openIntent = Intent(this@RustClashTileService, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 }
                 launchMainActivityAndCollapse(openIntent)
-                return
+                return@launch
             }
-        }
 
-        val prepareIntent = VpnService.prepare(this)
-        if (prepareIntent == null) {
-            val startIntent = Intent(this, RustClashVpnService::class.java).apply {
-                action = RustClashVpnService.ACTION_START_VPN
-                putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)
+            val prepareIntent = VpnService.prepare(this@RustClashTileService)
+            if (prepareIntent == null) {
+                val startIntent = Intent(appContext, RustClashVpnService::class.java).apply {
+                    action = RustClashVpnService.ACTION_START_VPN
+                    putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)
+                }
+                ContextCompat.startForegroundService(appContext, startIntent)
+                syncTileUi()
+            } else {
+                // VPN permission has not yet been granted by the user; open MainActivity to show consent dialog.
+                val openIntent = Intent(this@RustClashTileService, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                launchMainActivityAndCollapse(openIntent)
             }
-            ContextCompat.startForegroundService(this, startIntent)
-            syncTileUi()
-        } else {
-            // VPN permission has not yet been granted by the user; open MainActivity to show consent dialog.
-            val openIntent = Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            }
-            launchMainActivityAndCollapse(openIntent)
         }
     }
 

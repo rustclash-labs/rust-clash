@@ -6,6 +6,8 @@ use crate::error::{ProxyError, Result};
 
 pub const QTYPE_A: u16 = 1;
 pub const QTYPE_CNAME: u16 = 5;
+pub const QTYPE_PTR: u16 = 12;
+pub const QTYPE_MX: u16 = 15;
 pub const QTYPE_TXT: u16 = 16;
 pub const QTYPE_AAAA: u16 = 28;
 pub const QTYPE_SVCB: u16 = 64;
@@ -129,6 +131,42 @@ impl DnsQueryPacket {
 
         out.to_vec()
     }
+
+    /// Build a DNS PTR response encoding `ptr_target` as uncompressed RFC 1035 domain labels.
+    pub fn build_ptr_response(&self, raw_query: &[u8], ttl: u32, ptr_target: &str) -> Vec<u8> {
+        let rd = self.flags & 0x0100;
+        let opcode = self.flags & 0x7800;
+        let resp_flags: u16 = 0x8000 | opcode | rd | 0x0080;
+
+        let mut rdata = BytesMut::with_capacity(ptr_target.len() + 2);
+        encode_domain_name(ptr_target, &mut rdata);
+
+        let mut out = BytesMut::with_capacity(128 + rdata.len());
+        out.put_u16(self.id);
+        out.put_u16(resp_flags);
+        out.put_u16(1); // QDCOUNT = 1
+        out.put_u16(1); // ANCOUNT = 1
+        out.put_u16(0); // NSCOUNT
+        out.put_u16(0); // ARCOUNT
+
+        if self.question.end_offset <= raw_query.len() && self.question.end_offset > 12 {
+            out.put_slice(&raw_query[12..self.question.end_offset]);
+        } else {
+            encode_domain_name(&self.question.name, &mut out);
+            out.put_u16(self.question.qtype);
+            out.put_u16(self.question.qclass);
+        }
+
+        // Compression pointer to offset 12 (start of QNAME)
+        out.put_u16(0xC00C);
+        out.put_u16(QTYPE_PTR);
+        out.put_u16(QCLASS_IN);
+        out.put_u32(ttl);
+        out.put_u16(rdata.len() as u16);
+        out.put_slice(&rdata);
+
+        out.to_vec()
+    }
 }
 
 /// Build a standard recursive DNS query packet for `domain` and `qtype`.
@@ -195,7 +233,7 @@ pub fn extract_dns_response_meta(buf: &[u8]) -> Result<DnsResponseMeta> {
         pos = next + 4;
     }
 
-    let mut answers = Vec::with_capacity(ancount);
+    let mut answers = Vec::with_capacity(ancount.min(64));
     let mut min_ttl: Option<u32> = None;
 
     for _ in 0..ancount {

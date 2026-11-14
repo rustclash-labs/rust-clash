@@ -404,9 +404,18 @@ fn spawn_ws_handshake_future(
 ) -> HandshakeBoxFuture {
     Box::pin(async move {
         let req = build_ws_upgrade_request(&default_host, port, is_tls, &cfg, ed_bytes.as_deref())?;
-        let (ws, _resp) = tokio_tungstenite::client_async(req, inner)
-            .await
-            .map_err(ws_err_to_io)?;
+        let (ws, _resp) = tokio::time::timeout(
+            crate::outbound::OUTBOUND_HANDSHAKE_TIMEOUT,
+            tokio_tungstenite::client_async(req, inner),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WebSocket 0-RTT upgrade handshake timed out",
+            )
+        })?
+        .map_err(ws_err_to_io)?;
         Ok((ws, BytesMut::new()))
     })
 }
@@ -707,9 +716,18 @@ pub async fn connect_ws_stream(
     }
 
     let req = build_ws_upgrade_request(default_host, port, is_tls, cfg, None)?;
-    let (ws, _resp) = tokio_tungstenite::client_async(req, inner)
-        .await
-        .map_err(ws_err_to_io)?;
+    let (ws, _resp) = tokio::time::timeout(
+        crate::outbound::OUTBOUND_HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::client_async(req, inner),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "WebSocket upgrade handshake timed out",
+        )
+    })?
+    .map_err(ws_err_to_io)?;
     Ok(Box::new(WsByteStream::new(ws)))
 }
 

@@ -361,16 +361,58 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun stageExternalImportPayload(rawPayload: String) {
+        val trimmed = rawPayload.trim()
+        if (trimmed.isEmpty()) return
+        clearModalError()
+        _uiState.update { it.copy(pendingExternalImportPayload = trimmed) }
+    }
+
+    fun dismissPendingExternalImport() {
+        cancelImportAndClearModalError()
+        _uiState.update { it.copy(pendingExternalImportPayload = null) }
+    }
+
+    fun confirmPendingExternalImport(
+        autoSelect: Boolean = false,
+        enableSubscriptionAutoUpdate: Boolean = false,
+    ) {
+        val payload = _uiState.value.pendingExternalImportPayload ?: return
+        val subSecs = if (enableSubscriptionAutoUpdate) {
+            _uiState.value.defaultSubAutoUpdateSecs
+        } else {
+            0L
+        }
+        importUnifiedPayload(
+            rawPayload = payload,
+            deduplicate = true,
+            autoSelect = autoSelect,
+            subscriptionAutoUpdateSecs = subSecs,
+            fromExternalIntent = true,
+            externalConfirmed = true,
+            onSuccess = {
+                clearModalError()
+                _uiState.update { it.copy(pendingExternalImportPayload = null) }
+            },
+        )
+    }
+
     fun importUnifiedPayload(
         rawPayload: String,
         deduplicate: Boolean = true,
         autoSelect: Boolean = true,
         subscriptionAutoUpdateSecs: Long? = null,
+        fromExternalIntent: Boolean = false,
+        externalConfirmed: Boolean = false,
         onSuccess: (() -> Unit)? = null,
     ) {
-        if (_uiState.value.isImporting) return
-        val isModal = onSuccess != null
         val trimmed = rawPayload.trim()
+        if (fromExternalIntent && !externalConfirmed) {
+            stageExternalImportPayload(trimmed)
+            return
+        }
+        if (_uiState.value.isImporting) return
+        val isModal = onSuccess != null || fromExternalIntent
         if (trimmed.isEmpty()) {
             reportActionError("导入内容为空，请粘贴节点链接、Base64 订阅、YAML 或订阅地址", isModal)
             return
@@ -404,21 +446,28 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 val eff = resp.optString("effectiveOutbound", "DIRECT")
                 val inputKind = resp.optString("inputKind", "")
                 val activeProfId = resp.optString("activeProfileId", "").trim()
+                val importedProfId = resp.optString("importedProfileId", "").trim().ifEmpty { activeProfId }
+                val isExternalDeepLink = fromExternalIntent || trimmed.startsWith("clash://", ignoreCase = true)
                 val isSubImport = inputKind.contains("subscription", ignoreCase = true) ||
                     inputKind.equals("clash-install-config-url", ignoreCase = true) ||
                     trimmed.startsWith("https://", ignoreCase = true) ||
                     trimmed.startsWith("clash://", ignoreCase = true)
-                if (isSubImport && activeProfId.isNotEmpty()) {
-                    val rawTargetSecs = subscriptionAutoUpdateSecs ?: _uiState.value.defaultSubAutoUpdateSecs
+                if (isSubImport && importedProfId.isNotEmpty()) {
+                    val rawTargetSecs = when {
+                        isExternalDeepLink && !externalConfirmed -> 0L
+                        subscriptionAutoUpdateSecs != null -> subscriptionAutoUpdateSecs
+                        isExternalDeepLink -> 0L
+                        else -> _uiState.value.defaultSubAutoUpdateSecs
+                    }
                     val targetSecs = if (rawTargetSecs <= 0L) 0L else rawTargetSecs.coerceAtLeast(60L)
                     withContext(Dispatchers.IO) {
                         runCatching {
-                            NativeBridge.nativeUpdateProfileSettingsJson(stateDir, activeProfId, "", targetSecs)
+                            NativeBridge.nativeUpdateProfileSettingsJson(stateDir, importedProfId, "", targetSecs)
                         }
                     }
                 }
 
-                if (prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)) {
+                if (autoSelect && prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)) {
                     prefs.edit().putBoolean(RustClashVpnService.KEY_DEMO_MODE, false).apply()
                     _uiState.update { it.copy(demoMode = false) }
                 }

@@ -43,10 +43,39 @@ use crate::{
     tracker::TelemetryHub,
 };
 
+/// Generates a 256-bit (32-byte, 64 lowercase hex characters) controller secret
+/// directly from the OS CSPRNG (`rand::rng()`).
+pub fn generate_ephemeral_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Returns the engine's current controller secret if non-empty, or generates a fresh
+/// 256-bit OS CSPRNG hex secret.
+pub fn ensure_controller_secret(engine: &ProxyEngine) -> String {
+    engine
+        .config_snapshot()
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(generate_ephemeral_secret)
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub engine: Arc<ProxyEngine>,
     pub bound_addr: SocketAddr,
+    pub started_with_secret: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ControllerSecretContext {
+    started_with_secret: bool,
+    has_valid_secret: bool,
 }
 
 pub fn build_api_router(engine: Arc<ProxyEngine>) -> AxumRouter {
@@ -59,9 +88,15 @@ pub fn build_api_router(engine: Arc<ProxyEngine>) -> AxumRouter {
 }
 
 pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAddr) -> AxumRouter {
+    let started_with_secret = engine
+        .config_snapshot()
+        .secret
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty());
     let api_state = ApiState {
         engine: Arc::clone(&engine),
         bound_addr,
+        started_with_secret,
     };
 
     AxumRouter::new()
@@ -434,7 +469,7 @@ fn attach_cors_headers(resp: &mut Response, allowed_origin: Option<&str>) {
 
 async fn security_and_auth_middleware(
     State(state): State<ApiState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let configured_secret = state
@@ -588,6 +623,11 @@ async fn security_and_auth_middleware(
     } else {
         None
     };
+
+    req.extensions_mut().insert(ControllerSecretContext {
+        started_with_secret: state.started_with_secret,
+        has_valid_secret,
+    });
 
     let mut resp = next.run(req).await;
     attach_cors_headers(&mut resp, allowed_cors.as_deref());
@@ -816,16 +856,18 @@ struct RawYamlQuery {
 
 async fn get_raw_yaml(
     State(engine): State<Arc<ProxyEngine>>,
+    auth_ctx: Option<axum::extract::Extension<ControllerSecretContext>>,
     Query(query): Query<RawYamlQuery>,
 ) -> Response {
     let cfg = engine.config_snapshot();
     if query.include_sensitive {
-        let has_secret = cfg.secret.as_ref().is_some_and(|s| !s.is_empty());
-        if !has_secret {
+        let ctx = auth_ctx.map(|e| e.0).unwrap_or_default();
+        let has_secret = cfg.secret.as_ref().is_some_and(|s| !s.trim().is_empty());
+        if !ctx.started_with_secret || !has_secret || !ctx.has_valid_secret {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
-                    "message": "Revealing unredacted credentials via HTTP API requires a configured controller 'secret'"
+                    "message": "Revealing unredacted credentials via HTTP API requires a controller 'secret' configured at server startup and a valid Bearer token"
                 })),
             )
                 .into_response();
@@ -1507,6 +1549,10 @@ async fn post_import_uris(
     Json(req): Json<ImportUrisReq>,
 ) -> impl IntoResponse {
     if req.apply {
+        let prev_secret = engine
+            .config_snapshot()
+            .secret
+            .filter(|s| !s.trim().is_empty());
         match engine
             .import_unified_live_with_options(
                 &req.uris,
@@ -1518,6 +1564,25 @@ async fn post_import_uris(
             .await
         {
             Ok(report) => {
+                if let Some(sec) = prev_secret
+                    && engine
+                        .config_snapshot()
+                        .secret
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    && !engine.demo_info().enabled
+                {
+                    let mut live_cfg = engine.config_snapshot();
+                    live_cfg.secret = Some(sec);
+                    let _ = engine
+                        .activate_profile_config_with_selections(
+                            live_cfg,
+                            Some(&report.selected_groups),
+                        )
+                        .await;
+                }
                 let added_set: std::collections::HashSet<&str> =
                     report.added_nodes.iter().map(String::as_str).collect();
                 let mut nodes: Vec<_> = report
@@ -2187,21 +2252,30 @@ async fn post_create_profile_api(
         }
     };
 
+    let prev_secret = engine
+        .config_snapshot()
+        .secret
+        .filter(|s| !s.trim().is_empty());
+
     match mgr.create_profile_detailed(spec).await {
         Ok((meta, maybe_cfg, skipped_unsupported)) => {
-            if let Some(cfg) = maybe_cfg
-                && let Err(err) = engine
+            if let Some(mut cfg) = maybe_cfg {
+                if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
+                    cfg.secret = prev_secret;
+                }
+                if let Err(err) = engine
                     .activate_profile_config_with_selections(cfg, Some(&meta.selected_groups))
                     .await
-            {
-                let safe_err = crate::config::uri::redact_sensitive_text(&err.to_string());
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "message": format!("profile saved as '{}', but runtime activation failed: {safe_err}", meta.id)
-                    })),
-                )
-                    .into_response();
+                {
+                    let safe_err = crate::config::uri::redact_sensitive_text(&err.to_string());
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "message": format!("profile saved as '{}', but runtime activation failed: {safe_err}", meta.id)
+                        })),
+                    )
+                        .into_response();
+                }
             }
             engine.hub().push_log(
                 "info",
@@ -2243,8 +2317,16 @@ async fn put_activate_profile_api(
         }
     };
 
+    let prev_secret = engine
+        .config_snapshot()
+        .secret
+        .filter(|s| !s.trim().is_empty());
+
     match mgr.set_active_profile(&id) {
-        Ok(cfg) => {
+        Ok(mut cfg) => {
+            if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
+                cfg.secret = prev_secret;
+            }
             let sel = mgr.active_selected_groups();
             match engine
                 .activate_profile_config_with_selections(cfg, Some(&sel))
@@ -2287,25 +2369,32 @@ async fn post_refresh_profile_api(
     };
 
     let prev_cfg_opt = mgr.load_profile_config_by_id(&id);
+    let prev_secret = engine
+        .config_snapshot()
+        .secret
+        .filter(|s| !s.trim().is_empty());
 
     match mgr.refresh_subscription(&id).await {
-        Ok((meta, cfg, is_active)) => {
+        Ok((meta, mut cfg, is_active)) => {
             let diff_opt = prev_cfg_opt
                 .as_ref()
                 .map(|prev| crate::audit::diff_configs(prev, &cfg));
             let audit = crate::audit::audit_config(&cfg);
 
-            if is_active
-                && !engine.demo_info().enabled
-                && let Err(e) = engine
+            if is_active && !engine.demo_info().enabled {
+                if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
+                    cfg.secret = prev_secret;
+                }
+                if let Err(e) = engine
                     .activate_profile_config_with_selections(cfg, Some(&meta.selected_groups))
                     .await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
-                )
-                    .into_response();
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+                    )
+                        .into_response();
+                }
             }
             engine.hub().push_log(
                 "info",
@@ -2967,14 +3056,27 @@ async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> i
                 {
                     known_secrets.push(pass.clone());
                 }
-                for (k, v) in headers {
-                    let kl = k.to_ascii_lowercase();
-                    if (kl.contains("auth") || kl.contains("token") || kl.contains("cookie"))
-                        && !v.is_empty()
-                        && v != REDACTED_SECRET
-                    {
+                for v in headers.values() {
+                    if !v.is_empty() && v != REDACTED_SECRET {
                         known_secrets.push(v.clone());
                     }
+                }
+            }
+        }
+    }
+    for prov in cfg.rule_providers.values() {
+        if let Some(ref raw_url) = prov.url
+            && let Ok(parsed) = url::Url::parse(raw_url)
+        {
+            if let Some(pw) = parsed.password()
+                && !pw.is_empty()
+                && pw != REDACTED_SECRET
+            {
+                known_secrets.push(pw.to_string());
+            }
+            for (_, v) in parsed.query_pairs() {
+                if !v.is_empty() && v.as_ref() != REDACTED_SECRET && v.len() >= 6 {
+                    known_secrets.push(v.into_owned());
                 }
             }
         }
@@ -3056,8 +3158,10 @@ async fn post_diagnostics_audit_api(
         .as_deref()
         .is_some_and(|raw| !raw.trim().is_empty());
     let target_cfg = match req.yaml.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => match ClashConfig::from_yaml_str_sanitized(raw) {
-            Ok((mut parsed, _skipped)) => {
+        Some(raw) if !raw.trim().is_empty() => match ClashConfig::from_yaml_str(raw)
+            .or_else(|_| ClashConfig::from_yaml_str_sanitized(raw).map(|(c, _)| c))
+        {
+            Ok(mut parsed) => {
                 parsed.restore_redacted_from(&active_cfg);
                 parsed
             }

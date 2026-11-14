@@ -110,7 +110,7 @@ Every release publishes [`SHA256SUMS.txt`](https://github.com/rustclash-labs/rus
 
 ### 60-Second Demo Sandbox & CLI Quick Start
 
-Launch the self-contained local loopback cluster (no external servers or subscriptions needed) and open **`http://127.0.0.1:9090`**:
+Launch the self-contained local loopback cluster (no external servers or subscriptions needed) and open the authenticated **`http://127.0.0.1:9090/?secret=<ephemeral-token>`** URL printed at startup:
 
 ```bash
 # 1. Start the local multi-protocol Demo Sandbox (VLESS+PQ 0-RTT/1-RTT, AnyTLS v2 & SS-2022 on 127.0.0.1)
@@ -199,13 +199,13 @@ rust-clash keygen-vless --mode xorpub
 - **Multi-Transport & Split-Horizon DNS Engine**: `UDP`, `TCP`, **DNS-over-TLS (`tls://`)**, and **DNS-over-HTTPS (`https://` RFC 8484 over multiplexed `HTTP/2` `h2` & pooled `HTTP/1.1`)** with `nameserver-policy`, `proxy-server-nameserver`, `proxy-server-nameserver-policy`, `direct-nameserver-follow-policy`, root/`dns` static `hosts` (`use-hosts`), multi-wildcard `fake-ip-filter`, `singleflight` query & bootstrap deduplication, literal-IP `default-nameserver` bootstrap separation, `fake-ip` (`198.18.0.0/15`) & `redir-host`/`normal` modes, negative caching, and TTL clamping.
 - **RFC 8305 Happy Eyeballs, Unified Delay & Smart Preconnect**: Interleaved IPv6/IPv4 connection racing (`250 ms` stagger) integrated with engine DNS + `SocketProtector`, `rustls` `ClientSessionMemoryCache(256)`, `unified-delay` 1-RTT payload latency measurement, and platform-aware `PreconnectPolicy` (desktop idle session & DNS pre-warming vs. event-only mobile preconnect with `0 Hz` screen-off parking).
 - **Routing Engine**: Hash/radix domain matching, binary-search interval tables for `IP-CIDR` / `IP-CIDR6` / `SRC-IP-CIDR` / `RULE-SET` (`rule-providers`), built-in fallback + optional `.mmdb` / remote rule-list `GEOIP` & `GEOSITE`, `PROCESS-NAME` matching, and `/rules/explain` diagnostics.
-- **Profiles & Credential Hygiene**: Persistent HTTPS subscription manager (`Subscription-Userinfo`, V2Board/Mihomo YAML normalization, atomic `.bak` rollback), OS `SecretVault` integration (Windows DPAPI, macOS Keychain, Linux Secret Service, Android Keystore, with `0600` local AES-256-GCM fallback in headless environments), `RecoveryJournal` crash rollback, and automatic credential redaction in `GET /configs` and `GET /diagnostics/export`.
+- **Profiles & Credential Hygiene**: Persistent HTTPS subscription manager (`Subscription-Userinfo`, V2Board/Mihomo YAML normalization, atomic `.bak` rollback), OS `SecretVault` integration (Windows DPAPI, macOS Keychain via `security -i` stdin, Linux `libsecret` `secret-tool` stdin with `0600` local AES-256-GCM fallback in headless environments, and Android `0700` app-sandboxed file store with `allowBackup="false"`), `RecoveryJournal` crash rollback, and automatic credential redaction in `GET /configs` and `GET /diagnostics/export`.
 
 ---
 
 ## Single-Host Loopback Benchmark Summary (`v0.2.0`, Linux `x86_64`, `n = 6` Rounds)
 
-> **Benchmark Scope & Caveats**: Measurements below were recorded on **`rust-clash v0.2.0`** across 6 interleaved Latin-square rounds on a **single Linux `x86_64` cloud VM (`Intel Xeon Platinum 8481C`, 2 vCPUs)** over **kernel loopback (`127.0.0.1`)** against a local `shadowsocks-rust v1.25.0` server (`2022-blake3-aes-256-gcm`). Client, proxy, upstream server, and echo origin shared the same 2-vCPU host; results measure userspace CPU/memory overhead and loopback scheduling rather than physical NIC, WAN packet-loss, or mobile hardware performance. Notice that `sing-box` leads single-stream TCP bulk throughput on loopback, while 8-stream TCP multi-stream 95% confidence intervals overlap across all three engines. Full methodology, CIs, and raw data are in [`docs/PERFORMANCE_BENCHMARK.md`](docs/PERFORMANCE_BENCHMARK.md).
+> **Benchmark Scope & Caveats (`v0.2.0` Committed Baseline)**: Measurements below reproduce the exact recorded dataset in [`docs/benchmarks_latest.json`](docs/benchmarks_latest.json) (`rust-clash v0.2.0` historical baseline, `2026-11-09T03:15:17Z`, `v0.4.0+` shares the same core AEAD/`smoltcp` data plane) across 6 interleaved Latin-square rounds on a **single Linux `x86_64` cloud VM (`Intel Xeon Platinum 8481C`, 2 vCPUs)** over **kernel loopback (`127.0.0.1`)** against a local `shadowsocks-rust v1.25.0` server (`2022-blake3-aes-256-gcm`). Client, proxy, upstream server, and echo origin shared the same 2-vCPU host; results measure userspace CPU/memory overhead and loopback scheduling rather than physical NIC, WAN packet-loss, or mobile hardware performance. Notice that `sing-box` has the highest point-mean single-stream TCP bulk throughput (`7,743.4 ± 771.9 Mbps` vs `rust-clash` `5,747.5 ± 1,954.5 Mbps`, Welch $t = -2.326, p = 0.0555$), while 8-stream TCP multi-stream (`p >= 0.23`) is statistically indistinguishable across all three engines. Full methodology, exact two-sample Welch's $t$-tests, CIs, and raw per-round data are in [`docs/PERFORMANCE_BENCHMARK.md`](docs/PERFORMANCE_BENCHMARK.md).
 
 | Metric (`n = 6` interleaved rounds, `Mean ± SD` / `Median`) | `rust-clash v0.2.0` (Mixed) | `mihomo v1.19.33` (Mixed) | `sing-box v1.14.4` (Mixed) | `rust-clash v0.2.0` (`L3 TUN MTU 1500`) |
 |---|---:|---:|---:|---:|
@@ -213,10 +213,10 @@ rust-clash keygen-vless --mode xorpub
 | **Cold Startup Ready (ms)** | `22.87 ± 12.37` (`21.00`) | `25.64 ± 6.89` (`21.44`) | `43.51 ± 4.19` (`41.91`) | — |
 | **Idle CPU (%)** | `0.00 ± 0.00 %` | `0.17 ± 0.26 %` (`0.00 %`) | `0.00 ± 0.00 %` | `0.00 %` *(event-driven)* |
 | **Idle / Peak `VmRSS` (MiB)** | `9.63 ± 0.20` / `13.80 ± 0.28` | `39.49 ± 0.93` / `60.76 ± 1.11` | `54.35 ± 0.53` / `56.73 ± 0.52` | `9.46 ± 0.13` / `24.34 ± 0.45` |
-| **TCP Single-Stream 64 MiB (Mbps)** | `2,690 ± 148` (`2,704`) | `2,630 ± 78` (`2,621`) | `4,536 ± 231` (`4,606`) | `2,175 ± 225` (`2,243`, 16 MiB) |
-| **TCP Multi-Stream (Mbps)** | `5,347 ± 1,305` (`5,833`, 8-str) | `5,429 ± 511` (`5,381`, 8-str) | `6,078 ± 287` (`6,037`, 8-str) | `2,622 ± 143` (`2,600`, 4-str) |
+| **TCP Single-Stream 32 MiB (Mbps)** | `5,747.5 ± 1,954.5` (`6,303.8`) | `5,556.2 ± 442.7` (`5,615.6`) | `7,743.4 ± 771.9` (`7,980.2`) | `1,930.2 ± 337.4` (`1,816.0`, 16 MiB) |
+| **TCP Multi-Stream (Mbps)** | `5,347.0 ± 1,305.3` (`5,833.4`, 8-str) | `5,428.9 ± 510.7` (`5,381.2`, 8-str) | `6,077.9 ± 286.5` (`6,036.8`, 8-str) | `2,621.6 ± 142.7` (`2,600.1`, 4-str) |
 | **Encrypted Echo RTT `P50` (ms)** | `0.194 ± 0.042` (`0.178`) | `0.339 ± 0.020` (`0.333`) | `0.274 ± 0.023` (`0.269`) | `0.344 ± 0.023` (`0.343`) |
-| **UDP Relay (`loss` / `PPS`)** | `0.0%` / `11,630 ± 1,407` | `0.0%` / `10,200 ± 427` | `0.0%` / `12,642 ± 930` | `0.0%` / `8,036 ± 573` |
+| **UDP Relay (`loss` / `PPS`)** | `0.0%` / `11,629.5 ± 1,407.3` (`11,595.0`) | `0.0%` / `10,200.3 ± 427.1` (`10,035.5`) | `0.0%` / `12,642.2 ± 930.0` (`12,203.0`) | `0.0%` / `8,036.3 ± 573.3` (`7,762.5`) |
 | **DNS / Hijack `P50` (ms)** | `0.026 ± 0.001` (`26 µs`) | `0.046 ± 0.002` (`45 µs`) | `0.049 ± 0.005` (`48 µs`) | `0.033 ± 0.009` (`36 µs`) |
 
 ---

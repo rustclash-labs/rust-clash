@@ -311,6 +311,181 @@ def summarize_distribution(values: list[float], ndigits: int = 3) -> dict[str, A
     }
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Evaluate continued fraction for incomplete beta via modified Lentz's method."""
+    max_iter = 500
+    eps = 3.0e-15
+    fpmin = 1.0e-300
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        h *= d * c
+
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        del_h = d * c
+        h *= del_h
+        if abs(del_h - 1.0) <= eps:
+            break
+    return h
+
+
+def regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    """Compute regularized incomplete beta I_x(a, b) using pure Python stdlib math."""
+    if a <= 0.0 or b <= 0.0:
+        raise ValueError(f"Beta parameters must be positive (got a={a}, b={b})")
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    ln_beta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    front = math.exp(a * math.log(x) + b * math.log1p(-x) - ln_beta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def student_t_two_sided_p_value(t_stat: float, df: float) -> float:
+    """Exact two-sided p-value P(|T_df| >= |t_stat|) via I_{df/(df+t^2)}(df/2, 1/2)."""
+    if math.isnan(t_stat) or df <= 0.0:
+        return 1.0
+    if math.isinf(t_stat):
+        return 0.0
+    if t_stat == 0.0:
+        return 1.0
+    x = df / (df + t_stat * t_stat)
+    return max(0.0, min(1.0, regularized_incomplete_beta(0.5 * df, 0.5, x)))
+
+
+def welch_t_test(
+    sample_a: list[float], sample_b: list[float], alpha: float = 0.05
+) -> dict[str, Any]:
+    """Two-sample unequal-variance Welch's t-test with Satterthwaite degrees of freedom."""
+    n_a = len(sample_a)
+    n_b = len(sample_b)
+    if n_a < 2 or n_b < 2:
+        return {
+            "n_a": n_a,
+            "n_b": n_b,
+            "mean_a": statistics.fmean(sample_a) if sample_a else 0.0,
+            "mean_b": statistics.fmean(sample_b) if sample_b else 0.0,
+            "diff_mean": 0.0,
+            "t_stat": 0.0,
+            "df": 0.0,
+            "p_value": 1.0,
+            "significant_alpha_0_05": False,
+            "note": "insufficient_samples",
+        }
+
+    vals_a = [float(v) for v in sample_a]
+    vals_b = [float(v) for v in sample_b]
+    mean_a = statistics.fmean(vals_a)
+    mean_b = statistics.fmean(vals_b)
+    diff = mean_a - mean_b
+    var_a = statistics.variance(vals_a)
+    var_b = statistics.variance(vals_b)
+    se2_a = var_a / n_a
+    se2_b = var_b / n_b
+    se2_sum = se2_a + se2_b
+
+    if se2_sum == 0.0:
+        if abs(diff) <= 1e-12:
+            return {
+                "n_a": n_a,
+                "n_b": n_b,
+                "mean_a": round(mean_a, 6),
+                "mean_b": round(mean_b, 6),
+                "diff_mean": 0.0,
+                "t_stat": 0.0,
+                "df": float(n_a + n_b - 2),
+                "p_value": 1.0,
+                "significant_alpha_0_05": False,
+                "note": "identical_zero_variance",
+            }
+        return {
+            "n_a": n_a,
+            "n_b": n_b,
+            "mean_a": round(mean_a, 6),
+            "mean_b": round(mean_b, 6),
+            "diff_mean": round(diff, 6),
+            "t_stat": None,
+            "df": float(n_a + n_b - 2),
+            "p_value": 0.0,
+            "significant_alpha_0_05": True,
+            "note": "deterministic_zero_variance",
+        }
+
+    t_stat = diff / math.sqrt(se2_sum)
+    denom = (se2_a * se2_a) / (n_a - 1) + (se2_b * se2_b) / (n_b - 1)
+    df = (se2_sum * se2_sum) / denom
+    p_val = student_t_two_sided_p_value(t_stat, df)
+    return {
+        "n_a": n_a,
+        "n_b": n_b,
+        "mean_a": round(mean_a, 6),
+        "mean_b": round(mean_b, 6),
+        "diff_mean": round(diff, 6),
+        "t_stat": round(t_stat, 4),
+        "df": round(df, 4),
+        "p_value": p_val,
+        "significant_alpha_0_05": bool(p_val < alpha),
+    }
+
+
+def compute_comparative_welch_tests(
+    comparative_entries: list[dict[str, Any]],
+    metric_keys: list[str] | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Compute Welch's t-tests comparing rust-clash against mihomo and sing-box across all metrics."""
+    keys = metric_keys if metric_keys is not None else NUMERIC_MIXED_METRICS
+    by_slug: dict[str, dict[str, Any]] = {}
+    for entry in comparative_entries:
+        label = str(entry.get("engine", "")).lower()
+        if label.startswith("rust-clash"):
+            by_slug["rust-clash"] = entry
+        elif label.startswith("mihomo"):
+            by_slug["mihomo"] = entry
+        elif label.startswith("sing-box"):
+            by_slug["sing-box"] = entry
+
+    rc_rounds = by_slug.get("rust-clash", {}).get("raw_rounds", [])
+    results: dict[str, dict[str, dict[str, Any]]] = {}
+    for peer_slug, pair_key in [
+        ("mihomo", "rust_clash_vs_mihomo"),
+        ("sing-box", "rust_clash_vs_sing_box"),
+    ]:
+        peer_rounds = by_slug.get(peer_slug, {}).get("raw_rounds", [])
+        pair_metrics: dict[str, dict[str, Any]] = {}
+        for metric in keys:
+            vals_rc = [float(r[metric]) for r in rc_rounds if metric in r]
+            vals_peer = [float(r[metric]) for r in peer_rounds if metric in r]
+            pair_metrics[metric] = welch_t_test(vals_rc, vals_peer)
+        results[pair_key] = pair_metrics
+    return results
+
+
 def build_dns_query_packet(txid: int, domain: str) -> bytes:
     header = struct.pack("!HHHHHH", txid & 0xFFFF, 0x0100, 1, 0, 0, 0)
     qname = b"".join(bytes([len(lbl)]) + lbl.encode("ascii") for lbl in domain.split(".")) + b"\x00"
@@ -1008,6 +1183,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 "tun_dns_hijack_queries": 300,
             },
             "comparative_mixed_socks5": comparative_aggregated,
+            "welch_t_tests": compute_comparative_welch_tests(comparative_aggregated),
             "rust_clash_tun_l3_path": tun_aggregated,
         }
 
@@ -1021,9 +1197,77 @@ async def async_main(args: argparse.Namespace) -> int:
             h.close()
 
 
+def _verify_incomplete_beta_accuracy() -> None:
+    """Self-verify regularized incomplete beta against exact Student-t 95% critical values."""
+    for df, t_crit in STUDENT_T_95.items():
+        p = student_t_two_sided_p_value(t_crit, float(df))
+        if abs(p - 0.05) > 2e-4:
+            raise AssertionError(f"Student-t p-value check failed for df={df}: got p={p}")
+
+
+def recompute_stats_from_json(json_path: Path) -> int:
+    _verify_incomplete_beta_accuracy()
+    data = json.loads(json_path.read_text())
+    comp = data.get("comparative_mixed_socks5", [])
+    tun = data.get("rust_clash_tun_l3_path", {})
+    welch = compute_comparative_welch_tests(comp)
+
+    print(f"=== Welch's Two-Sample t-Test Recomputation ({json_path}) ===")
+    print(
+        f"{'Metric':<22} | {'vs mihomo (t, df, two-sided p)':<40} | {'vs sing-box (t, df, two-sided p)':<40}"
+    )
+    print("-" * 108)
+    for metric in NUMERIC_MIXED_METRICS:
+        m_res = welch["rust_clash_vs_mihomo"][metric]
+        s_res = welch["rust_clash_vs_sing_box"][metric]
+
+        def _fmt(r: dict[str, Any]) -> str:
+            t_v = r["t_stat"]
+            df_v = r["df"]
+            p_v = r["p_value"]
+            sig = "SIG" if r["significant_alpha_0_05"] else "ns"
+            if t_v is None:
+                return f"det (diff={r['diff_mean']:+.3f}), p=0 [{sig}]"
+            p_str = f"{p_v:.3e}" if p_v < 0.001 and p_v > 0.0 else f"{p_v:.4f}"
+            return f"t={t_v:+.3f}, df={df_v:.2f}, p={p_str} [{sig}]"
+
+        print(f"{metric:<22} | {_fmt(m_res):<40} | {_fmt(s_res):<40}")
+
+    if comp:
+        print("\n=== Comparative Mixed SOCKS5 Recorded Distributions ===")
+        for entry in comp:
+            print(f"  [{entry.get('engine')}]")
+            dists = entry.get("distributions", {})
+            for metric in ("binary_size_mib", "startup_ready_ms", "idle_cpu_pct", "idle_rss_mib", "peak_rss_mib", "tcp_1stream_mbps", "tcp_8stream_mbps", "proxy_rtt_p50_ms", "udp_loss_pct", "udp_pps", "dns_p50_ms"):
+                if metric in dists:
+                    d = dists[metric]
+                    print(
+                        f"    {metric:<20}: mean={d['mean']} ± {d['stdev']} (95% CI ±{d['ci95_half_width']}), "
+                        f"median={d['median']} (IQR {d['iqr']}), [{d['min']}..{d['max']}]"
+                    )
+
+    if tun and "distributions" in tun:
+        print("\n=== L3 smoltcp TUN Recorded Distributions ===")
+        for metric in NUMERIC_TUN_METRICS:
+            if metric in tun["distributions"]:
+                d = tun["distributions"][metric]
+                print(
+                    f"  {metric:<24}: mean={d['mean']} ± {d['stdev']} (95% CI ±{d['ci95_half_width']}), "
+                    f"median={d['median']} (IQR {d['iqr']}), [{d['min']}..{d['max']}]"
+                )
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run multi-round interleaved rust-clash vs mihomo vs sing-box + L3 TUN benchmarks"
+    )
+    parser.add_argument(
+        "--recompute-stats",
+        type=Path,
+        default=None,
+        help="Recompute and print exact two-sample Welch's t-test p-values from an existing JSON dataset (e.g. docs/benchmarks_latest.json)",
     )
     parser.add_argument(
         "--rounds",
@@ -1053,6 +1297,8 @@ def main() -> int:
         default=Path(__file__).resolve().parent.parent / "docs" / "benchmarks_latest.json",
     )
     args = parser.parse_args()
+    if args.recompute_stats is not None:
+        return recompute_stats_from_json(args.recompute_stats)
     return asyncio.run(async_main(args))
 
 

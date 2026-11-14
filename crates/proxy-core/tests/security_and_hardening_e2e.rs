@@ -1221,3 +1221,150 @@ async fn dns_ip_rule_resolution_no_resolve_and_accurate_geoip() {
 
     let _ = shutdown_tx.send(true);
 }
+
+#[tokio::test]
+async fn subscription_rce_secret_wipe_and_controller_self_bounce_are_blocked_e2e() {
+    use proxy_core::profile::parse_subscription_payload_sanitized;
+    use proxy_core::router::ruleset::resolve_confined_http_provider_path;
+
+    let state_dir = std::env::temp_dir().join(format!("rc-sec-p0-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // 1. P0-1: `resolve_confined_http_provider_path` and `ClashConfig::validate` block traversal & absolute paths
+    assert!(
+        resolve_confined_http_provider_path(&state_dir, "evil", Some("../../.bashrc"), "text")
+            .is_err()
+    );
+    assert!(
+        resolve_confined_http_provider_path(&state_dir, "evil", Some("/tmp/pwned.sh"), "text")
+            .is_err()
+    );
+    let bad_provider_yaml = r#"
+rule-providers:
+  evil:
+    type: http
+    behavior: domain
+    format: text
+    url: https://example.com/rules.txt
+    path: /tmp/evil_outside_state_dir.txt
+rules:
+  - RULE-SET,evil,DIRECT
+  - MATCH,DIRECT
+"#;
+    assert!(
+        ClashConfig::from_yaml_str(bad_provider_yaml).is_err(),
+        "HTTP rule-provider with path outside state_dir must fail validation"
+    );
+
+    // 2. P0-4: Malicious/Subconverter subscription with `secret: ""`, `allow-lan: true`, `file` provider,
+    //    and `http` provider custom `path` is sanitized on import AND never wipes live controller secret!
+    let hostile_sub = r#"
+mixed-port: 7890
+allow-lan: true
+bind-address: "0.0.0.0"
+external-controller: 0.0.0.0:9090
+secret: ""
+proxies:
+  - name: "Sub-SOCKS"
+    type: socks5
+    server: 127.0.0.1
+    port: 10808
+proxy-groups:
+  - name: "Proxy"
+    type: select
+    proxies: ["Sub-SOCKS", "DIRECT"]
+rule-providers:
+  probe-etc:
+    type: file
+    behavior: domain
+    format: text
+    path: /etc/hosts
+  remote-list:
+    type: http
+    behavior: domain
+    format: text
+    url: https://example.com/domains.txt
+    path: ../../../.bashrc
+rules:
+  - RULE-SET,probe-etc,Proxy
+  - RULE-SET,remote-list,Proxy
+  - MATCH,DIRECT
+"#;
+    let (sanitized_cfg, _, _) = parse_subscription_payload_sanitized(hostile_sub, &[]).unwrap();
+    assert!(!sanitized_cfg.allow_lan);
+    assert_eq!(sanitized_cfg.bind_address, "127.0.0.1");
+    assert_eq!(sanitized_cfg.external_controller, "127.0.0.1:9090");
+    assert!(sanitized_cfg.secret.is_none());
+    assert!(!sanitized_cfg.rule_providers.contains_key("probe-etc"));
+    assert_eq!(
+        sanitized_cfg.rule_providers["remote-list"].path, None,
+        "remote subscription HTTP rule-provider path must be stripped"
+    );
+
+    // Start live engine with an initial secret and verify profile activation with `secret: Some("")`
+    // and `allow_lan: true` preserves the daemon's secret and `allow_lan = false`!
+    let mut base_cfg = ClashConfig {
+        mixed_port: 0,
+        secret: Some("initial-daemon-secret-999".to_string()),
+        allow_lan: false,
+        ..Default::default()
+    };
+    base_cfg.dns.enable = false;
+
+    // Bind ephemeral port first to know controller port so engine blocks self-bounce to controller
+    let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reserved_ctrl_port = probe_listener.local_addr().unwrap().port();
+    drop(probe_listener);
+    base_cfg.external_controller = format!("127.0.0.1:{reserved_ctrl_port}");
+
+    let engine = ProxyEngine::start_with_state_dir(base_cfg, state_dir.clone())
+        .await
+        .unwrap();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (ctrl_addr, _api_task) = spawn_api_server(
+        &format!("127.0.0.1:{reserved_ctrl_port}"),
+        Arc::clone(&engine),
+        stop_rx,
+    )
+    .await
+    .unwrap();
+
+    let mut raw_override_attempt = sanitized_cfg.clone();
+    raw_override_attempt.secret = Some(String::new());
+    raw_override_attempt.allow_lan = true;
+    engine
+        .activate_profile_config_with_selections(raw_override_attempt, None)
+        .await
+        .unwrap();
+    let snap_after = engine.config_snapshot();
+    assert_eq!(
+        snap_after.secret.as_deref(),
+        Some("initial-daemon-secret-999"),
+        "profile activation must never wipe or overwrite active controller secret"
+    );
+    assert!(
+        !snap_after.allow_lan,
+        "profile activation must never enable allow_lan"
+    );
+
+    // 3. P0-3: Attempting to proxy to the controller port (`127.0.0.1:<ctrl_port>`) via MixedInbound is rejected (403)!
+    let mixed_addr = engine.mixed_addr();
+    let mut proxy_conn = TcpStream::connect(mixed_addr).await.unwrap();
+    let bounce_req = format!(
+        "GET http://127.0.0.1:{}/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        ctrl_addr.port(),
+        ctrl_addr.port()
+    );
+    proxy_conn.write_all(bounce_req.as_bytes()).await.unwrap();
+    let mut bounce_resp = Vec::new();
+    proxy_conn.read_to_end(&mut bounce_resp).await.unwrap();
+    let bounce_str = String::from_utf8_lossy(&bounce_resp);
+    assert!(
+        bounce_str.starts_with("HTTP/1.1 403"),
+        "MixedInbound must block self-bounce to controller port, got: {bounce_str}"
+    );
+
+    let _ = stop_tx.send(true);
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

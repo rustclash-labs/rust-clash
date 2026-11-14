@@ -166,6 +166,12 @@ pub fn resolve_controller_client(
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .or_else(|| {
+            std::env::var("RUST_CLASH_SECRET")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
             fallback_cfg
                 .and_then(|c| c.secret.clone())
                 .filter(|s| !s.is_empty())
@@ -201,6 +207,52 @@ fn sanitize_source_label(src: &str, include_network_metadata: bool) -> String {
         "profile:active".to_string()
     } else {
         src.to_string()
+    }
+}
+
+fn validate_audit_config_path(raw: &str) -> std::result::Result<PathBuf, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return Err("invalid config_path: path must not be empty or contain control characters");
+    }
+    if trimmed.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err("invalid config_path: parent directory traversal ('..') is forbidden");
+    }
+    let path = PathBuf::from(trimmed);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("invalid config_path: parent directory traversal ('..') is forbidden");
+    }
+    let has_yaml_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+    let has_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| !s.is_empty());
+    if !has_yaml_ext || !has_stem {
+        return Err("invalid config_path: only '.yaml' or '.yml' configuration files are allowed");
+    }
+    if let Ok(meta) = std::fs::metadata(&path)
+        && !meta.is_file()
+    {
+        return Err("invalid config_path: target must be a regular '.yaml' or '.yml' file");
+    }
+    Ok(path)
+}
+
+fn sanitize_audit_file_error(path: &std::path::Path) -> &'static str {
+    match std::fs::metadata(path) {
+        Err(_) => "failed to load config_path: file does not exist or is unreadable",
+        Ok(meta) if !meta.is_file() => {
+            "invalid config_path: target must be a regular '.yaml' or '.yml' file"
+        }
+        Ok(_) => {
+            "failed to parse or validate Clash YAML at config_path (syntax or schema error; raw file contents redacted)"
+        }
     }
 }
 
@@ -502,7 +554,12 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 .unwrap_or(false);
 
             if let Some(path_str) = draft_path {
-                let path_buf = PathBuf::from(path_str);
+                let path_buf = match validate_audit_config_path(path_str) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        return mcp_tool_result(&json!({ "error": reason }), true);
+                    }
+                };
                 match ClashConfig::from_file(&path_buf) {
                     Ok(draft_cfg) => {
                         let report = audit_config(&draft_cfg);
@@ -520,8 +577,8 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                         scrub_audit_payload(&mut out, opts.include_network_metadata);
                         mcp_tool_result(&out, false)
                     }
-                    Err(e) => mcp_tool_result(
-                        &json!({ "error": redact_sensitive_text(&e.to_string()) }),
+                    Err(_) => mcp_tool_result(
+                        &json!({ "error": sanitize_audit_file_error(&path_buf) }),
                         true,
                     ),
                 }
@@ -1466,5 +1523,82 @@ rules:
 
         let _ = stop_tx.send(true);
         engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mcp_audit_config_path_blocks_traversal_non_yaml_and_redacts_parse_errors() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        for bad_path in [
+            "../secret.yaml",
+            "configs/../../etc/shadow.yaml",
+            "..\\windows\\win.yml",
+            "/etc/passwd",
+            "/tmp/credentials.json",
+            ".yaml",
+        ] {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 91,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "audit_config_security",
+                        "arguments": { "config_path": bad_path }
+                    }
+                }),
+                &ro_opts,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp["result"]["isError"], true,
+                "expected bad config_path '{bad_path}' to be rejected"
+            );
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let secret_marker = "TOP_SECRET_ARBITRARY_FILE_CONTENT_991122";
+        let fake_yaml_path = std::env::temp_dir().join(format!(
+            "rc-mcp-non-yaml-{}-{nanos}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &fake_yaml_path,
+            format!("{{{secret_marker}: [unclosed_non_yaml_secret_line\n"),
+        )
+        .unwrap();
+
+        let parse_fail_resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 92,
+                "method": "tools/call",
+                "params": {
+                    "name": "audit_config_security",
+                    "arguments": { "config_path": fake_yaml_path.to_string_lossy() }
+                }
+            }),
+            &ro_opts,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&fake_yaml_path);
+
+        assert_eq!(parse_fail_resp["result"]["isError"], true);
+        let serialized = parse_fail_resp.to_string();
+        assert!(
+            !serialized.contains(secret_marker),
+            "parse failure must never echo arbitrary file contents back to MCP caller: {serialized}"
+        );
     }
 }

@@ -176,12 +176,30 @@ impl OutboundHandler for HttpOutbound {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(self.inner.cfg.server.as_str());
             let sni = crate::crypto::tls::parse_server_name(sni_str)?;
-            Box::new(connector.connect(sni, tcp).await?)
+            let tls = crate::outbound::with_handshake_timeout(
+                "HTTP proxy TLS handshake",
+                connector.connect(sni, tcp),
+            )
+            .await?;
+            Box::new(tls)
         } else {
             Box::new(tcp)
         };
 
         let authority = target.to_string();
+        if authority.is_empty()
+            || authority.bytes().any(|b| {
+                b <= 0x1f
+                    || b == 0x7f
+                    || b.is_ascii_whitespace()
+                    || matches!(b, b'/' | b'\\' | b'@')
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid target authority for HTTP CONNECT",
+            ));
+        }
         let mut req = format!(
             "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
         );
@@ -212,30 +230,35 @@ impl OutboundHandler for HttpOutbound {
         }
         req.push_str("\r\n");
 
-        stream.write_all(req.as_bytes()).await?;
-        stream.flush().await?;
+        let (mut resp_buf, hdr_end) =
+            crate::outbound::with_handshake_timeout("HTTP CONNECT handshake", async {
+                stream.write_all(req.as_bytes()).await?;
+                stream.flush().await?;
 
-        let mut resp_buf = BytesMut::with_capacity(512);
-        let mut tmp = [0u8; 512];
-        let hdr_end = loop {
-            if let Some(end) = find_header_end(&resp_buf) {
-                break end;
-            }
-            if resp_buf.len() >= 16 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "HTTP CONNECT response header exceeded 16 KiB",
-                ));
-            }
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "EOF before HTTP CONNECT response completed",
-                ));
-            }
-            resp_buf.extend_from_slice(&tmp[..n]);
-        };
+                let mut resp_buf = BytesMut::with_capacity(512);
+                let mut tmp = [0u8; 512];
+                let hdr_end = loop {
+                    if let Some(end) = find_header_end(&resp_buf) {
+                        break end;
+                    }
+                    if resp_buf.len() >= 16 * 1024 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HTTP CONNECT response header exceeded 16 KiB",
+                        ));
+                    }
+                    let n = stream.read(&mut tmp).await?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF before HTTP CONNECT response completed",
+                        ));
+                    }
+                    resp_buf.extend_from_slice(&tmp[..n]);
+                };
+                Ok((resp_buf, hdr_end))
+            })
+            .await?;
 
         let header_bytes = resp_buf.split_to(hdr_end);
         let status_line = std::str::from_utf8(&header_bytes)

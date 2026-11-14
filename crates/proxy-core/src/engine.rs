@@ -791,6 +791,88 @@ fn load_optional_mmdb(cfg: &ClashConfig) -> Result<Option<Arc<crate::router::mmd
     Ok(None)
 }
 
+fn canonical_ip_addr(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+    }
+}
+
+fn parse_loopback_or_unspec_port(spec: &str) -> Option<u16> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        let canon = canonical_ip_addr(addr.ip());
+        if (canon.is_loopback() || canon.is_unspecified()) && addr.port() != 0 {
+            return Some(addr.port());
+        }
+        return None;
+    }
+    if let Some(port_str) = trimmed.strip_prefix(':')
+        && let Ok(port) = port_str.parse::<u16>()
+        && port != 0
+    {
+        return Some(port);
+    }
+    if let Some((host, port_str)) = trimmed.rsplit_once(':')
+        && host.trim().eq_ignore_ascii_case("localhost")
+        && let Ok(port) = port_str.trim().parse::<u16>()
+        && port != 0
+    {
+        return Some(port);
+    }
+    None
+}
+
+fn parse_any_listen_port(spec: &str) -> Option<u16> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return (addr.port() != 0).then_some(addr.port());
+    }
+    if let Some((_, port_str)) = trimmed.rsplit_once(':')
+        && let Ok(port) = port_str.trim().parse::<u16>()
+        && port != 0
+    {
+        return Some(port);
+    }
+    None
+}
+
+fn compute_blocked_local_ports(cfg: &ClashConfig, dns_bound: Option<SocketAddr>) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let mut push_unique = |p: u16| {
+        if p != 0 && !ports.contains(&p) {
+            ports.push(p);
+        }
+    };
+    if let Some(ctrl_port) = parse_loopback_or_unspec_port(&cfg.external_controller) {
+        push_unique(ctrl_port);
+    }
+    if let Some(bound) = dns_bound {
+        push_unique(bound.port());
+    } else if cfg.dns.enable
+        && let Some(dns_port) = parse_any_listen_port(&cfg.dns.listen)
+    {
+        push_unique(dns_port);
+    }
+    ports
+}
+
+fn config_uses_geodata(cfg: &ClashConfig) -> bool {
+    if cfg.geodata_mode {
+        return true;
+    }
+    cfg.rules.iter().any(|rule| {
+        let prefix = rule.split(',').next().unwrap_or("").trim();
+        prefix.eq_ignore_ascii_case("GEOIP") || prefix.eq_ignore_ascii_case("GEOSITE")
+    })
+}
+
 async fn spawn_dynamic_dns_server(
     listen_addr: &str,
     router_slot: Arc<RwLock<Arc<Router>>>,
@@ -1111,24 +1193,40 @@ impl PreconnectPolicy {
     }
 }
 
+#[derive(Clone)]
+struct EngineStateSnapshot {
+    config: ClashConfig,
+    raw_yaml: String,
+    router: Arc<Router>,
+    mixed_policy: MixedInboundPolicy,
+    mixed_addr: SocketAddr,
+    dns_addr: Option<SocketAddr>,
+    tun_mode: TunRuntimeMode,
+}
+
+struct EngineState {
+    snapshot: Arc<EngineStateSnapshot>,
+    next_seq: u64,
+    mode_seq: u64,
+    unified_delay_seq: u64,
+    log_level_seq: u64,
+    saved_selections: HashMap<String, String>,
+    selection_seqs: HashMap<String, (String, u64)>,
+}
+
 /// Top-level `rust-clash` runtime engine managing Mixed Inbound, Fake-IP DNS,
 /// `smoltcp` Userspace/OS TUN, `Router`, hot-reloadable `ClashConfig`, and `TelemetryHub`.
 pub struct ProxyEngine {
-    config: RwLock<ClashConfig>,
-    raw_yaml: RwLock<String>,
+    state: RwLock<EngineState>,
     config_path: Option<PathBuf>,
-    router: Arc<RwLock<Arc<Router>>>,
+    router_slot: Arc<RwLock<Arc<Router>>>,
     mixed_policy: Arc<RwLock<MixedInboundPolicy>>,
     services: AsyncMutex<RuntimeServices>,
     hub: Arc<TelemetryHub>,
-    mixed_addr: RwLock<SocketAddr>,
-    dns_addr: RwLock<Option<SocketAddr>>,
-    tun_mode: RwLock<TunRuntimeMode>,
     active_os_tun: RwLock<Option<Arc<OsTunGuard>>>,
     last_tun_error: RwLock<Option<String>>,
     virtual_tun: Mutex<Option<VirtualTunHandle>>,
     state_dir: RwLock<PathBuf>,
-    saved_selections: RwLock<HashMap<String, String>>,
     profile_manager: RwLock<Option<Arc<crate::profile::ProfileManager>>>,
     geodata_manager: RwLock<Option<Arc<crate::router::geodata::GeoDataManager>>>,
     extra_ca_der: RwLock<Vec<CertificateDer<'static>>>,
@@ -1271,12 +1369,13 @@ impl ProxyEngine {
             extra_ca_der.clone(),
         )));
 
-        let policy = MixedInboundPolicy::from_config(
+        let mut policy = MixedInboundPolicy::from_config(
             cfg.allow_lan,
             &cfg.authentication,
             &cfg.lan_allowed_ips,
-        )?;
-        let mixed_policy = Arc::new(RwLock::new(policy));
+        )?
+        .with_blocked_local_ports(compute_blocked_local_ports(&cfg, None));
+        let mixed_policy = Arc::new(RwLock::new(policy.clone()));
 
         let dns_engine = Arc::new(FakeIpDnsEngine::with_extra_ca(
             &cfg.dns_with_merged_hosts(),
@@ -1389,11 +1488,12 @@ impl ProxyEngine {
         } else {
             (None, None)
         };
+        policy.blocked_local_ports = compute_blocked_local_ports(&cfg, dns_bound_opt);
+        *mixed_policy.write() = policy.clone();
 
         // 3. Userspace / OS `smoltcp` TUN stack
         let mut virtual_tun_opt = None;
         let mut initial_os_tun = None;
-        let mut last_tun_err = None;
         let (tun_service, initial_tun_mode) = if cfg.tun.enable {
             match start_tun_service(
                 &cfg,
@@ -1419,8 +1519,6 @@ impl ProxyEngine {
                         "failed to initialize TUN '{}' (auto-route={}): {err}",
                         cfg.tun.device, cfg.tun.auto_route
                     );
-                    last_tun_err = Some(msg.clone());
-                    let _ = last_tun_err;
                     return Err(ProxyError::Io(std::io::Error::new(err.kind(), msg)));
                 }
             }
@@ -1575,12 +1673,29 @@ impl ProxyEngine {
             );
         }
 
-        let raw_yaml = cfg.to_yaml_string().unwrap_or_default();
+        let raw_yaml = cfg.to_yaml_string()?;
+        let initial_saved = initial_selections.unwrap_or_default();
+        let initial_snapshot = Arc::new(EngineStateSnapshot {
+            config: cfg,
+            raw_yaml,
+            router: Arc::clone(&initial_router),
+            mixed_policy: policy,
+            mixed_addr: mixed_bound,
+            dns_addr: dns_bound_opt,
+            tun_mode: initial_tun_mode,
+        });
         let engine = Arc::new(Self {
-            config: RwLock::new(cfg),
-            raw_yaml: RwLock::new(raw_yaml),
+            state: RwLock::new(EngineState {
+                snapshot: initial_snapshot,
+                next_seq: 0,
+                mode_seq: 0,
+                unified_delay_seq: 0,
+                log_level_seq: 0,
+                saved_selections: initial_saved,
+                selection_seqs: HashMap::new(),
+            }),
             config_path: canonical_cfg_path,
-            router: router_slot,
+            router_slot,
             mixed_policy,
             services: AsyncMutex::new(RuntimeServices {
                 mixed: mixed_service,
@@ -1588,14 +1703,10 @@ impl ProxyEngine {
                 tun: tun_service,
             }),
             hub,
-            mixed_addr: RwLock::new(mixed_bound),
-            dns_addr: RwLock::new(dns_bound_opt),
-            tun_mode: RwLock::new(initial_tun_mode),
             active_os_tun: RwLock::new(initial_os_tun),
-            last_tun_error: RwLock::new(last_tun_err),
+            last_tun_error: RwLock::new(None),
             virtual_tun: Mutex::new(virtual_tun_opt),
             state_dir: RwLock::new(state_dir),
-            saved_selections: RwLock::new(initial_selections.unwrap_or_default()),
             profile_manager: RwLock::new(None),
             geodata_manager: RwLock::new(geodata_mgr),
             extra_ca_der: RwLock::new(extra_ca_der),
@@ -1612,8 +1723,16 @@ impl ProxyEngine {
         Ok(engine)
     }
 
+    fn state_snapshot(&self) -> Arc<EngineStateSnapshot> {
+        Arc::clone(&self.state.read().snapshot)
+    }
+
     pub fn config_snapshot(&self) -> ClashConfig {
-        self.config.read().clone()
+        self.state_snapshot().config.clone()
+    }
+
+    pub fn mixed_policy_snapshot(&self) -> MixedInboundPolicy {
+        self.state_snapshot().mixed_policy.clone()
     }
 
     pub fn config_path(&self) -> Option<&Path> {
@@ -1621,23 +1740,23 @@ impl ProxyEngine {
     }
 
     pub fn raw_yaml(&self) -> String {
-        self.raw_yaml.read().clone()
+        self.state_snapshot().raw_yaml.clone()
     }
 
     pub fn redacted_yaml(&self) -> String {
-        self.config
-            .read()
+        self.state_snapshot()
+            .config
             .redacted()
             .to_yaml_string()
             .unwrap_or_default()
     }
 
     pub fn router(&self) -> Arc<Router> {
-        Arc::clone(&self.router.read())
+        Arc::clone(&self.state_snapshot().router)
     }
 
     pub fn router_slot(&self) -> &Arc<RwLock<Arc<Router>>> {
-        &self.router
+        &self.router_slot
     }
 
     pub fn hub(&self) -> &Arc<TelemetryHub> {
@@ -1645,11 +1764,11 @@ impl ProxyEngine {
     }
 
     pub fn mixed_addr(&self) -> SocketAddr {
-        *self.mixed_addr.read()
+        self.state_snapshot().mixed_addr
     }
 
     pub fn dns_addr(&self) -> Option<SocketAddr> {
-        *self.dns_addr.read()
+        self.state_snapshot().dns_addr
     }
 
     pub fn extra_ca_der(&self) -> Vec<CertificateDer<'static>> {
@@ -1657,7 +1776,7 @@ impl ProxyEngine {
     }
 
     pub fn tun_mode(&self) -> TunRuntimeMode {
-        *self.tun_mode.read()
+        self.state_snapshot().tun_mode
     }
 
     pub fn is_tun_active(&self) -> bool {
@@ -1682,11 +1801,12 @@ impl ProxyEngine {
             }
             return snap;
         }
-        let cfg = self.config.read();
-        let mut snap = preflight_system_tun(cfg.tun.wintun_path.as_deref().map(Path::new));
+        let state_snap = self.state_snapshot();
+        let mut snap =
+            preflight_system_tun(state_snap.config.tun.wintun_path.as_deref().map(Path::new));
         snap.last_error = self.last_tun_error();
-        if self.is_virtual_tun_active() {
-            snap.device_name = Some(format!("{} (virtual)", cfg.tun.device));
+        if state_snap.tun_mode == TunRuntimeMode::Virtual {
+            snap.device_name = Some(format!("{} (virtual)", state_snap.config.tun.device));
         }
         snap
     }
@@ -1723,32 +1843,49 @@ impl ProxyEngine {
     }
 
     pub fn set_unified_delay(&self, enabled: bool) {
-        {
-            let mut cfg = self.config.write();
-            cfg.unified_delay = enabled;
-            if let Ok(y) = cfg.to_yaml_string() {
-                *self.raw_yaml.write() = y;
+        let router = {
+            let mut st = self.state.write();
+            let mut next_snap = (*st.snapshot).clone();
+            next_snap.config.unified_delay = enabled;
+            if let Ok(y) = next_snap.config.to_yaml_string() {
+                next_snap.raw_yaml = y;
             }
-        }
-        self.router().set_unified_delay(enabled);
+            let router = Arc::clone(&next_snap.router);
+            st.next_seq = st.next_seq.wrapping_add(1);
+            st.unified_delay_seq = st.next_seq;
+            st.snapshot = Arc::new(next_snap);
+            router
+        };
+        router.set_unified_delay(enabled);
         self.hub
             .push_log("info", format!("Updated unified-delay to {enabled}"));
     }
 
     pub fn set_mode(&self, mode: RunMode) {
-        {
-            let mut cfg = self.config.write();
-            cfg.mode = mode;
-            if let Ok(y) = cfg.to_yaml_string() {
-                *self.raw_yaml.write() = y;
+        let router = {
+            let mut st = self.state.write();
+            let mut next_snap = (*st.snapshot).clone();
+            next_snap.config.mode = mode;
+            if let Ok(y) = next_snap.config.to_yaml_string() {
+                next_snap.raw_yaml = y;
             }
-        }
-        self.router().set_mode(mode);
+            let router = Arc::clone(&next_snap.router);
+            st.next_seq = st.next_seq.wrapping_add(1);
+            st.mode_seq = st.next_seq;
+            st.snapshot = Arc::new(next_snap);
+            router
+        };
+        router.set_mode(mode);
         self.trigger_preconnect();
         if self.demo_cluster.read().is_none()
             && let Some(mgr) = self.profile_manager()
+            && let Err(err) = mgr.save_active_mode(mode)
         {
-            let _ = mgr.save_active_mode(mode);
+            tracing::warn!(mode = mode.as_str(), error = %err, "Failed to persist active routing mode");
+            self.hub.push_log(
+                "warn",
+                format!("Failed to persist routing mode '{}': {err}", mode.as_str()),
+            );
         }
         self.hub.push_log(
             "info",
@@ -1757,17 +1894,34 @@ impl ProxyEngine {
     }
 
     pub fn select_group_and_persist(&self, group_name: &str, proxy_name: &str) -> Result<()> {
-        let router = self.router();
-        let prev_eff = router.effective_outbound_for_group(group_name);
-        router.select_group(group_name, proxy_name)?;
-        let new_eff = router.effective_outbound_for_group(group_name);
-        self.saved_selections
-            .write()
-            .insert(group_name.to_string(), proxy_name.to_string());
+        let (prev_eff, new_eff) = {
+            let mut st = self.state.write();
+            let router = Arc::clone(&st.snapshot.router);
+            let prev_eff = router.effective_outbound_for_group(group_name);
+            router.select_group(group_name, proxy_name)?;
+            let new_eff = router.effective_outbound_for_group(group_name);
+            st.next_seq = st.next_seq.wrapping_add(1);
+            let seq = st.next_seq;
+            st.saved_selections
+                .insert(group_name.to_string(), proxy_name.to_string());
+            st.selection_seqs
+                .insert(group_name.to_string(), (proxy_name.to_string(), seq));
+            (prev_eff, new_eff)
+        };
         if self.demo_cluster.read().is_none()
             && let Some(mgr) = self.profile_manager()
+            && let Err(err) = mgr.save_group_selection(group_name, proxy_name)
         {
-            let _ = mgr.save_group_selection(group_name, proxy_name);
+            tracing::warn!(
+                group = group_name,
+                proxy = proxy_name,
+                error = %err,
+                "Failed to persist proxy group selection"
+            );
+            self.hub.push_log(
+                "warn",
+                format!("Failed to persist selection '{proxy_name}' in '{group_name}': {err}"),
+            );
         }
         let closed_stale = if let Some(ref target_eff) = new_eff
             && prev_eff.as_deref() != Some(target_eff.as_str())
@@ -1968,16 +2122,20 @@ impl ProxyEngine {
                             false,
                         )
                         .await;
-                        if updated > 0 {
-                            let cur_cfg = eng.config_snapshot();
-                            if eng.apply_config_transition(cur_cfg, None).await.is_ok() {
-                                eng.hub.push_log(
-                                    "info",
-                                    format!(
-                                        "Refreshed {updated} HTTP rule-provider(s) and hot-reloaded router"
-                                    ),
-                                );
-                            }
+                        if updated > 0
+                            && eng
+                                .apply_serialized_config_transition(None, |snap| {
+                                    (snap.config.clone(), None)
+                                })
+                                .await
+                                .is_ok()
+                        {
+                            eng.hub.push_log(
+                                "info",
+                                format!(
+                                    "Refreshed {updated} HTTP rule-provider(s) and hot-reloaded router"
+                                ),
+                            );
                         }
                     }
                 } else if weak_eng.strong_count() == 0 {
@@ -2017,11 +2175,15 @@ impl ProxyEngine {
 
     pub fn set_log_level(&self, level: String) {
         {
-            let mut cfg = self.config.write();
-            cfg.log_level = level.clone();
-            if let Ok(y) = cfg.to_yaml_string() {
-                *self.raw_yaml.write() = y;
+            let mut st = self.state.write();
+            let mut next_snap = (*st.snapshot).clone();
+            next_snap.config.log_level = level.clone();
+            if let Ok(y) = next_snap.config.to_yaml_string() {
+                next_snap.raw_yaml = y;
             }
+            st.next_seq = st.next_seq.wrapping_add(1);
+            st.log_level_seq = st.next_seq;
+            st.snapshot = Arc::new(next_snap);
         }
         self.hub
             .push_log("info", format!("Updated log-level to '{level}'"));
@@ -2029,12 +2191,15 @@ impl ProxyEngine {
     }
 
     pub async fn set_allow_lan(&self, allow: bool) -> Result<()> {
-        let mut cfg = self.config.read().clone();
-        if cfg.mixed_port == 0 {
-            cfg.mixed_port = self.mixed_addr().port();
-        }
-        cfg.allow_lan = allow;
-        self.apply_config_transition(cfg, None).await?;
+        self.apply_serialized_config_transition(None, |snap| {
+            let mut cfg = snap.config.clone();
+            if cfg.mixed_port == 0 {
+                cfg.mixed_port = snap.mixed_addr.port();
+            }
+            cfg.allow_lan = allow;
+            (cfg, None)
+        })
+        .await?;
         self.hub
             .push_log("info", format!("Updated allow-lan to {allow}"));
         Ok(())
@@ -2050,26 +2215,29 @@ impl ProxyEngine {
         strict_route: Option<bool>,
         ipv6: Option<bool>,
     ) -> Result<()> {
-        let mut cfg = self.config.read().clone();
-        if let Some(en) = enabled {
-            cfg.tun.enable = en;
-        }
-        if let Some(sr) = strict_route {
-            cfg.tun.strict_route = sr;
-        }
-        if let Some(v6) = ipv6 {
-            cfg.tun.ipv6 = v6;
-        }
-        self.apply_config_transition(cfg, None).await?;
-        let snap = self.config.read();
+        self.apply_serialized_config_transition(None, |snap| {
+            let mut cfg = snap.config.clone();
+            if let Some(en) = enabled {
+                cfg.tun.enable = en;
+            }
+            if let Some(sr) = strict_route {
+                cfg.tun.strict_route = sr;
+            }
+            if let Some(v6) = ipv6 {
+                cfg.tun.ipv6 = v6;
+            }
+            (cfg, None)
+        })
+        .await?;
+        let snap = self.state_snapshot();
         self.hub.push_log(
             "info",
             format!(
                 "TUN runtime updated: enable={}, strict-route={}, ipv6={}, mode={}",
-                snap.tun.enable,
-                snap.tun.strict_route,
-                snap.tun.ipv6,
-                self.tun_mode().as_str()
+                snap.config.tun.enable,
+                snap.config.tun.strict_route,
+                snap.config.tun.ipv6,
+                snap.tun_mode.as_str()
             ),
         );
         Ok(())
@@ -2101,13 +2269,19 @@ impl ProxyEngine {
             ca_for_profiles,
         )?;
         if self.demo_cluster.read().is_none() {
-            let cur_cfg = self.config.read().clone();
-            if !cur_cfg.proxies.is_empty()
+            let snap = self.state_snapshot();
+            if !snap.config.proxies.is_empty()
                 && let Ok((disk_cfg, _)) = mgr.load_active_config()
                 && disk_cfg.proxies.is_empty()
             {
-                let live_sel = self.router().manual_selections_snapshot();
-                let _ = mgr.persist_active_yaml(&cur_cfg, None, Some(&live_sel));
+                let live_sel = snap.router.manual_selections_snapshot();
+                if let Err(err) = mgr.persist_active_yaml(&snap.config, None, Some(&live_sel)) {
+                    tracing::warn!(error = %err, "Failed to persist initial active profile YAML");
+                    self.hub.push_log(
+                        "warn",
+                        format!("Failed to persist initial active profile YAML: {err}"),
+                    );
+                }
             }
         }
         self.attach_profile_manager(Arc::clone(&mgr));
@@ -2127,7 +2301,7 @@ impl ProxyEngine {
             self.state_dir(),
             ca,
         ));
-        created.attach_router_slot(Arc::downgrade(&self.router));
+        created.attach_router_slot(Arc::downgrade(&self.router_slot));
         *self.geodata_manager.write() = Some(Arc::clone(&created));
         Some(created)
     }
@@ -2161,7 +2335,7 @@ impl ProxyEngine {
     /// Attach a persistent `ProfileManager`, apply its saved proxy selections, and spawn its periodic background subscription & GeoData auto-refresh loop.
     pub fn attach_profile_manager(self: &Arc<Self>, mgr: Arc<crate::profile::ProfileManager>) {
         let already_attached = self.profile_manager.read().is_some();
-        mgr.attach_router_slot(Arc::downgrade(&self.router));
+        mgr.attach_router_slot(Arc::downgrade(&self.router_slot));
         let new_dir = mgr.state_dir();
         if *self.state_dir.read() != new_dir {
             *self.state_dir.write() = new_dir.clone();
@@ -2171,29 +2345,27 @@ impl ProxyEngine {
                 self.extra_ca_der.read().clone()
             };
             let gm = Arc::new(crate::router::geodata::GeoDataManager::new(&new_dir, ca));
-            gm.attach_router_slot(Arc::downgrade(&self.router));
+            gm.attach_router_slot(Arc::downgrade(&self.router_slot));
             *self.geodata_manager.write() = Some(gm);
         }
         *self.profile_manager.write() = Some(Arc::clone(&mgr));
         if self.demo_cluster.read().is_none() {
             let prof_sel = mgr.active_selected_groups();
             if !prof_sel.is_empty() {
-                let prev_eff = self
-                    .router()
-                    .effective_primary_outbound()
-                    .effective_outbound;
-                self.router().apply_saved_selections(&prof_sel);
-                let mut saved = self.saved_selections.write();
-                for (k, v) in prof_sel {
-                    saved.insert(k, v);
-                }
-                drop(saved);
-                if self
-                    .router()
-                    .effective_primary_outbound()
-                    .effective_outbound
-                    != prev_eff
-                {
+                let changed_eff = {
+                    let mut st = self.state.write();
+                    let router = Arc::clone(&st.snapshot.router);
+                    let prev_eff = router.effective_primary_outbound().effective_outbound;
+                    router.apply_saved_selections(&prof_sel);
+                    st.next_seq = st.next_seq.wrapping_add(1);
+                    let seq = st.next_seq;
+                    for (k, v) in prof_sel {
+                        st.saved_selections.insert(k.clone(), v.clone());
+                        st.selection_seqs.insert(k, (v, seq));
+                    }
+                    router.effective_primary_outbound().effective_outbound != prev_eff
+                };
+                if changed_eff {
                     self.trigger_preconnect();
                 }
             }
@@ -2230,8 +2402,28 @@ impl ProxyEngine {
                                             "info",
                                             format!("Auto-updated subscription profile '{}' ({} nodes)", meta.name, meta.proxy_count),
                                         );
-                                        if is_active && eng.demo_cluster.read().is_none() {
-                                            let _ = eng.activate_profile_config_with_selections(cfg, Some(&meta.selected_groups)).await;
+                                        if is_active
+                                            && eng.demo_cluster.read().is_none()
+                                            && let Err(err) = eng
+                                                .activate_profile_config_with_selections(
+                                                    cfg,
+                                                    Some(&meta.selected_groups),
+                                                )
+                                                .await
+                                        {
+                                            tracing::warn!(
+                                                profile_id = %id,
+                                                profile_name = %meta.name,
+                                                error = %err,
+                                                "Failed to activate auto-updated subscription profile"
+                                            );
+                                            eng.hub.push_log(
+                                                "warn",
+                                                format!(
+                                                    "Auto-updated subscription '{}' could not be activated live: {err}",
+                                                    meta.name
+                                                ),
+                                            );
                                         }
                                     }
                                     Err(err) => {
@@ -2242,12 +2434,32 @@ impl ProxyEngine {
                                     }
                                 }
                             }
-                            // Check cached GeoData staleness every 6 hours when previously downloaded
-                            if ticks.is_multiple_of(720)
+                            // Refresh GeoData every 6 hours, or 30s after first boot when never downloaded and GeoData rules are active
+                            let should_check_geodata = ticks.is_multiple_of(720) || ticks == 1;
+                            if should_check_geodata
+                                && eng.demo_cluster.read().is_none()
+                                && !eng.state_dir().as_os_str().is_empty()
                                 && let Some(gm) = eng.geodata_manager()
-                                && gm.status().last_updated_ms > 0
                             {
-                                let _ = gm.refresh_if_expired().await;
+                                let prev_updated_ms = gm.status().last_updated_ms;
+                                let eligible = if prev_updated_ms > 0 {
+                                    ticks.is_multiple_of(720)
+                                } else {
+                                    config_uses_geodata(&eng.config_snapshot())
+                                };
+                                if eligible {
+                                    let _ = gm.refresh_if_expired().await;
+                                    let new_status = gm.status();
+                                    if new_status.last_updated_ms > prev_updated_ms {
+                                        eng.hub.push_log(
+                                            "info",
+                                            format!(
+                                                "[GeoData] Auto-refreshed split-tunneling rule databases (source={})",
+                                                new_status.source_label
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -2259,8 +2471,9 @@ impl ProxyEngine {
     }
 
     /// Activate a `ClashConfig` from `ProfileManager`, cleanly exiting Demo Sandbox if active and
-    /// preserving the active Control API session (`external_controller`, `secret`, `cors_allowed_origins`)
-    /// and bound Mixed port so desktop/web clients and OS System Proxy never lose connectivity.
+    /// preserving the active Control API session (`external_controller`, `secret`), LAN/inbound
+    /// access policy (`allow_lan`, `bind_address`, `lan_allowed_ips`, `authentication`), and bound
+    /// Mixed/DNS/TUN settings so desktop/web clients and OS System Proxy never lose security or connectivity.
     pub async fn activate_profile_config(&self, new_cfg: ClashConfig) -> Result<()> {
         let sel = self.profile_manager().map(|m| m.active_selected_groups());
         self.activate_profile_config_with_selections(new_cfg, sel.as_ref())
@@ -2269,30 +2482,40 @@ impl ProxyEngine {
 
     pub async fn activate_profile_config_with_selections(
         &self,
-        mut new_cfg: ClashConfig,
+        new_cfg: ClashConfig,
         explicit_selections: Option<&HashMap<String, String>>,
     ) -> Result<()> {
-        let prev = self.config.read().clone();
-        new_cfg.external_controller = prev.external_controller;
-        if new_cfg.secret.is_none() {
-            new_cfg.secret = prev.secret;
-        }
-        new_cfg.mixed_port = self.mixed_addr().port();
-        if !prev.dns.enable {
-            new_cfg.dns.enable = false;
-        } else {
-            new_cfg.dns.listen = prev.dns.listen;
-        }
-        new_cfg.tun = prev.tun;
-
         let old_demo = self.demo_cluster.write().take();
         if old_demo.is_some() {
             self.extra_ca_der.write().clear();
         }
 
-        let raw_yaml = new_cfg.to_yaml_string().ok();
         if let Err(err) = self
-            .apply_config_transition_with_selections(new_cfg, raw_yaml, explicit_selections)
+            .apply_serialized_config_transition(explicit_selections, move |snap| {
+                let mut target_cfg = new_cfg;
+                let prev = &snap.config;
+                target_cfg.external_controller = prev.external_controller.clone();
+                if prev.secret.as_ref().is_some_and(|s| !s.trim().is_empty())
+                    || target_cfg
+                        .secret
+                        .as_ref()
+                        .is_none_or(|s| s.trim().is_empty())
+                {
+                    target_cfg.secret = prev.secret.clone();
+                }
+                target_cfg.allow_lan = prev.allow_lan;
+                target_cfg.bind_address = prev.bind_address.clone();
+                target_cfg.lan_allowed_ips = prev.lan_allowed_ips.clone();
+                target_cfg.authentication = prev.authentication.clone();
+                target_cfg.mixed_port = snap.mixed_addr.port();
+                if !prev.dns.enable {
+                    target_cfg.dns.enable = false;
+                } else {
+                    target_cfg.dns.listen = prev.dns.listen.clone();
+                }
+                target_cfg.tun = prev.tun.clone();
+                (target_cfg, None)
+            })
             .await
         {
             if let Some(d) = old_demo {
@@ -2321,19 +2544,30 @@ impl ProxyEngine {
                 return Ok(());
             }
             let (demo, mut demo_cfg) = DemoCluster::start().await?;
-            let prev = self.config.read().clone();
-            demo_cfg.external_controller = prev.external_controller;
-            demo_cfg.secret = prev.secret;
-            demo_cfg.mixed_port = self.mixed_addr().port();
-            demo_cfg.dns.listen = prev.dns.listen;
-            demo_cfg.tun = prev.tun;
-
             let prev_ca = std::mem::replace(
                 &mut *self.extra_ca_der.write(),
                 vec![demo.trusted_ca_der.clone()],
             );
-            let raw_yaml = demo_cfg.to_yaml_string().ok();
-            if let Err(err) = self.apply_config_transition(demo_cfg, raw_yaml).await {
+            if let Err(err) = self
+                .apply_serialized_config_transition(None, move |snap| {
+                    let prev = &snap.config;
+                    demo_cfg.external_controller = prev.external_controller.clone();
+                    demo_cfg.secret = prev.secret.clone();
+                    demo_cfg.allow_lan = prev.allow_lan;
+                    demo_cfg.bind_address = prev.bind_address.clone();
+                    demo_cfg.lan_allowed_ips = prev.lan_allowed_ips.clone();
+                    demo_cfg.authentication = prev.authentication.clone();
+                    demo_cfg.mixed_port = snap.mixed_addr.port();
+                    if !prev.dns.enable {
+                        demo_cfg.dns.enable = false;
+                    } else {
+                        demo_cfg.dns.listen = prev.dns.listen.clone();
+                    }
+                    demo_cfg.tun = prev.tun.clone();
+                    (demo_cfg, None)
+                })
+                .await
+            {
                 *self.extra_ca_der.write() = prev_ca;
                 demo.shutdown();
                 return Err(err);
@@ -2419,33 +2653,38 @@ impl ProxyEngine {
     }
 
     pub async fn reload_yaml(&self, yaml_text: &str) -> Result<()> {
-        let mut new_cfg = ClashConfig::from_yaml_str_unchecked(yaml_text).map_err(|e| {
+        let parsed_cfg = ClashConfig::from_yaml_str_unchecked(yaml_text).map_err(|e| {
             ProxyError::Config(crate::config::uri::redact_sensitive_text(&e.to_string()))
         })?;
         let had_redacted = yaml_text.contains(REDACTED_SECRET);
-        {
-            let prev = self.config.read();
-            new_cfg.restore_redacted_from(&prev);
-        }
-        let raw_override = if had_redacted {
-            None
-        } else {
-            Some(yaml_text.to_string())
-        };
-        self.apply_config_transition(new_cfg, raw_override)
-            .await
-            .map_err(|e| match e {
-                ProxyError::Config(msg) => {
-                    ProxyError::Config(crate::config::uri::redact_sensitive_text(&msg))
-                }
-                other => other,
-            })?;
+        let raw_text = yaml_text.to_string();
+        self.apply_serialized_config_transition(None, move |snap| {
+            let mut new_cfg = parsed_cfg;
+            new_cfg.restore_redacted_from(&snap.config);
+            let raw_override = if had_redacted { None } else { Some(raw_text) };
+            (new_cfg, raw_override)
+        })
+        .await
+        .map_err(|e| match e {
+            ProxyError::Config(msg) => {
+                ProxyError::Config(crate::config::uri::redact_sensitive_text(&msg))
+            }
+            other => other,
+        })?;
         if self.demo_cluster.read().is_none()
             && let Some(mgr) = self.profile_manager()
         {
-            let cur_cfg = self.config.read().clone();
-            let cur_sel = self.router().manual_selections_snapshot();
-            let _ = mgr.persist_active_yaml(&cur_cfg, None, Some(&cur_sel));
+            let snap = self.state_snapshot();
+            let cur_sel = snap.router.manual_selections_snapshot();
+            if let Err(err) = mgr.persist_active_yaml(&snap.config, None, Some(&cur_sel)) {
+                tracing::warn!(error = %err, "Failed to persist hot-reloaded YAML to active profile");
+                self.hub.push_log(
+                    "warn",
+                    format!(
+                        "Hot-reloaded YAML applied in memory, but failed to persist to profile: {err}"
+                    ),
+                );
+            }
         }
         self.hub
             .push_log("info", "Hot-reloaded YAML configuration successfully");
@@ -2462,57 +2701,158 @@ impl ProxyEngine {
             new_tun.stop().await;
         }
         if let Some(prev_tun_cfg) = stopped_old_tun_cfg {
-            let mut prev_cfg = self.config.read().clone();
+            let snap = self.state_snapshot();
+            let mut prev_cfg = snap.config.clone();
             prev_cfg.tun = prev_tun_cfg;
             let local_dns = services.dns.as_ref().map(|d| d.bound_addr);
             if let Ok((restored, vtun)) = start_tun_service(
                 &prev_cfg,
-                self.router.read().dns(),
+                snap.router.dns(),
                 local_dns,
-                Arc::clone(&self.router),
+                Arc::clone(&self.router_slot),
                 Arc::clone(&self.hub),
                 Arc::clone(&self.preconnect_wake),
                 self.state_dir(),
             ) {
-                *self.tun_mode.write() = restored.mode;
+                let restored_mode = restored.mode;
                 *self.active_os_tun.write() = restored.os_guard.clone();
                 *self.virtual_tun.lock() = vtun;
                 services.tun = Some(restored);
+                let mut st = self.state.write();
+                let mut next_snap = (*st.snapshot).clone();
+                next_snap.tun_mode = restored_mode;
+                st.snapshot = Arc::new(next_snap);
             } else {
-                *self.tun_mode.write() = TunRuntimeMode::Disabled;
                 *self.active_os_tun.write() = None;
-                self.config.write().tun.enable = false;
+                let mut st = self.state.write();
+                let mut next_snap = (*st.snapshot).clone();
+                next_snap.tun_mode = TunRuntimeMode::Disabled;
+                next_snap.config.tun.enable = false;
+                if let Ok(y) = next_snap.config.to_yaml_string() {
+                    next_snap.raw_yaml = y;
+                }
+                st.snapshot = Arc::new(next_snap);
             }
         }
     }
 
-    async fn apply_config_transition(
+    async fn rollback_failed_transition(
         &self,
-        new_cfg: ClashConfig,
-        raw_yaml_override: Option<String>,
-    ) -> Result<()> {
-        self.apply_config_transition_with_selections(new_cfg, raw_yaml_override, None)
+        services: &mut RuntimeServices,
+        rollback: TransitionRollbackState,
+    ) {
+        if rollback.dns_needs_restore {
+            if let Some(cur_dns) = services.dns.take() {
+                cur_dns.stop().await;
+            }
+            if let Some(prev_spec) = rollback.prev_dns_spec {
+                let (rb_tx, rb_rx) = watch::channel(false);
+                if let Ok((rb_bound, rb_udp, rb_tcp)) =
+                    spawn_dynamic_dns_server(&prev_spec, Arc::clone(&self.router_slot), rb_rx).await
+                {
+                    services.dns = Some(DnsService {
+                        listen_spec: prev_spec,
+                        bound_addr: rb_bound,
+                        shutdown_tx: rb_tx,
+                        udp_task: rb_udp,
+                        tcp_task: rb_tcp,
+                    });
+                }
+            }
+        }
+
+        if rollback.mixed_needs_restore {
+            let placeholder_tx = watch::channel(false).0;
+            let cur_mixed = std::mem::replace(
+                &mut services.mixed,
+                MixedService {
+                    listen_spec: String::new(),
+                    bound_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    shutdown_tx: placeholder_tx,
+                    task: tokio::spawn(async {}),
+                },
+            );
+            cur_mixed.stop().await;
+
+            let (rb_tx, rb_rx) = watch::channel(false);
+            if let Ok((rb_bound, rb_task)) = spawn_mixed_inbound_with_policy(
+                &rollback.prev_mixed_spec,
+                Arc::clone(&self.router_slot),
+                Arc::clone(&self.mixed_policy),
+                Arc::clone(&self.hub),
+                rb_rx,
+            )
             .await
+            {
+                services.mixed = MixedService {
+                    listen_spec: rollback.prev_mixed_spec,
+                    bound_addr: rb_bound,
+                    shutdown_tx: rb_tx,
+                    task: rb_task,
+                };
+            } else {
+                let (rb_tx2, rb_rx2) = watch::channel(false);
+                if let Ok((rb_bound, rb_task)) = spawn_mixed_inbound_with_policy(
+                    &rollback.prev_mixed_fallback_spec,
+                    Arc::clone(&self.router_slot),
+                    Arc::clone(&self.mixed_policy),
+                    Arc::clone(&self.hub),
+                    rb_rx2,
+                )
+                .await
+                {
+                    services.mixed = MixedService {
+                        listen_spec: rollback.prev_mixed_fallback_spec,
+                        bound_addr: rb_bound,
+                        shutdown_tx: rb_tx2,
+                        task: rb_task,
+                    };
+                }
+            }
+        }
+
+        self.restore_stopped_tun(
+            services,
+            rollback.pending_new_tun,
+            rollback.stopped_old_tun_cfg,
+        )
+        .await;
     }
 
-    async fn apply_config_transition_with_selections(
+    async fn apply_serialized_config_transition<F>(
         &self,
-        mut new_cfg: ClashConfig,
-        raw_yaml_override: Option<String>,
         explicit_selections: Option<&HashMap<String, String>>,
-    ) -> Result<()> {
+        build_fn: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&EngineStateSnapshot) -> (ClashConfig, Option<String>),
+    {
         let mut services = self.services.lock().await;
 
-        // 1. Validate config and construct new Policy + DNS + Outbounds + MMDB + Router BEFORE touching live listeners!
+        let (base_snapshot, start_seq, base_saved_selections) = {
+            let st = self.state.read();
+            (
+                Arc::clone(&st.snapshot),
+                st.next_seq,
+                st.saved_selections.clone(),
+            )
+        };
+        let (mut new_cfg, raw_yaml_override) = build_fn(&base_snapshot);
+
+        // 1. Validate config, pre-flight YAML serialization, and construct new Policy + DNS + Outbounds + MMDB + Router BEFORE touching live listeners!
         new_cfg.validate()?;
-        let prev_had_concrete = !self.config.read().proxies.is_empty();
-        let prev_router = Arc::clone(&self.router.read());
+        if raw_yaml_override.is_none() {
+            let _ = new_cfg.to_yaml_string()?;
+        }
+        let prev_had_concrete = !base_snapshot.config.proxies.is_empty();
+        let prev_router = Arc::clone(&base_snapshot.router);
         let extra_ca = self.extra_ca_der.read().clone();
-        let new_policy = MixedInboundPolicy::from_config(
+        let mut new_policy = MixedInboundPolicy::from_config(
             new_cfg.allow_lan,
             &new_cfg.authentication,
             &new_cfg.lan_allowed_ips,
-        )?;
+        )?
+        .with_blocked_local_ports(compute_blocked_local_ports(&new_cfg, None));
         let new_dns = Arc::new(FakeIpDnsEngine::with_extra_ca(
             &new_cfg.dns_with_merged_hosts(),
             &extra_ca,
@@ -2540,7 +2880,7 @@ impl ProxyEngine {
         new_router.import_delays_from(&prev_router);
 
         let mut carried_selections = prev_router.manual_selections_snapshot();
-        for (k, v) in self.saved_selections.read().iter() {
+        for (k, v) in &base_saved_selections {
             carried_selections
                 .entry(k.clone())
                 .or_insert_with(|| v.clone());
@@ -2580,20 +2920,27 @@ impl ProxyEngine {
             }
         };
 
+        let mut rollback = TransitionRollbackState {
+            prev_mixed_spec: services.mixed.listen_spec.clone(),
+            prev_mixed_fallback_spec: services.mixed.bound_addr.to_string(),
+            mixed_needs_restore: false,
+            prev_dns_spec: services.dns.as_ref().map(|d| d.listen_spec.clone()),
+            dns_needs_restore: false,
+            pending_new_tun: None,
+            stopped_old_tun_cfg: None,
+        };
+
         // 2. Apply TUN transition with full rollback record (`stopped_old_tun_cfg`)
-        let mut pending_new_tun: Option<(TunService, Option<VirtualTunHandle>)> = None;
-        let mut stopped_old_tun_cfg: Option<TunConfig> = None;
-        if preserve_virtual_tun {
-            if let Some(existing_tun) = services.tun.as_mut() {
-                existing_tun.config = new_cfg.tun.clone();
-            }
-        } else if need_tun_change {
+        if need_tun_change {
             if let Some(old_tun) = services.tun.take() {
-                stopped_old_tun_cfg = Some(old_tun.config.clone());
+                rollback.stopped_old_tun_cfg = Some(old_tun.config.clone());
                 old_tun.stop().await;
                 *self.active_os_tun.write() = None;
                 *self.virtual_tun.lock() = None;
-                *self.tun_mode.write() = TunRuntimeMode::Disabled;
+                let mut st = self.state.write();
+                let mut next_snap = (*st.snapshot).clone();
+                next_snap.tun_mode = TunRuntimeMode::Disabled;
+                st.snapshot = Arc::new(next_snap);
             }
             if new_cfg.tun.enable {
                 let local_dns = services.dns.as_ref().map(|d| d.bound_addr);
@@ -2601,14 +2948,14 @@ impl ProxyEngine {
                     &new_cfg,
                     &new_dns,
                     local_dns,
-                    Arc::clone(&self.router),
+                    Arc::clone(&self.router_slot),
                     Arc::clone(&self.hub),
                     Arc::clone(&self.preconnect_wake),
                     self.state_dir(),
                 ) {
                     Ok(started) => {
                         *self.last_tun_error.write() = None;
-                        pending_new_tun = Some(started);
+                        rollback.pending_new_tun = Some(started);
                     }
                     Err(err) => {
                         let msg = format!(
@@ -2616,7 +2963,7 @@ impl ProxyEngine {
                             new_cfg.tun.device, new_cfg.tun.auto_route
                         );
                         *self.last_tun_error.write() = Some(msg.clone());
-                        self.restore_stopped_tun(&mut services, None, stopped_old_tun_cfg)
+                        self.rollback_failed_transition(&mut services, rollback)
                             .await;
                         self.hub.push_log("error", &msg);
                         return Err(ProxyError::Io(std::io::Error::new(err.kind(), msg)));
@@ -2628,8 +2975,6 @@ impl ProxyEngine {
         }
 
         // 3. Rebind Mixed Inbound if port / bind-address / allow-lan changed
-        let prev_mixed_spec = services.mixed.listen_spec.clone();
-        let mut mixed_was_rebound = false;
         if need_mixed_rebind {
             let same_port =
                 new_cfg.mixed_port != 0 && services.mixed.bound_addr.port() == new_cfg.mixed_port;
@@ -2637,7 +2982,7 @@ impl ProxyEngine {
                 let (m_tx, m_rx) = watch::channel(false);
                 match spawn_mixed_inbound_with_policy(
                     &target_mixed_spec,
-                    Arc::clone(&self.router),
+                    Arc::clone(&self.router_slot),
                     Arc::clone(&self.mixed_policy),
                     Arc::clone(&self.hub),
                     m_rx,
@@ -2656,15 +3001,11 @@ impl ProxyEngine {
                         };
                         let old_svc = std::mem::replace(&mut services.mixed, new_svc);
                         old_svc.stop().await;
-                        mixed_was_rebound = true;
+                        rollback.mixed_needs_restore = true;
                     }
                     Err(err) => {
-                        self.restore_stopped_tun(
-                            &mut services,
-                            pending_new_tun,
-                            stopped_old_tun_cfg,
-                        )
-                        .await;
+                        self.rollback_failed_transition(&mut services, rollback)
+                            .await;
                         return Err(err);
                     }
                 }
@@ -2679,13 +3020,13 @@ impl ProxyEngine {
                         task: tokio::spawn(async {}),
                     },
                 );
-                let fallback_spec = old_svc.bound_addr.to_string();
                 old_svc.stop().await;
+                rollback.mixed_needs_restore = true;
 
                 let (m_tx, m_rx) = watch::channel(false);
                 match spawn_mixed_inbound_with_policy(
                     &target_mixed_spec,
-                    Arc::clone(&self.router),
+                    Arc::clone(&self.router_slot),
                     Arc::clone(&self.mixed_policy),
                     Arc::clone(&self.hub),
                     m_rx,
@@ -2699,50 +3040,10 @@ impl ProxyEngine {
                             shutdown_tx: m_tx,
                             task,
                         };
-                        mixed_was_rebound = true;
                     }
                     Err(err) => {
-                        let (rb_tx, rb_rx) = watch::channel(false);
-                        if let Ok((rb_bound, rb_task)) = spawn_mixed_inbound_with_policy(
-                            &prev_mixed_spec,
-                            Arc::clone(&self.router),
-                            Arc::clone(&self.mixed_policy),
-                            Arc::clone(&self.hub),
-                            rb_rx,
-                        )
-                        .await
-                        {
-                            services.mixed = MixedService {
-                                listen_spec: prev_mixed_spec,
-                                bound_addr: rb_bound,
-                                shutdown_tx: rb_tx,
-                                task: rb_task,
-                            };
-                        } else {
-                            let (rb_tx2, rb_rx2) = watch::channel(false);
-                            if let Ok((rb_bound, rb_task)) = spawn_mixed_inbound_with_policy(
-                                &fallback_spec,
-                                Arc::clone(&self.router),
-                                Arc::clone(&self.mixed_policy),
-                                Arc::clone(&self.hub),
-                                rb_rx2,
-                            )
-                            .await
-                            {
-                                services.mixed = MixedService {
-                                    listen_spec: fallback_spec,
-                                    bound_addr: rb_bound,
-                                    shutdown_tx: rb_tx2,
-                                    task: rb_task,
-                                };
-                            }
-                        }
-                        self.restore_stopped_tun(
-                            &mut services,
-                            pending_new_tun,
-                            stopped_old_tun_cfg,
-                        )
-                        .await;
+                        self.rollback_failed_transition(&mut services, rollback)
+                            .await;
                         return Err(err);
                     }
                 }
@@ -2761,15 +3062,11 @@ impl ProxyEngine {
             if !new_cfg.dns.enable {
                 if let Some(old_dns) = services.dns.take() {
                     old_dns.stop().await;
+                    rollback.dns_needs_restore = true;
                     self.hub.push_log("info", "Stopped DNS server");
                 }
             } else {
-                let target_dns_port = new_cfg
-                    .dns
-                    .listen
-                    .parse::<SocketAddr>()
-                    .map(|a| a.port())
-                    .unwrap_or(0);
+                let target_dns_port = parse_any_listen_port(&new_cfg.dns.listen).unwrap_or(0);
                 let same_dns_port = target_dns_port != 0
                     && services
                         .dns
@@ -2780,7 +3077,7 @@ impl ProxyEngine {
                     let (d_tx, d_rx) = watch::channel(false);
                     match spawn_dynamic_dns_server(
                         &new_cfg.dns.listen,
-                        Arc::clone(&self.router),
+                        Arc::clone(&self.router_slot),
                         d_rx,
                     )
                     .await
@@ -2797,52 +3094,25 @@ impl ProxyEngine {
                                 udp_task: t_udp,
                                 tcp_task: t_tcp,
                             });
+                            rollback.dns_needs_restore = true;
                             self.hub
                                 .push_log("info", format!("Rebound UDP+TCP DNS to {bound}"));
                         }
                         Err(err) => {
-                            if mixed_was_rebound {
-                                let (rb_tx, rb_rx) = watch::channel(false);
-                                if let Ok((rb_bound, rb_task)) = spawn_mixed_inbound_with_policy(
-                                    &prev_mixed_spec,
-                                    Arc::clone(&self.router),
-                                    Arc::clone(&self.mixed_policy),
-                                    Arc::clone(&self.hub),
-                                    rb_rx,
-                                )
-                                .await
-                                {
-                                    let cur = std::mem::replace(
-                                        &mut services.mixed,
-                                        MixedService {
-                                            listen_spec: prev_mixed_spec,
-                                            bound_addr: rb_bound,
-                                            shutdown_tx: rb_tx,
-                                            task: rb_task,
-                                        },
-                                    );
-                                    cur.stop().await;
-                                }
-                            }
-                            self.restore_stopped_tun(
-                                &mut services,
-                                pending_new_tun,
-                                stopped_old_tun_cfg,
-                            )
-                            .await;
+                            self.rollback_failed_transition(&mut services, rollback)
+                                .await;
                             return Err(err);
                         }
                     }
                 } else {
-                    let prev_dns_opt = services.dns.take();
-                    let prev_dns_spec = prev_dns_opt.as_ref().map(|d| d.listen_spec.clone());
-                    if let Some(old_dns) = prev_dns_opt {
+                    if let Some(old_dns) = services.dns.take() {
                         old_dns.stop().await;
+                        rollback.dns_needs_restore = true;
                     }
                     let (d_tx, d_rx) = watch::channel(false);
                     match spawn_dynamic_dns_server(
                         &new_cfg.dns.listen,
-                        Arc::clone(&self.router),
+                        Arc::clone(&self.router_slot),
                         d_rx,
                     )
                     .await
@@ -2856,55 +3126,11 @@ impl ProxyEngine {
                                 udp_task: t_udp,
                                 tcp_task: t_tcp,
                             });
+                            rollback.dns_needs_restore = true;
                         }
                         Err(err) => {
-                            if let Some(prev_spec) = prev_dns_spec {
-                                let (rb_tx, rb_rx) = watch::channel(false);
-                                if let Ok((rb_bound, rb_udp, rb_tcp)) = spawn_dynamic_dns_server(
-                                    &prev_spec,
-                                    Arc::clone(&self.router),
-                                    rb_rx,
-                                )
-                                .await
-                                {
-                                    services.dns = Some(DnsService {
-                                        listen_spec: prev_spec,
-                                        bound_addr: rb_bound,
-                                        shutdown_tx: rb_tx,
-                                        udp_task: rb_udp,
-                                        tcp_task: rb_tcp,
-                                    });
-                                }
-                            }
-                            if mixed_was_rebound {
-                                let (rb_tx, rb_rx) = watch::channel(false);
-                                if let Ok((rb_bound, rb_task)) = spawn_mixed_inbound_with_policy(
-                                    &prev_mixed_spec,
-                                    Arc::clone(&self.router),
-                                    Arc::clone(&self.mixed_policy),
-                                    Arc::clone(&self.hub),
-                                    rb_rx,
-                                )
-                                .await
-                                {
-                                    let cur = std::mem::replace(
-                                        &mut services.mixed,
-                                        MixedService {
-                                            listen_spec: prev_mixed_spec,
-                                            bound_addr: rb_bound,
-                                            shutdown_tx: rb_tx,
-                                            task: rb_task,
-                                        },
-                                    );
-                                    cur.stop().await;
-                                }
-                            }
-                            self.restore_stopped_tun(
-                                &mut services,
-                                pending_new_tun,
-                                stopped_old_tun_cfg,
-                            )
-                            .await;
+                            self.rollback_failed_transition(&mut services, rollback)
+                                .await;
                             return Err(err);
                         }
                     }
@@ -2912,8 +3138,24 @@ impl ProxyEngine {
             }
         }
 
+        // Pre-commit YAML serialization BEFORE mutating live locks or services so `to_yaml_string` can NEVER fail mid-commit!
+        let mut yaml_to_store = match raw_yaml_override {
+            Some(raw) => raw,
+            None => match new_cfg.to_yaml_string() {
+                Ok(yaml) => yaml,
+                Err(err) => {
+                    self.rollback_failed_transition(&mut services, rollback)
+                        .await;
+                    return Err(err);
+                }
+            },
+        };
+
         // 5. Commit TUN + Policy + Router + Runtime Addresses + Config Snapshot atomically
-        if let Some((new_tun_svc, vtun_opt)) = pending_new_tun {
+        if preserve_virtual_tun && let Some(existing_tun) = services.tun.as_mut() {
+            existing_tun.config = new_cfg.tun.clone();
+        }
+        if let Some((new_tun_svc, vtun_opt)) = rollback.pending_new_tun.take() {
             *self.virtual_tun.lock() = vtun_opt;
             *self.active_os_tun.write() = new_tun_svc.os_guard.clone();
             services.tun = Some(new_tun_svc);
@@ -2926,20 +3168,59 @@ impl ProxyEngine {
             .map(|t| t.mode)
             .unwrap_or(TunRuntimeMode::Disabled);
 
-        *self.mixed_policy.write() = new_policy;
-        *self.router.write() = Arc::clone(&new_router);
-        *self.saved_selections.write() = new_router.manual_selections_snapshot();
-        *self.mixed_addr.write() = final_mixed_addr;
-        *self.dns_addr.write() = final_dns_addr;
-        *self.tun_mode.write() = final_tun_mode;
+        new_policy.blocked_local_ports = compute_blocked_local_ports(&new_cfg, final_dns_addr);
 
-        let yaml_to_store = match raw_yaml_override {
-            Some(raw) => raw,
-            None => new_cfg.to_yaml_string()?,
+        let final_log_level = {
+            let mut st = self.state.write();
+            let mut scalar_overridden = false;
+            if st.mode_seq > start_seq {
+                let latest_mode = st.snapshot.config.mode;
+                new_cfg.mode = latest_mode;
+                new_router.set_mode(latest_mode);
+                scalar_overridden = true;
+            }
+            if st.unified_delay_seq > start_seq {
+                let latest_ud = st.snapshot.config.unified_delay;
+                new_cfg.unified_delay = latest_ud;
+                new_router.set_unified_delay(latest_ud);
+                scalar_overridden = true;
+            }
+            if st.log_level_seq > start_seq {
+                new_cfg.log_level = st.snapshot.config.log_level.clone();
+                scalar_overridden = true;
+            }
+            let mut concurrent_selections: Vec<(&str, &str, u64)> = st
+                .selection_seqs
+                .iter()
+                .filter_map(|(g, (p, seq))| {
+                    (*seq > start_seq).then_some((g.as_str(), p.as_str(), *seq))
+                })
+                .collect();
+            concurrent_selections.sort_by_key(|(_, _, seq)| *seq);
+            for (group, proxy, _) in concurrent_selections {
+                let _ = new_router.select_group(group, proxy);
+            }
+            if scalar_overridden && let Ok(updated_yaml) = new_cfg.to_yaml_string() {
+                yaml_to_store = updated_yaml;
+            }
+
+            let log_level = new_cfg.log_level.clone();
+            *self.mixed_policy.write() = new_policy.clone();
+            *self.router_slot.write() = Arc::clone(&new_router);
+            st.saved_selections = new_router.manual_selections_snapshot();
+            st.next_seq = st.next_seq.wrapping_add(1);
+            st.snapshot = Arc::new(EngineStateSnapshot {
+                config: new_cfg,
+                raw_yaml: yaml_to_store,
+                router: Arc::clone(&new_router),
+                mixed_policy: new_policy,
+                mixed_addr: final_mixed_addr,
+                dns_addr: final_dns_addr,
+                tun_mode: final_tun_mode,
+            });
+            log_level
         };
-        self.hub.set_log_level(&new_cfg.log_level);
-        *self.config.write() = new_cfg;
-        *self.raw_yaml.write() = yaml_to_store;
+        self.hub.set_log_level(&final_log_level);
 
         drop(services);
         self.trigger_preconnect();
@@ -3125,8 +3406,70 @@ impl ProxyEngine {
     }
 }
 
+struct TransitionRollbackState {
+    prev_mixed_spec: String,
+    prev_mixed_fallback_spec: String,
+    mixed_needs_restore: bool,
+    prev_dns_spec: Option<String>,
+    dns_needs_restore: bool,
+    pending_new_tun: Option<(TunService, Option<VirtualTunHandle>)>,
+    stopped_old_tun_cfg: Option<TunConfig>,
+}
+
 impl Drop for ProxyEngine {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_blocked_local_ports_collects_loopback_controller_and_dns_ports() {
+        let mut cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).expect("starter yaml");
+        cfg.external_controller = "127.0.0.1:9090".to_string();
+        cfg.dns.enable = true;
+        cfg.dns.listen = "127.0.0.1:1053".to_string();
+        assert_eq!(compute_blocked_local_ports(&cfg, None), vec![9090, 1053]);
+
+        let bound_dns: SocketAddr = "127.0.0.1:15353".parse().expect("valid addr");
+        assert_eq!(
+            compute_blocked_local_ports(&cfg, Some(bound_dns)),
+            vec![9090, 15353]
+        );
+
+        cfg.external_controller = "192.168.1.10:9090".to_string();
+        cfg.dns.enable = false;
+        assert!(compute_blocked_local_ports(&cfg, None).is_empty());
+
+        cfg.external_controller = "0.0.0.0:9091".to_string();
+        assert_eq!(compute_blocked_local_ports(&cfg, None), vec![9091]);
+        cfg.external_controller = "localhost:9092".to_string();
+        assert_eq!(compute_blocked_local_ports(&cfg, None), vec![9092]);
+    }
+
+    #[test]
+    fn config_uses_geodata_detects_geodata_mode_and_geo_rules() {
+        let mut cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).expect("starter yaml");
+        cfg.geodata_mode = false;
+        cfg.rules = vec!["MATCH,DIRECT".to_string()];
+        assert!(!config_uses_geodata(&cfg));
+
+        cfg.rules = vec![
+            "DOMAIN-SUFFIX,example.com,DIRECT".to_string(),
+            "GEOIP,CN,DIRECT".to_string(),
+        ];
+        assert!(config_uses_geodata(&cfg));
+
+        cfg.rules = vec!["geosite,cn,DIRECT".to_string()];
+        assert!(config_uses_geodata(&cfg));
+
+        cfg.rules.clear();
+        cfg.geodata_mode = true;
+        assert!(config_uses_geodata(&cfg));
     }
 }

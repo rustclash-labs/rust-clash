@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     net::SocketAddr,
+    ops::Deref,
     pin::Pin,
     sync::{
         Arc, Weak,
@@ -397,6 +398,58 @@ impl TelemetryHub {
             outbound.exit_category().to_string(),
             outbound.remote_endpoint(target),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_connection_guard(
+        self: &Arc<Self>,
+        inbound_type: impl Into<String>,
+        network: impl Into<String>,
+        source: Option<SocketAddr>,
+        target: &TargetAddr,
+        fake_ip: Option<String>,
+        rule: impl Into<String>,
+        rule_payload: impl Into<String>,
+        chains: Vec<String>,
+    ) -> ConnectionGuard {
+        let conn = self.register_connection(
+            inbound_type,
+            network,
+            source,
+            target,
+            fake_ip,
+            rule,
+            rule_payload,
+            chains,
+        );
+        ConnectionGuard::new(Arc::clone(self), conn)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_connection_with_outbound_guard(
+        self: &Arc<Self>,
+        inbound_type: impl Into<String>,
+        network: impl Into<String>,
+        source: Option<SocketAddr>,
+        target: &TargetAddr,
+        fake_ip: Option<String>,
+        rule: impl Into<String>,
+        rule_payload: impl Into<String>,
+        chains: Vec<String>,
+        outbound: &dyn OutboundHandler,
+    ) -> ConnectionGuard {
+        let conn = self.register_connection_with_outbound(
+            inbound_type,
+            network,
+            source,
+            target,
+            fake_ip,
+            rule,
+            rule_payload,
+            chains,
+            outbound,
+        );
+        ConnectionGuard::new(Arc::clone(self), conn)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -845,6 +898,62 @@ impl TelemetryHub {
     }
 }
 
+/// RAII guard for a newly registered [`ActiveConnection`] before it is handed off to [`TrackedStream`].
+///
+/// Automatically unregisters the connection from [`TelemetryHub`] when dropped unless
+/// [`ConnectionGuard::into_tracked_stream`], [`ConnectionGuard::record_failed`], or
+/// [`ConnectionGuard::disarm`] is invoked first.
+pub struct ConnectionGuard {
+    hub: Arc<TelemetryHub>,
+    conn: Arc<ActiveConnection>,
+    disarmed: bool,
+}
+
+impl ConnectionGuard {
+    pub fn new(hub: Arc<TelemetryHub>, conn: Arc<ActiveConnection>) -> Self {
+        Self {
+            hub,
+            conn,
+            disarmed: false,
+        }
+    }
+
+    pub fn connection(&self) -> &Arc<ActiveConnection> {
+        &self.conn
+    }
+
+    pub fn into_tracked_stream<S>(mut self, inner: S) -> TrackedStream<S> {
+        self.disarmed = true;
+        TrackedStream::new(inner, Arc::clone(&self.hub), Arc::clone(&self.conn))
+    }
+
+    pub fn record_failed(mut self, raw_reason: &str) {
+        self.disarmed = true;
+        self.hub.record_connection_failed(&self.conn.id, raw_reason);
+    }
+
+    pub fn disarm(mut self) -> Arc<ActiveConnection> {
+        self.disarmed = true;
+        Arc::clone(&self.conn)
+    }
+}
+
+impl Deref for ConnectionGuard {
+    type Target = ActiveConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.hub.unregister_connection(&self.conn.id);
+        }
+    }
+}
+
 /// Stream wrapper that automatically meters upload/download bytes and unregisters on drop.
 pub struct TrackedStream<S> {
     inner: S,
@@ -855,6 +964,10 @@ pub struct TrackedStream<S> {
 impl<S> TrackedStream<S> {
     pub fn new(inner: S, hub: Arc<TelemetryHub>, conn: Arc<ActiveConnection>) -> Self {
         Self { inner, hub, conn }
+    }
+
+    pub fn connection(&self) -> &Arc<ActiveConnection> {
+        &self.conn
     }
 }
 
@@ -915,5 +1028,70 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_guard_unregisters_on_early_drop_and_handoff_to_tracked_stream() {
+        let hub = Arc::new(TelemetryHub::new());
+        let target = TargetAddr::new_domain("example.com", 443).unwrap();
+
+        {
+            let _guard = hub.register_connection_guard(
+                "Mixed(SOCKS5)",
+                "tcp",
+                None,
+                &target,
+                None,
+                "MATCH",
+                "",
+                vec!["DIRECT".into()],
+            );
+            assert_eq!(hub.active_connection_count(), 1);
+        }
+        assert_eq!(
+            hub.active_connection_count(),
+            0,
+            "dropping ConnectionGuard early must unregister phantom active connection"
+        );
+
+        let guard = hub.register_connection_guard(
+            "Mixed(HTTP-CONNECT)",
+            "tcp",
+            None,
+            &target,
+            None,
+            "MATCH",
+            "",
+            vec!["DIRECT".into()],
+        );
+        guard.mark_established();
+        let tracked = guard.into_tracked_stream(tokio::io::empty());
+        assert_eq!(hub.active_connection_count(), 1);
+        drop(tracked);
+        assert_eq!(hub.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn connection_guard_record_failed_disarms_drop() {
+        let hub = Arc::new(TelemetryHub::new());
+        let target = TargetAddr::new_domain("timeout.example.com", 443).unwrap();
+        let guard = hub.register_connection_guard(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &target,
+            None,
+            "MATCH",
+            "",
+            vec!["PROXY".into()],
+        );
+        guard.record_failed("connect timeout");
+        assert_eq!(hub.active_connection_count(), 0);
+        assert_eq!(hub.failed_connections_total(), 1);
     }
 }

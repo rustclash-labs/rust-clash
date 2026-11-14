@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use std::{
 
 use parking_lot::{Mutex, RwLock};
 use proxy_core::{
-    api::spawn_api_server,
+    api::{generate_ephemeral_secret, spawn_api_server},
     config::{ClashConfig, uri::redact_sensitive_text},
     engine::ProxyEngine,
     platform::{
@@ -34,6 +34,7 @@ pub const STARTUP_CRASH_LOG_FILENAME: &str = "startup-crash.log";
 const INSTANCE_ACQUIRE_ATTEMPTS: usize = 6;
 const INSTANCE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const IPC_SOCKET_TIMEOUT: Duration = Duration::from_millis(600);
+const IPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -83,15 +84,23 @@ impl DesktopPrefs {
         ));
         let serialized = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+                if let Err(err) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(
+                        "Failed setting 0600 permissions on '{}': {err}",
+                        tmp_path.display()
+                    );
+                }
             }
             f.write_all(&serialized)?;
             f.sync_all()?;
@@ -110,26 +119,7 @@ pub struct DesktopIpcEndpoint {
 }
 
 fn generate_ipc_token() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    let stack_entropy = (&seq as *const u64 as usize) as u64;
-
-    fn splitmix64(mut x: u64) -> u64 {
-        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        x ^ (x >> 31)
-    }
-
-    let seed = nanos ^ pid.rotate_left(32) ^ stack_entropy.rotate_left(17) ^ seq;
-    let hi = splitmix64(seed);
-    let lo = splitmix64(hi ^ seed.rotate_right(19));
-    format!("{hi:016x}{lo:016x}")
+    generate_ephemeral_secret()
 }
 
 type WakeupCallback = Arc<dyn Fn() + Send + Sync>;
@@ -162,15 +152,23 @@ impl DesktopWakeupServer {
         };
         let serialized = serde_json::to_vec_pretty(&endpoint).map_err(io::Error::other)?;
         {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+                if let Err(err) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(
+                        "Failed setting 0600 permissions on '{}': {err}",
+                        tmp_path.display()
+                    );
+                }
             }
             f.write_all(&serialized)?;
             f.sync_all()?;
@@ -195,8 +193,8 @@ impl DesktopWakeupServer {
                     if stop_thread.load(Ordering::Acquire) {
                         break;
                     }
-                    let _ = stream.set_read_timeout(Some(IPC_SOCKET_TIMEOUT));
-                    let _ = stream.set_write_timeout(Some(IPC_SOCKET_TIMEOUT));
+                    let _ = stream.set_read_timeout(Some(IPC_ACCEPT_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(IPC_ACCEPT_TIMEOUT));
 
                     let mut line = String::new();
                     let read_ok = {
@@ -498,6 +496,8 @@ impl DesktopAppState {
             }
         }
 
+        cfg.ensure_ephemeral_secret();
+
         let is_default_dir = state_dir == default_state_dir();
         let primary_start = if is_default_dir && active_path.is_some() {
             ProxyEngine::start_with_path(cfg.clone(), active_path).await
@@ -522,15 +522,14 @@ impl DesktopAppState {
                             "Profile fallback failed ({}); recovered with clean default configuration so the console can open.",
                             redact_sensitive_text(&second_err.to_string())
                         ));
-                        match ProxyEngine::start_with_state_dir(
-                            ClashConfig::default(),
-                            state_dir.clone(),
-                        )
-                        .await
+                        let mut default_cfg = ClashConfig::default();
+                        default_cfg.ensure_ephemeral_secret();
+                        match ProxyEngine::start_with_state_dir(default_cfg, state_dir.clone())
+                            .await
                         {
                             Ok(eng) => eng,
                             Err(_) => {
-                                let emergency_cfg = ClashConfig {
+                                let mut emergency_cfg = ClashConfig {
                                     mixed_port: 0,
                                     dns: proxy_core::config::DnsConfig {
                                         listen: "127.0.0.1:0".to_string(),
@@ -542,6 +541,7 @@ impl DesktopAppState {
                                     },
                                     ..Default::default()
                                 };
+                                emergency_cfg.ensure_ephemeral_secret();
                                 ProxyEngine::start_with_state_dir(emergency_cfg, state_dir.clone())
                                     .await?
                             }
@@ -611,6 +611,18 @@ impl DesktopAppState {
                     .await?
                 }
             };
+        if engine
+            .config_snapshot()
+            .secret
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            let mut demo_cfg = engine.config_snapshot();
+            demo_cfg.ensure_ephemeral_secret();
+            if let Ok(yaml) = demo_cfg.to_yaml_string() {
+                let _ = engine.reload_yaml(&yaml).await;
+            }
+        }
         if let Ok(profile_mgr) = ProfileManager::open_or_init(&state_dir) {
             engine.attach_profile_manager(profile_mgr);
         }
@@ -834,6 +846,7 @@ pub async fn run_elevated_tun_helper(config_path: &std::path::Path) -> anyhow::R
                 .unwrap_or("insufficient privileges")
         );
     }
+    cfg.ensure_ephemeral_secret();
     cfg.tun.enable = true;
     cfg.tun.auto_route = true;
     let engine = ProxyEngine::start_with_path(cfg, Some(canon)).await?;
@@ -1348,6 +1361,14 @@ mod tests {
 
         assert!(temp_dir.join(DESKTOP_IPC_FILENAME).exists());
         assert!(temp_dir.join("rust-clash.instance.lock").exists());
+        assert!(
+            state
+                .status()
+                .api_secret
+                .as_deref()
+                .is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "desktop bootstrap must populate a 256-bit ephemeral api_secret when config omits secret"
+        );
         assert!(state.prefs().close_to_tray);
         state
             .set_close_to_tray(false)
@@ -1375,6 +1396,14 @@ mod tests {
         let recovered_state = DesktopAppState::bootstrap_in_state_dir(temp_dir.clone())
             .await
             .expect("desktop bootstrap must recover from corrupt active profile YAML");
+        assert!(
+            recovered_state
+                .status()
+                .api_secret
+                .as_deref()
+                .is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "fallback recovery bootstrap must also populate a 256-bit ephemeral api_secret"
+        );
         assert!(
             !recovered_state.prefs().close_to_tray,
             "persisted close_to_tray=false must reload across restarts"

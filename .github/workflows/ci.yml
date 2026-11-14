@@ -4,15 +4,11 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - "**.md"
-      - "docs/**"
       - "LICENSE*"
       - ".gitignore"
   pull_request:
     branches: [main]
     paths-ignore:
-      - "**.md"
-      - "docs/**"
       - "LICENSE*"
       - ".gitignore"
   workflow_dispatch:
@@ -45,64 +41,150 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Enforce Anonymous Project Git Identity
+      - name: Enforce Anonymous Project Git Identity Across Commit Range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           python3 - <<'PY'
-          import subprocess
-          allowed = {"rustclash.labs@proton.me", "noreply@github.com"}
-          for role, fmt in [("author", "%ae"), ("committer", "%ce")]:
-              email = subprocess.check_output(["git", "log", "-1", f"--format={fmt}", "HEAD"], text=True).strip().lower()
-              if email not in allowed and not email.endswith("[bot]@users.noreply.github.com"):
-                  raise SystemExit(
-                      f"Commit {role} email '{email}' exposes a personal GitHub account. "
-                      "Run ./scripts/setup_git_identity.sh ('RustClash Labs <rustclash.labs@proton.me>') and amend."
-                  )
-          print("Verified anonymous project Git identity on HEAD.")
+          import os, subprocess
+
+          allowed_emails = {"rustclash.labs@proton.me", "noreply@github.com"}
+          allowed_names = {"rustclash labs", "github"}
+          zero_sha = "0" * 40
+
+          event = os.environ.get("EVENT_NAME", "")
+          pr_base = os.environ.get("PR_BASE_SHA", "").strip()
+          pr_head = os.environ.get("PR_HEAD_SHA", "").strip()
+          before_sha = os.environ.get("BEFORE_SHA", "").strip()
+          head_sha = os.environ.get("HEAD_SHA", "").strip() or "HEAD"
+
+          def commit_exists(sha: str) -> bool:
+              if not sha or sha == zero_sha:
+                  return False
+              return (
+                  subprocess.run(
+                      ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  ).returncode
+                  == 0
+              )
+
+          if event == "pull_request" and pr_base and pr_head:
+              if not commit_exists(pr_base):
+                  subprocess.run(["git", "fetch", "--no-tags", "origin", pr_base], check=False)
+              if not commit_exists(pr_head):
+                  subprocess.run(["git", "fetch", "--no-tags", "origin", pr_head], check=False)
+              rev_spec = f"{pr_base}..{pr_head}"
+          elif event == "push" and before_sha and before_sha != zero_sha and commit_exists(before_sha):
+              rev_spec = f"{before_sha}..{head_sha}"
+          else:
+              rev_spec = head_sha
+
+          cmd = (
+              ["git", "log", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce", rev_spec]
+              if ".." in rev_spec
+              else ["git", "log", "-1", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce", rev_spec]
+          )
+          raw = subprocess.check_output(cmd, text=True).strip()
+          if not raw:
+              raw = subprocess.check_output(
+                  ["git", "log", "-1", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce", "HEAD"],
+                  text=True,
+              ).strip()
+
+          lines = [ln for ln in raw.splitlines() if ln.strip()]
+          for line in lines:
+              sha, an, ae, cn, ce = line.split("\x1f")
+              for role, name, email in [("author", an, ae), ("committer", cn, ce)]:
+                  norm_email = email.strip().lower()
+                  norm_name = name.strip().lower()
+                  email_ok = norm_email in allowed_emails or norm_email.endswith("[bot]@users.noreply.github.com")
+                  name_ok = norm_name in allowed_names or norm_name.endswith("[bot]")
+                  if not email_ok or not name_ok:
+                      raise SystemExit(
+                          f"Commit {sha[:12]} {role} '{name} <{email}>' exposes a personal GitHub account. "
+                          "Run ./scripts/setup_git_identity.sh ('RustClash Labs <rustclash.labs@proton.me>') and amend/rebase."
+                      )
+          print(f"Verified anonymous project Git identity across {len(lines)} commit(s) ({rev_spec}).")
           PY
 
       - name: Detect Platform-Specific Changes (Quota-Aware Routing)
         id: changes
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
           FULL_MATRIX: ${{ inputs.full_matrix }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$FULL_MATRIX" == "true" ]]; then
-            echo "run_macos=true" >> "$GITHUB_OUTPUT"
-            echo "run_windows=true" >> "$GITHUB_OUTPUT"
-            echo "run_android=true" >> "$GITHUB_OUTPUT"
-            echo "any_extra=true" >> "$GITHUB_OUTPUT"
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$FULL_MATRIX" == "true" ]]; then
+              RUN_MACOS="true"
+              RUN_WINDOWS="true"
+              RUN_ANDROID="true"
+              ANY_EXTRA="true"
+            else
+              RUN_MACOS="false"
+              RUN_WINDOWS="false"
+              RUN_ANDROID="false"
+              ANY_EXTRA="false"
+            fi
+            {
+              echo "run_macos=$RUN_MACOS"
+              echo "run_windows=$RUN_WINDOWS"
+              echo "run_android=$RUN_ANDROID"
+              echo "any_extra=$ANY_EXTRA"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_REF" ]]; then
-            git fetch --no-tags --depth=1 origin "$BASE_REF" || true
-            CHANGED="$(git diff --name-only FETCH_HEAD...HEAD || true)"
-          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-            CHANGED="$(git diff --name-only HEAD~1..HEAD || true)"
+          FAIL_OPEN="false"
+          CHANGED=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if [[ -z "$PR_BASE_SHA" || -z "$PR_HEAD_SHA" ]] || ! CHANGED="$(git diff --name-only "${PR_BASE_SHA}...${PR_HEAD_SHA}")"; then
+              echo "WARNING: PR git diff (${PR_BASE_SHA}...${PR_HEAD_SHA}) failed; failing open to full platform matrix."
+              FAIL_OPEN="true"
+            fi
           else
-            CHANGED=""
+            if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" == "$ZERO_SHA" ]] || ! CHANGED="$(git diff --name-only "${BEFORE_SHA}..${HEAD_SHA}")"; then
+              echo "Initial branch push or git diff (${BEFORE_SHA}..${HEAD_SHA}) unavailable; failing open to full platform matrix."
+              FAIL_OPEN="true"
+            fi
           fi
 
-          echo "Changed files:"
-          echo "$CHANGED"
-
-          RUN_MACOS="false"
-          RUN_WINDOWS="false"
-          RUN_ANDROID="false"
-
-          if echo "$CHANGED" | grep -Eq '^(platforms/macos-ne/|crates/tauri-app/|crates/proxy-cli/|crates/proxy-core/src/platform/tun/macos\.rs|crates/proxy-core/src/platform/sysproxy/|crates/proxy-ffi/src/ios_macos\.rs)'; then
+          if [[ "$FAIL_OPEN" == "true" ]]; then
             RUN_MACOS="true"
-          fi
-          if echo "$CHANGED" | grep -Eq '^(crates/tauri-app/|crates/proxy-cli/|crates/proxy-core/src/platform/tun/windows\.rs|scripts/fetch_wintun\.py)'; then
             RUN_WINDOWS="true"
-          fi
-          if echo "$CHANGED" | grep -Eq '^(android/|crates/proxy-ffi/|scripts/build_android\.sh)'; then
             RUN_ANDROID="true"
+          else
+            echo "Changed files:"
+            echo "$CHANGED"
+
+            RUN_MACOS="false"
+            RUN_WINDOWS="false"
+            RUN_ANDROID="false"
+
+            if printf '%s\n' "$CHANGED" | grep -Eq '^(Cargo\.toml$|Cargo\.lock$|crates/proxy-core/Cargo\.toml$|crates/proxy-core/src/platform/|crates/proxy-ffi/|crates/tauri-app/|crates/proxy-cli/|platforms/macos-ne/|\.github/workflows/ci\.yml$)'; then
+              RUN_MACOS="true"
+            fi
+            if printf '%s\n' "$CHANGED" | grep -Eq '^(Cargo\.toml$|Cargo\.lock$|crates/proxy-core/Cargo\.toml$|crates/proxy-core/src/platform/|crates/proxy-ffi/|crates/tauri-app/|crates/proxy-cli/|scripts/fetch_wintun\.py$|\.github/workflows/ci\.yml$)'; then
+              RUN_WINDOWS="true"
+            fi
+            if printf '%s\n' "$CHANGED" | grep -Eq '^(Cargo\.toml$|Cargo\.lock$|crates/proxy-core/Cargo\.toml$|crates/proxy-core/src/platform/|crates/proxy-ffi/|android/|scripts/build_android\.sh$|\.github/workflows/ci\.yml$)'; then
+              RUN_ANDROID="true"
+            fi
           fi
 
           ANY_EXTRA="false"
@@ -110,10 +192,12 @@ jobs:
             ANY_EXTRA="true"
           fi
 
-          echo "run_macos=$RUN_MACOS" >> "$GITHUB_OUTPUT"
-          echo "run_windows=$RUN_WINDOWS" >> "$GITHUB_OUTPUT"
-          echo "run_android=$RUN_ANDROID" >> "$GITHUB_OUTPUT"
-          echo "any_extra=$ANY_EXTRA" >> "$GITHUB_OUTPUT"
+          {
+            echo "run_macos=$RUN_MACOS"
+            echo "run_windows=$RUN_WINDOWS"
+            echo "run_android=$RUN_ANDROID"
+            echo "any_extra=$ANY_EXTRA"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -121,10 +205,11 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - name: Install & Build Production SPA
+      - name: Install, Test & Build Production SPA
         working-directory: ui
         run: |
           npm ci
+          npm test
           npm run build
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -203,8 +288,10 @@ jobs:
       - name: Check Rust Formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy Strict Lint Audit (Workspace + Tauri Desktop)
-        run: cargo clippy --locked --workspace --all-targets --features tauri-app/desktop -- -D warnings
+      - name: Clippy Strict Lint Audit (Workspace + Tauri Headless & Desktop)
+        run: |
+          cargo clippy --locked -p tauri-app --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features tauri-app/desktop -- -D warnings
 
       - name: Unit, E2E, Tauri Desktop & External Interop Suite
         env:

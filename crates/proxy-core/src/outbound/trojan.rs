@@ -96,14 +96,22 @@ impl TrojanInner {
 
         let base_stream: BoxedStream = if let Some(connector) = &self.tls_connector {
             let sni = crate::crypto::tls::parse_server_name(sni_host)?;
-            let tls = connector.connect(sni, tcp).await?;
+            let tls = crate::outbound::with_handshake_timeout(
+                "Trojan TLS handshake",
+                connector.connect(sni, tcp),
+            )
+            .await?;
             Box::new(tls)
         } else {
             Box::new(tcp)
         };
 
         if let Some(ws_cfg) = &self.cfg.ws_opts {
-            connect_ws_stream(base_stream, sni_host, self.cfg.port, self.cfg.tls, ws_cfg).await
+            crate::outbound::with_handshake_timeout(
+                "Trojan WebSocket handshake",
+                connect_ws_stream(base_stream, sni_host, self.cfg.port, self.cfg.tls, ws_cfg),
+            )
+            .await
         } else {
             Ok(base_stream)
         }
@@ -335,6 +343,8 @@ impl TrojanUdpSession {
     }
 }
 
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[async_trait]
 impl OutboundUdpSession for TrojanUdpSession {
     async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
@@ -344,6 +354,31 @@ impl OutboundUdpSession for TrojanUdpSession {
                 "Trojan UDP datagram exceeds 65535 bytes",
             ));
         }
+
+        let maybe_existing = {
+            let mut guard = self.tx.lock().await;
+            if let Some(existing) = guard.as_ref() {
+                if !existing.is_closed() {
+                    Some(existing.clone())
+                } else {
+                    *guard = None;
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(existing) = maybe_existing
+            && existing
+                .send((payload.to_vec(), target.clone()))
+                .await
+                .is_ok()
+        {
+            return Ok(());
+        }
+
+        let transport = self.inner.establish_transport().await?;
+        let req_hdr = self.inner.build_request_header(TROJAN_CMD_UDP, target)?;
 
         let mut guard = self.tx.lock().await;
         if let Some(existing) = guard.as_ref() {
@@ -358,8 +393,6 @@ impl OutboundUdpSession for TrojanUdpSession {
             *guard = None;
         }
 
-        let transport = self.inner.establish_transport().await?;
-        let req_hdr = self.inner.build_request_header(TROJAN_CMD_UDP, target)?;
         let stream = TrojanClientStream::new(transport, req_hdr);
         let (mut rd, mut wr) = tokio::io::split(stream);
 
@@ -384,6 +417,10 @@ impl OutboundUdpSession for TrojanUdpSession {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Trojan UDP queue closed"))?;
 
+        let started = tokio::time::Instant::now();
+        let last_active_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_active_wr = Arc::clone(&last_active_ms);
+
         let writer_handle = tokio::spawn(async move {
             while let Some((dgram, dst)) = pkt_rx.recv().await {
                 let mut pkt = BytesMut::with_capacity(32 + dgram.len());
@@ -393,6 +430,10 @@ impl OutboundUdpSession for TrojanUdpSession {
                 if wr.write_all(&pkt).await.is_err() || wr.flush().await.is_err() {
                     break;
                 }
+                last_active_wr.store(
+                    started.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             let _ = wr.shutdown().await;
         });
@@ -404,13 +445,23 @@ impl OutboundUdpSession for TrojanUdpSession {
         let closed_ref = Arc::clone(&self.closed);
         tokio::spawn(async move {
             loop {
-                match read_trojan_udp_packet(&mut rd).await {
-                    Ok(item) => {
+                match tokio::time::timeout(
+                    UDP_SESSION_IDLE_TIMEOUT,
+                    read_trojan_udp_packet(&mut rd),
+                )
+                .await
+                {
+                    Ok(Ok(item)) => {
+                        last_active_ms.store(
+                            started.elapsed().as_millis() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         if rx_tx.send(Ok(item)).await.is_err() {
+                            writer_abort.abort();
                             break;
                         }
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         writer_abort.abort();
                         if gen_ref.load(std::sync::atomic::Ordering::SeqCst) == my_gen {
                             closed_ref.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -422,6 +473,27 @@ impl OutboundUdpSession for TrojanUdpSession {
                                 format!("Trojan UDP remote stream closed: {err}"),
                             );
                             let _ = rx_tx.try_send(Err(eof_err));
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        let now_ms = started.elapsed().as_millis() as u64;
+                        let idle_ms = now_ms.saturating_sub(
+                            last_active_ms.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        if idle_ms < UDP_SESSION_IDLE_TIMEOUT.as_millis() as u64 {
+                            continue;
+                        }
+                        writer_abort.abort();
+                        if gen_ref.load(std::sync::atomic::Ordering::SeqCst) == my_gen {
+                            closed_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Ok(mut g) = tx_slot.try_lock() {
+                                *g = None;
+                            }
+                            let _ = rx_tx.try_send(Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "Trojan UDP session idle timeout",
+                            )));
                         }
                         break;
                     }

@@ -38,7 +38,7 @@ use crate::{
 
 /// Default staleness window for persisted GeoSite/GeoIP datasets (7 days).
 pub const DEFAULT_GEODATA_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-const MAX_GEODATA_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GEODATA_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 const GEOSITE_CN_FILE: &str = "geosite_cn.txt";
 const GEOSITE_NON_CN_FILE: &str = "geosite_geolocation_not_cn.txt";
@@ -70,7 +70,10 @@ impl GeoUpdateUrls {
                 geoip_cn_url:
                     "https://testingcf.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
                         .to_string(),
-                mmdb_url: None,
+                mmdb_url: Some(
+                    "https://testingcf.jsdelivr.net/gh/Loyalsoldier/geoip@release/Country.mmdb"
+                        .to_string(),
+                ),
             },
             Self {
                 label: "jsdelivr-fastly (Loyalsoldier/clash-rules)".to_string(),
@@ -83,7 +86,10 @@ impl GeoUpdateUrls {
                 geoip_cn_url:
                     "https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
                         .to_string(),
-                mmdb_url: None,
+                mmdb_url: Some(
+                    "https://fastly.jsdelivr.net/gh/Loyalsoldier/geoip@release/Country.mmdb"
+                        .to_string(),
+                ),
             },
             Self {
                 label: "github-raw (Loyalsoldier/clash-rules)".to_string(),
@@ -96,7 +102,10 @@ impl GeoUpdateUrls {
                 geoip_cn_url:
                     "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/cncidr.txt"
                         .to_string(),
-                mmdb_url: None,
+                mmdb_url: Some(
+                    "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb"
+                        .to_string(),
+                ),
             },
         ]
     }
@@ -453,15 +462,27 @@ impl GeoDataManager {
             let parsed_mmdb = if let Some(ref mmdb_url) = urls.mmdb_url
                 && !mmdb_url.trim().is_empty()
             {
-                let mmdb_bytes = fetch_http_bytes_protected_with_proxy(
+                match fetch_http_bytes_protected_with_proxy(
                     mmdb_url,
                     &self.extra_ca_der,
                     fallback_proxy.as_ref(),
                 )
-                .await?;
-                let reader = MmdbReader::from_bytes(mmdb_bytes.clone())?;
-                write_bytes_atomic(&self.geodata_dir.join(MMDB_FILE), &mmdb_bytes)?;
-                Some(Arc::new(reader))
+                .await
+                .and_then(|mmdb_bytes| {
+                    let reader = MmdbReader::from_bytes(mmdb_bytes.clone())?;
+                    write_bytes_atomic(&self.geodata_dir.join(MMDB_FILE), &mmdb_bytes)?;
+                    Ok(Arc::new(reader))
+                }) {
+                    Ok(reader) => Some(reader),
+                    Err(err) => {
+                        tracing::warn!(
+                            "Optional Country.mmdb download from '{}' failed ({}); continuing with GeoSite/GeoIP-CN rulesets and any existing MMDB cache",
+                            redact_sensitive_text(mmdb_url),
+                            redact_sensitive_text(&err.to_string())
+                        );
+                        load_optional_mmdb(&self.geodata_dir.join(MMDB_FILE))
+                    }
+                }
             } else {
                 load_optional_mmdb(&self.geodata_dir.join(MMDB_FILE))
             };
@@ -499,7 +520,11 @@ impl GeoDataManager {
                     m.source_label = urls.label.clone();
                     m.using_persisted_data = true;
                     m.last_error = None;
-                    let _ = save_manifest_atomic(&self.geodata_dir.join(MANIFEST_FILE), &m);
+                    if let Err(err) =
+                        save_manifest_atomic(&self.geodata_dir.join(MANIFEST_FILE), &m)
+                    {
+                        tracing::warn!("Failed persisting geodata manifest.json: {err}");
+                    }
                 }
                 Ok(self.status())
             }
@@ -519,7 +544,9 @@ impl GeoDataManager {
         let mut m = self.manifest.lock();
         m.last_attempt_ms = attempt_ms;
         m.last_error = Some(msg.to_string());
-        let _ = save_manifest_atomic(&self.geodata_dir.join(MANIFEST_FILE), &m);
+        if let Err(err) = save_manifest_atomic(&self.geodata_dir.join(MANIFEST_FILE), &m) {
+            tracing::warn!("Failed persisting geodata failure manifest.json: {err}");
+        }
     }
 }
 
@@ -637,11 +664,14 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .unwrap_or("geodata.dat");
     let tmp = path.with_file_name(format!(".{file_name}.tmp"));
     {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -989,7 +1019,7 @@ async fn read_bounded_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<
         }
         if out.len() + n > MAX_GEODATA_DOWNLOAD_BYTES {
             return Err(ProxyError::Config(
-                "GeoData download exceeds 16 MiB safety limit".into(),
+                "GeoData download exceeds 32 MiB safety limit".into(),
             ));
         }
         out.extend_from_slice(&buf[..n]);
@@ -1112,5 +1142,19 @@ mod tests {
         assert!(matcher.matches_domain("dl.google.com"));
         assert!(!matcher.matches_domain("www.google.com"));
         assert!(matcher.matches_domain("www.apple.com.cn"));
+    }
+
+    #[test]
+    fn default_mirrors_include_https_country_mmdb_urls() {
+        let mirrors = GeoUpdateUrls::default_mirrors();
+        assert!(!mirrors.is_empty());
+        for mirror in &mirrors {
+            let mmdb = mirror
+                .mmdb_url
+                .as_deref()
+                .expect("default GeoData mirror must populate mmdb_url");
+            assert!(mmdb.starts_with("https://"));
+            assert!(mmdb.ends_with("Country.mmdb"));
+        }
     }
 }

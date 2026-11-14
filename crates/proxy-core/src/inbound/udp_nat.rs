@@ -20,19 +20,39 @@ use crate::{
 
 const UDP_SESSION_QUEUE_CAPACITY: usize = 256;
 const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_UDP_DESTS_PER_SESSION: usize = 512;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PortFakeMapping {
+    Unique(TargetAddr),
+    Ambiguous,
+}
 
 #[derive(Default)]
 struct ReverseTargetMap {
     target_to_raw: HashMap<TargetAddr, TargetAddr>,
-    port_to_fake_raw: HashMap<u16, TargetAddr>,
+    port_to_fake_raw: HashMap<u16, PortFakeMapping>,
     last_raw_dst: Option<TargetAddr>,
 }
 
 impl ReverseTargetMap {
     fn record_outbound(&mut self, target: &TargetAddr, raw_dst: &TargetAddr, was_fake_ip: bool) {
-        self.target_to_raw.insert(target.clone(), raw_dst.clone());
+        if self.target_to_raw.contains_key(target)
+            || self.target_to_raw.len() < MAX_UDP_DESTS_PER_SESSION
+        {
+            self.target_to_raw.insert(target.clone(), raw_dst.clone());
+        }
         if was_fake_ip || matches!(target.host, HostName::Domain(_)) {
-            self.port_to_fake_raw.insert(target.port, raw_dst.clone());
+            if let Some(mapping) = self.port_to_fake_raw.get_mut(&target.port) {
+                if let PortFakeMapping::Unique(existing) = mapping
+                    && existing != raw_dst
+                {
+                    *mapping = PortFakeMapping::Ambiguous;
+                }
+            } else if self.port_to_fake_raw.len() < MAX_UDP_DESTS_PER_SESSION {
+                self.port_to_fake_raw
+                    .insert(target.port, PortFakeMapping::Unique(raw_dst.clone()));
+            }
         }
         self.last_raw_dst = Some(raw_dst.clone());
     }
@@ -41,8 +61,10 @@ impl ReverseTargetMap {
         if let Some(raw) = self.target_to_raw.get(remote_src) {
             return raw.clone();
         }
-        if let Some(fake_raw) = self.port_to_fake_raw.get(&remote_src.port) {
-            return fake_raw.clone();
+        match self.port_to_fake_raw.get(&remote_src.port) {
+            Some(PortFakeMapping::Unique(fake_raw)) => return fake_raw.clone(),
+            Some(PortFakeMapping::Ambiguous) => return remote_src.clone(),
+            None => {}
         }
         if matches!(remote_src.host, HostName::Ip(_)) {
             return remote_src.clone();
@@ -463,5 +485,41 @@ mod tests {
             "all 8 burst datagrams must be delivered"
         );
         mgr.reset_all_sessions();
+    }
+
+    #[test]
+    fn reverse_target_map_caps_entries_and_avoids_ambiguous_fake_ip_port_spoofing() {
+        let mut map = ReverseTargetMap::default();
+        let fake_a: TargetAddr = "198.18.0.10:443".parse().unwrap();
+        let fake_b: TargetAddr = "198.18.0.11:443".parse().unwrap();
+        let dom_a = TargetAddr::new_domain("a.example.com", 443).unwrap();
+        let dom_b = TargetAddr::new_domain("b.example.com", 443).unwrap();
+        let resolved_ip_a: TargetAddr = "93.184.216.34:443".parse().unwrap();
+
+        // Single Fake-IP on :443 maps resolved IP response back to fake_a.
+        map.record_outbound(&dom_a, &fake_a, true);
+        assert_eq!(map.map_return_source(&resolved_ip_a), fake_a);
+
+        // Second distinct Fake-IP sharing :443 marks :443 ambiguous instead of spoofing fake_b.
+        map.record_outbound(&dom_b, &fake_b, true);
+        assert_eq!(map.map_return_source(&dom_a), fake_a);
+        assert_eq!(map.map_return_source(&dom_b), fake_b);
+        assert_eq!(map.map_return_source(&resolved_ip_a), resolved_ip_a);
+
+        // Flooding > MAX_UDP_DESTS_PER_SESSION destinations stays bounded.
+        for i in 0..700u16 {
+            let t = TargetAddr::new_domain(format!("host-{i}.example.com"), 1000 + i).unwrap();
+            let raw: TargetAddr = format!(
+                "198.18.{}.{}:{}",
+                (i >> 8) as u8,
+                (i & 0xff) as u8,
+                1000 + i
+            )
+            .parse()
+            .unwrap();
+            map.record_outbound(&t, &raw, true);
+        }
+        assert!(map.target_to_raw.len() <= MAX_UDP_DESTS_PER_SESSION);
+        assert!(map.port_to_fake_raw.len() <= MAX_UDP_DESTS_PER_SESSION);
     }
 }

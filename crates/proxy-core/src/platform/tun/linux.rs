@@ -411,7 +411,11 @@ impl LinuxSystemTunSession {
 
             // Persist initial journal BEFORE adding routing rules so an abrupt SIGKILL mid-setup recovers cleanly!
             let rec_snap = rec.clone();
-            let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = Some(rec_snap));
+            if let Err(err) =
+                update_current_journal(&spec.state_dir, |j| j.linux_tun = Some(rec_snap))
+            {
+                tracing::warn!("Linux TUN: failed writing initial recovery journal: {err}");
+            }
 
             // 1. Populate our dedicated collision-free policy table `<table_id>`
             add_owned_route(
@@ -428,6 +432,7 @@ impl LinuxSystemTunSession {
             )?;
 
             // 2. High-priority explicit bypasses for proxy server & upstream DNS IPs
+            let mut ipv6_bypass_ok = true;
             for ip in &spec.bypass_ips {
                 match ip {
                     IpAddr::V4(v4) if !v4.is_loopback() && !spec.fake_ip_net.contains(v4) => {
@@ -440,11 +445,16 @@ impl LinuxSystemTunSession {
                     }
                     IpAddr::V6(v6) if spec.enable_ipv6 && !v6.is_loopback() => {
                         let host_cidr = format!("{v6}/128");
-                        let _ = add_owned_rule(
+                        if let Err(err) = add_owned_rule(
                             "-6",
                             &["pref", "8990", "to", &host_cidr, "lookup", "main"],
                             &mut rec.owned_v6_rule_del_args,
-                        );
+                        ) {
+                            tracing::warn!(
+                                "Linux TUN: failed adding IPv6 bypass rule for {host_cidr} ({err}); IPv6 catch-all TUN capture will be skipped to prevent routing loops"
+                            );
+                            ipv6_bypass_ok = false;
+                        }
                     }
                     _ => {}
                 }
@@ -501,21 +511,22 @@ impl LinuxSystemTunSession {
             )?;
 
             // 6. IPv6 default-route interception when `tun.ipv6: true`
+            //    Install bypass & suppress rules FIRST; if any fail, skip the catch-all IPv6
+            //    default route and `pref 9020` capture rule so an unguarded IPv6 loop never occurs.
             if spec.enable_ipv6 {
-                add_owned_route(
-                    "-6",
-                    &["default", "dev", &actual_name, "table", &table_str],
-                    &["default", "dev", &actual_name, "table", &table_str],
-                    &mut rec.owned_route_del_args,
-                )?;
                 for v6_local in ["::1/128", "fe80::/10"] {
-                    let _ = add_owned_rule(
+                    if let Err(err) = add_owned_rule(
                         "-6",
                         &["pref", "9000", "to", v6_local, "lookup", "main"],
                         &mut rec.owned_v6_rule_del_args,
-                    );
+                    ) {
+                        tracing::warn!(
+                            "Linux TUN: failed adding IPv6 local bypass rule for {v6_local} ({err})"
+                        );
+                        ipv6_bypass_ok = false;
+                    }
                 }
-                let _ = add_owned_rule(
+                if let Err(err) = add_owned_rule(
                     "-6",
                     &[
                         "pref",
@@ -526,14 +537,32 @@ impl LinuxSystemTunSession {
                         "0",
                     ],
                     &mut rec.owned_v6_rule_del_args,
-                );
-                add_owned_rule(
-                    "-6",
-                    &[
-                        "pref", "9020", "not", "fwmark", &mark_hex, "lookup", &table_str,
-                    ],
-                    &mut rec.owned_v6_rule_del_args,
-                )?;
+                ) {
+                    tracing::warn!(
+                        "Linux TUN: failed adding IPv6 suppress_prefixlength 0 rule ({err})"
+                    );
+                    ipv6_bypass_ok = false;
+                }
+
+                if ipv6_bypass_ok {
+                    add_owned_route(
+                        "-6",
+                        &["default", "dev", &actual_name, "table", &table_str],
+                        &["default", "dev", &actual_name, "table", &table_str],
+                        &mut rec.owned_route_del_args,
+                    )?;
+                    add_owned_rule(
+                        "-6",
+                        &[
+                            "pref", "9020", "not", "fwmark", &mark_hex, "lookup", &table_str,
+                        ],
+                        &mut rec.owned_v6_rule_del_args,
+                    )?;
+                } else {
+                    tracing::warn!(
+                        "Linux TUN: skipping IPv6 catch-all default route and pref 9020 rule because one or more IPv6 bypass/suppress rules failed"
+                    );
+                }
             }
 
             // 7. Best-effort per-link DNS registration with `systemd-resolved` (`198.18.0.2`, domain `~.`)
@@ -750,7 +779,9 @@ impl SystemTunSession for LinuxSystemTunSession {
         let _ = self.stop_watch_tx.send(true);
         rollback_linux_record(&self.recovery_record);
         clear_global_socket_protector();
-        let _ = update_current_journal(&self.spec.state_dir, |j| j.linux_tun = None);
+        if let Err(err) = update_current_journal(&self.spec.state_dir, |j| j.linux_tun = None) {
+            tracing::warn!("Linux TUN: failed clearing recovery journal on stop: {err}");
+        }
 
         if let Some(h) = self.rx_thread.take() {
             let _ = h.join();

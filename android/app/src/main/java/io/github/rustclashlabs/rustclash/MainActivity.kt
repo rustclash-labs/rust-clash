@@ -16,9 +16,21 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Dns
@@ -30,6 +42,9 @@ import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Route
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -39,7 +54,9 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,7 +65,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -352,7 +372,8 @@ class MainActivity : AppCompatActivity() {
         incoming.data = null
         incoming.removeExtra(Intent.EXTRA_TEXT)
 
-        viewModel.importUnifiedPayload(extracted, deduplicate = true, autoSelect = true)
+        // Stage external deep link / share payload for explicit user confirmation (never silent-import)
+        viewModel.stageExternalImportPayload(extracted)
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -805,4 +826,226 @@ internal fun RustClashAppScaffold(
             },
         )
     }
+
+    val pendingExternalPayload = state.pendingExternalImportPayload
+    if (pendingExternalPayload != null) {
+        ExternalImportConfirmDialog(
+            rawPayload = pendingExternalPayload,
+            isImporting = state.isImporting,
+            errorMessage = state.modalError,
+            onDismiss = viewModel::dismissPendingExternalImport,
+            onConfirm = { switchImmediately, enableAutoUpdate ->
+                viewModel.confirmPendingExternalImport(
+                    autoSelect = switchImmediately,
+                    enableSubscriptionAutoUpdate = enableAutoUpdate,
+                )
+            },
+        )
+    }
 }
+
+@Composable
+private fun ExternalImportConfirmDialog(
+    rawPayload: String,
+    isImporting: Boolean,
+    errorMessage: String?,
+    onDismiss: () -> Unit,
+    onConfirm: (switchImmediately: Boolean, enableSubscriptionAutoUpdate: Boolean) -> Unit,
+) {
+    val ext = LocalRustClashColors.current
+    val preview = remember(rawPayload) {
+        NodeImportSupport.classifyExternalImportPreview(rawPayload)
+    }
+    var switchImmediately by rememberSaveable(rawPayload) { mutableStateOf(false) }
+    var enableAutoUpdate by rememberSaveable(rawPayload) { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = {
+            if (!isImporting) {
+                onDismiss()
+            }
+        },
+        title = {
+            Text(
+                text = if (preview.isRemoteSubscription) {
+                    "确认导入外部远程订阅"
+                } else {
+                    "确认外部导入请求"
+                },
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = ext.cardSubtle,
+                    border = BorderStroke(1.dp, ext.hairline),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = preview.sanitizedSummary,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        if (!preview.targetHost.isNullOrBlank()) {
+                            Text(
+                                text = "目标主机：${preview.targetHost}",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.SemiBold,
+                                color = ext.emerald,
+                            )
+                        }
+                        if (!preview.profileDisplayHint.isNullOrBlank()) {
+                            Text(
+                                text = "配置名称：${preview.profileDisplayHint}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (preview.sanitizedPayloadPreview.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = preview.sanitizedPayloadPreview,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                if (!preview.securityWarning.isNullOrBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = ext.amberContainer,
+                        border = BorderStroke(1.dp, ext.amber.copy(alpha = 0.5f)),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = preview.securityWarning,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = ext.onAmberContainer,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
+                }
+
+                if (!errorMessage.isNullOrBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = ext.dangerContainer,
+                        border = BorderStroke(1.dp, ext.danger.copy(alpha = 0.5f)),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = NodeImportSupport.redactSecretsForUi(errorMessage),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = ext.onDangerContainer,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = ext.hairline)
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = !isImporting) {
+                            switchImmediately = !switchImmediately
+                        }
+                        .padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = switchImmediately,
+                        onCheckedChange = if (isImporting) {
+                            null
+                        } else {
+                            { switchImmediately = it }
+                        },
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "立即切换到导入的节点/配置",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "Switch to imported node/profile immediately",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                if (preview.isRemoteSubscription) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !isImporting) {
+                                enableAutoUpdate = !enableAutoUpdate
+                            }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = enableAutoUpdate,
+                            onCheckedChange = if (isImporting) {
+                                null
+                            } else {
+                                { enableAutoUpdate = it }
+                            },
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "允许后台定时自动更新此远程订阅",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = "仅在您完全信任该订阅源时开启",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(
+                enabled = !isImporting,
+                onClick = onDismiss,
+            ) {
+                Text("取消 (Cancel)")
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !isImporting,
+                onClick = {
+                    onConfirm(switchImmediately, preview.isRemoteSubscription && enableAutoUpdate)
+                },
+            ) {
+                Text(if (isImporting) "正在导入…" else "确认导入 (Import)")
+            }
+        },
+    )
+}
+

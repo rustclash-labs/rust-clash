@@ -11,6 +11,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --test src/utils/statusModel.test.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },

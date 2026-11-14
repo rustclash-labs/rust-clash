@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Once,
@@ -26,7 +25,7 @@ use jni::{
 };
 use parking_lot::Mutex;
 use proxy_core::{
-    api::{parse_explain_target, read_process_rss_bytes, spawn_api_server},
+    api::{parse_explain_target, read_process_rss_bytes},
     config::{
         ClashConfig, ProxyGroupType, ProxyNodeConfig, REDACTED_SECRET, RunMode,
         uri::redact_sensitive_text,
@@ -39,7 +38,6 @@ use proxy_core::{
     },
     router::{EffectiveOutboundSummary, Router, geodata::GeoDataManager},
 };
-use tokio::sync::watch;
 
 use crate::fd_bridge::CallbackSocketProtector;
 #[cfg(unix)]
@@ -92,9 +90,6 @@ fn ensure_tracing_initialized() {
 struct AndroidVpnRuntime {
     runtime: tokio::runtime::Runtime,
     engine: Arc<ProxyEngine>,
-    api_addr: SocketAddr,
-    api_secret: String,
-    api_stop_tx: watch::Sender<bool>,
     #[cfg(unix)]
     fd_bridge: Option<UnixPacketFdBridge>,
     protector: Arc<CallbackSocketProtector>,
@@ -104,7 +99,14 @@ struct AndroidVpnRuntime {
     is_wifi: AtomicBool,
 }
 
+/// Fast, microsecond-only pointer swap lock for reading/installing the active `AndroidVpnRuntime`.
+/// Never held across `rt.block_on(...)`, network fetches, `fd_bridge.stop()`, or `shutdown_timeout`.
 static ANDROID_RUNTIME: Mutex<Option<AndroidVpnRuntime>> = Mutex::new(None);
+/// Serializes `start_android_vpn_*` and `stop_android_vpn_*` lifecycle transitions outside `ANDROID_RUNTIME`.
+static LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+/// Incremented by `stop_android_vpn_core()` before waiting on `LIFECYCLE_LOCK` so a concurrent stop
+/// request cancels an in-flight `start_android_vpn_*` instead of installing a stale runtime.
+static STOP_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Persists Android debug diagnostic mode across VPN start/restart cycles within the process.
 static ANDROID_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 /// Serializes offline `ProfileManager::open_or_init` mutations so concurrent JNI calls never race on `profiles_index.json`.
@@ -142,7 +144,7 @@ fn collect_delays_map_from_router(router: &Router) -> HashMap<String, u64> {
 fn generate_ephemeral_api_secret() -> String {
     // 192 bits of OS CSPRNG entropy -> 48 hex chars
     let mut raw = [0u8; 24];
-    getrandom_bytes(&mut raw);
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut raw);
     let mut out = String::with_capacity(48);
     for b in raw {
         use std::fmt::Write;
@@ -151,22 +153,37 @@ fn generate_ephemeral_api_secret() -> String {
     out
 }
 
-fn getrandom_bytes(buf: &mut [u8]) {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(buf);
-            return;
-        }
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .to_le_bytes();
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = nanos[i % nanos.len()] ^ ((i as u8).wrapping_mul(0x9e));
+fn enforce_android_local_only_config(cfg: &mut ClashConfig) {
+    cfg.allow_lan = false;
+    cfg.bind_address = "127.0.0.1".to_string();
+    cfg.lan_allowed_ips.clear();
+    cfg.authentication.clear();
+}
+
+fn needs_local_only_sanitization(cfg: &ClashConfig) -> bool {
+    cfg.allow_lan
+        || cfg.bind_address != "127.0.0.1"
+        || !cfg.lan_allowed_ips.is_empty()
+        || !cfg.authentication.is_empty()
+}
+
+fn yaml_mentions_listener_exposure(yaml_text: &str) -> bool {
+    let lower = yaml_text.to_ascii_lowercase();
+    lower.contains("allow-lan")
+        || lower.contains("allow_lan")
+        || lower.contains("bind-address")
+        || lower.contains("bind_address")
+        || lower.contains("lan-allowed-ips")
+        || lower.contains("lan_allowed_ips")
+        || lower.contains("authentication")
+}
+
+fn clear_pending_jni_exception(env: &mut JNIEnv<'_>) -> bool {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+        true
+    } else {
+        false
     }
 }
 
@@ -174,15 +191,69 @@ fn jstring_to_rust(env: &mut JNIEnv<'_>, s: &JString<'_>) -> Result<String, Stri
     if s.is_null() {
         return Ok(String::new());
     }
-    env.get_string(s)
-        .map(Into::into)
-        .map_err(|e| format!("JNI string read error: {e}"))
+    match env.get_string(s) {
+        Ok(val) => Ok(val.into()),
+        Err(e) => {
+            clear_pending_jni_exception(env);
+            Err(format!("JNI string read error: {e}"))
+        }
+    }
 }
 
 fn rust_to_jstring<'a>(env: &mut JNIEnv<'a>, s: &str) -> jstring {
     match env.new_string(s) {
         Ok(js) => js.into_raw(),
-        Err(_) => ptr::null_jstring(),
+        Err(_) => {
+            clear_pending_jni_exception(env);
+            ptr::null_jstring()
+        }
+    }
+}
+
+fn jni_json_guarded<'local, F>(mut env: JNIEnv<'local>, f: F) -> jstring
+where
+    F: FnOnce(&mut JNIEnv<'local>) -> Result<serde_json::Value, String>,
+{
+    let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut env))) {
+        Ok(Ok(val)) => val.to_string(),
+        Ok(Err(err)) => serde_json::json!({
+            "ok": false,
+            "error": redact_sensitive_text(&err),
+        })
+        .to_string(),
+        Err(_) => {
+            clear_pending_jni_exception(&mut env);
+            serde_json::json!({
+                "ok": false,
+                "error": "internal Rust JNI panic",
+            })
+            .to_string()
+        }
+    };
+    rust_to_jstring(&mut env, &out)
+}
+
+fn jni_bool_guarded<F>(f: F) -> jboolean
+where
+    F: FnOnce() -> bool,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(true) => JNI_TRUE,
+        Ok(false) | Err(_) => JNI_FALSE,
+    }
+}
+
+fn jni_bool_env_guarded<'local, F>(mut env: JNIEnv<'local>, f: F) -> jboolean
+where
+    F: FnOnce(&mut JNIEnv<'local>) -> bool,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut env))) {
+        Ok(true) => JNI_TRUE,
+        Ok(false) => JNI_FALSE,
+        Err(_) => {
+            clear_pending_jni_exception(&mut env);
+            JNI_FALSE
+        }
     }
 }
 
@@ -201,31 +272,58 @@ fn build_android_socket_protector(
 ) -> Result<Arc<CallbackSocketProtector>, String> {
     #[cfg(unix)]
     {
-        let cls = env
-            .get_object_class(vpn_service)
-            .map_err(|e| format!("get_object_class(vpnService) failed: {e}"))?;
+        let cls = env.get_object_class(vpn_service).map_err(|e| {
+            clear_pending_jni_exception(env);
+            format!("get_object_class(vpnService) failed: {e}")
+        })?;
         let protect_mid = env
             .get_method_id(cls, "protectSocket", "(I)Z")
-            .map_err(|e| format!("get_method_id(protectSocket) failed: {e}"))?;
+            .map_err(|e| {
+                clear_pending_jni_exception(env);
+                format!("get_method_id(protectSocket) failed: {e}")
+            })?;
 
         Ok(Arc::new(CallbackSocketProtector::new_unix(
             "android-vpn-protect",
             false,
             move |fd: i32| {
                 let invoke_protect = |jenv: &mut JNIEnv<'_>| -> io::Result<bool> {
-                    let res = unsafe {
+                    // SAFETY: `vpn_service_ref` is a live `GlobalRef` to the `VpnService` object
+                    // from which `protect_mid` (`protectSocket(I)Z`) was looked up, and the single
+                    // `jint` argument matches `(I)Z` with primitive `Boolean` return type.
+                    let call_res = unsafe {
                         jenv.call_method_unchecked(
                             &vpn_service_ref,
                             protect_mid,
                             ReturnType::Primitive(Primitive::Boolean),
                             &[jvalue { i: fd }],
                         )
+                    };
+                    if jenv.exception_check().unwrap_or(false) {
+                        let _ = jenv.exception_clear();
+                        return Err(io::Error::other(format!(
+                            "JNI call protectSocket({fd}) threw a Java exception (cleared)"
+                        )));
                     }
-                    .map_err(|e| {
-                        io::Error::other(format!("JNI call protectSocket({fd}) failed: {e}"))
-                    })?;
-                    res.z()
-                        .map_err(|e| io::Error::other(format!("JNI boolean decode failed: {e}")))
+                    let res = match call_res {
+                        Ok(v) => v,
+                        Err(jni::errors::Error::JavaException) => {
+                            let _ = jenv.exception_clear();
+                            return Err(io::Error::other(format!(
+                                "JNI call protectSocket({fd}) threw JavaException (cleared)"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = jenv.exception_clear();
+                            return Err(io::Error::other(format!(
+                                "JNI call protectSocket({fd}) failed: {e}"
+                            )));
+                        }
+                    };
+                    res.z().map_err(|e| {
+                        let _ = jenv.exception_clear();
+                        io::Error::other(format!("JNI boolean decode failed: {e}"))
+                    })
                 };
 
                 let ok = match jvm.get_env() {
@@ -259,19 +357,15 @@ fn build_android_socket_protector(
     }
 }
 
-fn stop_existing_locked(slot: &mut Option<AndroidVpnRuntime>) {
-    #[allow(unused_mut)]
-    if let Some(mut prev) = slot.take() {
-        sync_delays_from_router(&prev.engine.router());
-        #[cfg(unix)]
-        if let Some(mut fb) = prev.fd_bridge.take() {
-            fb.stop();
-        }
-        let _ = prev.api_stop_tx.send(true);
-        prev.engine.shutdown();
-        clear_global_socket_protector();
-        prev.runtime.shutdown_timeout(Duration::from_millis(300));
+fn shutdown_runtime_outside_lock(#[allow(unused_mut)] mut prev: AndroidVpnRuntime) {
+    sync_delays_from_router(&prev.engine.router());
+    #[cfg(unix)]
+    if let Some(mut fb) = prev.fd_bridge.take() {
+        fb.stop();
     }
+    prev.engine.shutdown();
+    clear_global_socket_protector();
+    prev.runtime.shutdown_timeout(Duration::from_millis(300));
 }
 
 fn hash_canonical_json(val: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
@@ -550,8 +644,14 @@ fn start_android_vpn_with_state_dir_and_jvm(
     protector: Arc<CallbackSocketProtector>,
     jvm: Option<Arc<JavaVM>>,
 ) -> Result<serde_json::Value, String> {
-    let mut guard = ANDROID_RUNTIME.lock();
-    stop_existing_locked(&mut guard);
+    let _lifecycle_guard = LIFECYCLE_LOCK.lock();
+    let start_gen = STOP_GENERATION.load(Ordering::Acquire);
+
+    // Swap out any previous runtime under `ANDROID_RUNTIME` in microseconds, then shut down outside it.
+    let prev_rt = ANDROID_RUNTIME.lock().take();
+    if let Some(prev) = prev_rt {
+        shutdown_runtime_outside_lock(prev);
+    }
 
     // Harvest any verified positive proxy/bootstrap DNS cache entries from offline latency testing,
     // and drop the offline router + runtime BEFORE installing the new global SocketProtector so
@@ -605,6 +705,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             .map_err(|e| format!("start_demo failed: {e}"))?;
             e.set_preconnect_policy(PreconnectPolicy::Mobile);
             let mut cfg = e.config_snapshot();
+            enforce_android_local_only_config(&mut cfg);
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
             cfg.tun.ipv6 = true;
@@ -642,6 +743,12 @@ fn start_android_vpn_with_state_dir_and_jvm(
                 cfg = migrated.config;
             }
 
+            if needs_local_only_sanitization(&cfg) {
+                enforce_android_local_only_config(&mut cfg);
+                let _ = mgr.persist_active_yaml(&cfg, None, None);
+            } else {
+                enforce_android_local_only_config(&mut cfg);
+            }
             cfg.mixed_port = 0;
             cfg.dns.listen = "127.0.0.1:0".to_string();
             cfg.tun.enable = true;
@@ -677,6 +784,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
                 ClashConfig::from_yaml_str(yaml_str)
                     .map_err(|e| redact_sensitive_text(&format!("invalid YAML profile: {e}")))?
             };
+            enforce_android_local_only_config(&mut cfg);
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
             cfg.tun.ipv6 = true;
@@ -698,22 +806,11 @@ fn start_android_vpn_with_state_dir_and_jvm(
             e
         };
 
-        let sec = eng
-            .config_snapshot()
-            .secret
-            .unwrap_or_else(|| ephemeral_secret.clone());
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let (bound_api, _api_task) = spawn_api_server("127.0.0.1:0", Arc::clone(&eng), stop_rx)
-            .await
-            .map_err(|e| {
-                eng.shutdown();
-                format!("spawn_api_server failed: {e}")
-            })?;
-        Ok::<_, String>((eng, sec, bound_api, stop_tx))
+        Ok::<_, String>(eng)
     });
 
-    let (engine, active_secret, api_addr, api_stop_tx) = match startup_res {
-        Ok(tuple) => tuple,
+    let engine = match startup_res {
+        Ok(eng) => eng,
         Err(err) => {
             clear_global_socket_protector();
             rt.shutdown_timeout(Duration::from_millis(250));
@@ -721,6 +818,14 @@ fn start_android_vpn_with_state_dir_and_jvm(
             return Err(redact_sensitive_text(&err));
         }
     };
+
+    if STOP_GENERATION.load(Ordering::Acquire) != start_gen {
+        engine.shutdown();
+        clear_global_socket_protector();
+        rt.shutdown_timeout(Duration::from_millis(250));
+        // `owned_tun_fd` drops here via RAII -> `close(fd)` guaranteed!
+        return Err("VPN startup cancelled by concurrent stop request".to_string());
+    }
 
     seed_delays_into_router(&engine.router());
     if ANDROID_DEBUG_LOGGING.load(Ordering::Acquire) {
@@ -732,7 +837,6 @@ fn start_android_vpn_with_state_dir_and_jvm(
     let fd_bridge = if let Some(tun_owned) = owned_tun_fd {
         let Some(vtun) = engine.take_virtual_tun_handle() else {
             drop(tun_owned);
-            let _ = api_stop_tx.send(true);
             engine.shutdown();
             clear_global_socket_protector();
             rt.shutdown_timeout(Duration::from_millis(250));
@@ -742,7 +846,6 @@ fn start_android_vpn_with_state_dir_and_jvm(
             Ok(b) => Some(b),
             Err(e) => {
                 // `tun_owned` was already consumed and closed by `attach_owned_fd`!
-                let _ = api_stop_tx.send(true);
                 engine.shutdown();
                 clear_global_socket_protector();
                 rt.shutdown_timeout(Duration::from_millis(250));
@@ -757,12 +860,9 @@ fn start_android_vpn_with_state_dir_and_jvm(
     let dns_listen = engine.dns_addr().map(|a| a.to_string());
     let eff = engine.router().effective_primary_outbound();
 
-    *guard = Some(AndroidVpnRuntime {
+    let candidate = AndroidVpnRuntime {
         runtime: rt,
         engine,
-        api_addr,
-        api_secret: active_secret.clone(),
-        api_stop_tx,
         #[cfg(unix)]
         fd_bridge,
         protector,
@@ -770,13 +870,26 @@ fn start_android_vpn_with_state_dir_and_jvm(
         last_network_handle: AtomicI64::new(0),
         has_network_baseline: AtomicBool::new(false),
         is_wifi: AtomicBool::new(true),
-    });
+    };
+
+    let cancelled = {
+        let mut guard = ANDROID_RUNTIME.lock();
+        if STOP_GENERATION.load(Ordering::Acquire) != start_gen {
+            Some(candidate)
+        } else {
+            *guard = Some(candidate);
+            None
+        }
+    };
+    if let Some(aborted) = cancelled {
+        shutdown_runtime_outside_lock(aborted);
+        return Err("VPN startup cancelled by concurrent stop request".to_string());
+    }
 
     Ok(serde_json::json!({
         "ok": true,
-        "apiUrl": format!("http://{api_addr}"),
-        "apiPort": api_addr.port(),
-        "apiSecret": active_secret,
+        "apiUrl": "",
+        "apiPort": 0,
         "mixedPort": mixed_port,
         "dnsListen": dns_listen,
         "effectiveOutbound": eff.effective_outbound,
@@ -786,10 +899,15 @@ fn start_android_vpn_with_state_dir_and_jvm(
 
 /// Pure-Rust core implementation of `nativeStopVpn` (used by user stop, `onRevoke()`, and `onDestroy()`).
 pub fn stop_android_vpn_core() -> bool {
-    let mut guard = ANDROID_RUNTIME.lock();
-    let was_active = guard.is_some();
-    stop_existing_locked(&mut guard);
-    was_active
+    STOP_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let _lifecycle_guard = LIFECYCLE_LOCK.lock();
+    let prev = ANDROID_RUNTIME.lock().take();
+    if let Some(rt) = prev {
+        shutdown_runtime_outside_lock(rt);
+        true
+    } else {
+        false
+    }
 }
 
 /// Pure-Rust core implementation of `nativeNotifyNetworkChanged`.
@@ -797,50 +915,59 @@ pub fn notify_android_network_changed_core(
     network_handle: i64,
     is_wifi: bool,
 ) -> Option<NetworkChangeReport> {
-    let guard = ANDROID_RUNTIME.lock();
-    let Some(rt) = guard.as_ref() else {
-        drop(guard);
-        clear_offline_router_cache();
-        proxy_core::dns::upstream::clear_dns_upstream_pools();
-        return None;
+    enum HandoffState {
+        Offline,
+        NoChange,
+        Changed(Arc<ProxyEngine>, i64),
+    }
+
+    let state = {
+        let guard = ANDROID_RUNTIME.lock();
+        if let Some(rt) = guard.as_ref() {
+            let had_baseline = rt.has_network_baseline.swap(true, Ordering::AcqRel);
+            let prev_handle = rt
+                .last_network_handle
+                .swap(network_handle, Ordering::AcqRel);
+            let prev_wifi = rt.is_wifi.swap(is_wifi, Ordering::AcqRel);
+            if !had_baseline && network_handle != 0 {
+                HandoffState::NoChange
+            } else if prev_handle != network_handle || prev_wifi != is_wifi {
+                rt.network_transitions.fetch_add(1, Ordering::Relaxed);
+                HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
+            } else {
+                HandoffState::NoChange
+            }
+        } else {
+            HandoffState::Offline
+        }
     };
 
-    let had_baseline = rt.has_network_baseline.swap(true, Ordering::AcqRel);
-    let prev_handle = rt
-        .last_network_handle
-        .swap(network_handle, Ordering::AcqRel);
-    let prev_wifi = rt.is_wifi.swap(is_wifi, Ordering::AcqRel);
-
-    if !had_baseline && network_handle != 0 {
-        return Some(NetworkChangeReport {
+    match state {
+        HandoffState::Offline => {
+            clear_offline_router_cache();
+            proxy_core::dns::upstream::clear_dns_upstream_pools();
+            None
+        }
+        HandoffState::NoChange => Some(NetworkChangeReport {
             closed_active_connections: 0,
             reset_udp_nat_sessions: 0,
             evicted_tls_sessions: 0,
             dns_cache_flushed: false,
-        });
+        }),
+        HandoffState::Changed(engine, prev_handle) => {
+            let report = engine.notify_network_change();
+            engine.hub().push_log(
+                "info",
+                format!(
+                    "Android network handoff (handle {prev_handle} -> {network_handle}, wifi={is_wifi}): closed_tcp={}, reset_udp_nat={}, evicted_tls_pool={}",
+                    report.closed_active_connections,
+                    report.reset_udp_nat_sessions,
+                    report.evicted_tls_sessions
+                ),
+            );
+            Some(report)
+        }
     }
-
-    if prev_handle != network_handle || prev_wifi != is_wifi {
-        rt.network_transitions.fetch_add(1, Ordering::Relaxed);
-        let report = rt.engine.notify_network_change();
-        rt.engine.hub().push_log(
-            "info",
-            format!(
-                "Android network handoff (handle {prev_handle} -> {network_handle}, wifi={is_wifi}): closed_tcp={}, reset_udp_nat={}, evicted_tls_pool={}",
-                report.closed_active_connections,
-                report.reset_udp_nat_sessions,
-                report.evicted_tls_sessions
-            ),
-        );
-        return Some(report);
-    }
-
-    Some(NetworkChangeReport {
-        closed_active_connections: 0,
-        reset_udp_nat_sessions: 0,
-        evicted_tls_sessions: 0,
-        dns_cache_flushed: false,
-    })
 }
 
 /// Pure-Rust core status snapshot for `nativeGetStatusJson` and lifecycle tests.
@@ -874,8 +1001,8 @@ pub fn android_status_json_core() -> serde_json::Value {
             "effectiveOutbound": eff.effective_outbound,
             "effectiveProtocol": eff.effective_protocol,
             "effectiveDelayMs": active_delay,
-            "apiUrl": format!("http://{}", rt.api_addr),
-            "apiSecret": rt.api_secret,
+            "apiUrl": "",
+            "apiPort": 0,
             "mixedPort": rt.engine.mixed_addr().port(),
             "upRate": up_rate,
             "downRate": down_rate,
@@ -1040,24 +1167,122 @@ pub fn android_import_unified_core(
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let report = handle
+        let prev_snap = mgr.snapshot();
+        let prev_active_id = prev_snap.active_profile_id;
+        let prev_ids: std::collections::HashSet<String> =
+            prev_snap.profiles.into_iter().map(|p| p.id).collect();
+        let mut report = handle
             .block_on(engine.import_unified_live(raw_input, None, deduplicate, auto_select))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let after_snap = mgr.snapshot();
+        let imported_profile_id = after_snap
+            .profiles
+            .iter()
+            .find(|p| !prev_ids.contains(&p.id))
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| after_snap.active_profile_id.clone());
+        if (needs_local_only_sanitization(&report.config)
+            || needs_local_only_sanitization(&engine.config_snapshot()))
+            && mgr.active_profile_id() == imported_profile_id
+        {
+            enforce_android_local_only_config(&mut report.config);
+            let sel = mgr
+                .persist_active_yaml(&report.config, None, None)
+                .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+            if !engine.demo_info().enabled {
+                handle
+                    .block_on(
+                        engine.activate_profile_config_with_selections(
+                            report.config.clone(),
+                            Some(&sel),
+                        ),
+                    )
+                    .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+            }
+        } else {
+            enforce_android_local_only_config(&mut report.config);
+        }
+        if !auto_select
+            && mgr.active_profile_id() != prev_active_id
+            && prev_ids.contains(&prev_active_id)
+            && let Ok(mut prev_cfg) = mgr.set_active_profile(&prev_active_id)
+        {
+            enforce_android_local_only_config(&mut prev_cfg);
+            let prev_sel = mgr.active_selected_groups();
+            if !engine.demo_info().enabled {
+                let _ = handle.block_on(
+                    engine.activate_profile_config_with_selections(prev_cfg, Some(&prev_sel)),
+                );
+            }
+        }
         let eff = engine.router().effective_primary_outbound();
-        return Ok(build_android_mutation_json(&mgr, &report, true, Some(eff)));
+        let mut out = build_android_mutation_json(&mgr, &report, true, Some(eff));
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "importedProfileId".to_string(),
+                serde_json::Value::String(imported_profile_id),
+            );
+        }
+        return Ok(out);
     }
 
     let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    let prev_snap = mgr.snapshot();
+    let prev_active_id = prev_snap.active_profile_id;
+    let prev_ids: std::collections::HashSet<String> =
+        prev_snap.profiles.into_iter().map(|p| p.id).collect();
     let temp_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Tokio init failed: {e}"))?;
-    let report = temp_rt
+    let mut report = temp_rt
         .block_on(mgr.import_unified_input(raw_input, None, deduplicate, auto_select))
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    Ok(build_android_mutation_json(&mgr, &report, false, None))
+    let after_snap = mgr.snapshot();
+    let imported_profile_id = after_snap
+        .profiles
+        .iter()
+        .find(|p| !prev_ids.contains(&p.id))
+        .map(|p| p.id.clone())
+        .unwrap_or_else(|| after_snap.active_profile_id.clone());
+    if needs_local_only_sanitization(&report.config)
+        && mgr.active_profile_id() == imported_profile_id
+    {
+        enforce_android_local_only_config(&mut report.config);
+        let _ = mgr.persist_active_yaml(&report.config, None, None);
+    } else {
+        enforce_android_local_only_config(&mut report.config);
+    }
+    if !auto_select
+        && mgr.active_profile_id() != prev_active_id
+        && prev_ids.contains(&prev_active_id)
+        && let Ok(mut prev_cfg) = mgr.set_active_profile(&prev_active_id)
+    {
+        if needs_local_only_sanitization(&prev_cfg) {
+            enforce_android_local_only_config(&mut prev_cfg);
+            let _ = mgr.persist_active_yaml(&prev_cfg, None, None);
+        } else {
+            enforce_android_local_only_config(&mut prev_cfg);
+        }
+    }
+    let offline_eff = if mgr.active_profile_id() != imported_profile_id {
+        mgr.load_active_config().ok().map(|(active_cfg, _)| {
+            let sel = mgr.active_selected_groups();
+            compute_offline_effective_summary(&active_cfg, &sel, Some(state_dir))
+        })
+    } else {
+        None
+    };
+    let mut out = build_android_mutation_json(&mgr, &report, false, offline_eff);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "importedProfileId".to_string(),
+            serde_json::Value::String(imported_profile_id),
+        );
+    }
+    Ok(out)
 }
 
 /// Offline + Live persistent proxy selection in any `Select` group (`PROXY`, `🚀 Proxy`, etc.).
@@ -1167,7 +1392,7 @@ pub fn android_deduplicate_nodes_core(state_dir: &Path) -> Result<serde_json::Va
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeStartVpn<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     vpn_service: JObject<'local>,
     tun_fd: jint,
@@ -1178,6 +1403,8 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 
     #[cfg(unix)]
     let owned_tun_fd: Result<Option<OwnedFd>, String> = if tun_fd >= 0 {
+        // SAFETY: `tun_fd >= 0` was detached by Kotlin `ParcelFileDescriptor.detachFd()`,
+        // transferring exclusive ownership of the open kernel TUN file descriptor to Rust.
         Ok(Some(unsafe { OwnedFd::from_raw_fd(tun_fd) }))
     } else if tun_fd == -1 {
         Ok(None)
@@ -1188,21 +1415,22 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     #[cfg(not(unix))]
     let _ = tun_fd;
 
-    let res = (|| -> Result<serde_json::Value, String> {
+    jni_json_guarded(env, move |env| {
         #[cfg(unix)]
         let tun_raii = owned_tun_fd?;
 
-        let yaml_str = jstring_to_rust(&mut env, &yaml_config)?;
+        let yaml_str = jstring_to_rust(env, &yaml_config)?;
         let jvm = Arc::new(
             env.get_java_vm()
                 .map_err(|e| format!("get_java_vm failed: {e}"))?,
         );
-        let vpn_global = env
-            .new_global_ref(&vpn_service)
-            .map_err(|e| format!("new_global_ref(vpnService) failed: {e}"))?;
+        let vpn_global = env.new_global_ref(&vpn_service).map_err(|e| {
+            clear_pending_jni_exception(env);
+            format!("new_global_ref(vpnService) failed: {e}")
+        })?;
 
         let protector =
-            build_android_socket_protector(&mut env, Arc::clone(&jvm), &vpn_service, vpn_global)?;
+            build_android_socket_protector(env, Arc::clone(&jvm), &vpn_service, vpn_global)?;
         start_android_vpn_with_state_dir_and_jvm(
             #[cfg(unix)]
             tun_raii,
@@ -1212,24 +1440,14 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             protector,
             Some(jvm),
         )
-    })();
-
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(err) => serde_json::json!({
-            "ok": false,
-            "error": redact_sensitive_text(&err),
-        })
-        .to_string(),
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeStartVpnWithStateDir<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     vpn_service: JObject<'local>,
     tun_fd: jint,
@@ -1242,6 +1460,8 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     // CRITICAL RAII STEP: Immediately claim ownership of detached `tun_fd >= 0` BEFORE any `?` return!
     #[cfg(unix)]
     let owned_tun_fd: Result<Option<OwnedFd>, String> = if tun_fd >= 0 {
+        // SAFETY: `tun_fd >= 0` was detached by Kotlin `ParcelFileDescriptor.detachFd()`,
+        // transferring exclusive ownership of the open kernel TUN file descriptor to Rust.
         Ok(Some(unsafe { OwnedFd::from_raw_fd(tun_fd) }))
     } else if tun_fd == -1 {
         Ok(None)
@@ -1252,22 +1472,23 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     #[cfg(not(unix))]
     let _ = tun_fd;
 
-    let res = (|| -> Result<serde_json::Value, String> {
+    jni_json_guarded(env, move |env| {
         #[cfg(unix)]
         let tun_raii = owned_tun_fd?;
 
-        let state_dir_raw = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let yaml_str = jstring_to_rust(&mut env, &yaml_config)?;
+        let state_dir_raw = jstring_to_rust(env, &state_dir_jstr)?;
+        let yaml_str = jstring_to_rust(env, &yaml_config)?;
         let jvm = Arc::new(
             env.get_java_vm()
                 .map_err(|e| format!("get_java_vm failed: {e}"))?,
         );
-        let vpn_global = env
-            .new_global_ref(&vpn_service)
-            .map_err(|e| format!("new_global_ref(vpnService) failed: {e}"))?;
+        let vpn_global = env.new_global_ref(&vpn_service).map_err(|e| {
+            clear_pending_jni_exception(env);
+            format!("new_global_ref(vpnService) failed: {e}")
+        })?;
 
         let protector =
-            build_android_socket_protector(&mut env, Arc::clone(&jvm), &vpn_service, vpn_global)?;
+            build_android_socket_protector(env, Arc::clone(&jvm), &vpn_service, vpn_global)?;
         let opt_dir = if state_dir_raw.trim().is_empty() {
             None
         } else {
@@ -1282,17 +1503,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             protector,
             Some(jvm),
         )
-    })();
-
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(err) => serde_json::json!({
-            "ok": false,
-            "error": redact_sensitive_text(&err),
-        })
-        .to_string(),
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1300,11 +1511,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jboolean {
-    if stop_android_vpn_core() {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_guarded(stop_android_vpn_core)
 }
 
 #[unsafe(no_mangle)]
@@ -1314,11 +1521,9 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     network_handle: jlong,
     is_wifi: jboolean,
 ) -> jboolean {
-    if notify_android_network_changed_core(network_handle, is_wifi == JNI_TRUE).is_some() {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_guarded(|| {
+        notify_android_network_changed_core(network_handle, is_wifi == JNI_TRUE).is_some()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1326,37 +1531,34 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jstring {
-    let payload = android_status_json_core();
-    rust_to_jstring(&mut env, &payload.to_string())
+    let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(android_status_json_core))
+    {
+        Ok(payload) => payload.to_string(),
+        Err(_) => "{\"running\":false}".to_string(),
+    };
+    rust_to_jstring(&mut env, &out)
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeGetNodeManagerSnapshot<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
     ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_node_manager_snapshot_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeImportUnifiedPayload<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     payload_jstr: JString<'local>,
@@ -1364,56 +1566,42 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     auto_select: jboolean,
 ) -> jstring {
     ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let payload = jstring_to_rust(&mut env, &payload_jstr)?;
+    jni_json_guarded(env, |env| {
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let payload = jstring_to_rust(env, &payload_jstr)?;
         android_import_unified_core(
             Path::new(dir.trim()),
             &payload,
             deduplicate == JNI_TRUE,
             auto_select == JNI_TRUE,
         )
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSelectProxyPersisted<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     group_name_jstr: JString<'local>,
     proxy_name_jstr: JString<'local>,
 ) -> jstring {
     ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let grp = jstring_to_rust(&mut env, &group_name_jstr)?;
-        let prx = jstring_to_rust(&mut env, &proxy_name_jstr)?;
+    jni_json_guarded(env, |env| {
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let grp = jstring_to_rust(env, &group_name_jstr)?;
+        let prx = jstring_to_rust(env, &proxy_name_jstr)?;
         android_select_proxy_persisted_core(Path::new(dir.trim()), &grp, &prx)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeUpsertNodeJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     original_name_jstr: JString<'local>,
@@ -1421,10 +1609,10 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     auto_select: jboolean,
 ) -> jstring {
     ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let orig = jstring_to_rust(&mut env, &original_name_jstr)?;
-        let node_json = jstring_to_rust(&mut env, &node_json_jstr)?;
+    jni_json_guarded(env, |env| {
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let orig = jstring_to_rust(env, &original_name_jstr)?;
+        let node_json = jstring_to_rust(env, &node_json_jstr)?;
         let orig_opt = if orig.trim().is_empty() {
             None
         } else {
@@ -1436,183 +1624,145 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             &node_json,
             auto_select == JNI_TRUE,
         )
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeDeleteNodePersisted<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     node_name_jstr: JString<'local>,
 ) -> jstring {
     ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let name = jstring_to_rust(&mut env, &node_name_jstr)?;
+    jni_json_guarded(env, |env| {
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let name = jstring_to_rust(env, &node_name_jstr)?;
         android_delete_node_core(Path::new(dir.trim()), &name)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeDeduplicateNodesPersisted<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
     ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_deduplicate_nodes_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSwitchMode<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     mode_str: JString<'local>,
 ) -> jboolean {
-    let Ok(m_raw) = jstring_to_rust(&mut env, &mode_str) else {
-        return JNI_FALSE;
-    };
-    let mode = match m_raw.trim().to_ascii_lowercase().as_str() {
-        "global" => RunMode::Global,
-        "direct" => RunMode::Direct,
-        "rule" => RunMode::Rule,
-        _ => return JNI_FALSE,
-    };
-    if let Some((_, engine)) = live_handle_and_engine() {
-        engine.set_mode(mode);
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_env_guarded(env, |env| {
+        let Ok(m_raw) = jstring_to_rust(env, &mode_str) else {
+            return false;
+        };
+        let mode = match m_raw.trim().to_ascii_lowercase().as_str() {
+            "global" => RunMode::Global,
+            "direct" => RunMode::Direct,
+            "rule" => RunMode::Rule,
+            _ => return false,
+        };
+        if let Some((_, engine)) = live_handle_and_engine() {
+            engine.set_mode(mode);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSelectProxy<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     group_name: JString<'local>,
     proxy_name: JString<'local>,
 ) -> jboolean {
-    let (Ok(grp), Ok(prx)) = (
-        jstring_to_rust(&mut env, &group_name),
-        jstring_to_rust(&mut env, &proxy_name),
-    ) else {
-        return JNI_FALSE;
-    };
-    let Some((_, engine)) = live_handle_and_engine() else {
-        return JNI_FALSE;
-    };
-    if engine.select_group_and_persist(&grp, &prx).is_ok() {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_env_guarded(env, |env| {
+        let (Ok(grp), Ok(prx)) = (
+            jstring_to_rust(env, &group_name),
+            jstring_to_rust(env, &proxy_name),
+        ) else {
+            return false;
+        };
+        let Some((_, engine)) = live_handle_and_engine() else {
+            return false;
+        };
+        engine.select_group_and_persist(&grp, &prx).is_ok()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeReloadConfig<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     yaml_config: JString<'local>,
 ) -> jstring {
-    let res = (|| -> Result<(), String> {
-        let yaml = jstring_to_rust(&mut env, &yaml_config)?;
-        let (handle, engine, api_secret) = {
-            let guard = ANDROID_RUNTIME.lock();
-            let rt = guard
-                .as_ref()
-                .ok_or_else(|| "VPN engine is not running".to_string())?;
-            (
-                rt.runtime.handle().clone(),
-                Arc::clone(&rt.engine),
-                rt.api_secret.clone(),
-            )
-        };
+    jni_json_guarded(env, |env| {
+        let yaml = jstring_to_rust(env, &yaml_config)?;
+        let (handle, engine) =
+            live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
         let prev = engine.config_snapshot();
         let mut parsed = ClashConfig::from_yaml_str_unchecked(&yaml)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         parsed.restore_redacted_from(&prev);
+        enforce_android_local_only_config(&mut parsed);
         parsed.tun = prev.tun;
         parsed.tun.enable = true;
         parsed.tun.auto_route = false;
         if parsed.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
-            parsed.secret = Some(api_secret);
+            parsed.secret = prev
+                .secret
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(generate_ephemeral_api_secret()));
         }
         let merged = parsed
             .to_yaml_string()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         handle
             .block_on(engine.reload_yaml(&merged))
-            .map_err(|e| redact_sensitive_text(&e.to_string()))
-    })();
-    let out = match res {
-        Ok(()) => serde_json::json!({ "ok": true }).to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        Ok(serde_json::json!({ "ok": true }))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeImportUris<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     uris_payload: JString<'local>,
 ) -> jstring {
-    let res = (|| -> Result<usize, String> {
-        let raw = jstring_to_rust(&mut env, &uris_payload)?;
+    jni_json_guarded(env, |env| {
+        let raw = jstring_to_rust(env, &uris_payload)?;
         let (handle, engine) =
             live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
         let nodes = handle
             .block_on(engine.import_uris_live(&raw))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        Ok(nodes.len())
-    })();
-    let out = match res {
-        Ok(count) => serde_json::json!({ "ok": true, "imported": count }).to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+        Ok(serde_json::json!({ "ok": true, "imported": nodes.len() }))
+    })
 }
 
 pub fn android_flush_dns_core() -> bool {
@@ -1631,25 +1781,21 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jboolean {
-    if android_flush_dns_core() {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_guarded(android_flush_dns_core)
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeExplainRule<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     target_jstr: JString<'local>,
     network_jstr: JString<'local>,
 ) -> jstring {
-    let res = (|| -> Result<serde_json::Value, String> {
-        let target_raw = jstring_to_rust(&mut env, &target_jstr)?;
-        let net_raw = jstring_to_rust(&mut env, &network_jstr)?;
+    jni_json_guarded(env, |env| {
+        let target_raw = jstring_to_rust(env, &target_jstr)?;
+        let net_raw = jstring_to_rust(env, &network_jstr)?;
         let _ = net_raw;
         let (handle, engine) =
             live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
@@ -1670,14 +1816,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             "exit_type": decision.outbound.exit_category(),
             "remote_endpoint": decision.outbound.remote_endpoint(&decision.target),
         }))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 /// Live + recent connection-level diagnostics (`connecting`, `active`, `closed`, `failed`)
@@ -1759,9 +1898,15 @@ pub fn android_set_routing_preset_core(
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let (snap, cfg) = mgr
+        let (snap, mut cfg) = mgr
             .apply_routing_preset(choice)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            let _ = mgr.persist_active_yaml(&cfg, None, None);
+        } else {
+            enforce_android_local_only_config(&mut cfg);
+        }
         handle
             .block_on(
                 engine.activate_profile_config_with_selections(cfg, Some(&snap.selected_groups)),
@@ -1772,9 +1917,13 @@ pub fn android_set_routing_preset_core(
 
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let _ = mgr
+    let (_, mut cfg) = mgr
         .apply_routing_preset(choice)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    if needs_local_only_sanitization(&cfg) {
+        enforce_android_local_only_config(&mut cfg);
+        let _ = mgr.persist_active_yaml(&cfg, None, None);
+    }
     android_node_manager_snapshot_core(state_dir)
 }
 
@@ -1801,9 +1950,15 @@ pub fn android_save_custom_rules_core(
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let (snap, cfg) = mgr
+        let (snap, mut cfg) = mgr
             .save_custom_rules(rules)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            let _ = mgr.persist_active_yaml(&cfg, None, None);
+        } else {
+            enforce_android_local_only_config(&mut cfg);
+        }
         handle
             .block_on(
                 engine.activate_profile_config_with_selections(cfg, Some(&snap.selected_groups)),
@@ -1814,9 +1969,13 @@ pub fn android_save_custom_rules_core(
 
     let mgr = ProfileManager::open_or_init(state_dir)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let _ = mgr
+    let (_, mut cfg) = mgr
         .save_custom_rules(rules)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    if needs_local_only_sanitization(&cfg) {
+        enforce_android_local_only_config(&mut cfg);
+        let _ = mgr.persist_active_yaml(&cfg, None, None);
+    }
     android_node_manager_snapshot_core(state_dir)
 }
 
@@ -2051,9 +2210,15 @@ pub fn android_activate_profile_core(
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let cfg = mgr
+        let mut cfg = mgr
             .set_active_profile(profile_id)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            let _ = mgr.persist_active_yaml(&cfg, None, None);
+        } else {
+            enforce_android_local_only_config(&mut cfg);
+        }
         let sel = mgr.active_selected_groups();
         handle
             .block_on(engine.activate_profile_config_with_selections(cfg, Some(&sel)))
@@ -2064,9 +2229,13 @@ pub fn android_activate_profile_core(
         let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
         let mgr = ProfileManager::open_or_init(state_dir)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let _ = mgr
+        let mut cfg = mgr
             .set_active_profile(profile_id)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            let _ = mgr.persist_active_yaml(&cfg, None, None);
+        }
     }
     android_profiles_snapshot_core(state_dir)
 }
@@ -2104,9 +2273,17 @@ pub fn android_refresh_profile_core(
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let prev_cfg = mgr.load_profile_config_by_id(profile_id);
-        let (meta, cfg, is_active) = handle
+        let (meta, mut cfg, is_active) = handle
             .block_on(mgr.refresh_subscription(profile_id))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            if is_active {
+                let _ = mgr.persist_active_yaml(&cfg, None, None);
+            }
+        } else {
+            enforce_android_local_only_config(&mut cfg);
+        }
         let diff_opt = prev_cfg
             .as_ref()
             .map(|prev| proxy_core::audit::diff_configs(prev, &cfg));
@@ -2138,9 +2315,17 @@ pub fn android_refresh_profile_core(
             .enable_all()
             .build()
             .map_err(|e| format!("Tokio init failed: {e}"))?;
-        let (meta, cfg, _) = temp_rt
+        let (meta, mut cfg, is_active) = temp_rt
             .block_on(mgr.refresh_subscription(profile_id))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            if is_active {
+                let _ = mgr.persist_active_yaml(&cfg, None, None);
+            }
+        } else {
+            enforce_android_local_only_config(&mut cfg);
+        }
         let diff_opt = prev_cfg
             .as_ref()
             .map(|prev| proxy_core::audit::diff_configs(prev, &cfg));
@@ -2215,11 +2400,13 @@ pub fn android_save_active_yaml_core(
         let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml_text)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         parsed.restore_redacted_from(&prev_disk_cfg);
-        let raw_override = if yaml_text.contains(REDACTED_SECRET) {
-            None
-        } else {
-            Some(yaml_text)
-        };
+        enforce_android_local_only_config(&mut parsed);
+        let raw_override =
+            if yaml_text.contains(REDACTED_SECRET) || yaml_mentions_listener_exposure(yaml_text) {
+                None
+            } else {
+                Some(yaml_text)
+            };
         let sel = mgr
             .persist_active_yaml(&parsed, raw_override, None)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2241,11 +2428,13 @@ pub fn android_save_active_yaml_core(
         let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml_text)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         parsed.restore_redacted_from(&prev_disk_cfg);
-        let raw_override = if yaml_text.contains(REDACTED_SECRET) {
-            None
-        } else {
-            Some(yaml_text)
-        };
+        enforce_android_local_only_config(&mut parsed);
+        let raw_override =
+            if yaml_text.contains(REDACTED_SECRET) || yaml_mentions_listener_exposure(yaml_text) {
+                None
+            } else {
+                Some(yaml_text)
+            };
         let _ = mgr
             .persist_active_yaml(&parsed, raw_override, None)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2268,13 +2457,14 @@ pub fn android_set_demo_sandbox_core(enable: bool) -> Result<serde_json::Value, 
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeGetDiagnosticsJson(
-    mut env: JNIEnv<'_>,
+    env: JNIEnv<'_>,
     _class: JClass<'_>,
     limit: jint,
 ) -> jstring {
-    let lim = if limit <= 0 { 150usize } else { limit as usize };
-    let payload = android_get_diagnostics_core(lim);
-    rust_to_jstring(&mut env, &payload.to_string())
+    jni_json_guarded(env, |_| {
+        let lim = if limit <= 0 { 150usize } else { limit as usize };
+        Ok(android_get_diagnostics_core(lim))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -2282,167 +2472,121 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jboolean {
-    if android_clear_diagnostics_core() {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_guarded(android_clear_diagnostics_core)
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeGetRoutingSnapshotJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_get_routing_snapshot_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSetRoutingPresetJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     preset_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let preset = jstring_to_rust(&mut env, &preset_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let preset = jstring_to_rust(env, &preset_jstr)?;
         android_set_routing_preset_core(Path::new(dir.trim()), &preset)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSaveCustomRulesJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     rules_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let rules = jstring_to_rust(&mut env, &rules_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let rules = jstring_to_rust(env, &rules_jstr)?;
         android_save_custom_rules_core(Path::new(dir.trim()), &rules)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeGetGeoDataStatusJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_geodata_status_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeUpdateGeoDataJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_update_geodata_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeExplainRuleWithStateDirJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     target_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let target = jstring_to_rust(&mut env, &target_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let target = jstring_to_rust(env, &target_jstr)?;
         android_explain_rule_with_state_dir_core(Path::new(dir.trim()), &target)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeTestLatencyJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     target_name_jstr: JString<'local>,
     probe_url_jstr: JString<'local>,
     timeout_ms: jlong,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let target_name = jstring_to_rust(&mut env, &target_name_jstr)?;
-        let probe_url = jstring_to_rust(&mut env, &probe_url_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let target_name = jstring_to_rust(env, &target_name_jstr)?;
+        let probe_url = jstring_to_rust(env, &probe_url_jstr)?;
         let t_ms = if timeout_ms <= 0 {
             4000u64
         } else {
@@ -2454,154 +2598,105 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             Some(probe_url.as_str()),
             t_ms,
         )
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeGetProfilesSnapshotJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_profiles_snapshot_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeActivateProfileJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     profile_id_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let id = jstring_to_rust(&mut env, &profile_id_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let id = jstring_to_rust(env, &profile_id_jstr)?;
         android_activate_profile_core(Path::new(dir.trim()), id.trim())
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeDeleteProfileJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     profile_id_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let id = jstring_to_rust(&mut env, &profile_id_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let id = jstring_to_rust(env, &profile_id_jstr)?;
         android_delete_profile_core(Path::new(dir.trim()), id.trim())
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeRefreshProfileJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     profile_id_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let id = jstring_to_rust(&mut env, &profile_id_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let id = jstring_to_rust(env, &profile_id_jstr)?;
         android_refresh_profile_core(Path::new(dir.trim()), id.trim())
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeGetActiveYamlJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         android_get_active_yaml_core(Path::new(dir.trim()))
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSaveActiveYamlJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     yaml_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let yaml = jstring_to_rust(&mut env, &yaml_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let yaml = jstring_to_rust(env, &yaml_jstr)?;
         android_save_active_yaml_core(Path::new(dir.trim()), &yaml)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 /// Toggle low-power / screen-off Doze battery saver mode on the live Android `ProxyEngine`.
@@ -2620,27 +2715,19 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     _class: JClass<'_>,
     enable: jboolean,
 ) -> jboolean {
-    if android_set_low_power_mode_core(enable == JNI_TRUE) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_guarded(|| android_set_low_power_mode_core(enable == JNI_TRUE))
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeSetDemoSandboxJson(
-    mut env: JNIEnv<'_>,
+    env: JNIEnv<'_>,
     _class: JClass<'_>,
     enable: jboolean,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let out = match android_set_demo_sandbox_core(enable == JNI_TRUE) {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    jni_json_guarded(env, |_| {
+        ensure_tracing_initialized();
+        android_set_demo_sandbox_core(enable == JNI_TRUE)
+    })
 }
 
 /// Update profile display name and/or subscription auto-update interval (`None` = unchanged,
@@ -2688,18 +2775,18 @@ pub fn android_update_profile_settings_core(
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeUpdateProfileSettingsJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     profile_id_jstr: JString<'local>,
     name_jstr: JString<'local>,
     interval_secs: jlong,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let id = jstring_to_rust(&mut env, &profile_id_jstr)?;
-        let name_raw = jstring_to_rust(&mut env, &name_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let id = jstring_to_rust(env, &profile_id_jstr)?;
+        let name_raw = jstring_to_rust(env, &name_jstr)?;
         let name_opt = {
             let t = name_raw.trim();
             if t.is_empty() {
@@ -2721,14 +2808,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             name_opt,
             interval_opt,
         )
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 /// Enable or disable Android debug diagnostic mode offline or live.
@@ -3217,39 +3297,28 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     _class: JClass<'_>,
     enable: jboolean,
 ) -> jboolean {
-    if android_set_debug_logging_core(enable == JNI_TRUE) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    jni_bool_guarded(|| android_set_debug_logging_core(enable == JNI_TRUE))
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeCollectDebugSnapshotJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     since_epoch_ms: jlong,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
         let since_u64 = if since_epoch_ms <= 0 {
             0u64
         } else {
             since_epoch_ms as u64
         };
         android_collect_debug_snapshot_core(Path::new(dir.trim()), since_u64)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }
 
 /// Offline + Live unified website diagnostic (`diagnose_site`) for Android Jetpack Compose.
@@ -3359,22 +3428,15 @@ pub fn android_diagnose_site_core(
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeDiagnoseSiteJson<
     'local,
 >(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     target_jstr: JString<'local>,
 ) -> jstring {
-    ensure_tracing_initialized();
-    let res = (|| -> Result<serde_json::Value, String> {
-        let dir = jstring_to_rust(&mut env, &state_dir_jstr)?;
-        let target = jstring_to_rust(&mut env, &target_jstr)?;
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        let target = jstring_to_rust(env, &target_jstr)?;
         android_diagnose_site_core(Path::new(dir.trim()), &target)
-    })();
-    let out = match res {
-        Ok(v) => v.to_string(),
-        Err(e) => {
-            serde_json::json!({ "ok": false, "error": redact_sensitive_text(&e) }).to_string()
-        }
-    };
-    rust_to_jstring(&mut env, &out)
+    })
 }

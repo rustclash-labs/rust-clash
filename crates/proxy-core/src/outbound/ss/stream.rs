@@ -292,6 +292,17 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                 Poll::Ready(Ok(())) => {
                     let filled = rbuf.filled();
                     if filled.is_empty() {
+                        if !self.raw_in.is_empty()
+                            || matches!(
+                                self.read_state,
+                                ReadState::NeedSs2022RespFixed | ReadState::NeedPayloadChunk(_)
+                            )
+                        {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "truncated encrypted frame before EOF",
+                            )));
+                        }
                         return Poll::Ready(Ok(())); // Clean EOF
                     }
                     self.raw_in.extend_from_slice(filled);
@@ -479,5 +490,48 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
             Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn shadowsocks_stream_detects_truncated_frame_on_eof_and_allows_clean_eof() {
+        let kind = SsCipherKind::Aes256Gcm;
+        let master_key = kind.master_key("test-pass").unwrap();
+        let target = TargetAddr::new_domain("example.com", 443).unwrap();
+
+        // 1. Clean 0-byte EOF before salt -> Ok(0)
+        let (c_io, s_io) = tokio::io::duplex(1024);
+        drop(s_io);
+        let mut client =
+            ShadowsocksStream::new_client(c_io, kind, master_key.clone(), &target).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(client.read_to_end(&mut out).await.unwrap(), 0);
+        assert!(out.is_empty());
+
+        // 2. Truncated salt / partial frame before EOF -> UnexpectedEof
+        let (c_io2, mut s_io2) = tokio::io::duplex(1024);
+        s_io2.write_all(&[0xAA; 10]).await.unwrap();
+        drop(s_io2);
+        let mut client2 =
+            ShadowsocksStream::new_client(c_io2, kind, master_key.clone(), &target).unwrap();
+        let err = client2.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // 3. Truncated payload chunk after valid salt + encrypted length chunk -> UnexpectedEof
+        let (c_io3, mut s_io3) = tokio::io::duplex(1024);
+        let resp_salt = random_bytes(kind.salt_len()).unwrap();
+        let mut enc = SsAeadCipher::new(kind, &master_key, &resp_salt).unwrap();
+        let enc_len = enc.seal(&5u16.to_be_bytes()).unwrap();
+        s_io3.write_all(&resp_salt).await.unwrap();
+        s_io3.write_all(&enc_len).await.unwrap();
+        drop(s_io3);
+        let mut client3 = ShadowsocksStream::new_client(c_io3, kind, master_key, &target).unwrap();
+        let err3 = client3.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err3.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

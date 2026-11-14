@@ -329,6 +329,11 @@ impl CompiledRule {
                         "invalid GEOIP code '{code}' in rule '{trimmed}'"
                     )));
                 }
+                if !matches!(code.as_str(), "PRIVATE" | "LAN" | "CN") && !has_any_mmdb {
+                    tracing::warn!(
+                        "GEOIP,{code} in rule '{trimmed}' is using coarse built-in baseline CIDRs because no Country.mmdb database is loaded; update GeoData or configure `mmdb-path` for full country precision"
+                    );
+                }
                 RuleMatcher::GeoIp {
                     code,
                     builtin,
@@ -589,5 +594,33 @@ mod tests {
         }
 
         assert!(CompiledRule::parse("GEOIP,NONEXISTENT,DIRECT").is_err());
+
+        let jp_rule = CompiledRule::parse("GEOIP,JP,PROXY").unwrap();
+        assert!(jp_rule.matches(
+            None,
+            &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(49, 96, 0, 1)), 443)
+        ));
+        assert!(jp_rule.matches(
+            None,
+            &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(106, 128, 0, 1)), 443)
+        ));
+        assert!(!jp_rule.matches(
+            None,
+            &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(49, 112, 0, 1)), 443)
+        ));
+        assert!(!jp_rule.matches(
+            None,
+            &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(106, 192, 0, 1)), 443)
+        ));
+
+        let us_rule = CompiledRule::parse("GEOIP,US,PROXY").unwrap();
+        assert!(us_rule.matches(
+            None,
+            &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443)
+        ));
+        assert!(!us_rule.matches(
+            None,
+            &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 210, 0, 1)), 443)
+        ));
     }
 }

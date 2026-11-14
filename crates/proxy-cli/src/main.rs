@@ -291,9 +291,23 @@ async fn main() -> Result<()> {
                 None
             };
 
+            let mut generated_ephemeral = false;
             let engine: Arc<ProxyEngine> = if demo {
                 let eng =
                     ProxyEngine::start_demo(mixed_port, controller.clone(), dns_listen).await?;
+                if eng
+                    .config_snapshot()
+                    .secret
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+                {
+                    let mut demo_cfg = eng.config_snapshot();
+                    demo_cfg.ensure_ephemeral_secret();
+                    if let Ok(yaml) = demo_cfg.to_yaml_string() {
+                        let _ = eng.reload_yaml(&yaml).await;
+                        generated_ephemeral = true;
+                    }
+                }
                 if let Ok(profile_mgr) =
                     proxy_core::profile::ProfileManager::open_or_init(&state_dir)
                 {
@@ -311,6 +325,10 @@ async fn main() -> Result<()> {
                 if let Some(dl) = dns_listen {
                     cfg.dns.listen = dl;
                 }
+                if cfg.secret.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                    cfg.ensure_ephemeral_secret();
+                    generated_ephemeral = true;
+                }
                 ProxyEngine::start_with_path(cfg, Some(path)).await?
             } else {
                 let profile_mgr = proxy_core::profile::ProfileManager::open_or_init(&state_dir)?;
@@ -324,6 +342,10 @@ async fn main() -> Result<()> {
                 if let Some(dl) = dns_listen {
                     cfg.dns.listen = dl;
                 }
+                if cfg.secret.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                    cfg.ensure_ephemeral_secret();
+                    generated_ephemeral = true;
+                }
                 let eng = ProxyEngine::start_with_path(cfg, Some(active_path)).await?;
                 eng.attach_profile_manager(profile_mgr);
                 eng
@@ -333,6 +355,13 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let (api_addr, _api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
+
+            let active_secret = engine.config_snapshot().secret;
+            if generated_ephemeral && let Some(sec) = active_secret.as_deref() {
+                tracing::info!(
+                    "Generated ephemeral 256-bit controller secret; authenticated Web UI: http://{api_addr}/#secret={sec}"
+                );
+            }
 
             println!("================================================================");
             println!("  rust-clash v{} is running!", env!("CARGO_PKG_VERSION"));
@@ -344,7 +373,12 @@ async fn main() -> Result<()> {
                 "  TUN Runtime Mode              : {}",
                 engine.tun_mode().as_str()
             );
-            println!("  Web Console & Control API     : http://{api_addr}");
+            if generated_ephemeral && let Some(sec) = active_secret.as_deref() {
+                println!("  Web Console & Control API     : http://{api_addr}/#secret={sec}");
+                println!("  Ephemeral Bearer Secret       : {sec}");
+            } else {
+                println!("  Web Console & Control API     : http://{api_addr}");
+            }
             println!("================================================================");
 
             tokio::signal::ctrl_c()
@@ -376,13 +410,22 @@ async fn main() -> Result<()> {
                         .unwrap_or("insufficient privileges")
                 );
             }
+            let generated_ephemeral = cfg.secret.as_deref().is_none_or(|s| s.trim().is_empty());
+            if generated_ephemeral {
+                cfg.ensure_ephemeral_secret();
+            }
             cfg.tun.enable = true;
             cfg.tun.auto_route = true;
             let engine = ProxyEngine::start_with_path(cfg, Some(canon)).await?;
             let ctrl_listen = engine.config_snapshot().external_controller;
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let (_api_addr, _api_task) =
+            let (api_addr, _api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
+            if generated_ephemeral && let Some(sec) = engine.config_snapshot().secret.as_deref() {
+                tracing::info!(
+                    "Generated ephemeral 256-bit controller secret for elevated TUN helper; Web UI: http://{api_addr}/#secret={sec}"
+                );
+            }
             tokio::signal::ctrl_c()
                 .await
                 .context("failed waiting for Ctrl-C signal")?;

@@ -29,7 +29,7 @@ use crate::{
     dns::{
         upstream::{BootstrapDnsServer, DnsEndpointHost, DnsUpstream, clear_dns_upstream_pools},
         wire::{
-            DnsAnswerData, DnsQueryPacket, QTYPE_A, QTYPE_AAAA, QTYPE_HTTPS, QTYPE_SVCB,
+            DnsAnswerData, DnsQueryPacket, QTYPE_A, QTYPE_AAAA, QTYPE_HTTPS, QTYPE_PTR, QTYPE_SVCB,
             build_dns_query, extract_dns_response_meta, extract_ip_answers,
         },
     },
@@ -1882,23 +1882,37 @@ impl FakeIpDnsEngine {
             };
         }
 
+        if self.enabled
+            && self.fake_ip_mode
+            && query.question.qtype == QTYPE_PTR
+            && let Some(v4) = parse_in_addr_arpa_v4(&normalized)
+            && self.is_fake_ip(IpAddr::V4(v4))
+        {
+            if let Some(host) = self.lookup_domain(IpAddr::V4(v4)) {
+                self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(query.build_ptr_response(raw_query, 1, &host));
+            }
+            return Ok(query.build_response(raw_query, 3, 1, &[]));
+        }
+
         if self.enabled && self.fake_ip_mode && !self.should_bypass_fake_ip(&normalized) {
-            self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
-            return match query.question.qtype {
+            match query.question.qtype {
                 QTYPE_A => {
+                    self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
                     let fake_ip = self.assign_fake_ip(&normalized);
-                    Ok(query.build_response(
+                    return Ok(query.build_response(
                         raw_query,
                         0,
                         1, // 1s TTL prevents stale OS DNS cache across restarts
                         &[DnsAnswerData::A(fake_ip)],
-                    ))
+                    ));
                 }
                 QTYPE_AAAA | QTYPE_SVCB | QTYPE_HTTPS => {
-                    Ok(query.build_response(raw_query, 0, 1, &[]))
+                    self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(query.build_response(raw_query, 0, 1, &[]));
                 }
-                _ => Ok(query.build_response(raw_query, 0, 1, &[])),
-            };
+                _ => {}
+            }
         }
 
         // Check TTL-aware wire packet cache (`redir-host` / `normal` / bypassed domains)
@@ -2091,9 +2105,26 @@ async fn handle_local_tcp_dns_conn(
     Ok(())
 }
 
+fn parse_in_addr_arpa_v4(normalized: &str) -> Option<Ipv4Addr> {
+    let prefix = normalized.strip_suffix(".in-addr.arpa")?;
+    let mut octets = [0u8; 4];
+    let mut parts = prefix.split('.');
+    for slot in octets.iter_mut().rev() {
+        let part = parts.next()?;
+        *slot = part.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Ipv4Addr::from(octets))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::wire::{
+        QCLASS_IN, QTYPE_MX, QTYPE_TXT, decode_domain_name, encode_domain_name,
+    };
 
     #[tokio::test]
     async fn fake_ip_allocates_deterministic_ip_and_restores_domain() {
@@ -2129,6 +2160,91 @@ mod tests {
         assert!(engine.should_bypass_fake_ip("router.lan"));
         assert!(engine.should_bypass_fake_ip("www.msftconnecttest.com"));
         assert!(!engine.should_bypass_fake_ip("openai.com"));
+    }
+
+    #[tokio::test]
+    async fn fake_ip_handles_ptr_and_forwards_txt_mx_upstream() {
+        let upstream_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = upstream_sock.recv_from(&mut buf).await.unwrap();
+                let req = &buf[..n];
+                let parsed = DnsQueryPacket::parse(req).unwrap();
+                let resp = match parsed.question.qtype {
+                    QTYPE_TXT => parsed.build_response(
+                        req,
+                        0,
+                        120,
+                        &[DnsAnswerData::Txt("v=spf1 -all".to_string())],
+                    ),
+                    QTYPE_MX => {
+                        let mut mx_rdata = BytesMut::new();
+                        mx_rdata.put_u16(10);
+                        encode_domain_name("mx1.example.com", &mut mx_rdata);
+
+                        let mut out = BytesMut::new();
+                        out.put_u16(parsed.id);
+                        out.put_u16(0x8180);
+                        out.put_u16(1);
+                        out.put_u16(1);
+                        out.put_u16(0);
+                        out.put_u16(0);
+                        out.put_slice(&req[12..parsed.question.end_offset]);
+                        out.put_u16(0xC00C);
+                        out.put_u16(QTYPE_MX);
+                        out.put_u16(QCLASS_IN);
+                        out.put_u32(120);
+                        out.put_u16(mx_rdata.len() as u16);
+                        out.put_slice(&mx_rdata);
+                        out.to_vec()
+                    }
+                    other => panic!("unexpected upstream qtype {other}"),
+                };
+                upstream_sock.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let cfg = DnsConfig {
+            nameserver: vec![upstream_addr.to_string()],
+            fallback: Vec::new(),
+            ..DnsConfig::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        // 1. A query allocates Fake-IP 198.18.0.2 and increments fake_ip_hits -> 1
+        let q_a = build_dns_query(0x1001, "mail.example.com", QTYPE_A);
+        let r_a = engine.handle_dns_packet(&q_a).await.unwrap();
+        assert_eq!(
+            extract_ip_answers(&r_a).unwrap(),
+            vec![DnsAnswerData::A(Ipv4Addr::new(198, 18, 0, 2))]
+        );
+        assert_eq!(engine.fake_ip_hits.load(Ordering::Relaxed), 1);
+
+        // 2. PTR query for 2.0.18.198.in-addr.arpa resolves locally to mail.example.com -> hits = 2
+        let q_ptr = build_dns_query(0x1002, "2.0.18.198.in-addr.arpa", QTYPE_PTR);
+        let r_ptr = engine.handle_dns_packet(&q_ptr).await.unwrap();
+        let ptr_q = DnsQueryPacket::parse(&r_ptr).unwrap();
+        assert_eq!(u16::from_be_bytes([r_ptr[6], r_ptr[7]]), 1); // ANCOUNT == 1
+        let rdata_offset = ptr_q.question.end_offset + 12; // 2B ptr + 2B type + 2B class + 4B ttl + 2B rdlen
+        let (ptr_target, _) = decode_domain_name(&r_ptr, rdata_offset).unwrap();
+        assert_eq!(ptr_target, "mail.example.com");
+        assert_eq!(engine.fake_ip_hits.load(Ordering::Relaxed), 2);
+
+        // 3. TXT and MX queries are NOT swallowed as empty NOERROR by Fake-IP and forward upstream
+        let q_txt = build_dns_query(0x1003, "mail.example.com", QTYPE_TXT);
+        let r_txt = engine.handle_dns_packet(&q_txt).await.unwrap();
+        assert_eq!(u16::from_be_bytes([r_txt[6], r_txt[7]]), 1);
+        assert_eq!(engine.fake_ip_hits.load(Ordering::Relaxed), 2);
+
+        let q_mx = build_dns_query(0x1004, "mail.example.com", QTYPE_MX);
+        let r_mx = engine.handle_dns_packet(&q_mx).await.unwrap();
+        assert_eq!(u16::from_be_bytes([r_mx[6], r_mx[7]]), 1);
+        assert_eq!(engine.fake_ip_hits.load(Ordering::Relaxed), 2);
+
+        upstream_task.await.unwrap();
     }
 
     #[test]

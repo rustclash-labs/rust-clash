@@ -99,8 +99,23 @@ export const App: React.FC = () => {
 
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [demoExitBusy, setDemoExitBusy] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+
+  const handleApiError = useCallback((err: unknown) => {
+    if (err instanceof ApiHttpError && err.status === 401) {
+      setAuthRequired(true);
+      setOnline(true);
+      setLoadError(null);
+      return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    setLoadError(msg);
+    if (!(err instanceof ApiHttpError)) {
+      setOnline(false);
+    }
+  }, []);
 
   const handleChangeTheme = useCallback((next: "light" | "dark") => {
     setTheme(next);
@@ -153,6 +168,7 @@ export const App: React.FC = () => {
       setConnections(conns);
       setAuthRequired(false);
       setOnline(true);
+      setLoadError(null);
 
       try {
         const prof = await clashApi.getProfiles();
@@ -161,14 +177,9 @@ export const App: React.FC = () => {
         // optional profile endpoint on read-only/minimal cores
       }
     } catch (err) {
-      if (err instanceof ApiHttpError && err.status === 401) {
-        setAuthRequired(true);
-        setOnline(true);
-      } else {
-        setOnline(false);
-      }
+      handleApiError(err);
     }
-  }, []);
+  }, [handleApiError]);
 
   useEffect(() => {
     let cancelled = false;
@@ -205,12 +216,12 @@ export const App: React.FC = () => {
     void clashApi
       .getTrafficSnapshot()
       .then((snap) => setTrafficHistory(snap.history))
-      .catch(() => undefined);
+      .catch(handleApiError);
     void clashApi
       .getLogsSnapshot()
       .then((snap) => setLogs(snap.logs))
-      .catch(() => undefined);
-  }, [apiReady, refreshCore, wsEpoch]);
+      .catch(handleApiError);
+  }, [apiReady, handleApiError, refreshCore, wsEpoch]);
 
   useEffect(() => {
     if (!pageVisible || !androidBridge.isAvailable()) return;
@@ -237,8 +248,12 @@ export const App: React.FC = () => {
         if (document.hidden) return;
         void clashApi
           .getTrafficSnapshot()
-          .then((snap) => setTrafficHistory(snap.history))
-          .catch(() => undefined);
+          .then((snap) => {
+            setTrafficHistory(snap.history);
+            setOnline(true);
+            setLoadError(null);
+          })
+          .catch(handleApiError);
       }, 2000);
     };
 
@@ -288,7 +303,7 @@ export const App: React.FC = () => {
       stopFallbackPolling();
       if (ws) ws.close();
     };
-  }, [apiReady, pageVisible, authRequired, wsEpoch]);
+  }, [apiReady, pageVisible, authRequired, wsEpoch, handleApiError]);
 
   // Live WebSocket stream for `/connections` with HTTP fallback
   useEffect(() => {
@@ -310,14 +325,9 @@ export const App: React.FC = () => {
             setConnections(c);
             setAuthRequired(false);
             setOnline(true);
+            setLoadError(null);
           })
-          .catch((err) => {
-            if (err instanceof ApiHttpError && err.status === 401) {
-              setAuthRequired(true);
-            } else {
-              setOnline(false);
-            }
-          });
+          .catch(handleApiError);
       }, 2500);
     };
 
@@ -370,7 +380,7 @@ export const App: React.FC = () => {
       stopFallbackPolling();
       if (ws) ws.close();
     };
-  }, [apiReady, pageVisible, authRequired, wsEpoch]);
+  }, [apiReady, pageVisible, authRequired, wsEpoch, handleApiError]);
 
   // Live WebSocket stream for `/logs`
   useEffect(() => {
@@ -886,6 +896,37 @@ export const App: React.FC = () => {
             </div>
           )}
 
+          {loadError && !authRequired && (
+            <div
+              className="banner banner-err"
+              role="alert"
+            >
+              <span>
+                <strong>
+                  {tr("控制器连接异常：", "Controller connection error: ")}
+                </strong>
+                {loadError}
+              </span>
+              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => void refreshCore()}
+                >
+                  <RefreshIcon size={12} />
+                  <span>{tr("重试", "Retry")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => setLoadError(null)}
+                >
+                  {tr("关闭", "Dismiss")}
+                </button>
+              </div>
+            </div>
+          )}
+
           {authRequired && (
             <form
               onSubmit={handleSaveSecret}
@@ -997,8 +1038,13 @@ export const App: React.FC = () => {
               connections={connections}
               latestTraffic={latestTraffic}
               onRefresh={async () => {
-                const c = await clashApi.getConnections();
-                setConnections(c);
+                try {
+                  const c = await clashApi.getConnections();
+                  setConnections(c);
+                  setLoadError(null);
+                } catch (err) {
+                  handleApiError(err);
+                }
               }}
             />
           )}

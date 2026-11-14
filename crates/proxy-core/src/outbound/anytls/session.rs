@@ -31,13 +31,26 @@ use crate::{
 };
 
 const MAX_DATA_CHUNK: usize = 32 * 1024;
+const SESSION_OUTBOUND_QUEUE_CAP: usize = 256;
+const STREAM_INBOUND_QUEUE_CAP: usize = 256;
+const STREAM_INBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+const V1_COLD_SESSION_DETECT_TIMEOUT: Duration = Duration::from_millis(1500);
+const V2_SYNACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-enum OutgoingReq {
+enum OutboundCmd {
     /// First stream batch on a brand-new session (`cmdSettings + cmdSYN + cmdPSH(SocksAddr)`)
     /// or subsequent stream open (`cmdSYN + cmdPSH(SocksAddr)`).
     RawBatch(BytesMut),
     Frame(Frame),
 }
+
+type ReservePermitFut = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<OutboundCmd>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
 
 /// Shared pool metadata passed into each `AnyTlsClientSession` so pre-handoff TLS connections
 /// can never be returned to the idle pool after `AnyTlsSessionPool::on_network_change()`.
@@ -58,8 +71,9 @@ pub struct AnyTlsClientSession {
     active_streams: AtomicU32,
     healthy: AtomicBool,
     negotiated_v2: AtomicBool,
-    tx: mpsc::UnboundedSender<OutgoingReq>,
-    streams: Arc<DashMap<u32, mpsc::UnboundedSender<io::Result<Bytes>>>>,
+    v2_notify: Notify,
+    tx: mpsc::Sender<OutboundCmd>,
+    streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>>,
     synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>>,
     preconnect_pong: Mutex<Option<oneshot::Sender<io::Result<()>>>>,
     pool_return: Arc<Mutex<Vec<IdleSessionEntry>>>,
@@ -128,87 +142,24 @@ impl AnyTlsClientSession {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn connect_with_payload_and_dns(
-        seq: u64,
-        server_host: &str,
-        server_port: u16,
-        sni: &str,
-        password: &str,
-        tls_connector: &TlsConnector,
+    fn spawn_io_tasks(
+        self: &Arc<Self>,
+        tls_stream: TlsStream<TcpStream>,
+        mut rx: mpsc::Receiver<OutboundCmd>,
+        scheme_snapshot: PaddingScheme,
         shared_scheme: Arc<RwLock<PaddingScheme>>,
-        pool_ctx: SessionPoolContext,
-        initial_target: &TargetAddr,
-        initial_payload: &[u8],
-        dns: Option<&crate::dns::FakeIpDnsEngine>,
-    ) -> io::Result<(Arc<Self>, AnyTlsStream)> {
-        let tcp = crate::platform::socket_protect::protected_tcp_connect_host_with_dns(
-            server_host,
-            server_port,
-            dns,
-        )
-        .await?;
-        let server_name = crate::crypto::tls::parse_server_name(sni)?;
-        let mut tls_stream: TlsStream<TcpStream> = tls_connector.connect(server_name, tcp).await?;
-
-        let scheme_snapshot = shared_scheme.read().clone();
-
-        // Packet 0: Authentication `sha256(password) [32B] | padding0_len [u16 BE] | padding0`
-        let pw_hash = digest(&SHA256, password.as_bytes());
-        let pad0_len = scheme_snapshot.sample_padding0_len();
-        let mut auth_pkt = BytesMut::with_capacity(34 + pad0_len as usize);
-        auth_pkt.put_slice(pw_hash.as_ref());
-        auth_pkt.put_u16(pad0_len);
-        auth_pkt.put_bytes(0, pad0_len as usize);
-        tls_stream.write_all(&auth_pkt).await?;
-        tls_stream.flush().await?;
-
+    ) {
         let (mut rd, mut wr) = tokio::io::split(tls_stream);
-        let (tx, mut rx) = mpsc::unbounded_channel::<OutgoingReq>();
-        let streams: Arc<DashMap<u32, mpsc::UnboundedSender<io::Result<Bytes>>>> =
-            Arc::new(DashMap::new());
-        let synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>> =
-            Arc::new(DashMap::new());
-
-        let session = Arc::new(Self {
-            seq,
-            session_epoch: pool_ctx.session_epoch,
-            pool_epoch: Arc::clone(&pool_ctx.pool_epoch),
-            // Stream 1 is opened immediately in Packet 1 alongside cmdSettings
-            next_stream_id: AtomicU32::new(2),
-            active_streams: AtomicU32::new(1),
-            healthy: AtomicBool::new(true),
-            negotiated_v2: AtomicBool::new(false),
-            tx: tx.clone(),
-            streams: Arc::clone(&streams),
-            synack_waiters: Arc::clone(&synack_waiters),
-            preconnect_pong: Mutex::new(None),
-            pool_return: Arc::clone(&pool_ctx.idle),
-            io_aborts: Mutex::new((None, None)),
-        });
-
-        // Register in pool live tracker so network changes can immediately abort the underlying TLS socket
-        {
-            let mut live_guard = pool_ctx.live.lock();
-            live_guard.retain(|w| w.strong_count() > 0);
-            live_guard.push(Arc::downgrade(&session));
-        }
-
-        // Register stream 1 before dispatching Packet 1
-        let (s1_tx, s1_rx) = mpsc::unbounded_channel();
-        streams.insert(1, s1_tx);
-        let (synack_tx, synack_rx) = oneshot::channel();
-        synack_waiters.insert(1, synack_tx);
 
         // Writer task: shapes packets 1..stop through `scheme_snapshot`
-        let session_wr = Arc::clone(&session);
+        let session_wr = Arc::clone(self);
         let wr_join = tokio::spawn(async move {
             let mut pkt_idx = 1u32;
             while let Some(req) = rx.recv().await {
                 let mut batch = BytesMut::new();
                 match req {
-                    OutgoingReq::RawBatch(b) => batch.extend_from_slice(&b),
-                    OutgoingReq::Frame(f) => {
+                    OutboundCmd::RawBatch(b) => batch.extend_from_slice(&b),
+                    OutboundCmd::Frame(f) => {
                         if f.encode_into(&mut batch).is_err() {
                             break;
                         }
@@ -217,8 +168,8 @@ impl AnyTlsClientSession {
                 // Coalesce immediately queued frames into the same logical TLS write
                 while let Ok(more) = rx.try_recv() {
                     match more {
-                        OutgoingReq::RawBatch(b) => batch.extend_from_slice(&b),
-                        OutgoingReq::Frame(f) => {
+                        OutboundCmd::RawBatch(b) => batch.extend_from_slice(&b),
+                        OutboundCmd::Frame(f) => {
                             let _ = f.encode_into(&mut batch);
                         }
                     }
@@ -243,9 +194,10 @@ impl AnyTlsClientSession {
         });
 
         // Reader task: demuxes frames, updates `shared_scheme` on `cmdUpdatePaddingScheme`, replies to heartbeats
-        let session_rd = Arc::clone(&session);
+        let session_rd = Arc::clone(self);
         let scheme_rd = Arc::clone(&shared_scheme);
-        let tx_pong = tx.clone();
+        let tx_pong = self.tx.clone();
+        let seq = self.seq;
         let rd_join = tokio::spawn(async move {
             loop {
                 match Frame::read_from(&mut rd).await {
@@ -257,15 +209,25 @@ impl AnyTlsClientSession {
                             }
                         }
                         Command::HeartRequest => {
-                            let _ = tx_pong.send(OutgoingReq::Frame(Frame::empty(
+                            let pong = OutboundCmd::Frame(Frame::empty(
                                 Command::HeartResponse,
                                 frame.stream_id,
-                            )));
+                            ));
+                            if let Err(mpsc::error::TrySendError::Full(deferred)) =
+                                tx_pong.try_send(pong)
+                            {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    tx_pong.send(deferred),
+                                )
+                                .await;
+                            }
                         }
                         Command::ServerSettings => {
                             let text = String::from_utf8_lossy(&frame.data);
                             if text.lines().any(|l| l.trim() == "v=2") {
-                                session_rd.negotiated_v2.store(true, Ordering::Relaxed);
+                                session_rd.negotiated_v2.store(true, Ordering::Release);
+                                session_rd.v2_notify.notify_waiters();
                             }
                         }
                         Command::UpdatePaddingScheme => {
@@ -303,10 +265,33 @@ impl AnyTlsClientSession {
                             {
                                 let _ = waiter.send(Ok(()));
                             }
-                            if !frame.data.is_empty()
-                                && let Some(stx) = session_rd.streams.get(&frame.stream_id)
-                            {
-                                let _ = stx.send(Ok(frame.data));
+                            if !frame.data.is_empty() {
+                                let maybe_stx = session_rd
+                                    .streams
+                                    .get(&frame.stream_id)
+                                    .map(|entry| entry.value().clone());
+                                if let Some(stx) = maybe_stx {
+                                    match stx.try_send(Ok(frame.data)) {
+                                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                        Err(mpsc::error::TrySendError::Full(item)) => {
+                                            if tokio::time::timeout(
+                                                STREAM_INBOUND_SEND_TIMEOUT,
+                                                stx.send(item),
+                                            )
+                                            .await
+                                            .is_err()
+                                                && session_rd
+                                                    .streams
+                                                    .remove(&frame.stream_id)
+                                                    .is_some()
+                                            {
+                                                let _ = tx_pong.try_send(OutboundCmd::Frame(
+                                                    Frame::empty(Command::Fin, frame.stream_id),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         Command::Fin => {
@@ -327,7 +312,110 @@ impl AnyTlsClientSession {
                 }
             }
         });
-        *session.io_aborts.lock() = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+        *self.io_aborts.lock() = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+    }
+
+    fn finish_cold_synack(
+        session: Arc<Self>,
+        stream_handle: AnyTlsStream,
+        res: Result<io::Result<()>, oneshot::error::RecvError>,
+    ) -> io::Result<(Arc<Self>, AnyTlsStream)> {
+        match res {
+            Ok(Ok(())) => Ok((session, stream_handle)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                if !session.is_healthy() {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "AnyTLS session closed during stream handshake",
+                    ))
+                } else {
+                    Ok((session, stream_handle))
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_payload_and_dns(
+        seq: u64,
+        server_host: &str,
+        server_port: u16,
+        sni: &str,
+        password: &str,
+        tls_connector: &TlsConnector,
+        shared_scheme: Arc<RwLock<PaddingScheme>>,
+        pool_ctx: SessionPoolContext,
+        initial_target: &TargetAddr,
+        initial_payload: &[u8],
+        dns: Option<&crate::dns::FakeIpDnsEngine>,
+    ) -> io::Result<(Arc<Self>, AnyTlsStream)> {
+        let tcp = crate::platform::socket_protect::protected_tcp_connect_host_with_dns(
+            server_host,
+            server_port,
+            dns,
+        )
+        .await?;
+        let server_name = crate::crypto::tls::parse_server_name(sni)?;
+        let scheme_snapshot = shared_scheme.read().clone();
+
+        // Packet 0: Authentication `sha256(password) [32B] | padding0_len [u16 BE] | padding0`
+        let pw_hash = digest(&SHA256, password.as_bytes());
+        let pad0_len = scheme_snapshot.sample_padding0_len();
+        let mut auth_pkt = BytesMut::with_capacity(34 + pad0_len as usize);
+        auth_pkt.put_slice(pw_hash.as_ref());
+        auth_pkt.put_u16(pad0_len);
+        auth_pkt.put_bytes(0, pad0_len as usize);
+
+        let tls_stream: TlsStream<TcpStream> =
+            crate::outbound::with_handshake_timeout("AnyTLS TLS/auth handshake", async {
+                let mut tls = tls_connector.connect(server_name, tcp).await?;
+                tls.write_all(&auth_pkt).await?;
+                tls.flush().await?;
+                Ok(tls)
+            })
+            .await?;
+
+        let (tx, rx) = mpsc::channel::<OutboundCmd>(SESSION_OUTBOUND_QUEUE_CAP);
+        let streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>> = Arc::new(DashMap::new());
+        let synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>> =
+            Arc::new(DashMap::new());
+
+        let session = Arc::new(Self {
+            seq,
+            session_epoch: pool_ctx.session_epoch,
+            pool_epoch: Arc::clone(&pool_ctx.pool_epoch),
+            // Stream 1 is opened immediately in Packet 1 alongside cmdSettings
+            next_stream_id: AtomicU32::new(2),
+            active_streams: AtomicU32::new(1),
+            healthy: AtomicBool::new(true),
+            negotiated_v2: AtomicBool::new(false),
+            v2_notify: Notify::new(),
+            tx: tx.clone(),
+            streams: Arc::clone(&streams),
+            synack_waiters: Arc::clone(&synack_waiters),
+            preconnect_pong: Mutex::new(None),
+            pool_return: Arc::clone(&pool_ctx.idle),
+            io_aborts: Mutex::new((None, None)),
+        });
+
+        // Register in pool live tracker so network changes can immediately abort the underlying TLS socket
+        {
+            let mut live_guard = pool_ctx.live.lock();
+            live_guard.retain(|w| w.strong_count() > 0);
+            live_guard.push(Arc::downgrade(&session));
+        }
+
+        // Register stream 1 and pre-register `v2_notify` waiter before dispatching Packet 1
+        let (s1_tx, s1_rx) = mpsc::channel(STREAM_INBOUND_QUEUE_CAP);
+        streams.insert(1, s1_tx);
+        let (synack_tx, synack_rx) = oneshot::channel();
+        synack_waiters.insert(1, synack_tx);
+        let v2_notified = session.v2_notify.notified();
+        tokio::pin!(v2_notified);
+        v2_notified.as_mut().enable();
+
+        session.spawn_io_tasks(tls_stream, rx, scheme_snapshot, Arc::clone(&shared_scheme));
 
         // Build Packet 1: `cmdSettings` + `cmdSYN(1)` + `cmdPSH(1, SocksAddr || initial_payload)`
         let settings_payload = format!(
@@ -344,7 +432,8 @@ impl AnyTlsClientSession {
         Frame::empty(Command::Syn, 1).encode_into(&mut pkt1)?;
         Frame::new(Command::Psh, 1, psh_body.freeze()).encode_into(&mut pkt1)?;
 
-        tx.send(OutgoingReq::RawBatch(pkt1))
+        tx.send(OutboundCmd::RawBatch(pkt1))
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "AnyTLS session closed"))?;
 
         let stream_handle = AnyTlsStream {
@@ -352,36 +441,37 @@ impl AnyTlsClientSession {
             stream_id: 1,
             rx: s1_rx,
             read_buf: Bytes::new(),
+            reserve_fut: Mutex::new(None),
         };
 
-        // Wait briefly for v2 SYNACK if the server sends it rapidly, or proceed cleanly for v1 compatibility:
-        // Wait: in v2, if server fails outbound connect it returns SYNACK(error); let's await SYNACK if negotiated_v2,
-        // or wait up to a short handshake window if data/SYNACK arrives!
-        // Actually, AnyTLS v2 servers send `cmdServerSettings` immediately upon `cmdSettings`, and `cmdSYNACK` once target connects!
-        // Waiting on `synack_rx` with a reasonable connect timeout (10s) catches remote connection errors before returning `connect_tcp`!
-        match tokio::time::timeout(Duration::from_secs(10), synack_rx).await {
-            Ok(Ok(Ok(()))) => Ok((session, stream_handle)),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => {
-                if !session.is_healthy() {
-                    Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "AnyTLS session closed during stream handshake",
-                    ))
-                } else {
-                    Ok((session, stream_handle))
+        // AnyTLS v2 servers reply to `cmdSettings` immediately with `cmdServerSettings("v=2")` in 1 proxy RTT,
+        // and then send `cmdSYNACK` once target dial finishes. AnyTLS v1 servers send neither `cmdServerSettings`
+        // nor `cmdSYNACK`, so bound initial v1 detection to `V1_COLD_SESSION_DETECT_TIMEOUT` while allowing up to
+        // `V2_SYNACK_TIMEOUT` once `v=2` is confirmed.
+        tokio::pin!(synack_rx);
+        if !session.is_v2_negotiated() {
+            tokio::select! {
+                res = &mut synack_rx => {
+                    return Self::finish_cold_synack(Arc::clone(&session), stream_handle, res);
+                }
+                _ = &mut v2_notified => {}
+                _ = tokio::time::sleep(V1_COLD_SESSION_DETECT_TIMEOUT) => {
+                    if !session.is_v2_negotiated() {
+                        session.synack_waiters.remove(&1);
+                        return Ok((Arc::clone(&session), stream_handle));
+                    }
                 }
             }
+        }
+
+        match tokio::time::timeout(V2_SYNACK_TIMEOUT, &mut synack_rx).await {
+            Ok(res) => Self::finish_cold_synack(Arc::clone(&session), stream_handle, res),
             Err(_) => {
-                if session.negotiated_v2.load(Ordering::Relaxed) {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "AnyTLS v2 cmdSYNACK timed out",
-                    ))
-                } else {
-                    // v1 server never sends cmdServerSettings or cmdSYNACK
-                    Ok((session, stream_handle))
-                }
+                session.synack_waiters.remove(&1);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "AnyTLS v2 cmdSYNACK timed out",
+                ))
             }
         }
     }
@@ -408,8 +498,6 @@ impl AnyTlsClientSession {
         )
         .await?;
         let server_name = crate::crypto::tls::parse_server_name(sni)?;
-        let mut tls_stream: TlsStream<TcpStream> = tls_connector.connect(server_name, tcp).await?;
-
         let scheme_snapshot = shared_scheme.read().clone();
 
         // Packet 0: Authentication `sha256(password) [32B] | padding0_len [u16 BE] | padding0`
@@ -419,13 +507,20 @@ impl AnyTlsClientSession {
         auth_pkt.put_slice(pw_hash.as_ref());
         auth_pkt.put_u16(pad0_len);
         auth_pkt.put_bytes(0, pad0_len as usize);
-        tls_stream.write_all(&auth_pkt).await?;
-        tls_stream.flush().await?;
 
-        let (mut rd, mut wr) = tokio::io::split(tls_stream);
-        let (tx, mut rx) = mpsc::unbounded_channel::<OutgoingReq>();
-        let streams: Arc<DashMap<u32, mpsc::UnboundedSender<io::Result<Bytes>>>> =
-            Arc::new(DashMap::new());
+        let tls_stream: TlsStream<TcpStream> = crate::outbound::with_handshake_timeout(
+            "AnyTLS preconnect TLS/auth handshake",
+            async {
+                let mut tls = tls_connector.connect(server_name, tcp).await?;
+                tls.write_all(&auth_pkt).await?;
+                tls.flush().await?;
+                Ok(tls)
+            },
+        )
+        .await?;
+
+        let (tx, rx) = mpsc::channel::<OutboundCmd>(SESSION_OUTBOUND_QUEUE_CAP);
+        let streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>> = Arc::new(DashMap::new());
         let synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>> =
             Arc::new(DashMap::new());
         let (pong_tx, pong_rx) = oneshot::channel();
@@ -438,6 +533,7 @@ impl AnyTlsClientSession {
             active_streams: AtomicU32::new(0),
             healthy: AtomicBool::new(true),
             negotiated_v2: AtomicBool::new(false),
+            v2_notify: Notify::new(),
             tx: tx.clone(),
             streams: Arc::clone(&streams),
             synack_waiters: Arc::clone(&synack_waiters),
@@ -452,129 +548,7 @@ impl AnyTlsClientSession {
             live_guard.push(Arc::downgrade(&session));
         }
 
-        let session_wr = Arc::clone(&session);
-        let wr_join = tokio::spawn(async move {
-            let mut pkt_idx = 1u32;
-            while let Some(req) = rx.recv().await {
-                let mut batch = BytesMut::new();
-                match req {
-                    OutgoingReq::RawBatch(b) => batch.extend_from_slice(&b),
-                    OutgoingReq::Frame(f) => {
-                        if f.encode_into(&mut batch).is_err() {
-                            break;
-                        }
-                    }
-                }
-                while let Ok(more) = rx.try_recv() {
-                    match more {
-                        OutgoingReq::RawBatch(b) => batch.extend_from_slice(&b),
-                        OutgoingReq::Frame(f) => {
-                            let _ = f.encode_into(&mut batch);
-                        }
-                    }
-                    if batch.len() >= 32 * 1024 {
-                        break;
-                    }
-                }
-                let chunks = scheme_snapshot.shape_tls_writes(&mut pkt_idx, batch);
-                let mut write_failed = false;
-                for chunk in chunks {
-                    if wr.write_all(&chunk).await.is_err() {
-                        write_failed = true;
-                        break;
-                    }
-                }
-                if write_failed || wr.flush().await.is_err() {
-                    session_wr.mark_unhealthy("TLS write error");
-                    break;
-                }
-            }
-            let _ = wr.shutdown().await;
-        });
-
-        let session_rd = Arc::clone(&session);
-        let scheme_rd = Arc::clone(&shared_scheme);
-        let tx_pong = tx.clone();
-        let rd_join = tokio::spawn(async move {
-            loop {
-                match Frame::read_from(&mut rd).await {
-                    Ok(frame) => match frame.cmd {
-                        Command::Waste => {}
-                        Command::HeartResponse => {
-                            if let Some(waiter) = session_rd.preconnect_pong.lock().take() {
-                                let _ = waiter.send(Ok(()));
-                            }
-                        }
-                        Command::HeartRequest => {
-                            let _ = tx_pong.send(OutgoingReq::Frame(Frame::empty(
-                                Command::HeartResponse,
-                                frame.stream_id,
-                            )));
-                        }
-                        Command::ServerSettings => {
-                            let text = String::from_utf8_lossy(&frame.data);
-                            if text.lines().any(|l| l.trim() == "v=2") {
-                                session_rd.negotiated_v2.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Command::UpdatePaddingScheme => {
-                            let text = String::from_utf8_lossy(&frame.data);
-                            if let Ok(new_scheme) = PaddingScheme::parse(&text) {
-                                *scheme_rd.write() = new_scheme;
-                            }
-                        }
-                        Command::Alert => {
-                            let msg = String::from_utf8_lossy(&frame.data).into_owned();
-                            tracing::warn!("AnyTLS server alert on session #{seq}: {msg}");
-                            session_rd.mark_unhealthy(&format!("AnyTLS server alert: {msg}"));
-                            break;
-                        }
-                        Command::SynAck => {
-                            if let Some((_, waiter)) =
-                                session_rd.synack_waiters.remove(&frame.stream_id)
-                            {
-                                if frame.data.is_empty() {
-                                    let _ = waiter.send(Ok(()));
-                                } else {
-                                    let err_msg = String::from_utf8_lossy(&frame.data).into_owned();
-                                    session_rd.streams.remove(&frame.stream_id);
-                                    let _ = waiter.send(Err(io::Error::new(
-                                        io::ErrorKind::ConnectionRefused,
-                                        format!("AnyTLS SYNACK error: {err_msg}"),
-                                    )));
-                                }
-                            }
-                        }
-                        Command::Psh => {
-                            if let Some((_, waiter)) =
-                                session_rd.synack_waiters.remove(&frame.stream_id)
-                            {
-                                let _ = waiter.send(Ok(()));
-                            }
-                            if !frame.data.is_empty()
-                                && let Some(stx) = session_rd.streams.get(&frame.stream_id)
-                            {
-                                let _ = stx.send(Ok(frame.data));
-                            }
-                        }
-                        Command::Fin => {
-                            if let Some((_, waiter)) =
-                                session_rd.synack_waiters.remove(&frame.stream_id)
-                            {
-                                let _ = waiter.send(Ok(()));
-                            }
-                            session_rd.streams.remove(&frame.stream_id);
-                        }
-                        Command::Syn | Command::Settings => {}
-                    },
-                    Err(err) => {
-                        session_rd.mark_unhealthy(&format!("session read closed: {err}"));
-                        break;
-                    }
-                }
-            }
-        });
-        *session.io_aborts.lock() = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+        session.spawn_io_tasks(tls_stream, rx, scheme_snapshot, Arc::clone(&shared_scheme));
 
         // Packet 1: `cmdSettings` + `cmdHeartRequest(0)`.
         // Server processes `cmdSettings` (pushing `ServerSettings` + optional `UpdatePaddingScheme`)
@@ -589,7 +563,7 @@ impl AnyTlsClientSession {
         Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
         Frame::empty(Command::HeartRequest, 0).encode_into(&mut pkt1)?;
 
-        if tx.send(OutgoingReq::RawBatch(pkt1)).is_err() {
+        if tx.send(OutboundCmd::RawBatch(pkt1)).await.is_err() {
             session.abort_for_network_change();
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -660,10 +634,16 @@ impl AnyTlsClientSession {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 
-        let (stx, srx) = mpsc::unbounded_channel();
+        let (stx, srx) = mpsc::channel(STREAM_INBOUND_QUEUE_CAP);
         self.streams.insert(stream_id, stx);
-        let (synack_tx, synack_rx) = oneshot::channel();
-        self.synack_waiters.insert(stream_id, synack_tx);
+        let is_v2 = self.is_v2_negotiated();
+        let maybe_synack_rx = if is_v2 {
+            let (synack_tx, synack_rx) = oneshot::channel();
+            self.synack_waiters.insert(stream_id, synack_tx);
+            Some(synack_rx)
+        } else {
+            None
+        };
 
         let mut psh_body = BytesMut::with_capacity(32 + initial_payload.len());
         psh_body.extend_from_slice(&target.to_socks5_bytes()?);
@@ -673,7 +653,7 @@ impl AnyTlsClientSession {
         Frame::empty(Command::Syn, stream_id).encode_into(&mut batch)?;
         Frame::new(Command::Psh, stream_id, psh_body.freeze()).encode_into(&mut batch)?;
 
-        if self.tx.send(OutgoingReq::RawBatch(batch)).is_err() {
+        if self.tx.send(OutboundCmd::RawBatch(batch)).await.is_err() {
             self.streams.remove(&stream_id);
             self.synack_waiters.remove(&stream_id);
             self.active_streams.fetch_sub(1, Ordering::SeqCst);
@@ -688,20 +668,24 @@ impl AnyTlsClientSession {
             stream_id,
             rx: srx,
             read_buf: Bytes::new(),
+            reserve_fut: Mutex::new(None),
         };
 
-        if self.negotiated_v2.load(Ordering::Relaxed) {
-            match tokio::time::timeout(Duration::from_secs(10), synack_rx).await {
+        if let Some(synack_rx) = maybe_synack_rx {
+            match tokio::time::timeout(V2_SYNACK_TIMEOUT, synack_rx).await {
                 Ok(Ok(Ok(()))) => Ok(stream_handle),
                 Ok(Ok(Err(e))) => Err(e),
                 Ok(Err(_)) => Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     "AnyTLS session dropped while opening multiplexed stream",
                 )),
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "AnyTLS v2 cmdSYNACK timed out on reused session",
-                )),
+                Err(_) => {
+                    self.synack_waiters.remove(&stream_id);
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "AnyTLS v2 cmdSYNACK timed out on reused session",
+                    ))
+                }
             }
         } else {
             Ok(stream_handle)
@@ -713,12 +697,12 @@ impl AnyTlsClientSession {
     }
 
     pub fn is_v2_negotiated(&self) -> bool {
-        self.negotiated_v2.load(Ordering::Relaxed)
+        self.negotiated_v2.load(Ordering::Acquire)
     }
 
     pub fn send_ping(&self) -> bool {
         self.tx
-            .send(OutgoingReq::Frame(Frame::empty(Command::HeartRequest, 0)))
+            .try_send(OutboundCmd::Frame(Frame::empty(Command::HeartRequest, 0)))
             .is_ok()
     }
 
@@ -742,7 +726,7 @@ impl AnyTlsClientSession {
             let stream_keys: Vec<u32> = self.streams.iter().map(|e| *e.key()).collect();
             for k in stream_keys {
                 if let Some((_, stx)) = self.streams.remove(&k) {
-                    let _ = stx.send(Err(io::Error::new(
+                    let _ = stx.try_send(Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
                         reason.to_string(),
                     )));
@@ -779,9 +763,15 @@ impl AnyTlsClientSession {
         self.synack_waiters.remove(&stream_id);
         let was_present = self.streams.remove(&stream_id).is_some();
         if was_present && self.is_healthy() {
-            let _ = self
-                .tx
-                .send(OutgoingReq::Frame(Frame::empty(Command::Fin, stream_id)));
+            let fin_cmd = OutboundCmd::Frame(Frame::empty(Command::Fin, stream_id));
+            if let Err(mpsc::error::TrySendError::Full(cmd)) = self.tx.try_send(fin_cmd)
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                let tx_fin = self.tx.clone();
+                handle.spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), tx_fin.send(cmd)).await;
+                });
+            }
         }
         let prev = self.active_streams.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
@@ -806,8 +796,9 @@ impl AnyTlsClientSession {
 pub struct AnyTlsStream {
     session: Arc<AnyTlsClientSession>,
     stream_id: u32,
-    rx: mpsc::UnboundedReceiver<io::Result<Bytes>>,
+    rx: mpsc::Receiver<io::Result<Bytes>>,
     read_buf: Bytes,
+    reserve_fut: Mutex<Option<ReservePermitFut>>,
 }
 
 impl AnyTlsStream {
@@ -858,29 +849,69 @@ impl AsyncRead for AnyTlsStream {
 impl AsyncWrite for AnyTlsStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if !self.session.is_healthy() {
+        if !this.session.is_healthy() {
+            *this.reserve_fut.get_mut() = None;
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "AnyTLS session closed",
             )));
         }
-        let n = buf.len().min(MAX_DATA_CHUNK);
-        let frame = Frame::new(
-            Command::Psh,
-            self.stream_id,
-            Bytes::copy_from_slice(&buf[..n]),
-        );
-        self.session
-            .tx
-            .send(OutgoingReq::Frame(frame))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "AnyTLS writer closed"))?;
-        Poll::Ready(Ok(n))
+
+        loop {
+            if let Some(fut) = this.reserve_fut.get_mut().as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(permit)) => {
+                        *this.reserve_fut.get_mut() = None;
+                        let n = buf.len().min(MAX_DATA_CHUNK);
+                        let frame = Frame::new(
+                            Command::Psh,
+                            this.stream_id,
+                            Bytes::copy_from_slice(&buf[..n]),
+                        );
+                        permit.send(OutboundCmd::Frame(frame));
+                        return Poll::Ready(Ok(n));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        *this.reserve_fut.get_mut() = None;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "AnyTLS writer closed",
+                        )));
+                    }
+                }
+            }
+
+            match this.session.tx.try_reserve() {
+                Ok(permit) => {
+                    let n = buf.len().min(MAX_DATA_CHUNK);
+                    let frame = Frame::new(
+                        Command::Psh,
+                        this.stream_id,
+                        Bytes::copy_from_slice(&buf[..n]),
+                    );
+                    permit.send(OutboundCmd::Frame(frame));
+                    return Poll::Ready(Ok(n));
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "AnyTLS writer closed",
+                    )));
+                }
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    *this.reserve_fut.get_mut() =
+                        Some(Box::pin(this.session.tx.clone().reserve_owned()));
+                }
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
