@@ -25,7 +25,20 @@ dns:
   fake-ip-filter:
     - localhost
     - "*.lan"
+    - "*.local"
+    - "*.home.arpa"
     - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - connectivitycheck.gstatic.com
+    - captive.apple.com
+    - "+.stun.*.*"
+    - "+.stun.*.*.*"
+    - "+.stun.*.*.*.*"
+    - "+.stun6.*.*"
+    - "+.stun6.*.*.*"
+    - "stun*.l.google.com"
+    - "+.pool.ntp.org"
+    - "time.*.com"
   default-nameserver:
     - 1.1.1.1:53
     - 223.5.5.5:53

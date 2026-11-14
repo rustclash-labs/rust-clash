@@ -941,6 +941,30 @@ pub fn protected_udp_bind(
         Some(Protocol::UDP),
     )?;
     global_socket_protector().protect_udp(&sock, remote_hint)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{SOCKET, WSAIoctl};
+        const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+        let raw = sock.as_raw_socket() as SOCKET;
+        let enable: i32 = 0;
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: `raw` is a valid Winsock UDP `SOCKET` owned by `sock`, `enable` is a 4-byte `BOOL` (`FALSE`),
+        // and `bytes_returned` is a valid `DWORD` out-pointer per MSDN `SIO_UDP_CONNRESET` documentation.
+        unsafe {
+            let _ = WSAIoctl(
+                raw,
+                SIO_UDP_CONNRESET,
+                (&raw const enable).cast(),
+                std::mem::size_of::<i32>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &raw mut bytes_returned,
+                std::ptr::null_mut(),
+                None,
+            );
+        }
+    }
     sock.set_nonblocking(true)?;
     sock.bind(&bind_addr.into())?;
     let std_udp: std::net::UdpSocket = sock.into();

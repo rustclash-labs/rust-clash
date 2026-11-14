@@ -27,7 +27,7 @@ export function detectDefaultLang(): Lang {
     typeof navigator !== "undefined" && typeof navigator.language === "string"
       ? navigator.language
       : "zh-CN";
-  return navLang.startsWith("zh") ? "zh" : "zh";
+  return navLang.toLowerCase().startsWith("zh") ? "zh" : "en";
 }
 
 export function loadInitialTheme(): "light" | "dark" {

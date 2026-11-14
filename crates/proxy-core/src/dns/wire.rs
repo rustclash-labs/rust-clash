@@ -314,16 +314,24 @@ pub fn extract_ip_answers(buf: &[u8]) -> Result<Vec<DnsAnswerData>> {
 }
 
 pub fn encode_domain_name(domain: &str, out: &mut BytesMut) {
-    let clean = domain.trim().trim_end_matches('.');
+    let clean = domain.trim().trim_matches('.');
     if clean.is_empty() {
         out.put_u8(0);
         return;
     }
+    let mut wire_bytes = 1usize; // terminating root 0x00
     for label in clean.split('.') {
         let bytes = label.as_bytes();
+        if bytes.is_empty() {
+            continue;
+        }
         let len = bytes.len().min(63);
+        if wire_bytes + 1 + len > 255 {
+            break;
+        }
         out.put_u8(len as u8);
         out.put_slice(&bytes[..len]);
+        wire_bytes += 1 + len;
     }
     out.put_u8(0);
 }
@@ -333,6 +341,7 @@ pub fn decode_domain_name(buf: &[u8], start: usize) -> Result<(String, usize)> {
     let mut pos = start;
     let mut end_pos = None;
     let mut jumps = 0usize;
+    let mut total_wire_len = 1usize; // terminating root 0x00
 
     loop {
         if pos >= buf.len() {
@@ -353,6 +362,11 @@ pub fn decode_domain_name(buf: &[u8], start: usize) -> Result<(String, usize)> {
                 end_pos = Some(pos + 2);
             }
             let offset = (((len & 0x3F) as usize) << 8) | (buf[pos + 1] as usize);
+            if offset >= pos {
+                return Err(ProxyError::Dns(
+                    "invalid forward or self-referencing DNS compression pointer".into(),
+                ));
+            }
             jumps += 1;
             if jumps > 16 {
                 return Err(ProxyError::Dns(
@@ -366,6 +380,10 @@ pub fn decode_domain_name(buf: &[u8], start: usize) -> Result<(String, usize)> {
             return Err(ProxyError::Dns("unsupported DNS label flag".into()));
         }
         let label_len = len as usize;
+        total_wire_len = total_wire_len
+            .checked_add(1 + label_len)
+            .filter(|&n| n <= 255)
+            .ok_or_else(|| ProxyError::Dns("DNS domain name exceeds 255 octets".into()))?;
         pos += 1;
         if pos + label_len > buf.len() {
             return Err(ProxyError::Dns("truncated DNS label".into()));
@@ -378,4 +396,81 @@ pub fn decode_domain_name(buf: &[u8], start: usize) -> Result<(String, usize)> {
     }
 
     Ok((labels.join("."), end_pos.unwrap_or(pos)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_rejects_forward_and_self_compression_pointers_and_overlong_names() {
+        // Self-referencing pointer at offset 12 (`0xC0 0x0C`)
+        let mut self_ptr = vec![0u8; 12];
+        self_ptr.extend_from_slice(&[0xC0, 0x0C]);
+        assert!(decode_domain_name(&self_ptr, 12).is_err());
+
+        // Forward pointer at offset 12 pointing to offset 16 (`0xC0 0x10`)
+        let mut fwd_ptr = vec![0u8; 12];
+        fwd_ptr.extend_from_slice(&[0xC0, 0x10, 0x03, b'c', b'o', b'm', 0x00]);
+        assert!(decode_domain_name(&fwd_ptr, 12).is_err());
+
+        // Overlong domain > 255 octets on wire is truncated safely at encode time and parses cleanly
+        let overlong_domain = format!(
+            "{}.{}.{}.{}.example.com",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        );
+        let q = build_dns_query(0x1234, &overlong_domain, QTYPE_A);
+        let parsed = DnsQueryPacket::parse(&q).unwrap();
+        assert_eq!(parsed.question.qtype, QTYPE_A);
+        assert!(parsed.question.name.len() <= 253);
+    }
+
+    #[test]
+    fn wire_extracts_rcode_and_cname_chain_answers() {
+        let q = build_dns_query(0x4242, "alias.example.com", QTYPE_A);
+        let parsed_q = DnsQueryPacket::parse(&q).unwrap();
+        let servfail = parsed_q.build_response(&q, 2, 0, &[]);
+        assert_eq!(dns_response_rcode(&servfail).unwrap(), 2);
+
+        // Build synthetic DNS response with CNAME alias.example.com -> real.example.com + A 93.184.216.34
+        let mut pkt = BytesMut::new();
+        pkt.put_u16(0x4242);
+        pkt.put_u16(0x8180); // QR=1, RCODE=0
+        pkt.put_u16(1); // QDCOUNT
+        pkt.put_u16(2); // ANCOUNT
+        pkt.put_u16(0);
+        pkt.put_u16(0);
+        encode_domain_name("alias.example.com", &mut pkt);
+        pkt.put_u16(QTYPE_A);
+        pkt.put_u16(QCLASS_IN);
+
+        // Answer 1: CNAME -> real.example.com
+        encode_domain_name("alias.example.com", &mut pkt);
+        pkt.put_u16(QTYPE_CNAME);
+        pkt.put_u16(QCLASS_IN);
+        pkt.put_u32(120);
+        let mut cname_rdata = BytesMut::new();
+        encode_domain_name("real.example.com", &mut cname_rdata);
+        pkt.put_u16(cname_rdata.len() as u16);
+        pkt.put_slice(&cname_rdata);
+
+        // Answer 2: A real.example.com -> 93.184.216.34
+        encode_domain_name("real.example.com", &mut pkt);
+        pkt.put_u16(QTYPE_A);
+        pkt.put_u16(QCLASS_IN);
+        pkt.put_u32(60);
+        pkt.put_u16(4);
+        pkt.put_slice(&Ipv4Addr::new(93, 184, 216, 34).octets());
+
+        let meta = extract_dns_response_meta(&pkt).unwrap();
+        assert_eq!(meta.rcode, 0);
+        assert_eq!(meta.min_ttl, Some(60));
+        assert_eq!(
+            meta.answers,
+            vec![DnsAnswerData::A(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+    }
 }

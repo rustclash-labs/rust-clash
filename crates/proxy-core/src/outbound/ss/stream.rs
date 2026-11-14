@@ -328,16 +328,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
         // First flush any previously queued ciphertext chunk completely
         if !this.write_buf.is_empty() {
             match this.flush_write_buf(cx) {
-                Poll::Ready(Ok(())) => {
-                    if this.pending_plain_len > 0 {
-                        let done = this.pending_plain_len;
-                        this.pending_plain_len = 0;
-                        return Poll::Ready(Ok(done));
-                    }
-                }
+                Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
+        }
+        if this.pending_plain_len > 0 {
+            let done = this.pending_plain_len;
+            this.pending_plain_len = 0;
+            return Poll::Ready(Ok(done));
         }
 
         let max_chunk = this.max_chunk_size();

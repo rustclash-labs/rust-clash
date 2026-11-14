@@ -144,19 +144,64 @@ pub fn enable_system_proxy(
     Ok(query_sysproxy_status(state_dir))
 }
 
-/// Restore the original OS System Proxy settings recorded in `network_recovery.json`.
-pub fn disable_system_proxy(state_dir: &Path) -> io::Result<SysProxyStatus> {
-    let record_opt = RecoveryJournal::load_from(state_dir)
+fn load_current_pid_sysproxy_backup(state_dir: &Path) -> Option<SysProxyRecoveryRecord> {
+    RecoveryJournal::load_from(state_dir)
         .ok()
         .flatten()
-        .and_then(|j| j.sysproxy);
+        .filter(|j| j.pid == std::process::id())
+        .and_then(|j| j.sysproxy)
+}
 
-    if let Some(rec) = record_opt {
+fn parse_macos_bypass_domains_output(out: &str) -> Option<Vec<String>> {
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed
+        .to_ascii_lowercase()
+        .contains("there aren't any bypass domains")
+    {
+        return Some(Vec::new());
+    }
+    let domains: Vec<String> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && (!l.starts_with('*') || l.starts_with("*.")))
+        .map(ToString::to_string)
+        .collect();
+    Some(domains)
+}
+
+/// Restore the original OS System Proxy settings recorded in `network_recovery.json`.
+pub fn disable_system_proxy(state_dir: &Path) -> io::Result<SysProxyStatus> {
+    let loaded = RecoveryJournal::load_from(state_dir).ok().flatten();
+    if let Some(ref j) = loaded
+        && j.pid != std::process::id()
+        && crate::platform::recovery::is_pid_alive(j.pid)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "system proxy journal belongs to another live rust-clash process (PID {})",
+                j.pid
+            ),
+        ));
+    }
+
+    if let Some(j) = loaded
+        && let Some(rec) = j.sysproxy.clone()
+    {
         let mut backend = RealOsCommandBackend;
         restore_sysproxy_record_with_backend(&rec, &mut backend)?;
-        update_current_journal(state_dir, |j| {
-            j.sysproxy = None;
-        })?;
+        if j.pid == std::process::id() {
+            update_current_journal(state_dir, |cur| {
+                cur.sysproxy = None;
+            })?;
+        } else {
+            let mut updated = j;
+            updated.sysproxy = None;
+            updated.save_atomic(state_dir)?;
+        }
     }
     let _ = std::fs::remove_file(state_dir.join("sysproxy_active.json"));
     Ok(query_sysproxy_status(state_dir))
@@ -246,9 +291,33 @@ pub fn restore_sysproxy_record_with_backend<B: SysProxyCommandBackend>(
                         if svc.socks_enabled { "on" } else { "off" }.into(),
                     ],
                 );
+
+                if let Some(ref domains) = svc.bypass_domains {
+                    let mut b_args =
+                        vec!["-setproxybypassdomains".into(), svc.service_name.clone()];
+                    if domains.is_empty() {
+                        b_args.push("Empty".into());
+                    } else {
+                        b_args.extend(domains.iter().cloned());
+                    }
+                    let _ = backend.run_capture("networksetup", &b_args);
+                }
             }
         }
         "linux" => {
+            if let Some(ref ignore_hosts) = rec.linux_gnome_ignore_hosts
+                && !ignore_hosts.trim().is_empty()
+            {
+                let _ = backend.run_capture(
+                    "gsettings",
+                    &[
+                        "set".into(),
+                        "org.gnome.system.proxy".into(),
+                        "ignore-hosts".into(),
+                        ignore_hosts.trim().to_string(),
+                    ],
+                );
+            }
             let mode = rec.linux_gnome_mode.as_deref().unwrap_or("'none'");
             let cleaned = mode.trim().trim_matches('\'');
             let _ = backend.run_capture(
@@ -293,10 +362,7 @@ pub fn enable_macos_sysproxy_with_backend<B: SysProxyCommandBackend>(
         ));
     }
 
-    let existing_backup = RecoveryJournal::load_from(state_dir)
-        .ok()
-        .flatten()
-        .and_then(|j| j.sysproxy);
+    let existing_backup = load_current_pid_sysproxy_backup(state_dir);
 
     if existing_backup.is_none() {
         let mut backups = Vec::new();
@@ -313,6 +379,12 @@ pub fn enable_macos_sysproxy_with_backend<B: SysProxyCommandBackend>(
                     &["-getsocksfirewallproxy".into(), svc.clone()],
                 )
                 .unwrap_or_default();
+            let bypass_raw = backend
+                .run_capture(
+                    "networksetup",
+                    &["-getproxybypassdomains".into(), svc.clone()],
+                )
+                .unwrap_or_default();
             let (we, wh, wp) = parse_networksetup_proxy_output(&web);
             let (se, sh, sp) = parse_networksetup_proxy_output(&sweb);
             let (ke, kh, kp) = parse_networksetup_proxy_output(&socks);
@@ -327,6 +399,7 @@ pub fn enable_macos_sysproxy_with_backend<B: SysProxyCommandBackend>(
                 socks_enabled: ke,
                 socks_host: kh,
                 socks_port: kp,
+                bypass_domains: parse_macos_bypass_domains_output(&bypass_raw),
             });
         }
         update_current_journal(state_dir, |j| {
@@ -397,15 +470,25 @@ pub fn enable_linux_sysproxy_with_backend<B: SysProxyCommandBackend>(
             )
         })?;
 
-    let existing_backup = RecoveryJournal::load_from(state_dir)
-        .ok()
-        .flatten()
-        .and_then(|j| j.sysproxy);
+    let existing_backup = load_current_pid_sysproxy_backup(state_dir);
     if existing_backup.is_none() {
+        let prev_ignore_hosts = backend
+            .run_capture(
+                "gsettings",
+                &[
+                    "get".into(),
+                    "org.gnome.system.proxy".into(),
+                    "ignore-hosts".into(),
+                ],
+            )
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         update_current_journal(state_dir, |j| {
             j.sysproxy = Some(SysProxyRecoveryRecord {
                 platform: "linux".to_string(),
                 linux_gnome_mode: Some(prev_mode),
+                linux_gnome_ignore_hosts: prev_ignore_hosts,
                 ..Default::default()
             });
         })?;
@@ -424,7 +507,10 @@ pub fn enable_linux_sysproxy_with_backend<B: SysProxyCommandBackend>(
         )?;
     }
     if !bypass.is_empty() {
-        let quoted: Vec<String> = bypass.iter().map(|b| format!("'{b}'")).collect();
+        let quoted: Vec<String> = bypass
+            .iter()
+            .map(|b| format!("'{}'", b.replace('\\', "\\\\").replace('\'', "\\'")))
+            .collect();
         let list_arg = format!("[{}]", quoted.join(", "));
         let _ = backend.run_capture(
             "gsettings",
@@ -505,10 +591,7 @@ fn enable_windows_sysproxy(
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
 
-    let existing_backup = RecoveryJournal::load_from(state_dir)
-        .ok()
-        .flatten()
-        .and_then(|j| j.sysproxy);
+    let existing_backup = load_current_pid_sysproxy_backup(state_dir);
 
     if existing_backup.is_none() {
         let prev_enable = unsafe { query_reg_dword(hkey, "ProxyEnable") };
@@ -834,6 +917,91 @@ mod tests {
             mock.calls,
             vec!["gsettings set org.gnome.system.proxy mode none"]
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sysproxy_restores_macos_bypass_domains_and_linux_ignore_hosts() {
+        struct BypassMock {
+            calls: Vec<String>,
+        }
+        impl SysProxyCommandBackend for BypassMock {
+            fn run_capture(&mut self, program: &str, args: &[String]) -> io::Result<String> {
+                let cmd = format!("{program} {}", args.join(" "));
+                self.calls.push(cmd.clone());
+                if cmd == "networksetup -listallnetworkservices" {
+                    return Ok("An asterisk (*) denotes disabled.\nWi-Fi\n".into());
+                }
+                if cmd.starts_with("networksetup -getproxybypassdomains") {
+                    return Ok("*.corp.internal\n10.0.0.0/8\n".into());
+                }
+                if cmd.starts_with("networksetup -get") {
+                    return Ok("Enabled: No\nServer: \nPort: 0\n".into());
+                }
+                if cmd == "gsettings get org.gnome.system.proxy mode" {
+                    return Ok("'none'\n".into());
+                }
+                if cmd == "gsettings get org.gnome.system.proxy ignore-hosts" {
+                    return Ok("['localhost', '127.0.0.0/8', '.intranet.local']\n".into());
+                }
+                Ok(String::new())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("rc-sysproxy-bypass-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut mock = BypassMock { calls: Vec::new() };
+
+        enable_macos_sysproxy_with_backend(
+            "127.0.0.1",
+            7890,
+            &["localhost".into()],
+            &dir,
+            &mut mock,
+        )
+        .unwrap();
+        let rec_mac = RecoveryJournal::load_from(&dir)
+            .unwrap()
+            .unwrap()
+            .sysproxy
+            .unwrap();
+        assert_eq!(
+            rec_mac.macos_services[0].bypass_domains.as_deref(),
+            Some(&["*.corp.internal".to_string(), "10.0.0.0/8".to_string()][..])
+        );
+        mock.calls.clear();
+        restore_sysproxy_record_with_backend(&rec_mac, &mut mock).unwrap();
+        assert!(
+            mock.calls.iter().any(
+                |c| c == "networksetup -setproxybypassdomains Wi-Fi *.corp.internal 10.0.0.0/8"
+            )
+        );
+
+        update_current_journal(&dir, |j| j.sysproxy = None).unwrap();
+        enable_linux_sysproxy_with_backend(
+            "127.0.0.1",
+            7890,
+            &["localhost".into()],
+            &dir,
+            &mut mock,
+        )
+        .unwrap();
+        let rec_lin = RecoveryJournal::load_from(&dir)
+            .unwrap()
+            .unwrap()
+            .sysproxy
+            .unwrap();
+        assert_eq!(
+            rec_lin.linux_gnome_ignore_hosts.as_deref(),
+            Some("['localhost', '127.0.0.0/8', '.intranet.local']")
+        );
+        mock.calls.clear();
+        restore_sysproxy_record_with_backend(&rec_lin, &mut mock).unwrap();
+        assert!(mock.calls.contains(
+            &"gsettings set org.gnome.system.proxy ignore-hosts ['localhost', '127.0.0.0/8', '.intranet.local']"
+                .to_string()
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

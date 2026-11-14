@@ -232,6 +232,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let firstLen = scratch.withUnsafeMutableBufferPointer { buf -> Int in
                     rc_ne_wait_outbound_packet(handle, buf.baseAddress, buf.count, -1)
                 }
+                if firstLen == -2 {
+                    if scratch.count < 65536 {
+                        scratch = [UInt8](repeating: 0, count: 65536)
+                        continue
+                    }
+                    break
+                }
                 if firstLen < 0 {
                     // Engine stopped (`rc_ne_stop_engine` called)
                     break
@@ -250,6 +257,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 protos.reserveCapacity(64)
 
                 let appendScratchPacket: (Int) -> Void = { len in
+                    guard len > 0, len <= scratch.count else { return }
                     let data = Data(bytes: scratch, count: len)
                     let ipVer = (scratch[0] >> 4)
                     let protoFamily: Int32 = (ipVer == 6) ? AF_INET6 : AF_INET
@@ -261,16 +269,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
                 // Non-blockingly coalesce up to 63 additional queued packets into a single `writePackets` call
                 for _ in 0..<63 {
-                    let n = scratch.withUnsafeMutableBufferPointer { buf in
-                        rc_ne_pop_outbound_packet(handle, buf.baseAddress, buf.count)
+                    let n = scratch.withUnsafeMutableBufferPointer { buf -> Int in
+                        Int(rc_ne_pop_outbound_packet(handle, buf.baseAddress, buf.count))
                     }
-                    if n == 0 {
+                    if n <= 0 {
                         break
                     }
                     appendScratchPacket(n)
                 }
 
-                self.packetFlow.writePackets(batch, withProtocols: protos)
+                if !batch.isEmpty {
+                    self.packetFlow.writePackets(batch, withProtocols: protos)
+                }
             }
         }
     }

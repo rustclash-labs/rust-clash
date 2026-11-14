@@ -1073,38 +1073,11 @@ fn parse_http_response(raw: &[u8]) -> Result<ParsedHttpResponse> {
 
     let body_slice = &raw[hdr_end + 4..];
     let body = if is_chunked {
-        decode_chunked_body(body_slice)?
+        crate::config::decode_http_chunked_body(body_slice, MAX_GEODATA_DOWNLOAD_BYTES)?
     } else {
         body_slice.to_vec()
     };
     Ok((status, headers, body))
-}
-
-fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") else {
-            return Err(ProxyError::Config("truncated HTTP chunk header".into()));
-        };
-        let size_str = std::str::from_utf8(&input[..line_end])
-            .map_err(|_| ProxyError::Config("invalid HTTP chunk size".into()))?
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
-        let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| ProxyError::Config(format!("invalid chunk hex '{size_str}'")))?;
-        input = &input[line_end + 2..];
-        if size == 0 {
-            break;
-        }
-        if input.len() < size + 2 {
-            return Err(ProxyError::Config("truncated HTTP chunk payload".into()));
-        }
-        out.extend_from_slice(&input[..size]);
-        input = &input[size + 2..];
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

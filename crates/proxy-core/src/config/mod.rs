@@ -2140,25 +2140,70 @@ pub(crate) fn sanitize_loopback_external_controller(raw: &str, mixed_port: u16) 
     format!("127.0.0.1:{port}")
 }
 
+pub(crate) fn decode_http_chunked_body(mut input: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let Some(crlf) = input.windows(2).position(|w| w == b"\r\n") else {
+            return Err(ProxyError::Config("truncated HTTP chunk header".into()));
+        };
+        let len_str = std::str::from_utf8(&input[..crlf])
+            .map_err(|_| ProxyError::Config("invalid HTTP chunk size header".into()))?
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let chunk_len = usize::from_str_radix(len_str, 16)
+            .map_err(|_| ProxyError::Config("invalid chunked transfer hex length".into()))?;
+        let after_hdr = crlf
+            .checked_add(2)
+            .ok_or_else(|| ProxyError::Config("HTTP chunk header offset overflow".into()))?;
+        input = &input[after_hdr..];
+        if chunk_len == 0 {
+            if input.starts_with(b"\r\n") || input.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Ok(out);
+            }
+            return Err(ProxyError::Config(
+                "truncated HTTP terminating chunk".into(),
+            ));
+        }
+        let total_len = out
+            .len()
+            .checked_add(chunk_len)
+            .filter(|&n| n <= max_bytes)
+            .ok_or_else(|| {
+                ProxyError::Config(format!(
+                    "chunked HTTP body exceeds maximum allowed size ({max_bytes} bytes)"
+                ))
+            })?;
+        let chunk_end = chunk_len
+            .checked_add(2)
+            .ok_or_else(|| ProxyError::Config("HTTP chunk length overflow".into()))?;
+        if input.len() < chunk_end {
+            return Err(ProxyError::Config("truncated chunked HTTP payload".into()));
+        }
+        if &input[chunk_len..chunk_end] != b"\r\n" {
+            return Err(ProxyError::Config("invalid HTTP chunk delimiter".into()));
+        }
+        out.reserve(total_len.saturating_sub(out.len()));
+        out.extend_from_slice(&input[..chunk_len]);
+        input = &input[chunk_end..];
+    }
+}
+
 fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: &HashSet<String>) {
-    // Neutralize dangerous listener, authentication, secret, and privilege-escalation fields
-    // from untrusted remote subscription payloads.
+    // Neutralize dangerous listener, authentication, secret, host-path probing, and privilege-escalation
+    // fields from untrusted remote subscription payloads.
     cfg.secret = None;
     cfg.allow_lan = false;
     cfg.bind_address = "127.0.0.1".to_string();
     cfg.lan_allowed_ips.clear();
     cfg.authentication.clear();
     cfg.tun.enable = false;
+    cfg.tun.wintun_path = None;
+    cfg.mmdb_path = None;
 
     if !(576..=65535).contains(&cfg.tun.mtu) {
         cfg.tun.mtu = 1500;
-    }
-    if cfg
-        .mmdb_path
-        .as_deref()
-        .is_some_and(|p| !Path::new(p).is_file())
-    {
-        cfg.mmdb_path = None;
     }
     cfg.external_controller =
         sanitize_loopback_external_controller(&cfg.external_controller, cfg.mixed_port);
@@ -2960,13 +3005,24 @@ fn default_fake_ip_range() -> String {
     "198.18.0.0/15".to_string()
 }
 
-fn default_fake_ip_filter() -> Vec<String> {
+pub fn default_fake_ip_filter() -> Vec<String> {
     vec![
         "localhost".to_string(),
         "*.lan".to_string(),
         "*.local".to_string(),
+        "*.home.arpa".to_string(),
         "+.msftconnecttest.com".to_string(),
         "+.msftncsi.com".to_string(),
+        "connectivitycheck.gstatic.com".to_string(),
+        "captive.apple.com".to_string(),
+        "+.stun.*.*".to_string(),
+        "+.stun.*.*.*".to_string(),
+        "+.stun.*.*.*.*".to_string(),
+        "+.stun6.*.*".to_string(),
+        "+.stun6.*.*.*".to_string(),
+        "stun*.l.google.com".to_string(),
+        "+.pool.ntp.org".to_string(),
+        "time.*.com".to_string(),
     ]
 }
 
@@ -3003,7 +3059,8 @@ impl Default for DnsConfig {
 
 impl DnsConfig {
     pub fn parsed_fake_ip_net(&self) -> Result<Ipv4Net> {
-        self.fake_ip_range
+        let net = self
+            .fake_ip_range
             .parse::<Ipv4Net>()
             .map(|net| net.trunc())
             .map_err(|e| {
@@ -3011,7 +3068,15 @@ impl DnsConfig {
                     "invalid fake-ip-range '{}': {e}",
                     self.fake_ip_range
                 ))
-            })
+            })?;
+        if net.prefix_len() > 29 {
+            return Err(ProxyError::Config(format!(
+                "invalid fake-ip-range '{}': prefix length /{} is too narrow (must be <= /29 to allocate usable Fake-IPs)",
+                self.fake_ip_range,
+                net.prefix_len()
+            )));
+        }
+        Ok(net)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -4139,5 +4204,35 @@ rules:
             ) => assert_eq!(h_new, h_old),
             _ => panic!("expected Http proxy node"),
         }
+    }
+
+    #[test]
+    fn chunked_decoder_enforces_size_cap_and_default_fake_ip_filter_covers_stun_ntp_probes() {
+        let valid = b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(
+            decode_http_chunked_body(valid, 1024).unwrap(),
+            b"hello world"
+        );
+
+        let oversized_hdr = b"ffffffffffffffff\r\nx";
+        assert!(decode_http_chunked_body(oversized_hdr, 1024).is_err());
+
+        let exceeds_cap = b"a\r\n0123456789\r\n0\r\n\r\n";
+        assert!(decode_http_chunked_body(exceeds_cap, 5).is_err());
+
+        let incomplete = b"5\r\nhi";
+        assert!(decode_http_chunked_body(incomplete, 1024).is_err());
+
+        let filters = default_fake_ip_filter();
+        assert!(filters.iter().any(|p| p == "+.pool.ntp.org"));
+        assert!(filters.iter().any(|p| p == "stun*.l.google.com"));
+        assert!(filters.iter().any(|p| p == "captive.apple.com"));
+        assert!(filters.iter().any(|p| p == "connectivitycheck.gstatic.com"));
+
+        let dns_engine = crate::dns::fake_ip::FakeIpDnsEngine::new(&DnsConfig::default()).unwrap();
+        assert!(dns_engine.should_bypass_fake_ip("stun.l.google.com"));
+        assert!(dns_engine.should_bypass_fake_ip("stun1.l.google.com"));
+        assert!(dns_engine.should_bypass_fake_ip("0.cn.pool.ntp.org"));
+        assert!(dns_engine.should_bypass_fake_ip("captive.apple.com"));
     }
 }

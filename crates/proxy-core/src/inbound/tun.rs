@@ -456,6 +456,9 @@ pub fn spawn_userspace_tun(
 
             for k in finished_keys {
                 if let Some(flow) = flows.remove(&k) {
+                    if !flow.established {
+                        flow.task_abort.abort();
+                    }
                     sockets.remove(flow.handle);
                 }
             }
@@ -516,6 +519,12 @@ pub fn spawn_userspace_tun(
                 }
             }
         }
+
+        for (_, flow) in flows.drain() {
+            flow.task_abort.abort();
+            sockets.remove(flow.handle);
+        }
+        let _ = udp_nat.reset_all_sessions();
     });
 
     (
@@ -549,11 +558,16 @@ fn handle_ingress_packet(
             let Ok(ip4) = Ipv4Packet::new_checked(&pkt) else {
                 return;
             };
+            if ip4.frag_offset() != 0 || ip4.more_frags() {
+                return;
+            }
             let src_v4: Ipv4Addr = ip4.src_addr();
             let dst_v4: Ipv4Addr = ip4.dst_addr();
             match ip4.next_header() {
                 IpProtocol::Udp => {
-                    if let Ok(udp) = UdpPacket::new_checked(ip4.payload()) {
+                    if let Ok(udp) = UdpPacket::new_checked(ip4.payload())
+                        && udp.verify_checksum(&IpAddress::Ipv4(src_v4), &IpAddress::Ipv4(dst_v4))
+                    {
                         let src_port = udp.src_port();
                         let dst_port = udp.dst_port();
                         let payload = udp.payload().to_vec();
@@ -603,6 +617,9 @@ fn handle_ingress_packet(
                     let Ok(udp) = UdpPacket::new_checked(ip6.payload()) else {
                         return;
                     };
+                    if !udp.verify_checksum(&IpAddress::Ipv6(src_v6), &IpAddress::Ipv6(dst_v6)) {
+                        return;
+                    }
                     let src_port = udp.src_port();
                     let dst_port = udp.dst_port();
                     let src_addr = SocketAddr::new(IpAddr::V6(src_v6), src_port);
@@ -935,19 +952,53 @@ fn register_syn_flow(
 
         let writer_fut = async move {
             let drain_and_shutdown = async {
-                while let Some(first_chunk) = to_remote_rx.recv().await {
-                    if wr.write_all(&first_chunk).await.is_err() {
-                        return;
-                    }
-                    let mut write_failed = false;
-                    while let Ok(more) = to_remote_rx.try_recv() {
-                        if wr.write_all(&more).await.is_err() {
-                            write_failed = true;
-                            break;
+                // Coalesce client-speaks-first payload (TLS ClientHello / HTTP GET) for up to 15ms
+                // for 0-RTT proxy framing, then flush pending proxy target headers if no payload
+                // arrived so server-speaks-first protocols (SSH, SMTP, FTP, MySQL) never deadlock.
+                let mut client_eof = false;
+                match tokio::time::timeout(Duration::from_millis(15), to_remote_rx.recv()).await {
+                    Ok(Some(first_chunk)) => {
+                        if wr.write_all(&first_chunk).await.is_err() {
+                            return;
+                        }
+                        let mut write_failed = false;
+                        while let Ok(more) = to_remote_rx.try_recv() {
+                            if wr.write_all(&more).await.is_err() {
+                                write_failed = true;
+                                break;
+                            }
+                        }
+                        if write_failed || wr.flush().await.is_err() {
+                            return;
                         }
                     }
-                    if write_failed || wr.flush().await.is_err() {
-                        return;
+                    Ok(None) => {
+                        client_eof = true;
+                        if wr.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        if wr.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                if !client_eof {
+                    while let Some(first_chunk) = to_remote_rx.recv().await {
+                        if wr.write_all(&first_chunk).await.is_err() {
+                            return;
+                        }
+                        let mut write_failed = false;
+                        while let Ok(more) = to_remote_rx.try_recv() {
+                            if wr.write_all(&more).await.is_err() {
+                                write_failed = true;
+                                break;
+                            }
+                        }
+                        if write_failed || wr.flush().await.is_err() {
+                            return;
+                        }
                     }
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(2), wr.shutdown()).await;

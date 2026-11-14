@@ -522,7 +522,7 @@ mod darwin_impl {
 
             let stop_rx = Arc::clone(&stop_flag);
             let rx_cnt = Arc::clone(&rx_packets);
-            let rx_thread = std::thread::Builder::new()
+            let rx_thread = match std::thread::Builder::new()
                 .name("tun-macos-rx".into())
                 .spawn(move || {
                     let mut buf = vec![0u8; 65539];
@@ -563,11 +563,21 @@ mod darwin_impl {
                             }
                         }
                     }
-                })?;
+                }) {
+                Ok(h) => h,
+                Err(err) => {
+                    stop_flag.store(true, Ordering::Release);
+                    let _ = stop_watch_tx.send(true);
+                    rollback_macos_record(&rec);
+                    clear_global_socket_protector();
+                    let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                    return Err(err);
+                }
+            };
 
             let stop_tx = Arc::clone(&stop_flag);
             let tx_cnt = Arc::clone(&tx_packets);
-            let tx_thread = std::thread::Builder::new()
+            let tx_thread = match std::thread::Builder::new()
                 .name("tun-macos-tx".into())
                 .spawn(move || {
                     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -594,14 +604,25 @@ mod darwin_impl {
                             }
                         }
                     });
-                })?;
+                }) {
+                Ok(h) => h,
+                Err(err) => {
+                    stop_flag.store(true, Ordering::Release);
+                    let _ = stop_watch_tx.send(true);
+                    let _ = rx_thread.join();
+                    rollback_macos_record(&rec);
+                    clear_global_socket_protector();
+                    let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                    return Err(err);
+                }
+            };
 
             let stop_watch = Arc::clone(&stop_flag);
             let egress_watch = Arc::clone(&egress_snapshot);
             let transitions_watch = Arc::clone(&network_transitions);
             let dns_watch = spec.dns_engine.clone();
             let net_hook_watch = spec.network_change_hook.clone();
-            let watch_thread = std::thread::Builder::new()
+            let watch_thread = match std::thread::Builder::new()
                 .name("tun-macos-netwatch".into())
                 .spawn(move || {
                     while !stop_watch.load(Ordering::Acquire) {
@@ -628,7 +649,19 @@ mod darwin_impl {
                             }
                         }
                     }
-                })?;
+                }) {
+                Ok(h) => h,
+                Err(err) => {
+                    stop_flag.store(true, Ordering::Release);
+                    let _ = stop_watch_tx.send(true);
+                    let _ = rx_thread.join();
+                    let _ = tx_thread.join();
+                    rollback_macos_record(&rec);
+                    clear_global_socket_protector();
+                    let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                    return Err(err);
+                }
+            };
 
             Ok(Self {
                 spec,

@@ -431,16 +431,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessEncryptedStream<S> {
 
         if !self.write_buf.is_empty() {
             match self.flush_write_buf(cx) {
-                Poll::Ready(Ok(())) => {
-                    if self.pending_plain_written > 0 {
-                        let done = self.pending_plain_written;
-                        self.pending_plain_written = 0;
-                        return Poll::Ready(Ok(done));
-                    }
-                }
+                Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
+        }
+        if self.pending_plain_written > 0 {
+            let done = self.pending_plain_written;
+            self.pending_plain_written = 0;
+            return Poll::Ready(Ok(done));
         }
 
         let take = buf.len().min(MAX_WRITE_PLAINTEXT);
@@ -487,6 +486,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessEncryptedStream<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.pre_write.is_empty() {
+            let pre = std::mem::take(&mut self.pre_write);
+            if self.write_buf.is_empty() {
+                self.write_buf.extend_from_slice(&pre);
+            } else {
+                let mut combined = BytesMut::with_capacity(pre.len() + self.write_buf.len());
+                combined.extend_from_slice(&pre);
+                combined.extend_from_slice(&self.write_buf);
+                self.write_buf = combined;
+            }
+        }
         match self.flush_write_buf(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
             other => other,

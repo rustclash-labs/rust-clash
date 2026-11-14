@@ -136,6 +136,8 @@ pub struct SysProxyRecoveryRecord {
     pub windows_proxy_override: Option<String>,
     pub macos_services: Vec<MacOsProxyServiceBackup>,
     pub linux_gnome_mode: Option<String>,
+    #[serde(default)]
+    pub linux_gnome_ignore_hosts: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +152,8 @@ pub struct MacOsProxyServiceBackup {
     pub socks_enabled: bool,
     pub socks_host: String,
     pub socks_port: u16,
+    #[serde(default)]
+    pub bypass_domains: Option<Vec<String>>,
 }
 
 /// Persistent crash-recovery journal written atomically BEFORE applying host network mutations

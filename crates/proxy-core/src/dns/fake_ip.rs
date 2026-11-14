@@ -42,6 +42,7 @@ const MIN_NEGATIVE_TTL_SECS: u64 = 5;
 const MAX_NEGATIVE_TTL_SECS: u64 = 60;
 const DEFAULT_NXDOMAIN_TTL_SECS: u64 = 180;
 const MAX_NXDOMAIN_TTL_SECS: u64 = 600;
+const SERVFAIL_NEGATIVE_TTL_SECS: u64 = 2;
 const MAX_CONCURRENT_DNS_UDP_TASKS: usize = 256;
 const MAX_CONCURRENT_DNS_TCP_CONNS: usize = 128;
 const MAX_PERSISTED_FAKE_IP_ENTRIES: usize = 2048;
@@ -59,16 +60,78 @@ fn compute_negative_ttl_secs(min_neg_ttl: Option<u64>, nxdomain: bool) -> u64 {
     }
 }
 
+#[derive(Clone, Debug)]
+enum InflightOutcome {
+    Pending,
+    Resolved(std::result::Result<Vec<IpAddr>, String>),
+    Cancelled,
+}
+
+type InflightKey = (String, bool);
+type InflightMap = DashMap<InflightKey, watch::Sender<InflightOutcome>>;
+
 struct InflightLookupGuard<'a> {
-    map: &'a DashMap<String, watch::Sender<bool>>,
-    key: String,
-    tx: watch::Sender<bool>,
+    map: &'a InflightMap,
+    key: InflightKey,
+    tx: watch::Sender<InflightOutcome>,
+    completed: bool,
+}
+
+impl<'a> InflightLookupGuard<'a> {
+    fn acquire(
+        map: &'a InflightMap,
+        key: InflightKey,
+    ) -> std::result::Result<Self, watch::Receiver<InflightOutcome>> {
+        match map.entry(key.clone()) {
+            Entry::Occupied(occ) => Err(occ.get().subscribe()),
+            Entry::Vacant(vac) => {
+                let (tx, _rx) = watch::channel(InflightOutcome::Pending);
+                vac.insert(tx.clone());
+                Ok(Self {
+                    map,
+                    key,
+                    tx,
+                    completed: false,
+                })
+            }
+        }
+    }
+
+    fn finish(mut self, res: &Result<Vec<IpAddr>>) {
+        self.completed = true;
+        self.map.remove(&self.key);
+        let outcome = match res {
+            Ok(ips) => InflightOutcome::Resolved(Ok(ips.clone())),
+            Err(err) => InflightOutcome::Resolved(Err(err.to_string())),
+        };
+        let _ = self.tx.send(outcome);
+    }
 }
 
 impl Drop for InflightLookupGuard<'_> {
     fn drop(&mut self) {
-        self.map.remove(&self.key);
-        let _ = self.tx.send(true);
+        if !self.completed {
+            self.map.remove(&self.key);
+            let _ = self.tx.send(InflightOutcome::Cancelled);
+        }
+    }
+}
+
+async fn wait_for_inflight_outcome(
+    rx: &mut watch::Receiver<InflightOutcome>,
+) -> Option<Result<Vec<IpAddr>>> {
+    let wait_res = tokio::time::timeout(
+        Duration::from_secs(4),
+        rx.wait_for(|state| !matches!(state, InflightOutcome::Pending)),
+    )
+    .await;
+    let Ok(Ok(state_ref)) = wait_res else {
+        return None;
+    };
+    match &*state_ref {
+        InflightOutcome::Resolved(Ok(ips)) => Some(Ok(ips.clone())),
+        InflightOutcome::Resolved(Err(msg)) => Some(Err(ProxyError::Dns(msg.clone()))),
+        InflightOutcome::Pending | InflightOutcome::Cancelled => None,
     }
 }
 
@@ -132,6 +195,9 @@ enum CachedIpResolution {
     Negative {
         expires_at: Instant,
         nxdomain: bool,
+    },
+    TransientFailure {
+        expires_at: Instant,
     },
 }
 
@@ -486,10 +552,10 @@ pub struct FakeIpDnsEngine {
     proxy_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
     packet_cache: Mutex<LruCache<(String, u16), CachedWirePacket>>,
     bootstrap_cache: Mutex<LruCache<String, (Instant, Vec<IpAddr>)>>,
-    inflight_real: DashMap<String, watch::Sender<bool>>,
-    inflight_direct: DashMap<String, watch::Sender<bool>>,
-    inflight_proxy: DashMap<String, watch::Sender<bool>>,
-    inflight_bootstrap: DashMap<String, watch::Sender<bool>>,
+    inflight_real: InflightMap,
+    inflight_direct: InflightMap,
+    inflight_proxy: InflightMap,
+    inflight_bootstrap: InflightMap,
     total_queries: AtomicU64,
     fake_ip_hits: AtomicU64,
     cache_hits: AtomicU64,
@@ -566,7 +632,10 @@ impl FakeIpDnsEngine {
         let mut bootstrap_servers = Vec::new();
         for b in &cfg.default_nameserver {
             if !b.trim().is_empty() {
-                bootstrap_servers.push(BootstrapDnsServer::parse(b)?);
+                let parsed = BootstrapDnsServer::parse(b)?;
+                if !bootstrap_servers.contains(&parsed) {
+                    bootstrap_servers.push(parsed);
+                }
             }
         }
 
@@ -586,7 +655,9 @@ impl FakeIpDnsEngine {
             }
             let parsed = DnsUpstream::parse(ns)?;
             record_literal_ns(&parsed);
-            proxy_upstreams.push(parsed);
+            if !proxy_upstreams.contains(&parsed) {
+                proxy_upstreams.push(parsed);
+            }
         }
 
         let mut direct_upstreams = Vec::new();
@@ -596,7 +667,9 @@ impl FakeIpDnsEngine {
             }
             let parsed = DnsUpstream::parse(dns_str)?;
             record_literal_ns(&parsed);
-            direct_upstreams.push(parsed);
+            if !direct_upstreams.contains(&parsed) {
+                direct_upstreams.push(parsed);
+            }
         }
 
         let mut upstreams = Vec::new();
@@ -606,7 +679,9 @@ impl FakeIpDnsEngine {
             }
             let parsed = DnsUpstream::parse(ns)?;
             record_literal_ns(&parsed);
-            upstreams.push(parsed);
+            if !upstreams.contains(&parsed) {
+                upstreams.push(parsed);
+            }
         }
 
         let mut fallbacks = Vec::new();
@@ -616,7 +691,9 @@ impl FakeIpDnsEngine {
             }
             let parsed = DnsUpstream::parse(fb)?;
             record_literal_ns(&parsed);
-            fallbacks.push(parsed);
+            if !fallbacks.contains(&parsed) {
+                fallbacks.push(parsed);
+            }
         }
 
         let compile_policy_map = |policy_map: &HashMap<String, Vec<String>>,
@@ -636,7 +713,9 @@ impl FakeIpDnsEngine {
                     }
                     let parsed = DnsUpstream::parse(ns)?;
                     record_ns(&parsed);
-                    ups.push(parsed);
+                    if !ups.contains(&parsed) {
+                        ups.push(parsed);
+                    }
                 }
                 if ups.is_empty() {
                     continue;
@@ -922,7 +1001,10 @@ impl FakeIpDnsEngine {
                     guard.pop(&clean);
                     (expires_at > now).then_some((expires_at, ips))
                 }
-                Some(CachedIpResolution::Negative { .. }) => {
+                Some(
+                    CachedIpResolution::Negative { .. }
+                    | CachedIpResolution::TransientFailure { .. },
+                ) => {
                     guard.pop(&clean);
                     None
                 }
@@ -953,13 +1035,18 @@ impl FakeIpDnsEngine {
         }
     }
 
-    /// Flush positive/negative DNS resolution caches, wire packet caches, and pooled DoT/DoH sockets.
-    pub fn flush_cache(&self) {
+    /// Clear engine-local positive/negative DNS caches without evicting process-wide DoT/DoH pools.
+    pub fn clear_local_caches(&self) {
         self.real_ip_cache.lock().clear();
         self.direct_ip_cache.lock().clear();
         self.proxy_ip_cache.lock().clear();
         self.packet_cache.lock().clear();
         self.bootstrap_cache.lock().clear();
+    }
+
+    /// Flush positive/negative DNS resolution caches, wire packet caches, and pooled DoT/DoH sockets.
+    pub fn flush_cache(&self) {
+        self.clear_local_caches();
         clear_dns_upstream_pools();
     }
 
@@ -1199,6 +1286,7 @@ impl FakeIpDnsEngine {
         cache: &Mutex<LruCache<String, CachedIpResolution>>,
         normalized: &str,
         want_ipv6: bool,
+        allow_ipv6_fallback: bool,
     ) -> Option<Result<Vec<IpAddr>>> {
         let cached = cache.lock().get(normalized).cloned()?;
         match cached {
@@ -1206,11 +1294,16 @@ impl FakeIpDnsEngine {
                 if want_ipv6 {
                     Some(Ok(ips))
                 } else {
-                    let v4_only: Vec<IpAddr> = ips.into_iter().filter(IpAddr::is_ipv4).collect();
-                    if v4_only.is_empty() {
-                        None
-                    } else {
+                    let v4_only: Vec<IpAddr> =
+                        ips.iter().copied().filter(IpAddr::is_ipv4).collect();
+                    if !v4_only.is_empty() {
                         Some(Ok(v4_only))
+                    } else if allow_ipv6_fallback && !ips.is_empty() {
+                        Some(Ok(ips))
+                    } else {
+                        Some(Err(ProxyError::Dns(format!(
+                            "DNS NODATA (cached IPv4) for '{normalized}'"
+                        ))))
                     }
                 }
             }
@@ -1226,6 +1319,11 @@ impl FakeIpDnsEngine {
                     "DNS NODATA (cached) for '{normalized}'"
                 )))
             }),
+            CachedIpResolution::TransientFailure { expires_at } if Instant::now() < expires_at => {
+                Some(Err(ProxyError::Dns(format!(
+                    "DNS SERVFAIL (cached) for '{normalized}'"
+                ))))
+            }
             _ => None,
         }
     }
@@ -1302,36 +1400,23 @@ impl FakeIpDnsEngine {
                     return Ok(valid);
                 }
 
-                let _inflight_guard = {
-                    let waiter = match self.inflight_bootstrap.entry(norm.clone()) {
-                        Entry::Occupied(occ) => Err(occ.get().subscribe()),
-                        Entry::Vacant(vac) => {
-                            let (tx, _rx) = watch::channel(false);
-                            vac.insert(tx.clone());
-                            Ok(InflightLookupGuard {
-                                map: &self.inflight_bootstrap,
-                                key: norm.clone(),
-                                tx,
-                            })
+                let inflight_guard = match InflightLookupGuard::acquire(
+                    &self.inflight_bootstrap,
+                    (norm.clone(), want_ipv6),
+                ) {
+                    Ok(guard) => Some(guard),
+                    Err(mut rx) => {
+                        if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                            return outcome;
                         }
-                    };
-                    match waiter {
-                        Ok(guard) => Some(guard),
-                        Err(mut rx) => {
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(4),
-                                rx.wait_for(|&done| done),
-                            )
-                            .await;
-                            if let Some((expires_at, ips)) =
-                                self.bootstrap_cache.lock().get(&norm).cloned()
-                                && Instant::now() < expires_at
-                                && let Some(valid) = filter_bootstrap_ips(ips)
-                            {
-                                return Ok(valid);
-                            }
-                            None
+                        if let Some((expires_at, ips)) =
+                            self.bootstrap_cache.lock().get(&norm).cloned()
+                            && Instant::now() < expires_at
+                            && let Some(valid) = filter_bootstrap_ips(ips)
+                        {
+                            return Ok(valid);
                         }
+                        None
                     }
                 };
 
@@ -1339,7 +1424,11 @@ impl FakeIpDnsEngine {
                     && Instant::now() < expires_at
                     && let Some(valid) = filter_bootstrap_ips(ips)
                 {
-                    return Ok(valid);
+                    let res = Ok(valid);
+                    if let Some(g) = inflight_guard {
+                        g.finish(&res);
+                    }
+                    return res;
                 }
 
                 let (res_a, res_aaaa) = if want_ipv6 {
@@ -1363,16 +1452,24 @@ impl FakeIpDnsEngine {
                 }
 
                 if ips.is_empty() {
-                    return Err(ProxyError::Dns(format!(
+                    let res = Err(ProxyError::Dns(format!(
                         "default-nameserver bootstrap failed for DoH/DoT host '{domain}'"
                     )));
+                    if let Some(g) = inflight_guard {
+                        g.finish(&res);
+                    }
+                    return res;
                 }
 
                 self.bootstrap_cache.lock().put(
                     norm,
                     (Instant::now() + Duration::from_secs(min_ttl), ips.clone()),
                 );
-                Ok(ips)
+                let res = Ok(ips);
+                if let Some(g) = inflight_guard {
+                    g.finish(&res);
+                }
+                res
             }
         }
     }
@@ -1383,7 +1480,16 @@ impl FakeIpDnsEngine {
         raw_query: &[u8],
     ) -> Result<Vec<u8>> {
         let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
-        Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await
+        let resp = Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?;
+        if let Some(&flags_lo) = resp.get(3) {
+            let rcode = flags_lo & 0x0F;
+            if rcode == 2 || rcode == 5 {
+                return Err(ProxyError::Dns(format!(
+                    "upstream DNS returned RCODE {rcode}"
+                )));
+            }
+        }
+        Ok(resp)
     }
 
     async fn exchange_with_upstream_slice(
@@ -1480,13 +1586,15 @@ impl FakeIpDnsEngine {
         slice: &[DnsUpstream],
         normalized: &str,
         qtype: u16,
-    ) -> Option<crate::dns::wire::DnsResponseMeta> {
+    ) -> (Option<crate::dns::wire::DnsResponseMeta>, Option<String>) {
         let query = build_dns_query(rand::random(), normalized, qtype);
-        let resp = self
-            .exchange_with_upstream_slice(slice, &query)
-            .await
-            .ok()?;
-        extract_dns_response_meta(&resp).ok()
+        match self.exchange_with_upstream_slice(slice, &query).await {
+            Ok(resp) => match extract_dns_response_meta(&resp) {
+                Ok(meta) => (Some(meta), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+            Err(e) => (None, Some(e.to_string())),
+        }
     }
 
     async fn query_upstream_qtype(
@@ -1557,20 +1665,27 @@ impl FakeIpDnsEngine {
         slice: &[DnsUpstream],
         normalized: &str,
         want_ipv6: bool,
-    ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
-        let metas = if want_ipv6 {
-            let (m_a, m_aaaa) = tokio::join!(
+    ) -> (
+        Vec<IpAddr>,
+        Option<u64>,
+        Option<u64>,
+        bool,
+        bool,
+        Option<String>,
+    ) {
+        let (metas, err_detail) = if want_ipv6 {
+            let ((m_a, e_a), (m_aaaa, e_aaaa)) = tokio::join!(
                 self.query_slice_qtype(slice, normalized, QTYPE_A),
                 self.query_slice_qtype(slice, normalized, QTYPE_AAAA)
             );
-            [m_a, m_aaaa]
+            ([m_a, m_aaaa], e_a.or(e_aaaa))
         } else {
-            [
-                self.query_slice_qtype(slice, normalized, QTYPE_A).await,
-                None,
-            ]
+            let (m_a, e_a) = self.query_slice_qtype(slice, normalized, QTYPE_A).await;
+            ([m_a, None], e_a)
         };
-        self.collect_ips_from_metas(metas, want_ipv6)
+        let (resolved, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
+            self.collect_ips_from_metas(metas, want_ipv6);
+        (resolved, pos_ttl, neg_ttl, saw_nx, saw_nodata, err_detail)
     }
 
     /// Resolve a domain name to real IPv4 (and IPv6 if `dns.ipv6: true` and direct IPv6 is reachable)
@@ -1609,40 +1724,37 @@ impl FakeIpDnsEngine {
             return Ok(static_ips);
         }
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6) {
+        if let Some(cached) =
+            Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6, false)
+        {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
 
-        let _inflight_guard = {
-            let waiter = match self.inflight_real.entry(normalized.clone()) {
-                Entry::Occupied(occ) => Err(occ.get().subscribe()),
-                Entry::Vacant(vac) => {
-                    let (tx, _rx) = watch::channel(false);
-                    vac.insert(tx.clone());
-                    Ok(InflightLookupGuard {
-                        map: &self.inflight_real,
-                        key: normalized.clone(),
-                        tx,
-                    })
+        let inflight_guard = match InflightLookupGuard::acquire(
+            &self.inflight_real,
+            (normalized.clone(), want_ipv6),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(mut rx) => {
+                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                    return outcome;
                 }
-            };
-            match waiter {
-                Ok(guard) => Some(guard),
-                Err(mut rx) => {
-                    let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
-                        .await;
-                    if let Some(cached) =
-                        Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6)
-                    {
-                        return cached;
-                    }
-                    None
+                if let Some(cached) =
+                    Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6, false)
+                {
+                    return cached;
                 }
+                None
             }
         };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6) {
+        if let Some(cached) =
+            Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6, false)
+        {
+            if let Some(g) = inflight_guard {
+                g.finish(&cached);
+            }
             return cached;
         }
 
@@ -1650,8 +1762,10 @@ impl FakeIpDnsEngine {
             if let Some(policy_ups) =
                 Self::matching_policy_upstreams(&self.policy_rules, &normalized)
             {
-                self.query_slice_ips(policy_ups, &normalized, want_ipv6)
-                    .await
+                let (r, p, n, nx, nd, _) = self
+                    .query_slice_ips(policy_ups, &normalized, want_ipv6)
+                    .await;
+                (r, p, n, nx, nd)
             } else if !self.upstreams.is_empty() || !self.fallbacks.is_empty() {
                 let metas = if want_ipv6 {
                     let (m_a, m_aaaa) = tokio::join!(
@@ -1704,13 +1818,26 @@ impl FakeIpDnsEngine {
                         nxdomain: is_nxdomain,
                     },
                 );
+            } else {
+                self.real_ip_cache.lock().put(
+                    normalized.clone(),
+                    CachedIpResolution::TransientFailure {
+                        expires_at: Instant::now()
+                            + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                    },
+                );
             }
-            if is_nxdomain {
-                return Err(ProxyError::Dns(format!("DNS NXDOMAIN for '{normalized}'")));
+            let res = if is_nxdomain {
+                Err(ProxyError::Dns(format!("DNS NXDOMAIN for '{normalized}'")))
+            } else {
+                Err(ProxyError::Dns(format!(
+                    "DNS resolution failed for '{normalized}'"
+                )))
+            };
+            if let Some(g) = inflight_guard {
+                g.finish(&res);
             }
-            return Err(ProxyError::Dns(format!(
-                "DNS resolution failed for '{normalized}'"
-            )));
+            return res;
         }
 
         let ttl = min_pos_ttl.unwrap_or(60);
@@ -1721,12 +1848,16 @@ impl FakeIpDnsEngine {
                 ips: resolved.clone(),
             },
         );
-        Ok(resolved)
+        let res = Ok(resolved);
+        if let Some(g) = inflight_guard {
+            g.finish(&res);
+        }
+        res
     }
 
     /// Resolve a domain name for `DIRECT` outbound dialing and `GEOIP,CN` rule matching.
     /// Honors static `hosts` and (when `direct-nameserver-follow-policy: true`, the default)
-    /// `nameserver-policy` before `dns.direct-nameserver`, falling back cleanly to `resolve_real_ips`.
+    /// `nameserver-policy` before `dns.direct-nameserver` (delegating to `resolve_real_ips` only when `direct-nameserver` is unset).
     pub async fn resolve_direct_ips(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let want_ipv6 = self.direct_ipv6_enabled();
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -1761,46 +1892,41 @@ impl FakeIpDnsEngine {
             return self.resolve_real_ips_inner(domain, want_ipv6).await;
         }
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6)
+        if let Some(cached) =
+            Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6, false)
         {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
 
-        let inflight_guard = {
-            let waiter = match self.inflight_direct.entry(normalized.clone()) {
-                Entry::Occupied(occ) => Err(occ.get().subscribe()),
-                Entry::Vacant(vac) => {
-                    let (tx, _rx) = watch::channel(false);
-                    vac.insert(tx.clone());
-                    Ok(InflightLookupGuard {
-                        map: &self.inflight_direct,
-                        key: normalized.clone(),
-                        tx,
-                    })
+        let inflight_guard = match InflightLookupGuard::acquire(
+            &self.inflight_direct,
+            (normalized.clone(), want_ipv6),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(mut rx) => {
+                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                    return outcome;
                 }
-            };
-            match waiter {
-                Ok(guard) => Some(guard),
-                Err(mut rx) => {
-                    let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
-                        .await;
-                    if let Some(cached) =
-                        Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6)
-                    {
-                        return cached;
-                    }
-                    return self.resolve_real_ips_inner(domain, want_ipv6).await;
+                if let Some(cached) =
+                    Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6, false)
+                {
+                    return cached;
                 }
+                None
             }
         };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6)
+        if let Some(cached) =
+            Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6, false)
         {
+            if let Some(g) = inflight_guard {
+                g.finish(&cached);
+            }
             return cached;
         }
 
-        let (resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata) = self
+        let (resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata, err_detail) = self
             .query_slice_ips(&self.direct_upstreams, &normalized, want_ipv6)
             .await;
 
@@ -1813,7 +1939,11 @@ impl FakeIpDnsEngine {
                     ips: resolved.clone(),
                 },
             );
-            return Ok(resolved);
+            let res = Ok(resolved);
+            if let Some(g) = inflight_guard {
+                g.finish(&res);
+            }
+            return res;
         }
 
         if saw_nxdomain || saw_nodata {
@@ -1826,16 +1956,31 @@ impl FakeIpDnsEngine {
                     nxdomain: is_nxdomain,
                 },
             );
-            drop(inflight_guard);
-            return Err(ProxyError::Dns(if is_nxdomain {
+            let res = Err(ProxyError::Dns(if is_nxdomain {
                 format!("DNS NXDOMAIN for '{normalized}'")
             } else {
                 format!("DNS resolution failed for '{normalized}'")
             }));
+            if let Some(g) = inflight_guard {
+                g.finish(&res);
+            }
+            return res;
         }
 
-        drop(inflight_guard);
-        self.resolve_real_ips_inner(domain, want_ipv6).await
+        self.direct_ip_cache.lock().put(
+            normalized.clone(),
+            CachedIpResolution::TransientFailure {
+                expires_at: Instant::now() + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+            },
+        );
+        let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
+        let res = Err(ProxyError::Dns(format!(
+            "direct-nameserver DNS resolution failed for '{normalized}'{suffix}"
+        )));
+        if let Some(g) = inflight_guard {
+            g.finish(&res);
+        }
+        res
     }
 
     /// Resolve a domain-based proxy node server hostname (`server: hk01.example.com`)
@@ -1873,166 +2018,196 @@ impl FakeIpDnsEngine {
             return Ok(static_ips);
         }
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
+        {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
 
-        let _inflight_guard = {
-            let waiter = match self.inflight_proxy.entry(clean.clone()) {
-                Entry::Occupied(occ) => Err(occ.get().subscribe()),
-                Entry::Vacant(vac) => {
-                    let (tx, _rx) = watch::channel(false);
-                    vac.insert(tx.clone());
-                    Ok(InflightLookupGuard {
-                        map: &self.inflight_proxy,
-                        key: clean.clone(),
-                        tx,
-                    })
-                }
-            };
-            match waiter {
+        let inflight_guard =
+            match InflightLookupGuard::acquire(&self.inflight_proxy, (clean.clone(), want_ipv6)) {
                 Ok(guard) => Some(guard),
                 Err(mut rx) => {
-                    let _ = tokio::time::timeout(Duration::from_secs(4), rx.wait_for(|&done| done))
-                        .await;
+                    if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                        return outcome;
+                    }
                     if let Some(cached) =
-                        Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6)
+                        Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
                     {
                         return cached;
                     }
                     None
                 }
-            }
-        };
+            };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6) {
+        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
+        {
+            if let Some(g) = inflight_guard {
+                g.finish(&cached);
+            }
             return cached;
         }
 
-        let cache_and_return = |ips: Vec<IpAddr>, ttl_opt: Option<u64>| -> Result<Vec<IpAddr>> {
-            let ttl = ttl_opt.unwrap_or(60);
-            self.proxy_ip_cache.lock().put(
-                clean.clone(),
-                CachedIpResolution::Positive {
-                    expires_at: Instant::now() + Duration::from_secs(ttl),
-                    ips: ips.clone(),
-                },
-            );
-            Ok(ips)
-        };
+        let res = async {
+            let cache_and_return =
+                |ips: Vec<IpAddr>, ttl_opt: Option<u64>| -> Result<Vec<IpAddr>> {
+                    let ttl = ttl_opt.unwrap_or(60);
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::Positive {
+                            expires_at: Instant::now() + Duration::from_secs(ttl),
+                            ips: ips.clone(),
+                        },
+                    );
+                    Ok(ips)
+                };
 
-        // 1. Dedicated `proxy-server-nameserver-policy`
-        if let Some(ps_pol) = Self::matching_policy_upstreams(&self.proxy_policy_rules, &clean) {
-            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
-                self.query_slice_ips(ps_pol, &clean, want_ipv6).await;
-            if !ips.is_empty() {
-                return cache_and_return(ips, pos_ttl);
+            // 1. Dedicated `proxy-server-nameserver-policy`
+            if let Some(ps_pol) = Self::matching_policy_upstreams(&self.proxy_policy_rules, &clean)
+            {
+                let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata, err_detail) =
+                    self.query_slice_ips(ps_pol, &clean, want_ipv6).await;
+                if !ips.is_empty() {
+                    return cache_and_return(ips, pos_ttl);
+                }
+                if saw_nx || saw_nodata {
+                    let is_nx = saw_nx && !saw_nodata;
+                    let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::Negative {
+                            expires_at: Instant::now() + Duration::from_secs(ttl),
+                            nxdomain: is_nx,
+                        },
+                    );
+                } else {
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::TransientFailure {
+                            expires_at: Instant::now()
+                                + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                        },
+                    );
+                }
+                let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
+                return Err(ProxyError::Dns(format!(
+                    "proxy-server-nameserver-policy DNS resolution failed for '{clean}'{suffix}"
+                )));
             }
-            if saw_nx || saw_nodata {
-                let is_nx = saw_nx && !saw_nodata;
-                let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
-                self.proxy_ip_cache.lock().put(
-                    clean.clone(),
-                    CachedIpResolution::Negative {
-                        expires_at: Instant::now() + Duration::from_secs(ttl),
-                        nxdomain: is_nx,
-                    },
-                );
-            }
-            return Err(ProxyError::Dns(format!(
-                "proxy-server-nameserver-policy DNS resolution failed for '{clean}'"
-            )));
-        }
 
-        // 2. Dedicated `proxy-server-nameserver`
-        if !self.proxy_upstreams.is_empty() {
-            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) = self
-                .query_slice_ips(&self.proxy_upstreams, &clean, want_ipv6)
-                .await;
-            if !ips.is_empty() {
-                return cache_and_return(ips, pos_ttl);
+            // 2. Dedicated `proxy-server-nameserver`
+            if !self.proxy_upstreams.is_empty() {
+                let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata, err_detail) = self
+                    .query_slice_ips(&self.proxy_upstreams, &clean, want_ipv6)
+                    .await;
+                if !ips.is_empty() {
+                    return cache_and_return(ips, pos_ttl);
+                }
+                if saw_nx || saw_nodata {
+                    let is_nx = saw_nx && !saw_nodata;
+                    let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::Negative {
+                            expires_at: Instant::now() + Duration::from_secs(ttl),
+                            nxdomain: is_nx,
+                        },
+                    );
+                } else {
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::TransientFailure {
+                            expires_at: Instant::now()
+                                + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                        },
+                    );
+                }
+                let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
+                return Err(ProxyError::Dns(format!(
+                    "proxy-server-nameserver DNS resolution failed for '{clean}'{suffix}"
+                )));
             }
-            if saw_nx || saw_nodata {
-                let is_nx = saw_nx && !saw_nodata;
-                let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
-                self.proxy_ip_cache.lock().put(
-                    clean.clone(),
-                    CachedIpResolution::Negative {
-                        expires_at: Instant::now() + Duration::from_secs(ttl),
-                        nxdomain: is_nx,
-                    },
-                );
+
+            // 3. Domain-scoped `nameserver-policy` (used by subscriptions with self-hosted DoH/DoT!)
+            if let Some(pol) = Self::matching_policy_upstreams(&self.policy_rules, &clean) {
+                let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata, err_detail) =
+                    self.query_slice_ips(pol, &clean, want_ipv6).await;
+                if !ips.is_empty() {
+                    return cache_and_return(ips, pos_ttl);
+                }
+                if saw_nx || saw_nodata {
+                    let is_nx = saw_nx && !saw_nodata;
+                    let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::Negative {
+                            expires_at: Instant::now() + Duration::from_secs(ttl),
+                            nxdomain: is_nx,
+                        },
+                    );
+                } else {
+                    self.proxy_ip_cache.lock().put(
+                        clean.clone(),
+                        CachedIpResolution::TransientFailure {
+                            expires_at: Instant::now()
+                                + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                        },
+                    );
+                }
+                let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
+                return Err(ProxyError::Dns(format!(
+                    "nameserver-policy DNS resolution failed for proxy server{suffix}"
+                )));
             }
-            return Err(ProxyError::Dns(format!(
-                "proxy-server-nameserver DNS resolution failed for '{clean}'"
-            )));
-        }
 
-        // 3. Domain-scoped `nameserver-policy` (used by subscriptions with self-hosted DoH/DoT!)
-        if let Some(pol) = Self::matching_policy_upstreams(&self.policy_rules, &clean) {
-            let (ips, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
-                self.query_slice_ips(pol, &clean, want_ipv6).await;
-            if !ips.is_empty() {
-                return cache_and_return(ips, pos_ttl);
+            // 4. Configured `nameserver` / `fallback` & `direct-nameserver`
+            if let Ok(ips) = self.resolve_real_ips_inner(&clean, want_ipv6).await
+                && !ips.is_empty()
+            {
+                return cache_and_return(ips, Some(60));
             }
-            if saw_nx || saw_nodata {
-                let is_nx = saw_nx && !saw_nodata;
-                let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
-                self.proxy_ip_cache.lock().put(
-                    clean.clone(),
-                    CachedIpResolution::Negative {
-                        expires_at: Instant::now() + Duration::from_secs(ttl),
-                        nxdomain: is_nx,
-                    },
-                );
+            if !self.direct_upstreams.is_empty()
+                && let Ok(ips) = self.resolve_direct_ips(&clean).await
+                && !ips.is_empty()
+            {
+                return cache_and_return(ips, Some(60));
             }
-            return Err(ProxyError::Dns(
-                "nameserver-policy DNS resolution failed for proxy server".into(),
-            ));
-        }
 
-        // 4. Configured `nameserver` / `fallback` & `direct-nameserver`
-        if let Ok(ips) = self.resolve_real_ips_inner(&clean, want_ipv6).await
-            && !ips.is_empty()
-        {
-            return cache_and_return(ips, Some(60));
-        }
-        if !self.direct_upstreams.is_empty()
-            && let Ok(ips) = self.resolve_direct_ips(&clean).await
-            && !ips.is_empty()
-        {
-            return cache_and_return(ips, Some(60));
-        }
+            // 5. Literal-IP `default-nameserver` bootstrap & OS fallback bypassing Fake-IP
+            if let Ok(ips) = self
+                .resolve_bootstrap_host(&DnsEndpointHost::Domain(clean.clone()))
+                .await
+                && !ips.is_empty()
+            {
+                return cache_and_return(ips, Some(60));
+            }
 
-        // 5. Literal-IP `default-nameserver` bootstrap & OS fallback bypassing Fake-IP
-        if let Ok(ips) = self
-            .resolve_bootstrap_host(&DnsEndpointHost::Domain(clean.clone()))
-            .await
-            && !ips.is_empty()
-        {
-            return cache_and_return(ips, Some(60));
-        }
-
-        let addrs = crate::router::geodata::resolve_host_bypassing_fake_ip(&clean, 0).await?;
-        let mut ips: Vec<IpAddr> = addrs
-            .iter()
-            .map(|sa| sa.ip())
-            .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
-            .collect();
-        if ips.is_empty() {
-            ips = addrs
-                .into_iter()
+            let addrs = crate::router::geodata::resolve_host_bypassing_fake_ip(&clean, 0).await?;
+            let mut ips: Vec<IpAddr> = addrs
+                .iter()
                 .map(|sa| sa.ip())
-                .filter(|ip| !self.is_fake_ip(*ip))
+                .filter(|ip| (!ip.is_ipv6() || want_ipv6) && !self.is_fake_ip(*ip))
                 .collect();
+            if ips.is_empty() {
+                ips = addrs
+                    .into_iter()
+                    .map(|sa| sa.ip())
+                    .filter(|ip| !self.is_fake_ip(*ip))
+                    .collect();
+            }
+            if ips.is_empty() {
+                return Err(ProxyError::Dns(
+                    "unable to resolve real IP for proxy server".into(),
+                ));
+            }
+            cache_and_return(ips, Some(60))
         }
-        if ips.is_empty() {
-            return Err(ProxyError::Dns(
-                "unable to resolve real IP for proxy server".into(),
-            ));
+        .await;
+
+        if let Some(g) = inflight_guard {
+            g.finish(&res);
         }
-        cache_and_return(ips, Some(60))
+        res
     }
 
     pub fn entries_snapshot(&self) -> Vec<FakeIpEntry> {
@@ -2043,8 +2218,9 @@ impl FakeIpDnsEngine {
         self.pool.lock().ip_to_domain.len()
     }
 
-    /// Persist up to `2048` MRU Fake-IP <-> domain mappings atomically via a sibling `.json.tmp` file.
+    /// Persist up to `2048` MRU Fake-IP <-> domain mappings atomically via a unique sibling `.json.tmp.<pid>.<seq>` file.
     pub fn save_to_path(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        static SAVE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
         let (rev, mut entries) = {
             let guard = self.pool.lock();
             (
@@ -2066,8 +2242,27 @@ impl FakeIpDnsEngine {
             entries,
         };
         let encoded = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
-        let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &encoded)?;
+        let seq = SAVE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            if let Err(err) = f.write_all(&encoded) {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp_path, &encoded)?;
+        }
         if let Err(err) = std::fs::rename(&tmp_path, path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
@@ -2155,6 +2350,24 @@ impl FakeIpDnsEngine {
                 nxdomain: true,
             }) if *expires_at > now
         )
+    }
+
+    /// Returns `true` when `direct_ip_cache` (populated only for domains already routed to `DIRECT`)
+    /// holds an unexpired `NODATA` entry or an IPv6-only entry with zero IPv4 addresses.
+    /// Deliberately never inspects `real_ip_cache` so poisoned empty `A` responses on `nameserver`
+    /// cannot suppress Fake-IP synthesis for proxied domains.
+    fn has_cached_direct_nodata(&self, normalized: &str) -> bool {
+        let now = Instant::now();
+        match self.direct_ip_cache.lock().peek(normalized) {
+            Some(CachedIpResolution::Negative {
+                expires_at,
+                nxdomain: false,
+            }) => *expires_at > now,
+            Some(CachedIpResolution::Positive { expires_at, ips }) => {
+                *expires_at > now && !ips.iter().any(IpAddr::is_ipv4)
+            }
+            _ => false,
+        }
     }
 
     /// Process a raw RFC 1035 DNS request packet, returning the encoded DNS response packet.
@@ -2246,6 +2459,13 @@ impl FakeIpDnsEngine {
                     self.nxdomain_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(query.build_response(raw_query, 3, 5, &[]));
                 }
+                QTYPE_A
+                    if !self.direct_ipv6_enabled()
+                        && self.has_cached_direct_nodata(&normalized) =>
+                {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(query.build_response(raw_query, 0, 5, &[]));
+                }
                 QTYPE_A => {
                     self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
                     let fake_ip = self.assign_fake_ip(&normalized);
@@ -2315,13 +2535,30 @@ impl FakeIpDnsEngine {
                             wire: resp.clone(),
                         },
                     );
+                } else if meta.rcode == 2 || meta.rcode == 5 {
+                    self.packet_cache.lock().put(
+                        cache_key,
+                        CachedWirePacket {
+                            expires_at: Instant::now()
+                                + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                            wire: resp.clone(),
+                        },
+                    );
                 }
             }
             return Ok(resp);
         }
 
-        // Return SERVFAIL (2) if no upstream responded
-        Ok(query.build_response(raw_query, 2, 0, &[]))
+        // Return SERVFAIL (2) if no upstream responded, caching briefly to suppress retry storms
+        let servfail_resp = query.build_response(raw_query, 2, 0, &[]);
+        self.packet_cache.lock().put(
+            cache_key,
+            CachedWirePacket {
+                expires_at: Instant::now() + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                wire: servfail_resp.clone(),
+            },
+        );
+        Ok(servfail_resp)
     }
 
     /// High-level helper for `/dns/query?name=...&type=...` API endpoint.
@@ -3370,5 +3607,70 @@ mod tests {
 
             upstream_task.abort();
         });
+    }
+
+    #[tokio::test]
+    async fn servfail_negative_cache_suppresses_immediate_retry_storms() {
+        use std::sync::atomic::AtomicUsize;
+
+        let upstream_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = upstream_sock.recv_from(&mut buf).await {
+                hits_srv.fetch_add(1, Ordering::Relaxed);
+                if let Ok(qp) = DnsQueryPacket::parse(&buf[..n]) {
+                    let resp = qp.build_response(&buf[..n], 2, 0, &[]);
+                    let _ = upstream_sock.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        let cfg = DnsConfig {
+            enable: true,
+            ipv6: false,
+            enhanced_mode: "normal".to_string(),
+            default_nameserver: vec![upstream_addr.to_string()],
+            nameserver: vec![format!("udp://{upstream_addr}")],
+            direct_nameserver: vec![format!("udp://{upstream_addr}")],
+            ..DnsConfig::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        // First lookup hits upstream and caches SERVFAIL negative entry briefly
+        assert!(
+            engine
+                .resolve_direct_ips("broken-upstream.example")
+                .await
+                .is_err()
+        );
+        let first_hits = hits.load(Ordering::Relaxed);
+        assert!(first_hits >= 1);
+
+        // Immediate burst of retries hits the negative cache instead of hammering upstream
+        for _ in 0..5 {
+            assert!(
+                engine
+                    .resolve_direct_ips("broken-upstream.example")
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), first_hits);
+
+        // Explicit flush_cache clears the negative cache immediately
+        engine.flush_cache();
+        assert!(
+            engine
+                .resolve_direct_ips("broken-upstream.example")
+                .await
+                .is_err()
+        );
+        assert!(hits.load(Ordering::Relaxed) > first_hits);
+
+        srv_task.abort();
     }
 }

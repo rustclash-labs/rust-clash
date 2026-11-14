@@ -130,7 +130,7 @@ pub enum DnsEndpointHost {
     Domain(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DnsUpstream {
     Udp(SocketAddr),
     Tcp(SocketAddr),
@@ -150,7 +150,7 @@ pub enum DnsUpstream {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootstrapDnsServer {
     Udp(SocketAddr),
     Tcp(SocketAddr),
@@ -571,25 +571,35 @@ async fn forward_udp_dns_raw(ns: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
         if (buf[2] & 0x80) == 0 || [buf[0], buf[1]] != expected_id {
             continue;
         }
-        let resp_qdcount = u16::from_be_bytes([buf[4], buf[5]]);
-        if resp_qdcount >= 1
-            && let Some(ref exp) = expected_query
-        {
-            let Ok(resp_pkt) = crate::dns::wire::DnsQueryPacket::parse(&buf[..n]) else {
-                continue;
-            };
-            if resp_pkt.question.qtype != exp.question.qtype
-                || !resp_pkt
-                    .question
-                    .name
-                    .trim_end_matches('.')
-                    .eq_ignore_ascii_case(exp.question.name.trim_end_matches('.'))
-            {
-                continue;
-            }
+        if !dns_questions_match(expected_query.as_ref(), &buf[..n]) {
+            continue;
         }
         return Ok(buf[..n].to_vec());
     }
+}
+
+fn dns_questions_match(expected: Option<&crate::dns::wire::DnsQueryPacket>, resp: &[u8]) -> bool {
+    if resp.len() < 12 {
+        return false;
+    }
+    let Some(exp) = expected else {
+        return true;
+    };
+    let resp_qdcount = u16::from_be_bytes([resp[4], resp[5]]);
+    if resp_qdcount < 1 {
+        let resp_ancount = u16::from_be_bytes([resp[6], resp[7]]);
+        return resp_ancount == 0;
+    }
+    let Ok(resp_pkt) = crate::dns::wire::DnsQueryPacket::parse(resp) else {
+        return false;
+    };
+    resp_pkt.question.qtype == exp.question.qtype
+        && resp_pkt.question.qclass == exp.question.qclass
+        && resp_pkt
+            .question
+            .name
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(exp.question.name.trim_end_matches('.'))
 }
 
 /// Forward a DNS query over RFC 1035 TCP (2-byte big-endian length prefix) using `SocketProtector`.
@@ -657,6 +667,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let expected_id = [query[0], query[1]];
+    let expected_query = crate::dns::wire::DnsQueryPacket::parse(query).ok();
     let mut frame = BytesMut::with_capacity(2 + query.len());
     frame.put_u16(query.len() as u16);
     frame.put_slice(query);
@@ -676,6 +687,11 @@ where
             "TCP/DoT DNS response failed QR or Transaction-ID validation".into(),
         ));
     }
+    if !dns_questions_match(expected_query.as_ref(), &resp) {
+        return Err(ProxyError::Dns(
+            "TCP/DoT DNS response failed question validation".into(),
+        ));
+    }
     Ok(resp)
 }
 
@@ -686,6 +702,7 @@ async fn exchange_doh_over_stream(
     doh_wire: &[u8],
     orig_id: [u8; 2],
 ) -> Result<(Vec<u8>, bool)> {
+    let expected_query = crate::dns::wire::DnsQueryPacket::parse(doh_wire).ok();
     let req_head = format!(
         "POST {path_and_query} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
@@ -713,13 +730,13 @@ async fn exchange_doh_over_stream(
             return Err(ProxyError::Dns("DoH HTTP response exceeded 64 KiB".into()));
         }
         if let Some((parsed, server_closed)) = try_extract_complete_http_body(&raw_http)? {
-            let wire = finalize_doh_body(parsed, orig_id)?;
+            let wire = finalize_doh_body(parsed, expected_query.as_ref(), orig_id)?;
             return Ok((wire, !server_closed));
         }
     }
 
     let body = parse_http_response_body(&raw_http)?;
-    let wire = finalize_doh_body(body, orig_id)?;
+    let wire = finalize_doh_body(body, expected_query.as_ref(), orig_id)?;
     Ok((wire, false))
 }
 
@@ -743,6 +760,7 @@ pub async fn forward_doh_dns(
     let mut doh_wire = query.to_vec();
     doh_wire[0] = 0;
     doh_wire[1] = 0;
+    let expected_query = crate::dns::wire::DnsQueryPacket::parse(&doh_wire).ok();
 
     let pool_key = TlsDnsPoolKey {
         ns,
@@ -853,7 +871,7 @@ pub async fn forward_doh_dns(
     .map_err(|_| ProxyError::Timeout)?;
 
     match first_attempt {
-        H2DohOutcome::Body(body) => finalize_doh_body(body, orig_id),
+        H2DohOutcome::Body(body) => finalize_doh_body(body, expected_query.as_ref(), orig_id),
         H2DohOutcome::Fatal(err) => Err(err),
         H2DohOutcome::RetryOnFreshConn => {
             // Reused stream (>1) hit server close / GOAWAY / REFUSED_STREAM: retry once on Stream 1!
@@ -890,8 +908,12 @@ pub async fn forward_doh_dns(
     }
 }
 
-fn finalize_doh_body(mut body: Vec<u8>, orig_id: [u8; 2]) -> Result<Vec<u8>> {
-    if body.len() < 12 || (body[2] & 0x80) == 0 {
+fn finalize_doh_body(
+    mut body: Vec<u8>,
+    expected_query: Option<&crate::dns::wire::DnsQueryPacket>,
+    orig_id: [u8; 2],
+) -> Result<Vec<u8>> {
+    if body.len() < 12 || (body[2] & 0x80) == 0 || !dns_questions_match(expected_query, &body) {
         return Err(ProxyError::Dns(
             "invalid DNS wire payload in DoH response".into(),
         ));
@@ -1148,6 +1170,7 @@ impl Drop for PendingStreamGuard<'_> {
 }
 
 struct H2DohClient {
+    stream_open_lock: Mutex<()>,
     write_tx: mpsc::UnboundedSender<BytesMut>,
     pending: Arc<DashMap<u32, H2StreamAcc>>,
     next_stream_id: AtomicU32,
@@ -1508,6 +1531,7 @@ impl H2DohClient {
         let reader_abort = reader_jh.abort_handle();
 
         let client = Arc::new(Self {
+            stream_open_lock: Mutex::new(()),
             write_tx,
             pending,
             next_stream_id: AtomicU32::new(1),
@@ -1538,51 +1562,53 @@ impl H2DohClient {
         path_and_query: &str,
         doh_wire: &[u8],
     ) -> H2DohOutcome {
-        let sid = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        if sid > H2_MAX_STREAMS_PER_CONN * 2 + 1 {
-            self.closed.store(true, Ordering::Release);
-            return if sid > 1 {
-                H2DohOutcome::RetryOnFreshConn
-            } else {
-                H2DohOutcome::Fatal(ProxyError::Dns(
-                    "DoH HTTP/2 connection stream budget reached".into(),
-                ))
-            };
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.insert(
-            sid,
-            H2StreamAcc {
-                seen_final_status: false,
-                body: Vec::with_capacity(256),
-                tx,
-            },
-        );
-        let mut guard = PendingStreamGuard {
-            map: &self.pending,
-            sid,
-            disarmed: false,
-        };
-
-        if self.closed.load(Ordering::Acquire) {
-            return if sid > 1 {
-                H2DohOutcome::RetryOnFreshConn
-            } else {
-                H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 session already closed".into()))
-            };
-        }
-
         let mut req_buf = BytesMut::with_capacity(224 + doh_wire.len());
-        encode_doh_h2_request_frames(&mut req_buf, sid, host_header, path_and_query, doh_wire);
-        if self.write_tx.send(req_buf).is_err() {
-            self.closed.store(true, Ordering::Release);
-            return if sid > 1 {
-                H2DohOutcome::RetryOnFreshConn
-            } else {
-                H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 writer channel closed".into()))
+        let (sid, rx, mut guard) = {
+            // Hold non-blocking lock across stream ID assignment + write_tx enqueue so
+            // HTTP/2 HEADERS frames are strictly emitted in ascending stream ID order (RFC 9113 §5.1.1).
+            let _open_guard = self.stream_open_lock.lock();
+            let sid = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+            if sid > H2_MAX_STREAMS_PER_CONN * 2 + 1 {
+                self.closed.store(true, Ordering::Release);
+                return if sid > 1 {
+                    H2DohOutcome::RetryOnFreshConn
+                } else {
+                    H2DohOutcome::Fatal(ProxyError::Dns(
+                        "DoH HTTP/2 connection stream budget reached".into(),
+                    ))
+                };
+            }
+
+            let (tx, rx) = oneshot::channel();
+            self.pending.insert(
+                sid,
+                H2StreamAcc {
+                    seen_final_status: false,
+                    body: Vec::with_capacity(256),
+                    tx,
+                },
+            );
+            let guard = PendingStreamGuard {
+                map: &self.pending,
+                sid,
+                disarmed: false,
             };
-        }
+
+            if self.closed.load(Ordering::Acquire) {
+                return H2DohOutcome::RetryOnFreshConn;
+            }
+
+            encode_doh_h2_request_frames(&mut req_buf, sid, host_header, path_and_query, doh_wire);
+            if self.write_tx.send(req_buf).is_err() {
+                self.closed.store(true, Ordering::Release);
+                return if sid > 1 {
+                    H2DohOutcome::RetryOnFreshConn
+                } else {
+                    H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 writer channel closed".into()))
+                };
+            }
+            (sid, rx, guard)
+        };
 
         match rx.await {
             Ok(outcome) => {
@@ -1609,7 +1635,7 @@ impl H2DohClient {
         let keys: Vec<u32> = self.pending.iter().map(|e| *e.key()).collect();
         for sid in keys {
             if let Some((_, acc)) = self.pending.remove(&sid) {
-                let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                let _ = acc.tx.send(if !acc.seen_final_status {
                     H2DohOutcome::RetryOnFreshConn
                 } else {
                     H2DohOutcome::Fatal(ProxyError::Dns("DoH HTTP/2 pool flushed".into()))
@@ -1811,7 +1837,8 @@ where
     let _ = tls.write_all(&goaway).await;
     let _ = tls.flush().await;
 
-    finalize_doh_body(body, orig_id)
+    let expected_query = crate::dns::wire::DnsQueryPacket::parse(doh_wire).ok();
+    finalize_doh_body(body, expected_query.as_ref(), orig_id)
 }
 
 fn decode_hpack_int(input: &[u8], prefix_bits: u8) -> Result<(usize, usize)> {
@@ -1937,7 +1964,10 @@ fn hpack_decode_block_status(
             {
                 status = Some(code);
             }
-            if indexed_insert && dyn_table.len() < 64 {
+            if indexed_insert {
+                if dyn_table.len() >= 64 {
+                    dyn_table.pop();
+                }
                 dyn_table.insert(0, (name_bytes, val_bytes));
             }
         }

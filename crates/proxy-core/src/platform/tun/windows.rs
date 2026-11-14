@@ -262,11 +262,12 @@ mod win_impl {
                     CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
                     DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_DOMAIN, DNS_SETTING_IPV6,
                     DNS_SETTING_NAMESERVER, DNS_SETTING_SEARCHLIST, DeleteIpForwardEntry2,
-                    FreeInterfaceDnsSettings, GetBestRoute2, GetInterfaceDnsSettings,
-                    GetIpInterfaceEntry, InitializeIpForwardEntry, InitializeUnicastIpAddressEntry,
-                    MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
-                    MibAddInstance, MibDeleteInstance, MibParameterNotification,
-                    NotifyIpInterfaceChange, SetInterfaceDnsSettings, SetIpInterfaceEntry,
+                    FreeInterfaceDnsSettings, FreeMibTable, GetBestRoute2, GetInterfaceDnsSettings,
+                    GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
+                    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+                    MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW, MibAddInstance,
+                    MibDeleteInstance, MibParameterNotification, NotifyIpInterfaceChange,
+                    SetInterfaceDnsSettings, SetIpInterfaceEntry,
                 },
                 Ndis::NET_LUID_LH,
             },
@@ -525,8 +526,64 @@ mod win_impl {
         pub v6_gateway: Option<IpAddr>,
     }
 
+    /// Scan `GetIpForwardTable2` for the lowest-metric connected physical `/0` default route
+    /// excluding `excluded_tun_luid` when Wintun's `/1` split routes shadow `GetBestRoute2`.
+    fn fallback_default_route_egress(
+        family: u16,
+        excluded_tun_luid: u64,
+    ) -> Option<(u32, u64, Option<IpAddr>)> {
+        // SAFETY: `GetIpForwardTable2` allocates `table` which is freed via `FreeMibTable` before return.
+        unsafe {
+            let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+            let status = GetIpForwardTable2(family, &raw mut table);
+            if status != 0 || table.is_null() {
+                return None;
+            }
+            let num_entries = (*table).NumEntries as usize;
+            let rows_ptr = std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
+            let rows = std::slice::from_raw_parts(rows_ptr, num_entries);
+
+            let mut best: Option<(u32, u32, u64, Option<IpAddr>)> = None;
+            for row in rows {
+                if row.DestinationPrefix.PrefixLength != 0
+                    || row.Loopback != 0
+                    || row.InterfaceIndex <= 1
+                {
+                    continue;
+                }
+                let luid_val = row.InterfaceLuid.Value;
+                if luid_val == 0 || luid_val == excluded_tun_luid {
+                    continue;
+                }
+                let mut if_row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+                if_row.Family = family;
+                if_row.InterfaceLuid = row.InterfaceLuid;
+                let if_metric = if GetIpInterfaceEntry(&raw mut if_row) == 0 {
+                    if if_row.Connected == 0 {
+                        continue;
+                    }
+                    if_row.Metric
+                } else {
+                    0
+                };
+                let effective_metric = row.Metric.saturating_add(if_metric);
+                let gw = ip_from_sockaddr_inet(&row.NextHop);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_metric, _, _, _)| effective_metric < *best_metric)
+                {
+                    best = Some((effective_metric, row.InterfaceIndex, luid_val, gw));
+                }
+            }
+
+            FreeMibTable(table.cast::<c_void>());
+            best.map(|(_, idx, luid_val, gw)| (idx, luid_val, gw))
+        }
+    }
+
     /// Detect the active physical egress `InterfaceIndex`, `InterfaceLuid`, and next-hop gateway
-    /// via `GetBestRoute2`, explicitly ignoring `excluded_tun_luid` if Wintun is already active!
+    /// via `GetBestRoute2`, falling back to `GetIpForwardTable2` `/0` default-route inspection
+    /// when Wintun's `/1` split routes are active!
     pub fn detect_windows_physical_egress(excluded_tun_luid: u64) -> PhysicalEgressInfo {
         let mut info = PhysicalEgressInfo::default();
 
@@ -551,6 +608,14 @@ mod win_impl {
                 info.v4_gateway = ip_from_sockaddr_inet(&best_row.NextHop);
             }
         }
+        if info.v4_if_index == 0
+            && let Some((idx, luid_val, gw)) =
+                fallback_default_route_egress(AF_INET, excluded_tun_luid)
+        {
+            info.v4_if_index = idx;
+            info.v4_luid = luid_val;
+            info.v4_gateway = gw;
+        }
 
         // Probe IPv6 route toward `2606:4700:4700::1111`
         let dst_v6 = sockaddr_inet_from_ip(IpAddr::V6(
@@ -574,6 +639,14 @@ mod win_impl {
                 info.v6_luid = best_row6.InterfaceLuid.Value;
                 info.v6_gateway = ip_from_sockaddr_inet(&best_row6.NextHop);
             }
+        }
+        if info.v6_if_index == 0
+            && let Some((idx, luid_val, gw)) =
+                fallback_default_route_egress(AF_INET6, excluded_tun_luid)
+        {
+            info.v6_if_index = idx;
+            info.v6_luid = luid_val;
+            info.v6_gateway = gw;
         }
 
         info
@@ -1188,7 +1261,7 @@ mod win_impl {
             let stop_ev_rx = RawSendPtr(stop_event);
             let stop_rx = Arc::clone(&stop_flag);
             let rx_cnt = Arc::clone(&rx_packets);
-            let rx_thread = std::thread::Builder::new()
+            let rx_thread = match std::thread::Builder::new()
                 .name("tun-wintun-rx".into())
                 .spawn(move || {
                     let sess_p = sess_rx.ptr();
@@ -1223,12 +1296,36 @@ mod win_impl {
                             }
                         }
                     }
-                })?;
+                }) {
+                Ok(h) => h,
+                Err(err) => {
+                    stop_flag.store(true, Ordering::Release);
+                    let _ = stop_watch_tx.send(true);
+                    // SAFETY: Cancel MIB callback BEFORE `notify_ctx` drops on scope exit!
+                    unsafe {
+                        if !notify_handle.is_null() {
+                            let _ = CancelMibChangeNotify2(notify_handle);
+                        }
+                    }
+                    drop(notify_ctx);
+                    let mut outcome = RecoveryOutcome::default();
+                    recover_windows_tun_record(&rec, &mut outcome);
+                    // SAFETY: No worker thread spawned; safe to end session, close adapter, and close event.
+                    unsafe {
+                        (api.end_session)(session);
+                        (api.close_adapter)(adapter);
+                        let _ = CloseHandle(stop_event);
+                    }
+                    clear_global_socket_protector();
+                    let _ = update_current_journal(&spec.state_dir, |j| j.windows_tun = None);
+                    return Err(err);
+                }
+            };
 
             let api_tx = Arc::clone(&api);
             let sess_tx = RawSendPtr(session);
             let tx_cnt = Arc::clone(&tx_packets);
-            let tx_thread = std::thread::Builder::new()
+            let tx_thread = match std::thread::Builder::new()
                 .name("tun-wintun-tx".into())
                 .spawn(move || {
                     let sess_p = sess_tx.ptr();
@@ -1261,7 +1358,32 @@ mod win_impl {
                             }
                         }
                     });
-                })?;
+                }) {
+                Ok(h) => h,
+                Err(err) => {
+                    stop_flag.store(true, Ordering::Release);
+                    let _ = stop_watch_tx.send(true);
+                    // SAFETY: Cancel MIB callback FIRST before dropping `notify_ctx`, then signal `stop_event` and join `rx_thread` BEFORE `end_session`.
+                    unsafe {
+                        if !notify_handle.is_null() {
+                            let _ = CancelMibChangeNotify2(notify_handle);
+                        }
+                        let _ = SetEvent(stop_event);
+                    }
+                    drop(notify_ctx);
+                    let _ = rx_thread.join();
+                    let mut outcome = RecoveryOutcome::default();
+                    recover_windows_tun_record(&rec, &mut outcome);
+                    unsafe {
+                        (api.end_session)(session);
+                        (api.close_adapter)(adapter);
+                        let _ = CloseHandle(stop_event);
+                    }
+                    clear_global_socket_protector();
+                    let _ = update_current_journal(&spec.state_dir, |j| j.windows_tun = None);
+                    return Err(err);
+                }
+            };
 
             Ok(Self {
                 spec,

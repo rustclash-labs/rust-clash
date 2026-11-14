@@ -89,6 +89,7 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
 
   // YAML Editor Modal state
   const [yamlModalOpen, setYamlModalOpen] = useState(false);
+  const [yamlTargetId, setYamlTargetId] = useState<string | null>(null);
   const [yamlTargetName, setYamlTargetName] = useState("");
   const [yamlText, setYamlText] = useState("");
   const [yamlBusy, setYamlBusy] = useState<"audit" | "save" | null>(null);
@@ -337,11 +338,8 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
     setAuditReport(null);
     setDiffSummary(null);
     try {
-      if (profilesSnapshot && p.id !== profilesSnapshot.active_profile_id) {
-        await clashApi.activateProfile(p.id);
-        await onReloaded();
-      }
-      const raw = await clashApi.getRawYaml(false);
+      const raw = await clashApi.getProfileRawYaml(p.id, false);
+      setYamlTargetId(p.id);
       setYamlTargetName(p.name);
       setYamlText(raw.yaml);
       setYamlModalOpen(true);
@@ -408,15 +406,26 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
     setYamlBusy("save");
     setYamlMsg(null);
     try {
-      await clashApi.reloadYaml(yamlText);
+      const isEditingActive =
+        !yamlTargetId || yamlTargetId === profilesSnapshot?.active_profile_id;
+      if (yamlTargetId) {
+        await clashApi.saveProfileRawYaml(yamlTargetId, yamlText);
+      } else {
+        await clashApi.reloadYaml(yamlText);
+      }
       await onReloaded();
       setYamlModalOpen(false);
       setToast({
         ok: true,
-        text: tr(
-          "YAML 配置已验证并热重载生效",
-          "YAML configuration validated and hot-reloaded",
-        ),
+        text: isEditingActive
+          ? tr(
+              "YAML 配置已验证并热重载生效",
+              "YAML configuration validated and hot-reloaded",
+            )
+          : tr(
+              `配置「${yamlTargetName}」YAML 已验证并保存（当前激活配置保持不变）`,
+              `Saved validated YAML for '${yamlTargetName}' without switching active profile`,
+            ),
       });
     } catch (err) {
       setYamlMsg({

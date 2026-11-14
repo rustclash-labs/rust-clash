@@ -57,6 +57,12 @@ where
 pub trait OutboundUdpSession: Send + Sync {
     async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()>;
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)>;
+    /// Returns `true` when a `send_to` error is isolated to a single target destination
+    /// (e.g. per-domain DNS `NODATA`/`NXDOMAIN` or per-peer ICMP/route unreachability)
+    /// rather than a fatal failure of the underlying UDP session/socket itself.
+    fn is_target_transient_error(&self, _err: &io::Error) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -192,9 +198,14 @@ async fn measure_http_head_latency<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
+    let host_hdr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     if !unified_delay {
         let req = format!(
-            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
+            "HEAD {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
         );
         stream.write_all(req.as_bytes()).await?;
@@ -213,7 +224,7 @@ where
     // `unified-delay: true` (Mihomo-compatible):
     // 1. Warmup HEAD #1 over keep-alive (triggers lazy proxy->origin dial if not yet connected)
     let req1 = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/{}\r\nConnection: keep-alive\r\n\r\n",
+        "HEAD {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rust-clash/{}\r\nConnection: keep-alive\r\n\r\n",
         env!("CARGO_PKG_VERSION")
     );
     let t1_started = Instant::now();
@@ -262,7 +273,7 @@ where
 
     // 2. Measured HEAD #2 over the established end-to-end tunnel (pure 1-RTT payload latency)
     let req2 = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
+        "HEAD {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
         env!("CARGO_PKG_VERSION")
     );
     let t2_started = Instant::now();
@@ -345,11 +356,14 @@ impl DirectOutbound {
     }
 }
 
+const DIRECT_UDP_LOCAL_BIND_ERR_PREFIX: &str = "local UDP socket bind failed:";
+
 struct DirectUdpSession {
     direct: DirectOutbound,
     sock_v4: OnceCell<Arc<UdpSocket>>,
     sock_v6: OnceCell<Arc<UdpSocket>>,
     ready_notify: tokio::sync::Notify,
+    peer_to_domain: parking_lot::Mutex<lru::LruCache<SocketAddr, TargetAddr>>,
 }
 
 impl DirectUdpSession {
@@ -359,6 +373,9 @@ impl DirectUdpSession {
             sock_v4: OnceCell::new(),
             sock_v6: OnceCell::new(),
             ready_notify: tokio::sync::Notify::new(),
+            peer_to_domain: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(512).expect("non-zero capacity"),
+            )),
         }
     }
 
@@ -369,7 +386,9 @@ impl DirectUdpSession {
                 .sock_v4
                 .get_or_try_init(|| async {
                     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                    let s = protected_udp_bind(bind, Some(remote))?;
+                    let s = protected_udp_bind(bind, Some(remote)).map_err(|e| {
+                        io::Error::new(e.kind(), format!("{DIRECT_UDP_LOCAL_BIND_ERR_PREFIX} {e}"))
+                    })?;
                     Ok::<Arc<UdpSocket>, io::Error>(Arc::new(s))
                 })
                 .await?;
@@ -383,7 +402,19 @@ impl DirectUdpSession {
                 .sock_v6
                 .get_or_try_init(|| async {
                     let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-                    let s = protected_udp_bind(bind, Some(remote))?;
+                    // On IPv4-only kernels (`ipv6.disable=1`), `AF_INET6` socket creation fails
+                    // with `EAFNOSUPPORT` / `AddrNotAvailable` — treat that as per-family transient
+                    // so IPv4 destinations on the same `DirectUdpSession` remain usable.
+                    let s = protected_udp_bind(bind, Some(remote)).map_err(|e| {
+                        if crate::platform::socket_protect::is_local_ipv6_unreachable_error(&e) {
+                            e
+                        } else {
+                            io::Error::new(
+                                e.kind(),
+                                format!("{DIRECT_UDP_LOCAL_BIND_ERR_PREFIX} {e}"),
+                            )
+                        }
+                    })?;
                     Ok::<Arc<UdpSocket>, io::Error>(Arc::new(s))
                 })
                 .await?;
@@ -392,6 +423,14 @@ impl DirectUdpSession {
             }
             Ok(sock)
         }
+    }
+
+    fn map_peer_source(&self, peer: SocketAddr) -> TargetAddr {
+        self.peer_to_domain
+            .lock()
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| TargetAddr::from(peer))
     }
 }
 
@@ -414,6 +453,15 @@ fn order_direct_udp_addrs(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 
 #[async_trait]
 impl OutboundUdpSession for DirectUdpSession {
+    fn is_target_transient_error(&self, err: &io::Error) -> bool {
+        !err.to_string()
+            .starts_with(DIRECT_UDP_LOCAL_BIND_ERR_PREFIX)
+            && !matches!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::OutOfMemory
+            )
+    }
+
     async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
         let addrs = order_direct_udp_addrs(self.direct.resolve_target_addrs(target).await?);
         if addrs.is_empty() {
@@ -431,6 +479,9 @@ impl OutboundUdpSession for DirectUdpSession {
             };
             match send_res {
                 Ok(()) => {
+                    if matches!(target.host, HostName::Domain(_)) {
+                        self.peer_to_domain.lock().put(remote_addr, target.clone());
+                    }
                     crate::platform::socket_protect::note_direct_addr_connect_result(
                         remote_addr,
                         Ok(()),
@@ -457,52 +508,90 @@ impl OutboundUdpSession for DirectUdpSession {
     }
 
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
+        let mut b4 = vec![0u8; 65535];
+        let mut b6 = vec![0u8; 65535];
         loop {
+            // Pin and enable `ready_notify` BEFORE reading `OnceCell`s so `notify_waiters()`
+            // from `socket_for` can never be lost in the window between `.get()` and `.await`.
+            let notified = self.ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let v4 = self.sock_v4.get().cloned();
             let v6 = self.sock_v6.get().cloned();
             match (v4, v6) {
                 (Some(s4), Some(s6)) => {
-                    let mut b4 = vec![0u8; 65535];
-                    let mut b6 = vec![0u8; 65535];
                     tokio::select! {
                         res = s4.recv_from(&mut b4) => {
-                            let (n, peer) = res?;
-                            b4.truncate(n);
-                            return Ok((b4, TargetAddr::from(peer)));
+                            match res {
+                                Ok((n, peer)) => {
+                                    return Ok((b4[..n].to_vec(), self.map_peer_source(peer)));
+                                }
+                                Err(e) if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::ConnectionRefused
+                                        | io::ErrorKind::Interrupted
+                                ) => continue,
+                                Err(e) => return Err(e),
+                            }
                         }
                         res = s6.recv_from(&mut b6) => {
-                            let (n, peer) = res?;
-                            b6.truncate(n);
-                            return Ok((b6, TargetAddr::from(peer)));
+                            match res {
+                                Ok((n, peer)) => {
+                                    return Ok((b6[..n].to_vec(), self.map_peer_source(peer)));
+                                }
+                                Err(e) if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::ConnectionRefused
+                                        | io::ErrorKind::Interrupted
+                                ) => continue,
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                 }
                 (Some(s4), None) => {
-                    let mut b4 = vec![0u8; 65535];
-                    let notified = self.ready_notify.notified();
                     tokio::select! {
                         res = s4.recv_from(&mut b4) => {
-                            let (n, peer) = res?;
-                            b4.truncate(n);
-                            return Ok((b4, TargetAddr::from(peer)));
+                            match res {
+                                Ok((n, peer)) => {
+                                    return Ok((b4[..n].to_vec(), self.map_peer_source(peer)));
+                                }
+                                Err(e) if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::ConnectionRefused
+                                        | io::ErrorKind::Interrupted
+                                ) => continue,
+                                Err(e) => return Err(e),
+                            }
                         }
-                        _ = notified => continue,
+                        _ = &mut notified => continue,
                     }
                 }
                 (None, Some(s6)) => {
-                    let mut b6 = vec![0u8; 65535];
-                    let notified = self.ready_notify.notified();
                     tokio::select! {
                         res = s6.recv_from(&mut b6) => {
-                            let (n, peer) = res?;
-                            b6.truncate(n);
-                            return Ok((b6, TargetAddr::from(peer)));
+                            match res {
+                                Ok((n, peer)) => {
+                                    return Ok((b6[..n].to_vec(), self.map_peer_source(peer)));
+                                }
+                                Err(e) if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::ConnectionRefused
+                                        | io::ErrorKind::Interrupted
+                                ) => continue,
+                                Err(e) => return Err(e),
+                            }
                         }
-                        _ = notified => continue,
+                        _ = &mut notified => continue,
                     }
                 }
                 (None, None) => {
-                    self.ready_notify.notified().await;
+                    notified.await;
                 }
             }
         }

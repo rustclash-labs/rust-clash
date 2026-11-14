@@ -87,43 +87,74 @@ impl ShadowsocksOutbound {
     }
 }
 
-/// 64-packet sliding anti-replay window per SIP022 server session ID.
-#[derive(Default)]
-struct SlidingReplayWindow {
-    server_session_id: Option<u64>,
+const MAX_TRACKED_SERVER_SESSIONS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ServerReplaySlot {
+    server_session_id: u64,
     max_pkt_id: u64,
     bitmap: u64,
+    last_touch: u64,
+}
+
+/// 64-packet sliding anti-replay window across up to 8 concurrent SIP022 server session IDs.
+#[derive(Default)]
+struct SlidingReplayWindow {
+    slots: [Option<ServerReplaySlot>; MAX_TRACKED_SERVER_SESSIONS],
+    clock: u64,
 }
 
 impl SlidingReplayWindow {
     fn accept(&mut self, server_sid: u64, pkt_id: u64) -> bool {
-        if self.server_session_id != Some(server_sid) {
-            self.server_session_id = Some(server_sid);
-            self.max_pkt_id = pkt_id;
-            self.bitmap = 1;
-            return true;
-        }
-        if pkt_id > self.max_pkt_id {
-            let shift = pkt_id - self.max_pkt_id;
-            if shift >= 64 {
-                self.bitmap = 1;
-            } else {
-                self.bitmap = (self.bitmap << shift) | 1;
+        self.clock = self.clock.wrapping_add(1);
+        let touch = self.clock;
+
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|s| s.server_session_id == server_sid)
+        {
+            if pkt_id > slot.max_pkt_id {
+                let shift = pkt_id - slot.max_pkt_id;
+                if shift >= 64 {
+                    slot.bitmap = 1;
+                } else {
+                    slot.bitmap = (slot.bitmap << shift) | 1;
+                }
+                slot.max_pkt_id = pkt_id;
+                slot.last_touch = touch;
+                return true;
             }
-            self.max_pkt_id = pkt_id;
-            true
-        } else {
-            let diff = self.max_pkt_id - pkt_id;
+            let diff = slot.max_pkt_id - pkt_id;
             if diff >= 64 {
                 return false;
             }
             let mask = 1u64 << diff;
-            if (self.bitmap & mask) != 0 {
+            if (slot.bitmap & mask) != 0 {
                 return false;
             }
-            self.bitmap |= mask;
-            true
+            slot.bitmap |= mask;
+            slot.last_touch = touch;
+            return true;
         }
+
+        let new_slot = ServerReplaySlot {
+            server_session_id: server_sid,
+            max_pkt_id: pkt_id,
+            bitmap: 1,
+            last_touch: touch,
+        };
+        if let Some(empty) = self.slots.iter_mut().find(|s| s.is_none()) {
+            *empty = Some(new_slot);
+        } else if let Some(lru) = self
+            .slots
+            .iter_mut()
+            .min_by_key(|s| s.map_or(0, |v| v.last_touch))
+        {
+            *lru = Some(new_slot);
+        }
+        true
     }
 }
 

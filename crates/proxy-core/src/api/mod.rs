@@ -78,6 +78,9 @@ struct ControllerSecretContext {
     has_valid_secret: bool,
 }
 
+#[derive(Clone)]
+struct WsShutdownWatch(Option<watch::Receiver<bool>>);
+
 pub fn build_api_router(engine: Arc<ProxyEngine>) -> AxumRouter {
     let fallback_addr = engine
         .config_snapshot()
@@ -88,6 +91,14 @@ pub fn build_api_router(engine: Arc<ProxyEngine>) -> AxumRouter {
 }
 
 pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAddr) -> AxumRouter {
+    build_api_router_with_addr_and_shutdown(engine, bound_addr, None)
+}
+
+fn build_api_router_with_addr_and_shutdown(
+    engine: Arc<ProxyEngine>,
+    bound_addr: SocketAddr,
+    api_shutdown: Option<watch::Receiver<bool>>,
+) -> AxumRouter {
     let started_with_secret = engine
         .config_snapshot()
         .secret
@@ -173,6 +184,10 @@ pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAd
             "/profiles/{id}",
             delete(delete_profile_api).patch(patch_profile_settings_api),
         )
+        .route(
+            "/profiles/{id}/raw",
+            get(get_profile_raw_yaml_api).put(put_profile_raw_yaml_api),
+        )
         .route("/profiles/{id}/activate", put(put_activate_profile_api))
         .route("/profiles/{id}/refresh", post(post_refresh_profile_api))
         .route("/demo/toggle", post(post_demo_toggle_api))
@@ -193,6 +208,7 @@ pub fn build_api_router_with_addr(engine: Arc<ProxyEngine>, bound_addr: SocketAd
         .route("/logs", get(get_or_ws_logs))
         .fallback(serve_embedded_spa)
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(axum::extract::Extension(WsShutdownWatch(api_shutdown)))
         .layer(middleware::from_fn_with_state(
             api_state,
             security_and_auth_middleware,
@@ -227,7 +243,7 @@ pub async fn spawn_api_server(
         "info",
         format!("Control API & Embedded Web Console listening on http://{bound}"),
     );
-    let app = build_api_router_with_addr(engine, bound);
+    let app = build_api_router_with_addr_and_shutdown(engine, bound, Some(shutdown.clone()));
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(
@@ -990,24 +1006,83 @@ fn connections_snapshot_json(engine: &ProxyEngine) -> serde_json::Value {
     })
 }
 
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn ws_send_text_bounded(socket: &mut WebSocket, text: String) -> bool {
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(Message::Text(text.into()))).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn handle_ws_inbound_frame(
+    socket: &mut WebSocket,
+    frame: Option<std::result::Result<Message, axum::Error>>,
+) -> bool {
+    match frame {
+        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => false,
+        Some(Ok(Message::Ping(payload))) => matches!(
+            tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(Message::Pong(payload))).await,
+            Ok(Ok(()))
+        ),
+        Some(Ok(_)) => true,
+    }
+}
+
+async fn wait_ws_shutdown(
+    eng_stop: &mut watch::Receiver<bool>,
+    api_stop: &mut Option<watch::Receiver<bool>>,
+) {
+    if *eng_stop.borrow() || api_stop.as_ref().is_some_and(|rx| *rx.borrow()) {
+        return;
+    }
+    match api_stop {
+        Some(srv_rx) => {
+            tokio::select! {
+                _ = eng_stop.changed() => {}
+                _ = srv_rx.changed() => {}
+            }
+        }
+        None => {
+            let _ = eng_stop.changed().await;
+        }
+    }
+}
+
 async fn get_or_ws_connections(
     ws_res: std::result::Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    ws_stop: Option<axum::extract::Extension<WsShutdownWatch>>,
     State(engine): State<Arc<ProxyEngine>>,
 ) -> Response {
+    let api_stop = ws_stop.and_then(|e| e.0.0);
     match ws_res {
-        Ok(ws) => ws.on_upgrade(move |socket| stream_connections_ws(socket, engine)),
+        Ok(ws) => ws.on_upgrade(move |socket| stream_connections_ws(socket, engine, api_stop)),
         Err(_) => Json(connections_snapshot_json(&engine)).into_response(),
     }
 }
 
-async fn stream_connections_ws(mut socket: WebSocket, engine: Arc<ProxyEngine>) {
+async fn stream_connections_ws(
+    mut socket: WebSocket,
+    engine: Arc<ProxyEngine>,
+    mut api_stop: Option<watch::Receiver<bool>>,
+) {
+    let mut eng_stop = engine.subscribe_shutdown();
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
-        let msg = connections_snapshot_json(&engine).to_string();
-        if socket.send(Message::Text(msg.into())).await.is_err() {
-            break;
+        tokio::select! {
+            _ = wait_ws_shutdown(&mut eng_stop, &mut api_stop) => break,
+            inbound = socket.recv() => {
+                if !handle_ws_inbound_frame(&mut socket, inbound).await {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let msg = connections_snapshot_json(&engine).to_string();
+                if !ws_send_text_bounded(&mut socket, msg).await {
+                    break;
+                }
+            }
         }
     }
 }
@@ -1859,13 +1934,15 @@ async fn post_live_benchmark(
 
 async fn get_or_ws_traffic(
     ws_res: std::result::Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    ws_stop: Option<axum::extract::Extension<WsShutdownWatch>>,
     State(engine): State<Arc<ProxyEngine>>,
 ) -> Response {
+    let api_stop = ws_stop.and_then(|e| e.0.0);
     match ws_res {
-        Ok(ws) => ws.on_upgrade(move |socket| stream_traffic_ws(socket, engine)),
+        Ok(ws) => ws.on_upgrade(move |socket| stream_traffic_ws(socket, engine, api_stop)),
         Err(_) => {
             let history = engine.hub().traffic_history();
-            let latest = history.last().copied().unwrap_or_default();
+            let latest = history.last().cloned().unwrap_or_default();
             Json(serde_json::json!({
                 "up": latest.up,
                 "down": latest.down,
@@ -1878,29 +1955,47 @@ async fn get_or_ws_traffic(
     }
 }
 
-async fn stream_traffic_ws(mut socket: WebSocket, engine: Arc<ProxyEngine>) {
+async fn stream_traffic_ws(
+    mut socket: WebSocket,
+    engine: Arc<ProxyEngine>,
+    mut api_stop: Option<watch::Receiver<bool>>,
+) {
+    let mut eng_stop = engine.subscribe_shutdown();
     let mut rx = engine.hub().subscribe_traffic();
     loop {
-        match rx.recv().await {
-            Ok(point) => {
-                let Ok(text) = serde_json::to_string(&point) else {
-                    continue;
-                };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+        tokio::select! {
+            _ = wait_ws_shutdown(&mut eng_stop, &mut api_stop) => break,
+            inbound = socket.recv() => {
+                if !handle_ws_inbound_frame(&mut socket, inbound).await {
                     break;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            item = rx.recv() => {
+                match item {
+                    Ok(point) => {
+                        let Ok(text) = serde_json::to_string(&point) else {
+                            continue;
+                        };
+                        if !ws_send_text_bounded(&mut socket, text).await {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 }
 
 async fn get_or_ws_memory(
     ws_res: std::result::Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    ws_stop: Option<axum::extract::Extension<WsShutdownWatch>>,
+    State(engine): State<Arc<ProxyEngine>>,
 ) -> Response {
+    let api_stop = ws_stop.and_then(|e| e.0.0);
     match ws_res {
-        Ok(ws) => ws.on_upgrade(stream_memory_ws),
+        Ok(ws) => ws.on_upgrade(move |socket| stream_memory_ws(socket, engine, api_stop)),
         Err(_) => Json(serde_json::json!({
             "inuse": read_process_rss_bytes(),
             "oslimit": 0u64,
@@ -1909,27 +2004,44 @@ async fn get_or_ws_memory(
     }
 }
 
-async fn stream_memory_ws(mut socket: WebSocket) {
+async fn stream_memory_ws(
+    mut socket: WebSocket,
+    engine: Arc<ProxyEngine>,
+    mut api_stop: Option<watch::Receiver<bool>>,
+) {
+    let mut eng_stop = engine.subscribe_shutdown();
     let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
-        let msg = serde_json::json!({
-            "inuse": read_process_rss_bytes(),
-            "oslimit": 0u64,
-        })
-        .to_string();
-        if socket.send(Message::Text(msg.into())).await.is_err() {
-            break;
+        tokio::select! {
+            _ = wait_ws_shutdown(&mut eng_stop, &mut api_stop) => break,
+            inbound = socket.recv() => {
+                if !handle_ws_inbound_frame(&mut socket, inbound).await {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let msg = serde_json::json!({
+                    "inuse": read_process_rss_bytes(),
+                    "oslimit": 0u64,
+                })
+                .to_string();
+                if !ws_send_text_bounded(&mut socket, msg).await {
+                    break;
+                }
+            }
         }
     }
 }
 
 async fn get_or_ws_logs(
     ws_res: std::result::Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    ws_stop: Option<axum::extract::Extension<WsShutdownWatch>>,
     State(engine): State<Arc<ProxyEngine>>,
 ) -> Response {
+    let api_stop = ws_stop.and_then(|e| e.0.0);
     match ws_res {
-        Ok(ws) => ws.on_upgrade(move |socket| stream_logs_ws(socket, engine)),
+        Ok(ws) => ws.on_upgrade(move |socket| stream_logs_ws(socket, engine, api_stop)),
         Err(_) => {
             let logs = engine.hub().recent_logs();
             Json(serde_json::json!({ "logs": logs })).into_response()
@@ -1937,26 +2049,44 @@ async fn get_or_ws_logs(
     }
 }
 
-async fn stream_logs_ws(mut socket: WebSocket, engine: Arc<ProxyEngine>) {
+async fn stream_logs_ws(
+    mut socket: WebSocket,
+    engine: Arc<ProxyEngine>,
+    mut api_stop: Option<watch::Receiver<bool>>,
+) {
+    let mut eng_stop = engine.subscribe_shutdown();
     for entry in engine.hub().recent_logs() {
+        if *eng_stop.borrow() || api_stop.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return;
+        }
         if let Ok(text) = serde_json::to_string(&entry)
-            && socket.send(Message::Text(text.into())).await.is_err()
+            && !ws_send_text_bounded(&mut socket, text).await
         {
             return;
         }
     }
     let mut rx = engine.hub().subscribe_logs();
     loop {
-        match rx.recv().await {
-            Ok(entry) => {
-                if let Ok(text) = serde_json::to_string(&entry)
-                    && socket.send(Message::Text(text.into())).await.is_err()
-                {
+        tokio::select! {
+            _ = wait_ws_shutdown(&mut eng_stop, &mut api_stop) => break,
+            inbound = socket.recv() => {
+                if !handle_ws_inbound_frame(&mut socket, inbound).await {
                     break;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            item = rx.recv() => {
+                match item {
+                    Ok(entry) => {
+                        if let Ok(text) = serde_json::to_string(&entry)
+                            && !ws_send_text_bounded(&mut socket, text).await
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 }
@@ -2531,6 +2661,182 @@ async fn patch_profile_settings_api(
     }
 }
 
+async fn get_profile_raw_yaml_api(
+    State(engine): State<Arc<ProxyEngine>>,
+    Path(id): Path<String>,
+    auth_ctx: Option<axum::extract::Extension<ControllerSecretContext>>,
+    Query(query): Query<RawYamlQuery>,
+) -> Response {
+    let mgr = match ensure_profile_manager(&engine) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(cfg) = mgr.load_profile_config_by_id(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": format!("profile '{id}' not found") })),
+        )
+            .into_response();
+    };
+
+    if query.include_sensitive {
+        let ctx = auth_ctx.map(|e| e.0).unwrap_or_default();
+        let live_cfg = engine.config_snapshot();
+        let has_secret = live_cfg
+            .secret
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if !ctx.started_with_secret || !has_secret || !ctx.has_valid_secret {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "message": "Revealing unredacted credentials via HTTP API requires a controller 'secret' configured at server startup and a valid Bearer token"
+                })),
+            )
+                .into_response();
+        }
+        let yaml = match cfg.to_yaml_string() {
+            Ok(y) => y,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let exported_uris: Vec<String> = cfg.proxies.iter().map(export_proxy_uri).collect();
+        return Json(serde_json::json!({
+            "id": id,
+            "active": mgr.active_profile_id() == id,
+            "yaml": yaml,
+            "uris": exported_uris,
+            "redacted": false,
+        }))
+        .into_response();
+    }
+
+    let redacted_cfg = cfg.redacted();
+    let redacted_yaml = match redacted_cfg.to_yaml_string() {
+        Ok(y) => y,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+                })),
+            )
+                .into_response();
+        }
+    };
+    let redacted_uris: Vec<String> = redacted_cfg.proxies.iter().map(export_proxy_uri).collect();
+    Json(serde_json::json!({
+        "id": id,
+        "active": mgr.active_profile_id() == id,
+        "yaml": redacted_yaml,
+        "uris": redacted_uris,
+        "redacted": true,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PutProfileRawYamlReq {
+    payload: String,
+}
+
+async fn put_profile_raw_yaml_api(
+    State(engine): State<Arc<ProxyEngine>>,
+    Path(id): Path<String>,
+    Json(req): Json<PutProfileRawYamlReq>,
+) -> Response {
+    let mgr = match ensure_profile_manager(&engine) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(prev_cfg) = mgr.load_profile_config_by_id(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": format!("profile '{id}' not found") })),
+        )
+            .into_response();
+    };
+
+    if mgr.active_profile_id() == id && !engine.demo_info().enabled {
+        return match engine.reload_yaml(&req.payload).await {
+            Ok(()) => (StatusCode::OK, Json(mgr.snapshot())).into_response(),
+            Err(ProxyError::Routing(msg)) => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&msg) })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+            )
+                .into_response(),
+        };
+    }
+
+    let mut parsed = match ClashConfig::from_yaml_str_unchecked(&req.payload) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+                })),
+            )
+                .into_response();
+        }
+    };
+    parsed.restore_redacted_from(&prev_cfg);
+    if let Err(e) = parsed.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+            })),
+        )
+            .into_response();
+    }
+    match mgr.persist_profile_yaml(&id, &parsed, None, None) {
+        Ok(_) => {
+            engine
+                .hub()
+                .push_log("info", format!("Saved raw YAML for profile '{id}'"));
+            (StatusCode::OK, Json(mgr.snapshot())).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&e.to_string())
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct ExitIpQuery {
     #[serde(default)]
@@ -2612,26 +2918,9 @@ fn extract_http_response_body_str(raw: &[u8]) -> Option<String> {
     });
     let body_raw = &raw[hdr_end + 4..];
     if is_chunked {
-        let mut out = Vec::new();
-        let mut cur = body_raw;
-        while let Some(crlf) = cur.windows(2).position(|w| w == b"\r\n") {
-            let len_str = std::str::from_utf8(&cur[..crlf])
-                .ok()?
-                .split(';')
-                .next()?
-                .trim();
-            let chunk_len = usize::from_str_radix(len_str, 16).ok()?;
-            cur = &cur[crlf + 2..];
-            if chunk_len == 0 {
-                break;
-            }
-            if cur.len() < chunk_len + 2 {
-                return None;
-            }
-            out.extend_from_slice(&cur[..chunk_len]);
-            cur = &cur[chunk_len + 2..];
-        }
-        String::from_utf8(out).ok()
+        crate::config::decode_http_chunked_body(body_raw, 1024 * 1024)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
     } else {
         String::from_utf8(body_raw.to_vec()).ok()
     }
@@ -3535,5 +3824,151 @@ RssShmem:\t   90100 kB
         let total = read_process_total_vmrss_bytes();
         assert!(rss > 0);
         assert!(total >= rss || total > 0);
+    }
+
+    #[tokio::test]
+    async fn profile_raw_yaml_endpoints_and_ws_graceful_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rc-api-prof-raw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let prof_mgr =
+            crate::profile::ProfileManager::open_or_init(&tmp_dir).expect("init profile manager");
+
+        let yaml_a = "\
+mixed-port: 0
+mode: rule
+dns:
+  enable: false
+proxies:
+  - name: Node-A
+    type: ss
+    server: 198.51.100.10
+    port: 8388
+    cipher: aes-256-gcm
+    password: secret-password-a
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [Node-A, DIRECT]
+rules:
+  - MATCH,PROXY
+";
+        let yaml_b = "\
+mixed-port: 0
+mode: rule
+dns:
+  enable: false
+proxies:
+  - name: Node-B
+    type: ss
+    server: 198.51.100.20
+    port: 8388
+    cipher: aes-256-gcm
+    password: secret-password-b
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [Node-B, DIRECT]
+rules:
+  - MATCH,PROXY
+";
+
+        let (meta_a, _, _) = prof_mgr
+            .create_profile_detailed(crate::profile::CreateProfileSpec {
+                name: "Profile A".to_string(),
+                yaml: Some(yaml_a.to_string()),
+                uris: None,
+                subscription_url: None,
+                auto_update_interval_secs: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        let (meta_b, _, _) = prof_mgr
+            .create_profile_detailed(crate::profile::CreateProfileSpec {
+                name: "Profile B".to_string(),
+                yaml: Some(yaml_b.to_string()),
+                uris: None,
+                subscription_url: None,
+                auto_update_interval_secs: None,
+                activate: false,
+            })
+            .await
+            .unwrap();
+
+        let cfg_a = ClashConfig::from_yaml_str(yaml_a).unwrap();
+        let engine = ProxyEngine::start_with_state_dir(cfg_a, tmp_dir.clone())
+            .await
+            .expect("start engine");
+        engine.attach_profile_manager(Arc::clone(&prof_mgr));
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (bound, server_handle) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), stop_rx)
+            .await
+            .expect("spawn api server");
+
+        // Open a live /traffic WebSocket stream so we also verify graceful shutdown doesn't hang!
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://{bound}/traffic"))
+            .await
+            .expect("connect /traffic ws");
+
+        // 1. GET /profiles/{id}/raw on inactive Profile B returns redacted YAML without changing active Profile A
+        let mut get_conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let get_http = format!(
+            "GET /profiles/{}/raw HTTP/1.1\r\nHost: {bound}\r\nConnection: close\r\n\r\n",
+            meta_b.id
+        );
+        get_conn.write_all(get_http.as_bytes()).await.unwrap();
+        let mut get_raw = Vec::new();
+        get_conn.read_to_end(&mut get_raw).await.unwrap();
+        let get_body = extract_http_response_body_str(&get_raw).unwrap();
+        let get_json: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+        assert_eq!(get_json["active"], false);
+        assert_eq!(get_json["redacted"], true);
+        let redacted_b = get_json["yaml"].as_str().unwrap();
+        assert!(redacted_b.contains("Node-B"));
+        assert!(!redacted_b.contains("secret-password-b"));
+        assert_eq!(prof_mgr.snapshot().active_profile_id, meta_a.id);
+
+        // 2. PUT /profiles/{id}/raw updates inactive Profile B (restoring redacted secret!) while keeping Profile A active
+        let updated_b = redacted_b.replace("port: 8388", "port: 9443");
+        let put_payload = serde_json::json!({ "payload": updated_b }).to_string();
+        let mut put_conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let put_http = format!(
+            "PUT /profiles/{}/raw HTTP/1.1\r\nHost: {bound}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            meta_b.id,
+            put_payload.len(),
+            put_payload
+        );
+        put_conn.write_all(put_http.as_bytes()).await.unwrap();
+        let mut put_raw = Vec::new();
+        put_conn.read_to_end(&mut put_raw).await.unwrap();
+        assert!(String::from_utf8_lossy(&put_raw).starts_with("HTTP/1.1 200"));
+        assert_eq!(prof_mgr.snapshot().active_profile_id, meta_a.id);
+
+        let saved_cfg_b = prof_mgr
+            .load_profile_config_by_id(&meta_b.id)
+            .expect("load updated Profile B");
+        assert_eq!(saved_cfg_b.proxies[0].name(), "Node-B");
+        match &saved_cfg_b.proxies[0] {
+            crate::config::ProxyNodeConfig::Ss { port, password, .. } => {
+                assert_eq!(*port, 9443);
+                assert_eq!(password, "secret-password-b");
+            }
+            other => panic!("unexpected node variant: {other:?}"),
+        }
+
+        // 3. Trigger API shutdown while ws_stream is open — server_handle must exit promptly (< 2s)
+        let _ = stop_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("API server with active WebSocket must shut down cleanly within 2s")
+            .unwrap();
+        let _ = ws_stream.close(None).await;
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

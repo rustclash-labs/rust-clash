@@ -356,12 +356,19 @@ impl OutboundHandler for Socks5Outbound {
         )
         .await?;
 
+        if bnd.port == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SOCKS5 UDP associate returned invalid BND.PORT 0",
+            ));
+        }
+
         let relay_ip = match bnd.host {
             HostName::Ip(ip) if !ip.is_unspecified() => ip,
             HostName::Ip(_) => peer_ip,
             HostName::Domain(ref d) => {
                 if let Some(dns) = &self.inner.dns {
-                    *dns.resolve_direct_ips(d)
+                    *dns.resolve_proxy_server_ips(d)
                         .await
                         .map_err(|e| e.into_io())?
                         .first()
@@ -369,7 +376,14 @@ impl OutboundHandler for Socks5Outbound {
                             io::Error::new(io::ErrorKind::HostUnreachable, "empty SOCKS5 relay DNS")
                         })?
                 } else {
-                    peer_ip
+                    crate::router::geodata::resolve_host_bypassing_fake_ip(d, bnd.port)
+                        .await
+                        .map_err(|e| e.into_io())?
+                        .first()
+                        .map(SocketAddr::ip)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::HostUnreachable, "empty SOCKS5 relay DNS")
+                        })?
                 }
             }
         };

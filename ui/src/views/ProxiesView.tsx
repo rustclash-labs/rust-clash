@@ -85,6 +85,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   );
   const [editingOriginalProto, setEditingOriginalProto] =
     useState<NodeProto | null>(null);
+  const [editingOriginalNode, setEditingOriginalNode] =
+    useState<ProxyNodeConfigPayload | null>(null);
 
   // Paste tab
   const [pasteInput, setPasteInput] = useState("");
@@ -205,6 +207,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const resetManualForm = useCallback(() => {
     setEditingOriginalName(null);
     setEditingOriginalProto(null);
+    setEditingOriginalNode(null);
     setProto("vless");
     setNodeName("");
     setServerHost("");
@@ -262,6 +265,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setModalError(null);
     setEditingOriginalName(node.name);
     setEditingOriginalProto(node.type);
+    setEditingOriginalNode(node);
     setModalMode("manual");
     setProto(node.type);
     setNodeName(node.name);
@@ -344,10 +348,16 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setToast(null);
     try {
       await clashApi.selectProxy(group.name, memberName);
-      if (config?.mode === "direct") {
-        await clashApi.patchConfigs({ mode: "rule" });
-      }
       await onRefreshProxies();
+      if (config?.mode === "direct") {
+        setToast({
+          ok: true,
+          text: tr(
+            `已将「${group.name}」切换为「${memberName}」（当前处于直连模式，切回规则或全局模式后生效）`,
+            `Selected '${memberName}' in '${group.name}' (currently in Direct mode — switch to Rule or Global mode to route via proxy)`,
+          ),
+        });
+      }
     } catch (err) {
       setToast({
         ok: false,
@@ -427,11 +437,12 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       setPasteInput("");
       setModalOpen(false);
       const dup = res["skipped-duplicates"] ?? 0;
+      const skippedUnsupported = res["skipped-unsupported"]?.length ?? 0;
       setToast({
         ok: true,
         text: tr(
-          `成功导入 ${res.count} 个节点${dup > 0 ? `（已自动跳过 ${dup} 个重复节点）` : ""}，已受手动节点保护。`,
-          `Imported ${res.count} node(s)${dup > 0 ? ` (${dup} duplicates skipped)` : ""} with manual-node protection.`,
+          `成功导入 ${res.count} 个节点${dup > 0 ? `（跳过 ${dup} 个重复节点）` : ""}${skippedUnsupported > 0 ? `（跳过 ${skippedUnsupported} 个暂不支持协议节点）` : ""}，已受手动节点保护。`,
+          `Imported ${res.count} node(s)${dup > 0 ? ` (${dup} duplicates skipped)` : ""}${skippedUnsupported > 0 ? ` (${skippedUnsupported} unsupported skipped)` : ""} with manual-node protection.`,
         ),
       });
     } catch (err) {
@@ -458,11 +469,25 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     }
   };
 
-  const buildWsTransportPayload = () => {
+  const buildWsTransportPayload = (
+    existingWs?: {
+      path?: string;
+      headers?: Record<string, string>;
+      "max-early-data"?: number;
+      "early-data-header-name"?: string | null;
+    } | null,
+  ) => {
     if (transportNet !== "ws") {
       return { network: "tcp", wsOpts: undefined };
     }
     const headers: Record<string, string> = {};
+    if (existingWs?.headers) {
+      for (const [k, v] of Object.entries(existingWs.headers)) {
+        if (k.toLowerCase() !== "host") {
+          headers[k] = v;
+        }
+      }
+    }
     if (wsHost.trim()) headers.Host = wsHost.trim();
     const trimmedEarly = wsMaxEarlyData.trim();
     let earlyNum = 0;
@@ -485,7 +510,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         ...(earlyNum > 0
           ? {
               "max-early-data": earlyNum,
-              "early-data-header-name": "Sec-WebSocket-Protocol",
+              "early-data-header-name":
+                existingWs?.["early-data-header-name"] ??
+                "Sec-WebSocket-Protocol",
             }
           : {}),
       },
@@ -542,7 +569,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      const wsCfg = buildWsTransportPayload();
+      const origVless =
+        sameProto && editingOriginalNode?.type === "vless"
+          ? editingOriginalNode
+          : null;
+      const wsCfg = buildWsTransportPayload(origVless?.["ws-opts"]);
       return {
         type: "vless",
         name: cleanName,
@@ -554,6 +585,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         servername: vlessServername.trim() || null,
         "skip-cert-verify": vlessSkipVerify,
         alpn: alpnList,
+        ...(origVless?.flow ? { flow: origVless.flow } : {}),
         network: wsCfg.network,
         ...(wsCfg.wsOpts ? { "ws-opts": wsCfg.wsOpts } : {}),
         udp: udpEnabled,
@@ -569,7 +601,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      const wsCfg = buildWsTransportPayload();
+      const origTrojan =
+        sameProto && editingOriginalNode?.type === "trojan"
+          ? editingOriginalNode
+          : null;
+      const wsCfg = buildWsTransportPayload(origTrojan?.["ws-opts"]);
       return {
         type: "trojan",
         name: cleanName,
@@ -614,6 +650,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         : sameProto && authHadSavedPassword
           ? REDACTED_SECRET
           : null;
+      const origHttp =
+        sameProto && editingOriginalNode?.type === "http"
+          ? editingOriginalNode
+          : null;
       return {
         type: "http",
         name: cleanName,
@@ -624,6 +664,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         tls: proxyTls,
         sni: proxySni.trim() || null,
         "skip-cert-verify": proxySkipVerify,
+        ...(origHttp?.headers ? { headers: origHttp.headers } : {}),
       };
     }
 
@@ -635,6 +676,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+    const origAnytls =
+      sameProto && editingOriginalNode?.type === "anytls"
+        ? editingOriginalNode
+        : null;
     return {
       type: "anytls",
       name: cleanName,
@@ -644,6 +689,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       sni: anytlsSni.trim() || null,
       "skip-cert-verify": anytlsSkipVerify,
       alpn: alpnList,
+      ...(origAnytls?.["idle-session-check-interval"] !== undefined
+        ? {
+            "idle-session-check-interval":
+              origAnytls["idle-session-check-interval"],
+          }
+        : {}),
+      ...(origAnytls?.["idle-session-timeout"] !== undefined
+        ? { "idle-session-timeout": origAnytls["idle-session-timeout"] }
+        : {}),
+      ...(origAnytls?.["min-idle-session"] !== undefined
+        ? { "min-idle-session": origAnytls["min-idle-session"] }
+        : {}),
       udp: udpEnabled,
     };
   };
@@ -1636,10 +1693,28 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                         <input
                           type="password"
                           className="input"
+                          placeholder={
+                            editingOriginalName && authHadSavedPassword
+                              ? tr("留空保持原密码", "Leave blank to keep saved")
+                              : ""
+                          }
                           value={authPassword}
                           onChange={(e) => setAuthPassword(e.target.value)}
                         />
                       </div>
+                      {proxyTls && (
+                        <div className="form-field full">
+                          <label className="form-label">
+                            {tr("TLS SNI (可选)", "TLS SNI (optional)")}
+                          </label>
+                          <input
+                            className="input mono"
+                            placeholder="proxy.example.com"
+                            value={proxySni}
+                            onChange={(e) => setProxySni(e.target.value)}
+                          />
+                        </div>
+                      )}
                     </>
                   )}
 
@@ -1671,7 +1746,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                               onChange={(e) => setWsPath(e.target.value)}
                             />
                           </div>
-                          <div className="form-field full">
+                          <div className="form-field">
                             <label className="form-label">
                               WS Host Header ({tr("可选", "optional")})
                             </label>
@@ -1680,6 +1755,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                               placeholder="cdn.example.com"
                               value={wsHost}
                               onChange={(e) => setWsHost(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">
+                              WS 0-RTT Early Data ({tr("可选", "optional")})
+                            </label>
+                            <input
+                              className="input mono"
+                              placeholder="2048"
+                              value={wsMaxEarlyData}
+                              onChange={(e) => setWsMaxEarlyData(e.target.value)}
                             />
                           </div>
                         </>
@@ -1698,6 +1784,139 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                   }}
                 >
                   <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                    {proto === "vless" && (
+                      <>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={vlessTls}
+                            onChange={(e) => setVlessTls(e.target.checked)}
+                          />
+                          {tr("启用 TLS", "Enable TLS")}
+                        </label>
+                        {vlessTls && (
+                          <label
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 6,
+                              fontSize: 12.5,
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={vlessSkipVerify}
+                              onChange={(e) =>
+                                setVlessSkipVerify(e.target.checked)
+                              }
+                            />
+                            {tr("跳过证书校验", "Skip Cert Verify")}
+                          </label>
+                        )}
+                      </>
+                    )}
+                    {proto === "trojan" && (
+                      <>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={trojanTls}
+                            onChange={(e) => setTrojanTls(e.target.checked)}
+                          />
+                          {tr("启用 TLS", "Enable TLS")}
+                        </label>
+                        {trojanTls && (
+                          <label
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 6,
+                              fontSize: 12.5,
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={trojanSkipVerify}
+                              onChange={(e) =>
+                                setTrojanSkipVerify(e.target.checked)
+                              }
+                            />
+                            {tr("跳过证书校验", "Skip Cert Verify")}
+                          </label>
+                        )}
+                      </>
+                    )}
+                    {proto === "anytls" && (
+                      <label
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 6,
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={anytlsSkipVerify}
+                          onChange={(e) =>
+                            setAnytlsSkipVerify(e.target.checked)
+                          }
+                        />
+                        {tr("跳过证书校验", "Skip Cert Verify")}
+                      </label>
+                    )}
+                    {(proto === "socks5" || proto === "http") && (
+                      <>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={proxyTls}
+                            onChange={(e) => setProxyTls(e.target.checked)}
+                          />
+                          {tr("启用 TLS", "Enable TLS")}
+                        </label>
+                        {proxyTls && (
+                          <label
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 6,
+                              fontSize: 12.5,
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={proxySkipVerify}
+                              onChange={(e) =>
+                                setProxySkipVerify(e.target.checked)
+                              }
+                            />
+                            {tr("跳过证书校验", "Skip Cert Verify")}
+                          </label>
+                        )}
+                      </>
+                    )}
                     {proto !== "http" && (
                       <label
                         style={{

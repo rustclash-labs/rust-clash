@@ -8,6 +8,8 @@ const MMDB_METADATA_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";
 const DATA_SECTION_SEPARATOR_SIZE: usize = 16;
 const MAX_METADATA_SEARCH_BYTES: usize = 128 * 1024;
 const MAX_DECODE_DEPTH: usize = 16;
+const MAX_DECODE_NODES: usize = 4096;
+const MAX_MMDB_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Pure-Rust MaxMind DB (`.mmdb`) v2.0 binary format reader supporting 24-bit, 28-bit, and 32-bit
 /// search-tree records, IPv4-in-IPv6 (`::ffff:0:0/96`) fast-path prefix caching, and pointer-compressed
@@ -34,6 +36,19 @@ enum MmdbValue {
 
 impl MmdbReader {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let meta = std::fs::metadata(path.as_ref()).map_err(|e| {
+            ProxyError::Config(format!(
+                "failed reading MaxMind GeoIP database '{}': {e}",
+                path.as_ref().display()
+            ))
+        })?;
+        if meta.len() > MAX_MMDB_FILE_BYTES {
+            return Err(ProxyError::Config(format!(
+                "MaxMind GeoIP database '{}' exceeds 64 MiB limit ({} bytes)",
+                path.as_ref().display(),
+                meta.len()
+            )));
+        }
         let bytes = std::fs::read(path.as_ref()).map_err(|e| {
             ProxyError::Config(format!(
                 "failed reading MaxMind GeoIP database '{}': {e}",
@@ -44,6 +59,12 @@ impl MmdbReader {
     }
 
     pub fn from_bytes(raw: Vec<u8>) -> Result<Self> {
+        if raw.len() as u64 > MAX_MMDB_FILE_BYTES {
+            return Err(ProxyError::Config(format!(
+                "MaxMind GeoIP database exceeds 64 MiB limit ({} bytes)",
+                raw.len()
+            )));
+        }
         let search_start = raw.len().saturating_sub(MAX_METADATA_SEARCH_BYTES);
         let tail = &raw[search_start..];
         let rel_pos = tail
@@ -54,7 +75,8 @@ impl MmdbReader {
             })?;
         let meta_start = search_start + rel_pos + MMDB_METADATA_MARKER.len();
 
-        let (meta_val, _) = decode_value(&raw, meta_start, meta_start, 0)?;
+        let mut meta_budget = MAX_DECODE_NODES;
+        let (meta_val, _) = decode_value(&raw, meta_start, meta_start, 0, &mut meta_budget)?;
         let MmdbValue::Map(meta_map) = meta_val else {
             return Err(ProxyError::Config(
                 "invalid .mmdb metadata: expected map".into(),
@@ -91,7 +113,9 @@ impl MmdbReader {
         let tree_size = node_count
             .checked_mul(node_byte_size)
             .ok_or_else(|| ProxyError::Config(".mmdb tree size overflow".into()))?;
-        let data_section_start = tree_size + DATA_SECTION_SEPARATOR_SIZE;
+        let data_section_start = tree_size
+            .checked_add(DATA_SECTION_SEPARATOR_SIZE)
+            .ok_or_else(|| ProxyError::Config(".mmdb data_section_start overflow".into()))?;
         if data_section_start > meta_start {
             return Err(ProxyError::Config(
                 "corrupt .mmdb file: tree overlaps metadata section".into(),
@@ -149,17 +173,23 @@ impl MmdbReader {
             _ => return None,
         };
 
-        if record <= self.node_count {
-            return None;
-        }
-        let data_offset = self
-            .data_section_start
-            .checked_add(record - self.node_count - DATA_SECTION_SEPARATOR_SIZE)?;
+        let rel_record = record
+            .checked_sub(self.node_count)?
+            .checked_sub(DATA_SECTION_SEPARATOR_SIZE)?;
+        let data_offset = self.data_section_start.checked_add(rel_record)?;
         if data_offset >= self.raw.len() {
             return None;
         }
 
-        let (val, _) = decode_value(&self.raw, self.data_section_start, data_offset, 0).ok()?;
+        let mut budget = MAX_DECODE_NODES;
+        let (val, _) = decode_value(
+            &self.raw,
+            self.data_section_start,
+            data_offset,
+            0,
+            &mut budget,
+        )
+        .ok()?;
         extract_iso_code(&val)
     }
 
@@ -176,13 +206,18 @@ impl MmdbReader {
     }
 
     fn read_record(&self, node: usize, bit: usize) -> Result<usize> {
-        let base = node * self.node_byte_size;
-        if base + self.node_byte_size > self.raw.len() {
+        let base = node
+            .checked_mul(self.node_byte_size)
+            .ok_or_else(|| ProxyError::Config("corrupt .mmdb: node offset overflow".into()))?;
+        let end = base
+            .checked_add(self.node_byte_size)
+            .ok_or_else(|| ProxyError::Config("corrupt .mmdb: node end overflow".into()))?;
+        if end > self.raw.len() {
             return Err(ProxyError::Config(
                 "corrupt .mmdb: node read out of bounds".into(),
             ));
         }
-        let b = &self.raw[base..base + self.node_byte_size];
+        let b = &self.raw[base..end];
         let rec = match (self.record_size_bits, bit) {
             (24, 0) => ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | (b[2] as usize),
             (24, _) => ((b[3] as usize) << 16) | ((b[4] as usize) << 8) | (b[5] as usize),
@@ -253,12 +288,20 @@ fn decode_value(
     base_offset: usize,
     mut pos: usize,
     depth: usize,
+    remaining_budget: &mut usize,
 ) -> Result<(MmdbValue, usize)> {
     if depth > MAX_DECODE_DEPTH {
         return Err(ProxyError::Config(
             ".mmdb data pointer/nesting exceeded maximum depth".into(),
         ));
     }
+    if *remaining_budget == 0 {
+        return Err(ProxyError::Config(
+            ".mmdb data decode exceeded maximum node budget".into(),
+        ));
+    }
+    *remaining_budget -= 1;
+
     if pos >= buf.len() {
         return Err(ProxyError::Config(
             "unexpected EOF in .mmdb data section".into(),
@@ -299,7 +342,7 @@ fn decode_value(
         let target = base_offset
             .checked_add(ptr_offset)
             .ok_or_else(|| ProxyError::Config(".mmdb pointer arithmetic overflow".into()))?;
-        let (pointed, _) = decode_value(buf, base_offset, target, depth + 1)?;
+        let (pointed, _) = decode_value(buf, base_offset, target, depth + 1, remaining_budget)?;
         return Ok((pointed, next_pos));
     }
 
@@ -345,8 +388,18 @@ fn decode_value(
             Ok((MmdbValue::Str(s), pos + payload_size))
         }
         // Double (8 bytes) / Float (4 bytes)
-        3 => Ok((MmdbValue::Other, pos + 8)),
-        15 => Ok((MmdbValue::Other, pos + 4)),
+        3 => {
+            if pos + 8 > buf.len() {
+                return Err(ProxyError::Config("truncated .mmdb double".into()));
+            }
+            Ok((MmdbValue::Other, pos + 8))
+        }
+        15 => {
+            if pos + 4 > buf.len() {
+                return Err(ProxyError::Config("truncated .mmdb float".into()));
+            }
+            Ok((MmdbValue::Other, pos + 4))
+        }
         // Bytes (4) / uint128 (10)
         4 | 10 => {
             if pos + payload_size > buf.len() {
@@ -377,8 +430,10 @@ fn decode_value(
             let mut map = HashMap::with_capacity(payload_size.min(32));
             let mut cur = pos;
             for _ in 0..payload_size {
-                let (k_val, next_k) = decode_value(buf, base_offset, cur, depth + 1)?;
-                let (v_val, next_v) = decode_value(buf, base_offset, next_k, depth + 1)?;
+                let (k_val, next_k) =
+                    decode_value(buf, base_offset, cur, depth + 1, remaining_budget)?;
+                let (v_val, next_v) =
+                    decode_value(buf, base_offset, next_k, depth + 1, remaining_budget)?;
                 if let MmdbValue::Str(k) = k_val {
                     map.insert(k, v_val);
                 }
@@ -391,7 +446,8 @@ fn decode_value(
             let mut arr = Vec::with_capacity(payload_size.min(32));
             let mut cur = pos;
             for _ in 0..payload_size {
-                let (elem, next_c) = decode_value(buf, base_offset, cur, depth + 1)?;
+                let (elem, next_c) =
+                    decode_value(buf, base_offset, cur, depth + 1, remaining_budget)?;
                 arr.push(elem);
                 cur = next_c;
             }
