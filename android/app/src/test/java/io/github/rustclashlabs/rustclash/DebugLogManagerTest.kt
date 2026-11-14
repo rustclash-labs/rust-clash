@@ -3,6 +3,7 @@ package io.github.rustclashlabs.rustclash
 import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
 import io.github.rustclashlabs.rustclash.vpn.MobileTimelineEvent
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
+import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -483,6 +484,180 @@ class DebugLogManagerTest {
         val idxNonCn = report.indexOf("`GeoSite,geolocation-!cn` -> `PROXY` (hits=`60` (total=`120`))")
         val idxCn = report.indexOf("`GeoSite,cn` -> `DIRECT` (hits=`10` (total=`100`))")
         assertTrue(idxNonCn >= 0 && idxCn > idxNonCn)
+    }
+
+    @Test
+    fun formatSliceReportRendersWireCacheHitsCoalescedMultipliersAndClearPreservesBaseline() {
+        val nowMs = 1_763_100_000_000L
+
+        // 1. Prime network fingerprint dedup, then clear while RUNNING -> preserves LOG_CLEARED & resets dedup
+        DebugLogManager.onNetworkCandidateObserved(
+            eventType = "NET_CAPS",
+            networkHandle = 777L,
+            isWifi = true,
+            isCellular = false,
+            isEthernet = false,
+            isValidated = true,
+            isNotMetered = true,
+            downBandwidthKbps = 100_000,
+            upBandwidthKbps = 50_000,
+            triggeredHandoff = false,
+            hasIpv6 = true,
+        )
+        val runningBaseline = DebugLogManager.resetTimelineWindowOnClear(
+            nowMs = nowMs,
+            batteryPct = 82,
+            vpnState = VpnLifecycleState.RUNNING,
+            activeNode = "HK-IPLC-01",
+        )
+        assertEquals(1, runningBaseline.size)
+        assertEquals("LOG_CLEARED", runningBaseline[0].category)
+        assertTrue(runningBaseline[0].detail.contains("logs reset while state=running"))
+        assertTrue(runningBaseline[0].detail.contains("node=HK-IPLC-01"))
+
+        // Re-observing the exact same network fingerprint after clear MUST record fresh NET_CAPS
+        DebugLogManager.onNetworkCandidateObserved(
+            eventType = "NET_CAPS",
+            networkHandle = 777L,
+            isWifi = true,
+            isCellular = false,
+            isEthernet = false,
+            isValidated = true,
+            isNotMetered = true,
+            downBandwidthKbps = 100_000,
+            upBandwidthKbps = 50_000,
+            triggeredHandoff = false,
+            hasIpv6 = true,
+        )
+        val afterNetReobserve = DebugLogManager.snapshotTimelineEventsForTest()
+        assertEquals(2, afterNetReobserve.size)
+        assertEquals("NET_CAPS", afterNetReobserve[1].category)
+
+        // Clearing while DISCONNECTED leaves timeline empty
+        val disconnectedBaseline = DebugLogManager.resetTimelineWindowOnClear(
+            nowMs = nowMs + 5_000L,
+            batteryPct = 82,
+            vpnState = VpnLifecycleState.DISCONNECTED,
+            activeNode = "",
+        )
+        assertTrue(disconnectedBaseline.isEmpty())
+
+        // 2. Verify wireCacheHits= and coalescedCount (x4) on failedConnections & recentConnections
+        val window = DebugLogManager.WindowTelemetryState(
+            windowStartMs = nowMs,
+            capturedAtMs = nowMs + 600_000L,
+            sessionStartMs = nowMs - 5_000L,
+            screenOnMs = 600_000L,
+            screenOffMs = 0L,
+            startBatteryPct = 82,
+            events = runningBaseline,
+        )
+        val sysMeta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "Google",
+            deviceModel = "Pixel 9",
+            androidRelease = "15",
+            sdkInt = 35,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.4.5",
+            appVersionCode = 21,
+            battery = DebugLogManager.BatterySnapshot(levelPct = 81, isCharging = false, temperatureCelsius = 31.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 18L * 1024L * 1024L,
+            jvmMaxBytes = 256L * 1024L * 1024L,
+            nativeHeapBytes = 20L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+        val coalescedJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 605,
+              "mode": "rule",
+              "routingPreset": "smart-cn",
+              "effectiveOutbound": "HK-IPLC-01",
+              "effectiveProtocol": "VLESS",
+              "effectiveDelayMs": 31,
+              "isWifi": true,
+              "dns": {
+                "total_queries": 50,
+                "fake_ip_hits": 40,
+                "cache_hits": 6,
+                "resolverCacheHits": 14,
+                "suppressed_queries": 2,
+                "upstream_queries": 4,
+                "upstream_errors": 0,
+                "upstream_avg_ms": 19,
+                "upstream_max_ms": 42,
+                "active_fake_ip_entries": 32
+              },
+              "failedConnections": [
+                {
+                  "host": "chat.openai.com",
+                  "destinationPort": 443,
+                  "network": "udp",
+                  "fakeIp": "198.18.0.42",
+                  "rule": "GeoSite",
+                  "rulePayload": "geolocation-!cn",
+                  "effectiveOutbound": "HK-IPLC-01",
+                  "effectiveProtocol": "VLESS",
+                  "error": "quic udp blocked",
+                  "coalescedCount": 4,
+                  "startEpochMs": 1763100010000
+                },
+                {
+                  "host": "single-fail.example.org",
+                  "destinationPort": 443,
+                  "network": "tcp",
+                  "rule": "Match",
+                  "rulePayload": "",
+                  "effectiveOutbound": "HK-IPLC-01",
+                  "effectiveProtocol": "VLESS",
+                  "error": "connection reset",
+                  "coalescedCount": 1,
+                  "startEpochMs": 1763100020000
+                }
+              ],
+              "recentConnections": [
+                {
+                  "host": "chat.openai.com",
+                  "destinationPort": 443,
+                  "network": "udp",
+                  "rule": "GeoSite",
+                  "rulePayload": "geolocation-!cn",
+                  "effectiveOutbound": "HK-IPLC-01",
+                  "connectDurationMs": null,
+                  "upload": 0,
+                  "download": 0,
+                  "status": "failed",
+                  "coalescedCount": 4,
+                  "startEpochMs": 1763100010000
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val report = DebugLogManager.formatSliceReport(
+            trigger = "manual",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = coalescedJson,
+            crashBreadcrumb = null,
+        )
+        assertTrue(report.contains("wireCacheHits=`6` resolverCacheHits=`14`"))
+        assertFalse(report.contains(" cacheHits=`"))
+        assertTrue(report.contains("#### Failed Connections (2 entries, 5 total)"))
+        assertTrue(report.contains("error=`quic udp blocked` (x4)"))
+        assertTrue(report.contains("error=`connection reset`"))
+        assertFalse(report.contains("(x1)"))
+        assertTrue(report.contains("status=`failed` (x4)"))
+        assertTrue(report.contains("**LOG_CLEARED**: logs reset while state=running"))
     }
 }
 

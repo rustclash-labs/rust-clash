@@ -11,6 +11,8 @@ import io.github.rustclashlabs.rustclash.vpn.PerAppVpnPolicy
 import io.github.rustclashlabs.rustclash.vpn.RustClashVpnService
 import io.github.rustclashlabs.rustclash.vpn.UnderlyingNetworkTracker
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
+import io.github.rustclashlabs.rustclash.vpn.VpnRoutePlan
+import io.github.rustclashlabs.rustclash.vpn.VpnRoutePlanner
 import io.github.rustclashlabs.rustclash.vpn.VpnSessionConfig
 import io.github.rustclashlabs.rustclash.vpn.VpnStateTracker
 import io.github.rustclashlabs.rustclash.vpn.isGlobalUnicastIpv6Address
@@ -1244,9 +1246,9 @@ class VpnConfigAndLifecycleTest {
             crashBreadcrumb = null,
         )
         assertTrue(
-            "Expected DNS & Fake-IP line to include cacheHits and resolverCacheHits: $report",
+            "Expected DNS & Fake-IP line to include wireCacheHits and resolverCacheHits: $report",
             report.contains(
-                "- DNS & Fake-IP: queries=`120` fakeIpHits=`75` cacheHits=`30` resolverCacheHits=`19` " +
+                "- DNS & Fake-IP: queries=`120` fakeIpHits=`75` wireCacheHits=`30` resolverCacheHits=`19` " +
                     "aaaaSuppressed=`4` nxdomainCached=`2` upstreamQueries=`26` upstreamErrors=`0` " +
                     "upstreamAvgMs=`28ms` upstreamMaxMs=`91ms` activeFakeIps=`64`",
             ),
@@ -1279,7 +1281,7 @@ class VpnConfigAndLifecycleTest {
         )
         assertTrue(
             "Expected snake_case resolver_cache_hits fallback to render accurately: $snakeOnlyReport",
-            snakeOnlyReport.contains("cacheHits=`3` resolverCacheHits=`7` aaaaSuppressed=`0`"),
+            snakeOnlyReport.contains("wireCacheHits=`3` resolverCacheHits=`7` aaaaSuppressed=`0`"),
         )
     }
 
@@ -1448,5 +1450,117 @@ class VpnConfigAndLifecycleTest {
         assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("::1")))
         assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("::")))
         assertFalse(isGlobalUnicastIpv6Address(InetAddress.getByName("198.18.0.1")))
+    }
+
+    @Test
+    fun vpnRoutePlannerExcludesPrivateLanMulticastLoopbackAndPreservesFakeIpAcrossApiLevels() {
+        fun matchesTun(ip: String, plan: VpnRoutePlan): Boolean =
+            VpnRoutePlanner.matchesTun(ip, plan)
+
+        val defaultCfg = VpnSessionConfig(enableIpv6 = true).validated()
+        val api33Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 33)
+        val api32Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 32)
+        val api26Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 26)
+
+        assertTrue(api33Plan.useExcludeRoutes)
+        assertFalse(api32Plan.useExcludeRoutes)
+        assertFalse(api26Plan.useExcludeRoutes)
+        assertEquals(api32Plan, api26Plan)
+        assertEquals(VpnRoutePlanner.EXCLUDED_IPV4_PREFIXES, api33Plan.excludedIpv4)
+        assertEquals(VpnRoutePlanner.EXCLUDED_IPV6_PREFIXES, api33Plan.excludedIpv6)
+
+        // Verify exact mathematical partition of 2^32 IPv4 space on API 26-32 and zero host bits on all routes
+        var includedIpCount = 0L
+        var prevEnd: UInt? = null
+        for (route in api32Plan.includedIpv4) {
+            val canonical = VpnRoutePlanner.canonicalizeIpv4Cidr(route.address, route.prefixLength)
+            assertEquals("Route ${route.cidr} must have zero host bits", canonical, route)
+            val range = VpnRoutePlanner.cidrToIpv4Range(route)!!
+            if (prevEnd != null) {
+                assertTrue("Included IPv4 routes must be strictly disjoint and sorted", prevEnd < range.first)
+            }
+            prevEnd = range.last
+            includedIpCount += (1L shl (32 - route.prefixLength))
+        }
+        val excludedIpCount = VpnRoutePlanner.EXCLUDED_IPV4_PREFIXES.sumOf { 1L shl (32 - it.prefixLength) }
+        assertEquals(1L shl 32, includedIpCount + excludedIpCount)
+
+        val mustRouteIntoTunIpv4 = listOf(
+            "198.18.0.1",     // TUN IPv4
+            "198.18.0.42",    // Fake-IP
+            "198.19.255.254", // TUN DNS
+            "198.17.255.255",
+            "198.20.0.1",
+            "1.1.1.1",
+            "8.8.8.8",
+            "223.5.5.5",
+            "36.155.182.57",
+            "100.64.0.1",
+            "172.15.255.254",
+            "172.32.0.1",
+            "192.167.255.254",
+            "192.169.0.1",
+        )
+        val mustExcludeFromTunIpv4 = listOf(
+            "192.168.0.1",
+            "192.168.1.1",
+            "192.168.31.254",
+            "10.0.0.1",
+            "10.255.255.254",
+            "172.16.0.1",
+            "172.31.255.254",
+            "127.0.0.1",
+            "169.254.10.20",
+            "224.0.0.251",    // mDNS
+            "239.255.255.250", // SSDP
+            "255.255.255.255",
+            "0.0.0.0",
+        )
+
+        for ((label, plan) in listOf("API33+" to api33Plan, "API26-32" to api32Plan)) {
+            for (ip in mustRouteIntoTunIpv4) {
+                assertTrue("[$label] Expected $ip to route into tun0", matchesTun(ip, plan))
+            }
+            for (ip in mustExcludeFromTunIpv4) {
+                assertFalse("[$label] Expected $ip to be excluded from tun0", matchesTun(ip, plan))
+            }
+
+            // IPv6 inclusion & exclusion parity across API 33+ and API 26-32
+            for (v6In in listOf("2409:8c1e::1", "2606:4700:4700::1111", "fdfe:dcba:9876::1", "fdfe:dcba:9876::2")) {
+                assertTrue("[$label] Expected IPv6 $v6In to route into tun0", matchesTun(v6In, plan))
+            }
+            for (v6Ex in listOf("::", "::1", "fe80::1", "ff02::fb")) {
+                assertFalse("[$label] Expected IPv6 $v6Ex to be excluded from tun0", matchesTun(v6Ex, plan))
+            }
+        }
+
+        // IPv4-only session disables all IPv6 routes cleanly
+        val v4OnlyCfg = VpnSessionConfig(enableIpv6 = false).validated()
+        for (sdk in listOf(28, 34)) {
+            val v4Plan = VpnRoutePlanner.buildPlan(v4OnlyCfg, sdkInt = sdk)
+            assertTrue(v4Plan.includedIpv6.isEmpty())
+            assertTrue(v4Plan.excludedIpv6.isEmpty())
+            assertFalse(matchesTun("2409:8c1e::1", v4Plan))
+            assertTrue(matchesTun("198.18.0.42", v4Plan))
+        }
+    }
+
+    @Test
+    fun vpnRoutePlannerNeverExcludesCustomSessionTunSubnetOrDnsIpv4() {
+        val customCfg = VpnSessionConfig(
+            ipv4Address = "10.0.0.1",
+            ipv4PrefixLength = 24,
+            dnsIpv4 = "192.168.50.53",
+            enableIpv6 = true,
+        ).validated()
+
+        for (sdk in listOf(29, 34)) {
+            val plan = VpnRoutePlanner.buildPlan(customCfg, sdkInt = sdk)
+            assertTrue("sdk=$sdk must route custom TUN address", plan.matchesTun("10.0.0.1"))
+            assertTrue("sdk=$sdk must route custom TUN subnet peer", plan.matchesTun("10.0.0.42"))
+            assertTrue("sdk=$sdk must route custom TUN DNS IPv4", plan.matchesTun("192.168.50.53"))
+            assertFalse("sdk=$sdk must still exclude outside 10.0.0.0/24", plan.matchesTun("10.0.1.1"))
+            assertFalse("sdk=$sdk must still exclude outside 192.168.50.53/32", plan.matchesTun("192.168.1.1"))
+        }
     }
 }

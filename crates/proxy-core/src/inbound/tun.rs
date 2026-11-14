@@ -141,6 +141,7 @@ struct BridgeFlow {
     pending_tx: BytesMut,
     from_remote_rx: mpsc::Receiver<Vec<u8>>,
     to_remote_tx: Option<mpsc::Sender<Vec<u8>>>,
+    _bridge_closed_rx: watch::Receiver<()>,
     remote_eof: bool,
     remote_failed: Arc<AtomicBool>,
     task_abort: AbortHandle,
@@ -813,6 +814,7 @@ fn register_syn_flow(
 
     let (to_remote_tx, mut to_remote_rx) = mpsc::channel::<Vec<u8>>(TUN_FLOW_STREAM_CAPACITY);
     let (from_remote_tx, from_remote_rx) = mpsc::channel::<Vec<u8>>(TUN_FLOW_STREAM_CAPACITY);
+    let (bridge_closed_tx, bridge_closed_rx) = watch::channel(());
     let remote_failed = Arc::new(AtomicBool::new(false));
     let remote_failed_task = Arc::clone(&remote_failed);
     let wake_task = Arc::clone(wake_notify);
@@ -879,6 +881,9 @@ fn register_syn_flow(
                 wake_task.notify_one();
                 return;
             }
+            _ = bridge_closed_tx.closed() => {
+                return;
+            }
             res = tokio::time::timeout(
                 OUTBOUND_CONNECT_TIMEOUT,
                 decision.outbound.connect_tcp(&decision.target),
@@ -929,37 +934,49 @@ fn register_syn_flow(
         let (mut rd, mut wr) = tokio::io::split(tracked);
 
         let writer_fut = async move {
-            while let Some(first_chunk) = to_remote_rx.recv().await {
-                if wr.write_all(&first_chunk).await.is_err() {
-                    break;
-                }
-                let mut write_failed = false;
-                while let Ok(more) = to_remote_rx.try_recv() {
-                    if wr.write_all(&more).await.is_err() {
-                        write_failed = true;
-                        break;
+            let drain_and_shutdown = async {
+                while let Some(first_chunk) = to_remote_rx.recv().await {
+                    if wr.write_all(&first_chunk).await.is_err() {
+                        return;
+                    }
+                    let mut write_failed = false;
+                    while let Ok(more) = to_remote_rx.try_recv() {
+                        if wr.write_all(&more).await.is_err() {
+                            write_failed = true;
+                            break;
+                        }
+                    }
+                    if write_failed || wr.flush().await.is_err() {
+                        return;
                     }
                 }
-                if write_failed || wr.flush().await.is_err() {
-                    break;
-                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), wr.shutdown()).await;
+            };
+            tokio::select! {
+                () = drain_and_shutdown => {}
+                () = async {
+                    bridge_closed_tx.closed().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } => {}
             }
-            let _ = wr.shutdown().await;
         };
 
         let wake_rd = Arc::clone(&wake_task);
         let reader_fut = async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                match rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
-                            break;
-                        }
-                        wake_rd.notify_one();
-                    }
+                let n = tokio::select! {
+                    biased;
+                    _ = from_remote_tx.closed() => break,
+                    res = rd.read(&mut buf) => match res {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    },
+                };
+                if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
                 }
+                wake_rd.notify_one();
             }
             drop(from_remote_tx);
             wake_rd.notify_one();
@@ -988,6 +1005,7 @@ fn register_syn_flow(
             pending_tx: BytesMut::new(),
             from_remote_rx,
             to_remote_tx: Some(to_remote_tx),
+            _bridge_closed_rx: bridge_closed_rx,
             remote_eof: false,
             remote_failed,
             task_abort: flow_task.abort_handle(),
@@ -1238,6 +1256,7 @@ mod tests {
         );
         let handle = sockets.add(sock);
         let (_tx, rx) = mpsc::channel(1);
+        let (_bridge_closed_tx, bridge_closed_rx) = watch::channel(());
         let noop_task = tokio::spawn(async {});
 
         let mono_now = Instant::now();
@@ -1254,6 +1273,7 @@ mod tests {
             pending_tx: BytesMut::new(),
             from_remote_rx: rx,
             to_remote_tx: None,
+            _bridge_closed_rx: bridge_closed_rx,
             remote_eof: false,
             remote_failed: Arc::new(AtomicBool::new(false)),
             task_abort: noop_task.abort_handle(),
@@ -1328,6 +1348,55 @@ mod tests {
         Arc::new(RwLock::new(router))
     }
 
+    fn build_ipv4_tcp_packet(
+        src: (Ipv4Addr, u16),
+        dst: (Ipv4Addr, u16),
+        control: smoltcp::wire::TcpControl,
+        seq: i32,
+        ack: Option<i32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let checksum_caps = ChecksumCapabilities::default();
+        let (src_ip, src_port) = src;
+        let (dst_ip, dst_port) = dst;
+        let src_v4: Ipv4Address = src_ip;
+        let dst_v4: Ipv4Address = dst_ip;
+        let is_syn = control == smoltcp::wire::TcpControl::Syn;
+        let tcp_repr = smoltcp::wire::TcpRepr {
+            src_port,
+            dst_port,
+            control,
+            seq_number: smoltcp::wire::TcpSeqNumber(seq),
+            ack_number: ack.map(smoltcp::wire::TcpSeqNumber),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: is_syn.then_some(1440),
+            sack_permitted: is_syn,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        let tcp_len = tcp_repr.buffer_len();
+        let ip_repr = Ipv4Repr {
+            src_addr: src_v4,
+            dst_addr: dst_v4,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp_len,
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0u8; ip_repr.buffer_len() + tcp_len];
+        let mut ip_pkt = Ipv4Packet::new_unchecked(&mut bytes);
+        ip_repr.emit(&mut ip_pkt, &checksum_caps);
+        let mut tcp_pkt = TcpPacket::new_unchecked(ip_pkt.payload_mut());
+        tcp_repr.emit(
+            &mut tcp_pkt,
+            &IpAddress::Ipv4(src_v4),
+            &IpAddress::Ipv4(dst_v4),
+            &checksum_caps,
+        );
+        bytes
+    }
+
     fn build_ipv6_tcp_syn_packet(
         src_ip: Ipv6Addr,
         src_port: u16,
@@ -1370,6 +1439,122 @@ mod tests {
             &checksum_caps,
         );
         bytes
+    }
+
+    #[tokio::test]
+    async fn tun_client_tcp_rst_immediately_closes_flow_task_and_unregisters_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let (_keep_alive_tx, keep_alive_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            let _ = payload_tx.send(buf[..n].to_vec());
+            // Hold the upstream TcpStream open without sending bytes or EOF.
+            let _ = keep_alive_rx.await;
+        });
+
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let dst_ip = dns.assign_fake_ip("localhost");
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Direct,
+                HashMap::new(),
+                &[],
+                &rules,
+                dns,
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, _tun_task) =
+            spawn_userspace_tun(1500, router_slot, Arc::clone(&hub), shutdown_rx);
+
+        let client = (Ipv4Addr::new(198, 18, 0, 10), 54001u16);
+        let dst = (dst_ip, server_port);
+
+        // 1. 3-way TCP handshake over virtual TUN stack
+        let syn_pkt = build_ipv4_tcp_packet(
+            client,
+            dst,
+            smoltcp::wire::TcpControl::Syn,
+            10_000,
+            None,
+            &[],
+        );
+        vtun.ingress_tx.send(syn_pkt).await.unwrap();
+
+        let syn_ack_raw = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected IPv4 TCP SYN-ACK")
+            .expect("egress packet");
+        let ip4_sa = Ipv4Packet::new_checked(&syn_ack_raw).unwrap();
+        let tcp_sa = TcpPacket::new_checked(ip4_sa.payload()).unwrap();
+        assert!(tcp_sa.syn() && tcp_sa.ack() && !tcp_sa.rst());
+        assert_eq!(tcp_sa.ack_number().0, 10_001);
+        let server_next_seq = tcp_sa.seq_number().0.wrapping_add(1);
+
+        let ack_pkt = build_ipv4_tcp_packet(
+            client,
+            dst,
+            smoltcp::wire::TcpControl::None,
+            10_001,
+            Some(server_next_seq),
+            &[],
+        );
+        vtun.ingress_tx.send(ack_pkt).await.unwrap();
+
+        // 2. Send client payload and verify upstream TcpListener received it while holding stream open
+        let payload = b"hello-rst-leak-test";
+        let data_pkt = build_ipv4_tcp_packet(
+            client,
+            dst,
+            smoltcp::wire::TcpControl::Psh,
+            10_001,
+            Some(server_next_seq),
+            payload,
+        );
+        vtun.ingress_tx.send(data_pkt).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), payload_rx)
+            .await
+            .expect("upstream server should receive client payload")
+            .expect("payload oneshot");
+        assert_eq!(received, payload);
+        assert_eq!(hub.active_connection_count(), 1);
+
+        // 3. Inject client TCP RST (`SO_LINGER(0)`) matching exact next client seq_number
+        let client_next_seq = 10_001i32.wrapping_add(payload.len() as i32);
+        let rst_pkt = build_ipv4_tcp_packet(
+            client,
+            dst,
+            smoltcp::wire::TcpControl::Rst,
+            client_next_seq,
+            Some(server_next_seq),
+            &[],
+        );
+        vtun.ingress_tx.send(rst_pkt).await.unwrap();
+
+        // 4. `flow_task` must exit immediately via `from_remote_tx.closed()` and drop `TrackedStream`
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while hub.active_connection_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("active_connection_count must drop to 0 within 500ms after client TCP RST");
+
+        let _ = shutdown_tx.send(true);
+        drop(_keep_alive_tx);
+        let _ = server_task.await;
     }
 
     #[tokio::test]

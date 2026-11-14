@@ -1010,6 +1010,7 @@ pub fn notify_android_network_changed_with_caps_core(
     enum HandoffState {
         Offline,
         NoChange,
+        Ipv6Gained(Arc<ProxyEngine>),
         Changed(Arc<ProxyEngine>, i64),
     }
 
@@ -1029,6 +1030,8 @@ pub fn notify_android_network_changed_with_caps_core(
                 HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
             } else if prev_ipv6 && !has_ipv6 {
                 HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
+            } else if !prev_ipv6 && has_ipv6 {
+                HandoffState::Ipv6Gained(Arc::clone(&rt.engine))
             } else {
                 HandoffState::NoChange
             }
@@ -1049,6 +1052,22 @@ pub fn notify_android_network_changed_with_caps_core(
             evicted_tls_sessions: 0,
             dns_cache_flushed: false,
         }),
+        HandoffState::Ipv6Gained(engine) => {
+            engine.router().dns().flush_cache();
+            proxy_core::dns::upstream::clear_dns_upstream_pools();
+            engine.hub().push_log(
+                "info",
+                format!(
+                    "Android link gained global IPv6 (handle {network_handle}, wifi={is_wifi}): flushed single-stack DNS cache"
+                ),
+            );
+            Some(NetworkChangeReport {
+                closed_active_connections: 0,
+                reset_udp_nat_sessions: 0,
+                evicted_tls_sessions: 0,
+                dns_cache_flushed: true,
+            })
+        }
         HandoffState::Changed(engine, prev_handle) => {
             let report = engine.notify_network_change();
             engine.hub().push_log(
@@ -3065,6 +3084,7 @@ fn build_window_diagnostic_sections(
         }
     }
 
+    let mut window_connections_total = 0usize;
     let mut window_tcp = 0usize;
     let mut window_udp = 0usize;
     let mut window_failed = 0usize;
@@ -3097,20 +3117,23 @@ fn build_window_diagnostic_sections(
     let mut by_domain: HashMap<String, DomainAgg> = HashMap::new();
 
     for c in &window_conns {
+        let weight = c.coalesced_count.max(1) as usize;
+        window_connections_total = window_connections_total.saturating_add(weight);
         if c.metadata.network.eq_ignore_ascii_case("udp") {
-            window_udp += 1;
+            window_udp = window_udp.saturating_add(weight);
         } else {
-            window_tcp += 1;
+            window_tcp = window_tcp.saturating_add(weight);
         }
-        if c.status == "failed" || c.error.is_some() {
-            window_failed += 1;
+        let is_failed = c.status == "failed" || c.error.is_some();
+        if is_failed {
+            window_failed = window_failed.saturating_add(weight);
         }
         let is_zero_rx = c.status == "closed" && c.download == 0 && c.upload > 0;
         if is_zero_rx {
             window_zero_rx += 1;
         }
         if c.metadata.fake_ip.is_some() {
-            window_fake_ip_restored += 1;
+            window_fake_ip_restored = window_fake_ip_restored.saturating_add(weight);
         }
 
         let ob_entry = by_outbound.entry(c.effective_outbound.clone()).or_default();
@@ -3118,9 +3141,9 @@ fn build_window_diagnostic_sections(
             ob_entry.protocol.clone_from(&c.effective_protocol);
             ob_entry.exit_type.clone_from(&c.exit_type);
         }
-        ob_entry.connections += 1;
-        if c.status == "failed" || c.error.is_some() {
-            ob_entry.failures += 1;
+        ob_entry.connections = ob_entry.connections.saturating_add(weight);
+        if is_failed {
+            ob_entry.failures = ob_entry.failures.saturating_add(weight);
         }
         if is_zero_rx {
             ob_entry.zero_rx_count += 1;
@@ -3135,9 +3158,9 @@ fn build_window_diagnostic_sections(
 
         let safe_host = redact_sensitive_text(&c.metadata.host);
         let dom_entry = by_domain.entry(safe_host).or_default();
-        dom_entry.connections += 1;
-        if c.status == "failed" || c.error.is_some() {
-            dom_entry.failures += 1;
+        dom_entry.connections = dom_entry.connections.saturating_add(weight);
+        if is_failed {
+            dom_entry.failures = dom_entry.failures.saturating_add(weight);
         }
         dom_entry.upload_bytes = dom_entry.upload_bytes.saturating_add(c.upload);
         dom_entry.download_bytes = dom_entry.download_bytes.saturating_add(c.download);
@@ -3214,7 +3237,11 @@ fn build_window_diagnostic_sections(
             }
         })
         .collect();
-    window_failed = window_failed.max(failed_in_window.len());
+    let failed_in_window_total: usize = failed_in_window
+        .iter()
+        .map(|c| c.coalesced_count.max(1) as usize)
+        .sum();
+    window_failed = window_failed.max(failed_in_window_total);
 
     let failed_connections_json: Vec<serde_json::Value> = failed_in_window
         .into_iter()
@@ -3232,6 +3259,7 @@ fn build_window_diagnostic_sections(
                 "effectiveProtocol": c.effective_protocol,
                 "exitType": c.exit_type,
                 "error": c.error.as_deref().map(redact_sensitive_text),
+                "coalescedCount": c.coalesced_count.max(1),
                 "startEpochMs": c.start_epoch_ms,
                 "endEpochMs": c.end_epoch_ms,
             })
@@ -3287,6 +3315,7 @@ fn build_window_diagnostic_sections(
                 "download": c.download,
                 "status": c.status,
                 "error": c.error.as_deref().map(redact_sensitive_text),
+                "coalescedCount": c.coalesced_count.max(1),
                 "startEpochMs": c.start_epoch_ms,
             })
         })
@@ -3294,7 +3323,7 @@ fn build_window_diagnostic_sections(
 
     WindowDiagnosticSections {
         carry_over_count,
-        window_connections: window_conns.len(),
+        window_connections: window_connections_total,
         window_tcp,
         window_udp,
         window_failed,
@@ -3759,6 +3788,7 @@ mod tests {
             error: error.map(ToOwned::to_owned),
             end_epoch_ms,
             connect_duration_ms,
+            coalesced_count: 1,
         }
     }
 
@@ -4097,10 +4127,11 @@ mod tests {
         assert_eq!(snap["hasIpv6"], false);
         assert_eq!(snap["lastNetworkHandle"], 202);
 
-        // 3. Gaining IPv6 on same Wi-Fi handle (202, true, true) updates hasIpv6 without tearing down IPv4 sessions
+        // 3. Gaining IPv6 on same Wi-Fi handle (202, true, true) flushes single-stack DNS cache without tearing down IPv4 sessions
         let gain_v6 = notify_android_network_changed_with_caps_core(202, true, true)
             .expect("active runtime on ipv6 gain");
-        assert!(!gain_v6.dns_cache_flushed);
+        assert!(gain_v6.dns_cache_flushed);
+        assert_eq!(gain_v6.closed_active_connections, 0);
         let status_v6 = android_status_json_core();
         assert_eq!(status_v6["networkTransitions"], 1);
         assert_eq!(status_v6["hasIpv6"], true);
@@ -4113,6 +4144,112 @@ mod tests {
         assert_eq!(status_no_v6["networkTransitions"], 1);
         assert_eq!(status_no_v6["hasIpv6"], false);
 
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn window_diagnostic_sections_weights_coalesced_failed_connections() {
+        let mut coalesced = sample_conn(
+            "burst-fail",
+            "tcp",
+            "api.openai.com",
+            "Node-SG",
+            2_500,
+            Some(2_900),
+            None,
+            0,
+            0,
+            Some("198.18.0.42"),
+            "failed",
+            Some("connection reset by peer"),
+        );
+        coalesced.coalesced_count = 4;
+
+        let sec = build_window_diagnostic_sections(&[coalesced], 2_000, 5_000, &HashMap::new());
+        assert_eq!(sec.window_connections, 4);
+        assert_eq!(sec.window_tcp, 4);
+        assert_eq!(sec.window_udp, 0);
+        assert_eq!(sec.window_failed, 4);
+        assert_eq!(sec.window_fake_ip_restored, 4);
+
+        assert_eq!(sec.outbound_stats_json.len(), 1);
+        assert_eq!(sec.outbound_stats_json[0]["connections"], 4);
+        assert_eq!(sec.outbound_stats_json[0]["failures"], 4);
+
+        assert_eq!(sec.top_domains_json.len(), 1);
+        assert_eq!(sec.top_domains_json[0]["connections"], 4);
+        assert_eq!(sec.top_domains_json[0]["failures"], 4);
+
+        assert_eq!(sec.failed_connections_json.len(), 1);
+        assert_eq!(sec.failed_connections_json[0]["coalescedCount"], 4);
+
+        assert_eq!(sec.recent_connections_json.len(), 1);
+        assert_eq!(sec.recent_connections_json[0]["coalescedCount"], 4);
+    }
+
+    #[test]
+    fn ipv6_gain_on_same_network_handle_flushes_dns_without_closing_active_connections() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-ipv6-gain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            true,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        // Establish IPv4-only Wi-Fi baseline on handle 303.
+        let base_rep = notify_android_network_changed_with_caps_core(303, true, false)
+            .expect("active runtime on baseline");
+        assert!(!base_rep.dns_cache_flushed);
+
+        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let target = proxy_core::addr::TargetAddr::new_domain("ipv4.example.com", 443).unwrap();
+        let active_conn = engine.hub().register_connection(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &target,
+            None,
+            "MATCH",
+            "",
+            vec!["DIRECT".to_string()],
+        );
+        active_conn.mark_established();
+        assert_eq!(engine.hub().active_connection_count(), 1);
+
+        // SLAAC Router Advertisement arrives on the same handle (has_ipv6: false -> true):
+        // DNS cache must flush while preserving healthy IPv4 connections.
+        let gain_rep = notify_android_network_changed_with_caps_core(303, true, true)
+            .expect("active runtime on ipv6 gain");
+        assert!(gain_rep.dns_cache_flushed);
+        assert_eq!(gain_rep.closed_active_connections, 0);
+        assert_eq!(gain_rep.reset_udp_nat_sessions, 0);
+        assert_eq!(gain_rep.evicted_tls_sessions, 0);
+        assert_eq!(engine.hub().active_connection_count(), 1);
+        assert!(!active_conn.is_closed());
+        assert!(
+            engine
+                .hub()
+                .recent_logs()
+                .iter()
+                .any(|e| e.payload.contains("Android link gained global IPv6 (handle 303, wifi=true): flushed single-stack DNS cache"))
+        );
+
+        engine.hub().unregister_connection(&active_conn.id);
+        drop(active_conn);
+        drop(engine);
         assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
