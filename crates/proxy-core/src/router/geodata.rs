@@ -199,7 +199,18 @@ pub fn matches_geosite_dynamic(
     let base_matched = match norm.as_str() {
         "cn" | "china" | "geolocation-cn" => LIVE_GEODATA.read().geosite_cn.matches_domain(host),
         "geolocation-!cn" | "gfw" | "proxy" | "tld-!cn" => {
-            LIVE_GEODATA.read().geosite_non_cn.matches_domain(host)
+            let ds = LIVE_GEODATA.read();
+            if attrs.is_empty() {
+                ds.geosite_non_cn
+                    .match_specificity(host)
+                    .is_some_and(|non_cn_spec| {
+                        ds.geosite_cn
+                            .match_specificity(host)
+                            .is_none_or(|cn_spec| non_cn_spec > cn_spec)
+                    })
+            } else {
+                ds.geosite_non_cn.matches_domain(host)
+            }
         }
         "google-cn" | "apple-cn" | "microsoft-cn" | "steam-cn" => {
             lookup_builtin_geosite_cn_subset(&norm).is_some_and(|m| m.matches_domain(host))
@@ -1156,5 +1167,82 @@ mod tests {
             assert!(mmdb.starts_with("https://"));
             assert!(mmdb.ends_with("Country.mmdb"));
         }
+    }
+
+    #[test]
+    fn geosite_dynamic_specificity_disambiguates_cn_ntp_from_proxy_ntp_suffix() {
+        static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        let _serial = TEST_LOCK.lock();
+
+        struct LiveGeodataRestoreGuard(Arc<GeoDataset>);
+        impl Drop for LiveGeodataRestoreGuard {
+            fn drop(&mut self) {
+                install_live_geodata(Arc::clone(&self.0));
+            }
+        }
+        let _restore = LiveGeodataRestoreGuard(current_geodata());
+
+        let cn_builtin = lookup_builtin_geosite("cn").unwrap();
+        let non_cn_builtin = lookup_builtin_geosite("geolocation-!cn").unwrap();
+
+        // 1. Offline built-in dataset: cn.pool.ntp.org matches `cn` and NOT `geolocation-!cn`
+        install_live_geodata(Arc::new(GeoDataset::builtin_only()));
+        assert!(!matches_geosite_dynamic(
+            "geolocation-!cn",
+            non_cn_builtin,
+            "cn.pool.ntp.org"
+        ));
+        assert!(matches_geosite_dynamic("cn", cn_builtin, "cn.pool.ntp.org"));
+        assert!(matches_geosite_dynamic(
+            "cn",
+            cn_builtin,
+            "0.cn.pool.ntp.org"
+        ));
+
+        // 2. Dynamic persisted dataset where proxy has `domain:ntp.org` + `domain:cloudflare.com`
+        //    and direct has `domain:cn.pool.ntp.org`: longer CN suffix wins over broader proxy suffix
+        let base = GeoDataset::builtin_only();
+        let direct_rules = GeoSiteMatcher::from_rule_text("domain:cn.pool.ntp.org\n");
+        let proxy_rules = GeoSiteMatcher::from_rule_text(
+            "domain:ntp.org\ndomain:cloudflare.com\ndomain:blocked-sub.example.cn\n",
+        );
+        install_live_geodata(Arc::new(GeoDataset {
+            geosite_cn: base.geosite_cn.merged_with(&direct_rules),
+            geosite_non_cn: base.geosite_non_cn.merged_with(&proxy_rules),
+            geoip_cn: base.geoip_cn,
+            mmdb: None,
+            using_persisted_data: true,
+        }));
+
+        assert!(!matches_geosite_dynamic(
+            "geolocation-!cn",
+            non_cn_builtin,
+            "cn.pool.ntp.org"
+        ));
+        assert!(!matches_geosite_dynamic(
+            "geolocation-!cn",
+            non_cn_builtin,
+            "2.cn.pool.ntp.org"
+        ));
+        assert!(matches_geosite_dynamic("cn", cn_builtin, "cn.pool.ntp.org"));
+
+        // Non-CN NTP hosts still match `geolocation-!cn`
+        assert!(matches_geosite_dynamic(
+            "geolocation-!cn",
+            non_cn_builtin,
+            "pool.ntp.org"
+        ));
+        assert!(matches_geosite_dynamic(
+            "geolocation-!cn",
+            non_cn_builtin,
+            "time.cloudflare.com"
+        ));
+
+        // Conversely, a more specific proxy subdomain under `.cn` still wins for `geolocation-!cn`
+        assert!(matches_geosite_dynamic(
+            "geolocation-!cn",
+            non_cn_builtin,
+            "api.blocked-sub.example.cn"
+        ));
     }
 }

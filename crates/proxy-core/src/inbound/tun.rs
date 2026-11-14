@@ -32,7 +32,7 @@ use crate::{
     addr::{HostName, TargetAddr},
     inbound::udp_nat::UdpNatManager,
     router::Router,
-    tracker::TelemetryHub,
+    tracker::{SessionResetter, TelemetryHub},
 };
 
 pub const TUN_PACKET_QUEUE_CAPACITY: usize = 4096;
@@ -132,14 +132,53 @@ struct BridgeFlow {
     handle: SocketHandle,
     established: bool,
     created_at: Instant,
+    created_wall_ms: u64,
     last_active: Instant,
+    last_active_wall_ms: u64,
     fin_started_at: Option<Instant>,
+    fin_started_wall_ms: Option<u64>,
     pending_tx: BytesMut,
     from_remote_rx: mpsc::Receiver<Vec<u8>>,
     to_remote_tx: Option<mpsc::Sender<Vec<u8>>>,
     remote_eof: bool,
     remote_failed: Arc<AtomicBool>,
     task_abort: AbortHandle,
+}
+
+impl BridgeFlow {
+    fn is_timed_out(&self, now: Instant, now_wall_ms: u64) -> bool {
+        let syn_timed_out = !self.established
+            && (now.duration_since(self.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT
+                || now_wall_ms.saturating_sub(self.created_wall_ms)
+                    > TCP_SYN_HANDSHAKE_TIMEOUT.as_millis() as u64);
+        let idle_timed_out = now.duration_since(self.last_active) > TCP_IDLE_TIMEOUT
+            || now_wall_ms.saturating_sub(self.last_active_wall_ms)
+                > TCP_IDLE_TIMEOUT.as_millis() as u64;
+        let fin_timed_out = (self
+            .fin_started_at
+            .is_some_and(|t| now.duration_since(t) > TCP_HALF_CLOSE_TIMEOUT)
+            || self.fin_started_wall_ms.is_some_and(|w| {
+                now_wall_ms.saturating_sub(w) > TCP_HALF_CLOSE_TIMEOUT.as_millis() as u64
+            }))
+            && self.pending_tx.is_empty();
+        syn_timed_out || idle_timed_out || fin_timed_out
+    }
+}
+
+struct TunIdleWakeResetter {
+    wake_notify: Arc<Notify>,
+}
+
+impl SessionResetter for TunIdleWakeResetter {
+    fn reset_sessions(&self) -> usize {
+        self.wake_notify.notify_one();
+        0
+    }
+
+    fn reap_idle_sessions(&self) -> usize {
+        self.wake_notify.notify_one();
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -197,6 +236,10 @@ pub fn spawn_userspace_tun(
         let mut flows: HashMap<FourTuple, BridgeFlow> = HashMap::new();
         let udp_sem = Arc::new(Semaphore::new(MAX_TUN_UDP_INFLIGHT));
         let wake_notify = Arc::new(Notify::new());
+        let _tun_reap_waker: Arc<dyn SessionResetter> = Arc::new(TunIdleWakeResetter {
+            wake_notify: Arc::clone(&wake_notify),
+        });
+        hub.register_session_resetter(Arc::downgrade(&_tun_reap_waker));
 
         let egress_for_udp = egress_tx.clone();
         let udp_nat = UdpNatManager::new(
@@ -276,6 +319,7 @@ pub fn spawn_userspace_tun(
             let _ = iface.poll(ts, &mut device, &mut sockets);
 
             let now = Instant::now();
+            let now_wall = TelemetryHub::now_ms();
             let mut finished_keys = Vec::new();
             let mut has_backpressured_rx = false;
             let mut has_more_ready_rx = false;
@@ -317,6 +361,7 @@ pub fn spawn_userspace_tun(
                                     }
                                     drained_bytes += chunk.len();
                                     flow.last_active = now;
+                                    flow.last_active_wall_ms = now_wall;
                                     permit.send(chunk);
                                 }
                                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -350,6 +395,7 @@ pub fn spawn_userspace_tun(
                 {
                     flow.to_remote_tx.take();
                     flow.fin_started_at.get_or_insert(now);
+                    flow.fin_started_wall_ms.get_or_insert(now_wall);
                 }
 
                 // Flush any buffered bytes from remote outbound -> smoltcp TX buffer
@@ -357,6 +403,7 @@ pub fn spawn_userspace_tun(
                     let sent = sock.send_slice(&flow.pending_tx).unwrap_or(0);
                     if sent > 0 {
                         flow.last_active = now;
+                        flow.last_active_wall_ms = now_wall;
                         flow.pending_tx.advance(sent);
                     }
                 }
@@ -368,6 +415,7 @@ pub fn spawn_userspace_tun(
                             let sent = sock.send_slice(&data).unwrap_or(0);
                             if sent > 0 {
                                 flow.last_active = now;
+                                flow.last_active_wall_ms = now_wall;
                             }
                             if sent < data.len() {
                                 flow.pending_tx.extend_from_slice(&data[sent..]);
@@ -379,6 +427,7 @@ pub fn spawn_userspace_tun(
                             if !flow.remote_eof {
                                 flow.remote_eof = true;
                                 flow.fin_started_at.get_or_insert(now);
+                                flow.fin_started_wall_ms.get_or_insert(now_wall);
                                 sock.close();
                             }
                             break;
@@ -387,15 +436,8 @@ pub fn spawn_userspace_tun(
                 }
 
                 // Enforce SYN handshake timeout, half-close linger timeout, and idle timeout
-                let syn_timed_out = !flow.established
-                    && now.duration_since(flow.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT;
-                let idle_timed_out = now.duration_since(flow.last_active) > TCP_IDLE_TIMEOUT;
-                let fin_timed_out = flow
-                    .fin_started_at
-                    .is_some_and(|t| now.duration_since(t) > TCP_HALF_CLOSE_TIMEOUT)
-                    && flow.pending_tx.is_empty();
-
-                if syn_timed_out || idle_timed_out || fin_timed_out {
+                // using both monotonic `Instant` and wall-clock epoch ms (for Android deep sleep).
+                if flow.is_timed_out(now, now_wall) {
                     flow.task_abort.abort();
                     sock.abort();
                     finished_keys.push(*tuple);
@@ -432,18 +474,40 @@ pub fn spawn_userspace_tun(
                     next_delay = fold_min_delay(next_delay, Duration::from_millis(5));
                 }
                 let check_now = Instant::now();
+                let check_now_wall = TelemetryHub::now_ms();
                 for flow in flows.values() {
                     if !flow.established {
-                        let rem = TCP_SYN_HANDSHAKE_TIMEOUT
+                        let rem_mono = TCP_SYN_HANDSHAKE_TIMEOUT
                             .saturating_sub(check_now.duration_since(flow.created_at));
-                        next_delay = fold_min_delay(next_delay, rem.max(Duration::from_millis(1)));
+                        let rem_wall =
+                            TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(Duration::from_millis(
+                                check_now_wall.saturating_sub(flow.created_wall_ms),
+                            ));
+                        next_delay = fold_min_delay(
+                            next_delay,
+                            rem_mono.min(rem_wall).max(Duration::from_millis(1)),
+                        );
                     }
-                    let rem_idle =
+                    let rem_idle_mono =
                         TCP_IDLE_TIMEOUT.saturating_sub(check_now.duration_since(flow.last_active));
-                    next_delay = fold_min_delay(next_delay, rem_idle.max(Duration::from_millis(1)));
+                    let rem_idle_wall = TCP_IDLE_TIMEOUT.saturating_sub(Duration::from_millis(
+                        check_now_wall.saturating_sub(flow.last_active_wall_ms),
+                    ));
+                    next_delay = fold_min_delay(
+                        next_delay,
+                        rem_idle_mono
+                            .min(rem_idle_wall)
+                            .max(Duration::from_millis(1)),
+                    );
                     if let Some(fin_t) = flow.fin_started_at {
-                        let rem_fin =
+                        let mut rem_fin =
                             TCP_HALF_CLOSE_TIMEOUT.saturating_sub(check_now.duration_since(fin_t));
+                        if let Some(fin_w) = flow.fin_started_wall_ms {
+                            let rem_fin_wall = TCP_HALF_CLOSE_TIMEOUT.saturating_sub(
+                                Duration::from_millis(check_now_wall.saturating_sub(fin_w)),
+                            );
+                            rem_fin = rem_fin.min(rem_fin_wall);
+                        }
                         next_delay =
                             fold_min_delay(next_delay, rem_fin.max(Duration::from_millis(1)));
                     }
@@ -699,6 +763,7 @@ fn register_syn_flow(
     let remote_failed_task = Arc::clone(&remote_failed);
     let wake_task = Arc::clone(wake_notify);
     let now = Instant::now();
+    let now_wall = TelemetryHub::now_ms();
 
     let current_router = Arc::clone(&router.read());
     let hub_clone = Arc::clone(hub);
@@ -861,8 +926,11 @@ fn register_syn_flow(
             handle,
             established: false,
             created_at: now,
+            created_wall_ms: now_wall,
             last_active: now,
+            last_active_wall_ms: now_wall,
             fin_started_at: None,
+            fin_started_wall_ms: None,
             pending_tx: BytesMut::new(),
             from_remote_rx,
             to_remote_tx: Some(to_remote_tx),
@@ -1101,4 +1169,59 @@ pub fn try_attach_linux_os_tun(
 ) -> io::Result<OsTunGuard> {
     let default_net: Ipv4Net = "198.18.0.0/15".parse().expect("valid CIDR");
     attach_os_tun(device_name, 1500, default_net, Vec::new(), handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bridge_flow_wall_clock_timeout_fires_when_monotonic_clock_freezes() {
+        let mut sockets = SocketSet::new(vec![]);
+        let sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        let handle = sockets.add(sock);
+        let (_tx, rx) = mpsc::channel(1);
+        let noop_task = tokio::spawn(async {});
+
+        let mono_now = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+        let mut flow = BridgeFlow {
+            handle,
+            established: true,
+            created_at: mono_now,
+            created_wall_ms: base_wall,
+            last_active: mono_now,
+            last_active_wall_ms: base_wall,
+            fin_started_at: None,
+            fin_started_wall_ms: None,
+            pending_tx: BytesMut::new(),
+            from_remote_rx: rx,
+            to_remote_tx: None,
+            remote_eof: false,
+            remote_failed: Arc::new(AtomicBool::new(false)),
+            task_abort: noop_task.abort_handle(),
+        };
+
+        // Fresh established flow is not timed out.
+        assert!(!flow.is_timed_out(mono_now, base_wall + 5_000));
+
+        // Monotonic clock froze at `mono_now`, but wall clock advanced 309s (> 120s TCP_IDLE_TIMEOUT).
+        assert!(flow.is_timed_out(mono_now, base_wall + 309_000));
+
+        // Half-closed flow with empty pending_tx times out after 10s wall-clock advance even if monotonic froze.
+        flow.fin_started_at = Some(mono_now);
+        flow.fin_started_wall_ms = Some(base_wall);
+        assert!(!flow.is_timed_out(mono_now, base_wall + 9_000));
+        assert!(flow.is_timed_out(mono_now, base_wall + 11_000));
+
+        // Unestablished SYN flow times out after 15s wall-clock advance even if monotonic froze.
+        flow.established = false;
+        flow.fin_started_at = None;
+        flow.fin_started_wall_ms = None;
+        assert!(!flow.is_timed_out(mono_now, base_wall + 14_000));
+        assert!(flow.is_timed_out(mono_now, base_wall + 16_000));
+    }
 }

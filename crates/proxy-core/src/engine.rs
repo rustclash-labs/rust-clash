@@ -1357,6 +1357,7 @@ impl ProxyEngine {
 }
 
 const FAKE_IP_CACHE_FILENAME: &str = "fake_ip_cache.json";
+const FAKE_IP_CHECKPOINT_DEBOUNCE: Duration = Duration::from_secs(30);
 
 impl ProxyEngine {
     #[allow(clippy::too_many_arguments)]
@@ -1734,6 +1735,7 @@ impl ProxyEngine {
         });
         Self::spawn_http_rule_providers_task(&engine);
         Self::spawn_preconnect_task(&engine);
+        Self::spawn_fake_ip_checkpoint_task(&engine);
         Ok(engine)
     }
 
@@ -2169,6 +2171,98 @@ impl ProxyEngine {
         engine._bg_tasks.lock().push(handle);
     }
 
+    fn spawn_fake_ip_checkpoint_task(engine: &Arc<Self>) {
+        let weak_eng = Arc::downgrade(engine);
+        let mut stop_rx = engine.shutdown_tx.subscribe();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let (weak_router, notify, should_wait) = {
+                    let Some(eng) = weak_eng.upgrade() else {
+                        break;
+                    };
+                    let router = eng.router();
+                    let notify = router.dns().assignment_notify();
+                    let dirty_and_enabled = eng
+                        .persist_fake_ip
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        && !eng.is_demo_sandbox()
+                        && router.dns().has_unpersisted_entries();
+                    (Arc::downgrade(&router), notify, !dirty_and_enabled)
+                };
+
+                if should_wait {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    let skip_wait = weak_eng.upgrade().is_some_and(|eng| {
+                        let cur_router = eng.router();
+                        let same_router = weak_router
+                            .upgrade()
+                            .is_some_and(|prev| Arc::ptr_eq(&prev, &cur_router));
+                        !same_router
+                            || (eng
+                                .persist_fake_ip
+                                .load(std::sync::atomic::Ordering::Acquire)
+                                && !eng.is_demo_sandbox()
+                                && cur_router.dns().has_unpersisted_entries())
+                    });
+
+                    if !skip_wait {
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            _ = &mut notified => {}
+                        }
+                    }
+
+                    // If woken purely by a config-reload router swap (`notify_waiters()`) and the
+                    // new router has no unpersisted Fake-IP entries, re-bind immediately at 0 Hz.
+                    let rebound_clean = weak_eng.upgrade().is_some_and(|eng| {
+                        let cur_router = eng.router();
+                        let same_router = weak_router
+                            .upgrade()
+                            .is_some_and(|prev| Arc::ptr_eq(&prev, &cur_router));
+                        !same_router && !cur_router.dns().has_unpersisted_entries()
+                    });
+                    if rebound_clean {
+                        continue;
+                    }
+                }
+
+                drop(notify);
+
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ = tokio::time::sleep(FAKE_IP_CHECKPOINT_DEBOUNCE) => {}
+                }
+
+                if let Some(eng) = weak_eng.upgrade() {
+                    if eng
+                        .persist_fake_ip
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        && eng.router().dns().has_unpersisted_entries()
+                    {
+                        eng.persist_fake_ip_cache();
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+        engine._bg_tasks.lock().push(handle);
+    }
+
     pub fn is_demo_sandbox(&self) -> bool {
         self.demo_cluster.read().is_some()
     }
@@ -2205,6 +2299,7 @@ impl ProxyEngine {
     }
 
     pub fn set_low_power_mode(&self, enabled: bool) {
+        let _ = self.hub.reap_idle_sessions();
         if enabled {
             self.persist_fake_ip_cache();
         }
@@ -2300,11 +2395,13 @@ impl ProxyEngine {
     }
 
     pub fn set_state_dir_for_test(&self, dir: PathBuf) {
-        self.persist_fake_ip.store(
-            !dir.as_os_str().is_empty(),
-            std::sync::atomic::Ordering::Release,
-        );
+        let persist = !dir.as_os_str().is_empty();
+        self.persist_fake_ip
+            .store(persist, std::sync::atomic::Ordering::Release);
         *self.state_dir.write() = dir;
+        if persist && self.router().dns().has_unpersisted_entries() {
+            self.router().dns().assignment_notify().notify_waiters();
+        }
     }
 
     pub fn profile_manager(&self) -> Option<Arc<crate::profile::ProfileManager>> {
@@ -2407,6 +2504,9 @@ impl ProxyEngine {
         if !new_dir.as_os_str().is_empty() && self.demo_cluster.read().is_none() {
             self.persist_fake_ip
                 .store(true, std::sync::atomic::Ordering::Release);
+            if self.router().dns().has_unpersisted_entries() {
+                self.router().dns().assignment_notify().notify_waiters();
+            }
         }
         *self.profile_manager.write() = Some(Arc::clone(&mgr));
         if self.demo_cluster.read().is_none() {
@@ -3312,6 +3412,7 @@ impl ProxyEngine {
             });
             log_level
         };
+        prev_router.dns().assignment_notify().notify_waiters();
         self.hub.set_log_level(&final_log_level);
 
         drop(services);
@@ -3472,8 +3573,11 @@ impl ProxyEngine {
     }
 
     pub fn shutdown(&self) {
-        self.persist_fake_ip_cache();
         let _ = self.shutdown_tx.send(true);
+        for handle in self._bg_tasks.lock().drain(..) {
+            handle.abort();
+        }
+        self.persist_fake_ip_cache();
         if let Some(os_guard) = self.active_os_tun.write().take() {
             os_guard.stop_now();
         }
@@ -3564,5 +3668,62 @@ mod tests {
         cfg.rules.clear();
         cfg.geodata_mode = true;
         assert!(config_uses_geodata(&cfg));
+    }
+
+    #[tokio::test]
+    async fn set_low_power_mode_reaps_idle_sessions_and_shutdown_aborts_bg_tasks() {
+        struct CountingResetter(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::tracker::SessionResetter for CountingResetter {
+            fn reset_sessions(&self) -> usize {
+                0
+            }
+
+            fn reap_idle_sessions(&self) -> usize {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                1
+            }
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustclash-engine-test-{}", Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).expect("starter yaml");
+        cfg.mixed_port = 0;
+        cfg.dns.enable = false;
+        cfg.tun.enable = false;
+
+        let engine = ProxyEngine::start_with_options(
+            cfg,
+            temp_dir.clone(),
+            PreconnectPolicy::Disabled,
+            None,
+            None,
+        )
+        .await
+        .expect("start engine");
+
+        assert!(
+            !engine._bg_tasks.lock().is_empty(),
+            "background tasks (including Fake-IP checkpoint) must be tracked in _bg_tasks"
+        );
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resetter: Arc<dyn crate::tracker::SessionResetter> =
+            Arc::new(CountingResetter(Arc::clone(&calls)));
+        engine
+            .hub()
+            .register_session_resetter(Arc::downgrade(&resetter));
+
+        engine.set_low_power_mode(true);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        engine.set_low_power_mode(false);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        engine.shutdown();
+        assert!(engine._bg_tasks.lock().is_empty());
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

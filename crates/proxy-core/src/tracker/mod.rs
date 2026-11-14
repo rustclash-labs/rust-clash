@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::DashMap;
@@ -68,6 +68,12 @@ fn is_important_log(level: &str, payload: &str) -> bool {
 /// sockets bound to a stale network interface.
 pub trait SessionResetter: Send + Sync {
     fn reset_sessions(&self) -> usize;
+
+    /// Reap sessions whose wall-clock idle age exceeded their idle timeout
+    /// (e.g. across Android/Linux deep suspend where `CLOCK_MONOTONIC` freezes).
+    fn reap_idle_sessions(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +156,7 @@ pub struct ActiveConnection {
     pub effective_protocol: String,
     pub exit_type: String,
     pub remote_endpoint: String,
+    started_mono: Instant,
     established: AtomicBool,
     connect_duration_ms: AtomicU64,
     closed: AtomicBool,
@@ -159,7 +166,7 @@ pub struct ActiveConnection {
 impl ActiveConnection {
     pub fn mark_established(&self) {
         if !self.established.swap(true, Ordering::Release) {
-            let dur = TelemetryHub::now_ms().saturating_sub(self.start_epoch_ms);
+            let dur = self.started_mono.elapsed().as_millis() as u64;
             let _ = self.connect_duration_ms.compare_exchange(
                 u64::MAX,
                 dur,
@@ -531,6 +538,7 @@ impl TelemetryHub {
             effective_protocol,
             exit_type,
             remote_endpoint,
+            started_mono: Instant::now(),
             established: AtomicBool::new(false),
             connect_duration_ms: AtomicU64::new(u64::MAX),
             closed: AtomicBool::new(false),
@@ -761,6 +769,25 @@ impl TelemetryHub {
             active
         };
         live.into_iter().map(|r| r.reset_sessions()).sum()
+    }
+
+    /// Reap sessions across all registered `SessionResetter`s whose wall-clock or monotonic
+    /// idle age exceeded their idle timeout (e.g. across Android/Linux deep suspend).
+    pub fn reap_idle_sessions(&self) -> usize {
+        let live: Vec<Arc<dyn SessionResetter>> = {
+            let mut guard = self.session_resetters.lock();
+            let mut active = Vec::with_capacity(guard.len());
+            guard.retain(|w| {
+                if let Some(strong) = w.upgrade() {
+                    active.push(strong);
+                    true
+                } else {
+                    false
+                }
+            });
+            active
+        };
+        live.into_iter().map(|r| r.reap_idle_sessions()).sum()
     }
 
     pub fn active_connection_count(&self) -> usize {
@@ -1275,5 +1302,51 @@ mod tests {
                 .all(|w| w[0].timestamp_ms <= w[1].timestamp_ms),
             "logs_in_window must return entries in chronological order"
         );
+    }
+
+    #[test]
+    fn mark_established_uses_monotonic_clock_and_reap_idle_sessions_prunes_dead_resetters() {
+        struct MockResetter(usize);
+        impl SessionResetter for MockResetter {
+            fn reset_sessions(&self) -> usize {
+                0
+            }
+
+            fn reap_idle_sessions(&self) -> usize {
+                self.0
+            }
+        }
+
+        let hub = Arc::new(TelemetryHub::new());
+        let r1: Arc<dyn SessionResetter> = Arc::new(MockResetter(3));
+        let r2: Arc<dyn SessionResetter> = Arc::new(MockResetter(5));
+        hub.register_session_resetter(Arc::downgrade(&r1));
+        hub.register_session_resetter(Arc::downgrade(&r2));
+        assert_eq!(hub.reap_idle_sessions(), 8);
+
+        drop(r1);
+        assert_eq!(hub.reap_idle_sessions(), 5);
+
+        let target = TargetAddr::new_domain("mono.example.com", 443).unwrap();
+        let conn = hub.register_connection(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &target,
+            None,
+            "MATCH",
+            "",
+            vec!["PROXY".into()],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        conn.mark_established();
+        let snap = conn.snapshot();
+        assert_eq!(snap.status, "active");
+        let dur = snap.connect_duration_ms.expect("connect_duration_ms set");
+        assert!(
+            (4..5_000).contains(&dur),
+            "unexpected handshake duration {dur}ms"
+        );
+        hub.unregister_connection(&conn.id);
     }
 }
