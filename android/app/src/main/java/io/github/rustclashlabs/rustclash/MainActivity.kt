@@ -178,7 +178,7 @@ class MainActivity : AppCompatActivity() {
                     }.getOrDefault(false)
                 }
                 if (ok) {
-                    viewModel.emitUiMessage("已导出脱敏 YAML 配置文件")
+                    viewModel.emitUiMessage("已导出脱敏 YAML（密码已隐去为 ***REDACTED***，适合排障分享，不可跨设备恢复密钥）")
                 } else {
                     viewModel.emitUiMessage("导出 YAML 配置文件失败")
                 }
@@ -643,6 +643,8 @@ internal fun RustClashAppScaffold(
                     onSetDiagnosticsFilter = viewModel::setDiagnosticsFilter,
                     onClearDiagnostics = viewModel::clearDiagnostics,
                     onExplainTarget = viewModel::explainTargetRule,
+                    onDiagnoseSite = viewModel::diagnoseSite,
+                    onNavigateToNodes = { currentDestination = MainDestination.NODES },
                     onRuleSearchChange = viewModel::setRuleSearchQuery,
                 )
 
@@ -657,6 +659,7 @@ internal fun RustClashAppScaffold(
                     onDeleteProfile = viewModel::deleteProfile,
                     onRenameProfile = viewModel::renameProfile,
                     onUpdateProfileAutoUpdate = viewModel::updateProfileAutoUpdate,
+                    onDismissOpSummary = viewModel::dismissProfileOpSummary,
                     onOpenCustomRulesEditor = {
                         viewModel.loadActiveYamlAndRules {
                             viewModel.clearModalError()

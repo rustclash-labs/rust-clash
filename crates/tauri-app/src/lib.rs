@@ -208,14 +208,14 @@ impl DesktopWakeupServer {
                     }
                     if line.trim() == expected_line {
                         count_thread.fetch_add(1, Ordering::AcqRel);
-                        let _ = stream.write_all(b"OK\n");
-                        let _ = stream.flush();
                         let registered = cb_thread.lock().clone();
                         if let Some(cb) = registered {
                             cb();
                         } else {
                             pending_thread.store(true, Ordering::Release);
                         }
+                        let _ = stream.write_all(b"OK\n");
+                        let _ = stream.flush();
                     } else {
                         let _ = stream.write_all(b"ERR\n");
                         let _ = stream.flush();

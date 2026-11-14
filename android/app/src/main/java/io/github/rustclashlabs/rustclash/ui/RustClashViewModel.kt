@@ -647,6 +647,39 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun diagnoseSite(targetInput: String) {
+        val cleaned = targetInput.trim()
+        if (cleaned.isEmpty()) {
+            emitMessage("请输入要诊断的网站域名或链接（例如 chatgpt.com 或 github.com）")
+            return
+        }
+        if (!NativeBridge.ensureLoaded() || _uiState.value.isDiagnosingSite) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isDiagnosingSite = true) }
+            try {
+                val raw = withContext(Dispatchers.IO) {
+                    NativeBridge.nativeDiagnoseSiteJson(stateDir, cleaned)
+                }
+                UiJsonParsers.parseSiteDiagnosisResponse(raw)
+                    .onSuccess { diag ->
+                        _uiState.update { it.copy(siteDiagnosis = diag) }
+                        syncSnapshotQuietly()
+                    }
+                    .onFailure { err ->
+                        emitMessage(err.message ?: "网站连通性诊断失败")
+                    }
+            } finally {
+                _uiState.update { it.copy(isDiagnosingSite = false) }
+            }
+        }
+    }
+
+    fun dismissProfileOpSummary() {
+        if (_uiState.value.lastProfileOpSummary != null) {
+            _uiState.update { it.copy(lastProfileOpSummary = null) }
+        }
+    }
+
     fun clearDiagnostics() {
         if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
@@ -678,6 +711,10 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun refreshProfileSubscription(profileId: String) {
         if (!NativeBridge.ensureLoaded() || _uiState.value.refreshingProfileId != null) return
+        val fallbackName = _uiState.value.profiles
+            .firstOrNull { it.id == profileId }
+            ?.let { _uiState.value.resolveProfileDisplayName(it) }
+            ?: "订阅配置"
         viewModelScope.launch {
             _uiState.update { it.copy(refreshingProfileId = profileId) }
             try {
@@ -686,12 +723,25 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 val parsed = UiJsonParsers.parseProfilesSnapshot(raw)
                 if (parsed != null) {
-                    _uiState.update { it.copy(activeProfileId = parsed.first, profiles = parsed.second) }
+                    val summary = UiJsonParsers.parseRefreshSummary(raw, fallbackName)
+                    _uiState.update {
+                        it.copy(
+                            activeProfileId = parsed.first,
+                            profiles = parsed.second,
+                            lastProfileOpSummary = summary ?: it.lastProfileOpSummary,
+                        )
+                    }
                     syncSnapshotQuietly()
-                    emitMessage("订阅更新完成")
+                    val msg = if (summary != null) {
+                        val gradePart = summary.auditGrade?.let { g -> " · 安全评级 $g" } ?: ""
+                        "订阅更新完成：共 ${summary.totalNodes} 节点（+${summary.diffAddedCount} / -${summary.diffRemovedCount}）$gradePart"
+                    } else {
+                        "订阅更新完成"
+                    }
+                    emitMessage(msg)
                 } else {
                     val err = runCatching { JSONObject(raw).optString("error") }.getOrNull()
-                    emitMessage("订阅更新失败（已保留原配置）：${err ?: "请求失败"}")
+                    emitMessage("订阅更新失败（已安全保留上一份可用配置）：${UiJsonParsers.formatCleanBackendError(err, "请求失败")}")
                 }
             } finally {
                 _uiState.update { it.copy(refreshingProfileId = null) }

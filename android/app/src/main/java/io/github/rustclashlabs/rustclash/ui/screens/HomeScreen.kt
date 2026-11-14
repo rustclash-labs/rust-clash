@@ -170,6 +170,14 @@ fun HomeScreen(
                             onTestActiveLatency()
                         },
                     )
+                    DropdownMenuItem(
+                        text = { Text("诊断网站连接问题") },
+                        leadingIcon = { Icon(Icons.Rounded.Public, contentDescription = null) },
+                        onClick = {
+                            showTopMenu = false
+                            onNavigateToRules(2)
+                        },
+                    )
                 }
             }
         }
@@ -244,7 +252,11 @@ fun HomeScreen(
             Spacer(modifier = Modifier.height(10.dp))
 
             val statusTitle = when (state.vpnState) {
-                VpnLifecycleState.RUNNING -> "已连接"
+                VpnLifecycleState.RUNNING -> if (state.routingPreset == RoutingPresetUi.DIRECT) {
+                    "已连接（全局直连）"
+                } else {
+                    "已连接"
+                }
                 VpnLifecycleState.PREPARING, VpnLifecycleState.STARTING -> "正在连接…"
                 VpnLifecycleState.RECONNECTING -> "网络恢复中…"
                 VpnLifecycleState.STOPPING -> "正在断开…"
@@ -262,15 +274,17 @@ fun HomeScreen(
             Spacer(modifier = Modifier.height(4.dp))
 
             val noSavedNodes = state.nodes.isEmpty() && !state.demoMode
-            val heroSubtitle = if (noSavedNodes && state.routingPreset != RoutingPresetUi.DIRECT) {
-                "点击导入首个代理节点 · ${state.routingPreset.modeDisplay}"
-            } else {
-                "${state.effectiveOutbound} · ${state.routingPreset.modeDisplay}"
+            val isDirectConnected = isConnected && state.routingPreset == RoutingPresetUi.DIRECT
+            val heroSubtitle = when {
+                isDirectConnected -> "当前为 Direct 模式 · 流量不经过代理节点"
+                noSavedNodes && state.routingPreset != RoutingPresetUi.DIRECT ->
+                    "点击导入首个代理节点 · ${state.routingPreset.modeDisplay}"
+                else -> "${state.effectiveOutbound} · ${state.routingPreset.modeDisplay}"
             }
             Text(
                 text = heroSubtitle,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (noSavedNodes && state.routingPreset != RoutingPresetUi.DIRECT) {
+                color = if (isDirectConnected || (noSavedNodes && state.routingPreset != RoutingPresetUi.DIRECT)) {
                     extColors.amber
                 } else {
                     MaterialTheme.colorScheme.onSurfaceVariant
@@ -480,6 +494,45 @@ fun HomeScreen(
                             modifier = Modifier.size(18.dp),
                         )
                     }
+                }
+
+                HorizontalDivider(
+                    modifier = Modifier.padding(horizontal = 18.dp),
+                    thickness = 0.8.dp,
+                    color = extColors.hairline,
+                )
+
+                // Row 4: 诊断连接问题（为什么某网站打不开？）
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onNavigateToRules(2) }
+                        .padding(horizontal = 18.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "诊断连接问题",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "网站打不开？一键实测分流路径 · DNS · 隧道 · TLS",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                        contentDescription = "打开网站排障",
+                        tint = extColors.emerald,
+                        modifier = Modifier.size(20.dp),
+                    )
                 }
             }
         }

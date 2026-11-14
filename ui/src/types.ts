@@ -625,3 +625,52 @@ export interface EndpointMatrixReport {
   udp_probe: UdpProbeResult;
   items: EndpointMatrixItem[];
 }
+
+export interface SiteTakeoverContext {
+  core_running: boolean;
+  sysproxy_enabled: boolean;
+  tun_enabled: boolean;
+  platform_hint?: string;
+}
+
+export interface SiteStageCheck {
+  stage: string;
+  label_zh: string;
+  label_en: string;
+  status: "ok" | "warning" | "failed" | "skipped";
+  latency_ms?: number | null;
+  detail_zh: string;
+  detail_en: string;
+}
+
+export interface SiteDiagnosisReport {
+  input: string;
+  normalized_url: string;
+  target_host: string;
+  target_port: number;
+  mode: string;
+  matched_rule: string;
+  rule_type: string;
+  rule_payload: string;
+  chains: string[];
+  route_flow: string[];
+  effective_outbound: string;
+  effective_protocol: string;
+  exit_type: string;
+  remote_endpoint: string;
+  takeover: SiteTakeoverContext;
+  diagnosis_code: string;
+  severity: "ok" | "warning" | "error";
+  headline_zh: string;
+  headline_en: string;
+  summary_zh: string;
+  summary_en: string;
+  route_summary_zh: string;
+  route_summary_en: string;
+  actions_zh: string[];
+  actions_en: string[];
+  suggested_action_kind?: string | null;
+  stage_checks: SiteStageCheck[];
+  waterfall?: WaterfallProbeReport | null;
+}
+

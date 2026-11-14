@@ -21,13 +21,13 @@
 `rust-clash` combines a pure-Rust proxy kernel (`crates/proxy-core`), CLI daemon (`crates/proxy-cli`), Tauri 2 desktop client (`crates/tauri-app`), JNI/C-ABI bridge (`crates/proxy-ffi`), Jetpack Compose Android `VpnService` app (`android/`), and embedded React 19 Web Console (`ui/`) — supporting **VLESS (`mlkem768x25519plus` Post-Quantum 0-RTT/1-RTT)**, **Trojan**, **AnyTLS v2**, **Shadowsocks-2022 (`SIP022`)**, **SOCKS5 / HTTP(S)**, **Multi-Transport Fake-IP DNS**, and **event-driven `smoltcp` Userspace TUN** without Go (`mihomo`/`sing-box`/`xray-core`) or C/C++ proxy sidecars.
 
 > [!IMPORTANT]
-> **Experimental & AI-Authored Prototype (`v0.3.7`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
+> **Experimental & AI-Authored Prototype (`v0.4.0`, Pre-1.0)**: Written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review; **not** independently security-audited. Linux (`ip netns` `/dev/net/tun`) and localhost external protocol interop run in automated CI, while physical Windows, macOS, and Android TUN/VPN hardware UAT and desktop code-signing remain pending — see [**Platform Compatibility & Verification Status**](#platform-compatibility--verification-status) before use.
 
 ---
 
 ## Product Screenshots
 
-> All screenshots below are captured directly from the live `rust-clash v0.3.2` daemon and embedded Web Console using the built-in `--demo` local loopback sandbox and synthetic RFC 2606 (`*.example.com`) configurations — zero mockups and zero real server credentials.
+> Screenshots below were captured from the live `rust-clash` `--demo` local loopback sandbox (`v0.3.2` visual baseline) using synthetic RFC 2606 (`*.example.com`) configurations — zero mockups and zero real server credentials. `v0.4.0` further refines the Overview and Tools views with a **3-Layer Honest Status Strip** (`Core Engine` · `System Proxy / TUN` · `Internet Connectivity`), **Plain-Language Site Connectivity Doctor**, and **Structured Subscription Import & Diff Reports**.
 
 ### Dashboard, Real-Time Encrypted Throughput & OS Integration
 
@@ -82,11 +82,12 @@ Instead of competing purely on legacy protocol sprawl, `rust-clash` targets thre
 
 ### 1. Config Security Audit (`Clippy for Clash` — `rust-clash audit` & `/diagnostics/audit`)
 - **Static Security & Rule Linter (`0–100` Score, Grade `A`–`F`)**: Flags MITM-vulnerable `skip-cert-verify: true` nodes, unencrypted remote transports, unauthenticated LAN controllers, shadowed domain/CIDR rules, dead rules after `MATCH`, and `IP-CIDR`/`GEOIP` rules missing `no-resolve` (distinguishing encrypted DoH/DoT pre-route lookups from plaintext `:53` ISP DNS exposure).
-- **Split-DNS Route Simulator & Subscription Diffs**: Separates offline `static_first_member_estimate` previews from live `Router` selector/URLTest state (`live_router_selection`) and optional live DNS resolution (`?resolve_dns=true`), plus **credential-redacted Subscription Refresh Security Diffs** that warn before newly insecure upstream nodes go unnoticed.
+- **Split-DNS Route Simulator, Structured Import Reports & Subscription Diffs**: Separates offline `static_first_member_estimate` previews from live `Router` selector/URLTest state (`live_router_selection`) and optional live DNS resolution (`?resolve_dns=true`), surfaces grouped unsupported-protocol import breakdowns (`VMess` / `Hysteria2` / `TUIC`) alongside duplicate counts, and computes **credential-redacted Subscription Refresh Security Diffs** with automatic rollback on failed refreshes.
 
-### 2. Network Diagnostic Timing Waterfall (`rust-clash probe` & `/proxies/{name}/probe` · `/matrix`)
-- **Stage-Exact Latency Decomposition**: Breaks TCP connection health into `DNS Resolve → Tunnel Connect → TLS Handshake [TLSv1.3 / ALPN] → HTTP TTFB` (isolated from parallel UDP checks so slow or blackholed UDP probes never inflate TCP latency history).
-- **Actionable HTTP & UDP Verdicts**: Distinguishes `Reachable` (`2xx`/`3xx`), `AuthRequired` (`401` unblocked API gateway), `RateLimited` (`429` shared-IP quota/throttle — never misreported as API-ready), and `BlockedOrChallenged` (`403`/`451` Geo/WAF blocks); verifies **real UDP datagram relay** (`verified` vs `blackholed` vs `unsupported`) via RFC 1035 DNS echo; and enforces a built-in **SSRF / private-network guard** (blocking loopback, RFC1918 LAN, link-local `169.254.0.0/16`, and cloud metadata endpoints by default).
+### 2. Plain-Language Site Connectivity Doctor & Timing Waterfall (`POST /diagnostics/site-check`, `rust-clash probe`, `/proxies/{name}/probe` · `/matrix`)
+- **"Why Can't This Website Open?" (`POST /diagnostics/site-check` & Android `nativeDiagnoseSiteJson`)**: Combines rule evaluation (`Rule` / `Global` / `Direct`), OS takeover state (`System Proxy` / `TUN`), and live `DNS → Tunnel → TLS → HTTP TTFB` probing into plain-language root-cause verdicts (`REJECT` rule block, `Direct` mode bypass, takeover disabled, DNS failure, proxy TCP timeout, TLS handshake drop, `403`/`451` geo/WAF block, `429` shared-IP rate limit) with 1-click remediation actions.
+- **3-Layer Honest Connection Status & Zero Fabricated Metrics**: Separates `Core Engine`, `System Proxy / TUN`, and `Internet Connectivity` (never claiming "Connected & Healthy" when egress probes fail, never guessing exit countries from node names, and never silently mutating user routing modes on connect).
+- **Stage-Exact Latency Decomposition & UDP Verification**: Breaks TCP connection health into `DNS Resolve → Tunnel Connect → TLS Handshake [TLSv1.3 / ALPN] → HTTP TTFB`, verifies **real UDP datagram relay** (`verified` vs `blackholed` vs `unsupported`) via RFC 1035 DNS echo, and enforces a built-in **SSRF / private-network guard** (blocking loopback, RFC1918 LAN, link-local `169.254.0.0/16`, and cloud metadata endpoints by default).
 
 ### 3. AI / `MCP` Integration (`rust-clash mcp`)
 - **Zero-Config JSON-RPC 2.0 `stdio` MCP Server**: Exposes `audit_config_security`, `explain_route`, `probe_waterfall`, `probe_ai_matrix`, and `get_proxy_status` (plus opt-in `switch_proxy_selector` behind `--allow-mutations`) so **Claude Code**, **Gemini CLI**, or **Cursor** can diagnose routing mismatches, Split-DNS leaks, and `403`/`429` API errors directly.
@@ -96,16 +97,16 @@ Instead of competing purely on legacy protocol sprawl, `rust-clash` targets thre
 
 ## Download & Quick Start
 
-### Prebuilt Releases ([`v0.3.7` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
+### Prebuilt Releases ([`v0.4.0` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest))
 
 Every release publishes [`SHA256SUMS.txt`](https://github.com/rustclash-labs/rust-clash/releases/latest) across all 14 desktop, CLI, and mobile artifacts:
 
 | Platform | Desktop / Mobile App | Headless CLI (`rust-clash`) | Notes |
 |---|---|---|---|
-| **Linux (`x86_64`)** | `RustClash_0.3.7_amd64.deb`<br/>`RustClash-0.3.7-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
-| **Windows 10/11 (`x86_64`)** | `RustClash_0.3.7_x64-setup.exe`<br/>`RustClash_0.3.7_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
-| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.3.7_aarch64.dmg`<br/>`RustClash_0.3.7_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
-| **Android 8.0+ (`API 26+`)** | `rust-clash-android-arm64-v8a.apk`<br/>`rust-clash-android-universal.apk` | — *(JNI `libproxy_ffi.so` bundled)* | Signed with project release keystore (`x86_64` APK & `.aab` also attached) |
+| **Linux (`x86_64`)** | `RustClash_0.4.0_amd64.deb`<br/>`RustClash-0.4.0-1.x86_64.rpm` | `rust-clash-cli-linux-x86_64.tar.gz` | Embedded Web UI included in both CLI & Tauri desktop packages |
+| **Windows 10/11 (`x86_64`)** | `RustClash_0.4.0_x64-setup.exe`<br/>`RustClash_0.4.0_x64_en-US.msi` | `rust-clash-cli-windows-x86_64.zip` | Unsigned installer (SmartScreen prompt); bundled `wintun.dll` retains Microsoft/WireGuard LLC signature |
+| **macOS 13+ (`arm64` / `x64`)** | `RustClash_0.4.0_aarch64.dmg`<br/>`RustClash_0.4.0_x64.dmg` | `rust-clash-cli-macos-arm64.tar.gz`<br/>`rust-clash-cli-macos-x86_64.tar.gz` | Unsigned `.dmg` (Gatekeeper prompt); physical macOS TUN pending UAT |
+| **Android 8.0+ (`API 26+`)** | `rust-clash-android-arm64-v8a.apk`<br/>`rust-clash-android-universal.apk` | — *(JNI `libproxy_ffi.so` bundled)* | Signed with persistent project release keystore (`io.github.rustclashlabs.rustclash`, `versionCode 16`) |
 
 ### 60-Second Demo Sandbox & CLI Quick Start
 

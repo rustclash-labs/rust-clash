@@ -760,4 +760,108 @@ class VpnConfigAndLifecycleTest {
         assertEquals("每 24 小时", UiJsonParsers.formatAutoUpdateInterval(86400L))
         assertEquals("每 15 分钟", UiJsonParsers.formatAutoUpdateInterval(900L))
     }
+
+    @Test
+    fun siteDiagnosisAndImportRefreshParsersExposePlainLanguageAndProtocolBreakdowns() {
+        val rawSiteJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "diagnosis": {
+                "input": "chatgpt.com",
+                "normalized_url": "https://chatgpt.com/",
+                "target_host": "chatgpt.com",
+                "target_port": 443,
+                "mode": "rule",
+                "matched_rule": "DOMAIN-SUFFIX(openai.com)",
+                "route_flow": ["Rule 模式", "DOMAIN-SUFFIX(openai.com)", "PROXY", "JP-VLESS-01"],
+                "effective_outbound": "JP-VLESS-01",
+                "effective_protocol": "vless",
+                "exit_type": "PROXY",
+                "diagnosis_code": "tls_handshake_failed",
+                "severity": "error",
+                "headline_zh": "代理 TCP 建连成功，但 TLS 加密握手失败",
+                "summary_zh": "节点 JP-VLESS-01 已连通，但与目标站点协商 TLS 时被中断。",
+                "route_summary_zh": "预计分流路径：Rule 模式 → DOMAIN-SUFFIX(openai.com) → PROXY → JP-VLESS-01",
+                "actions_zh": ["建议切换到其他节点后重新检测。"],
+                "suggested_action_kind": "switch_node",
+                "stage_checks": [
+                  {"stage": "routing", "label_zh": "分流规则判定", "status": "ok", "latency_ms": null, "detail_zh": "命中 PROXY"},
+                  {"stage": "tunnel", "label_zh": "代理节点建连", "status": "ok", "latency_ms": 62, "detail_zh": "TCP 握手成功"},
+                  {"stage": "tls", "label_zh": "TLS 加密握手", "status": "failed", "latency_ms": 115, "detail_zh": "handshake eof"}
+                ]
+              }
+            }
+        """.trimIndent()
+
+        val diag = UiJsonParsers.parseSiteDiagnosisResponse(rawSiteJson).getOrThrow()
+        assertTrue(diag.vpnRunning)
+        assertEquals("chatgpt.com", diag.targetHost)
+        assertEquals(443, diag.targetPort)
+        assertEquals("error", diag.severity)
+        assertEquals("switch_node", diag.suggestedActionKind)
+        assertEquals(3, diag.stageChecks.size)
+        assertEquals(62L, diag.stageChecks[1].latencyMs)
+        assertEquals("failed", diag.stageChecks[2].status)
+
+        val rawImportJson = """
+            {
+              "ok": true,
+              "count": 18,
+              "addedNodes": ["HK-01", "JP-01"],
+              "totalNodes": 18,
+              "skippedDuplicates": 2,
+              "skippedUnsupported": [
+                {"name": "US-VMess-1", "protocol": "vmess", "reason": "VMess 暂未内置"},
+                {"name": "US-VMess-2", "protocol": "vmess", "reason": "VMess 暂未内置"},
+                {"name": "SG-HY2-1", "protocol": "hy2", "reason": "Hysteria2 QUIC 暂未内置"}
+              ]
+            }
+        """.trimIndent()
+        val importSum = UiJsonParsers.parseImportSummary(rawImportJson, "主力订阅")
+        assertNotNull(importSum)
+        assertFalse(importSum!!.isRefresh)
+        assertEquals(2, importSum.addedNodes)
+        assertEquals(2, importSum.skippedDuplicates)
+        assertEquals(3, importSum.skippedUnsupportedTotal)
+        assertEquals(2, importSum.skippedGroups.size)
+        assertEquals("VMess", importSum.skippedGroups[0].protocolLabel)
+        assertEquals(2, importSum.skippedGroups[0].count)
+        assertEquals("Hysteria2", importSum.skippedGroups[1].protocolLabel)
+        assertEquals(1, importSum.skippedGroups[1].count)
+
+        val rawRefreshJson = """
+            {
+              "ok": true,
+              "auditScore": 92,
+              "auditGrade": "A",
+              "refreshedProfile": {
+                "id": "sub-hk",
+                "name": "主力订阅",
+                "proxy_count": 20,
+                "rule_count": 135,
+                "manual_proxy_count": 2
+              },
+              "diff": {
+                "added_proxies": [{"name": "TW-01"}, {"name": "TW-02"}],
+                "removed_proxies": ["OLD-HK"],
+                "changed_proxies": [],
+                "newly_insecure_nodes": [],
+                "rules_prev_count": 120,
+                "rules_next_count": 135
+              }
+            }
+        """.trimIndent()
+        val refreshSum = UiJsonParsers.parseRefreshSummary(rawRefreshJson, "备用名称")
+        assertNotNull(refreshSum)
+        assertTrue(refreshSum!!.isRefresh)
+        assertEquals("主力订阅", refreshSum.profileName)
+        assertEquals(20, refreshSum.totalNodes)
+        assertEquals(2, refreshSum.diffAddedCount)
+        assertEquals(1, refreshSum.diffRemovedCount)
+        assertEquals(120, refreshSum.rulesPrevCount)
+        assertEquals(135, refreshSum.rulesNextCount)
+        assertEquals("A", refreshSum.auditGrade)
+        assertEquals(2, refreshSum.manualProtectedCount)
+    }
 }

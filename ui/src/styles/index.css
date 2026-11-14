@@ -532,6 +532,21 @@ textarea.code-editor {
   color: var(--accent-emerald-text);
 }
 
+.status-pill.checking {
+  background: var(--accent-sky-soft);
+  color: var(--accent-sky);
+}
+
+.status-pill.warn {
+  background: var(--accent-amber-soft);
+  color: var(--accent-amber);
+}
+
+.status-pill.error {
+  background: var(--accent-rose-soft);
+  color: var(--accent-rose);
+}
+
 .status-pill.direct {
   background: var(--bg-subcard);
   color: var(--text-secondary);
@@ -551,6 +566,68 @@ textarea.code-editor {
 
 .status-pill.running .status-pill-dot {
   background: #22c55e;
+}
+
+.three-layer-strip {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.three-layer-cell {
+  background: var(--bg-subcard);
+  border-radius: 11px;
+  padding: 6px 10px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.three-layer-title {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.three-layer-val {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.layer-dot {
+  width: 6.5px;
+  height: 6.5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.layer-dot.emerald {
+  background: #22c55e;
+}
+.layer-dot.sky {
+  background: var(--accent-sky);
+}
+.layer-dot.amber {
+  background: var(--accent-amber);
+}
+.layer-dot.rose {
+  background: var(--accent-rose);
+}
+.layer-dot.neutral {
+  background: var(--text-muted);
 }
 
 .country-badge-btn {

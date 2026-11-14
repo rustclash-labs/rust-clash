@@ -87,6 +87,8 @@ fun RulesScreen(
     onSetDiagnosticsFilter: (DiagnosticsFilter) -> Unit,
     onClearDiagnostics: () -> Unit,
     onExplainTarget: (String) -> Unit,
+    onDiagnoseSite: (String) -> Unit = {},
+    onNavigateToNodes: () -> Unit = {},
     onRuleSearchChange: (String) -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
@@ -168,7 +170,7 @@ fun RulesScreen(
                 unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
                 text = {
                     Text(
-                        text = "命中测试",
+                        text = "网站排障",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (selectedTab == 2) FontWeight.SemiBold else FontWeight.Medium,
                         maxLines = 1,
@@ -194,6 +196,9 @@ fun RulesScreen(
             else -> RuleExplainAndTableTab(
                 state = state,
                 onExplainTarget = onExplainTarget,
+                onDiagnoseSite = onDiagnoseSite,
+                onNavigateToNodes = onNavigateToNodes,
+                onSelectRoutingPreset = onSelectRoutingPreset,
                 onRuleSearchChange = onRuleSearchChange,
             )
         }
@@ -643,18 +648,20 @@ private fun DiagnosticRowCard(entry: DiagnosticEntryUi) {
 private fun RuleExplainAndTableTab(
     state: AppUiState,
     onExplainTarget: (String) -> Unit,
+    onDiagnoseSite: (String) -> Unit = {},
+    onNavigateToNodes: () -> Unit = {},
+    onSelectRoutingPreset: (RoutingPresetUi) -> Unit = {},
     onRuleSearchChange: (String) -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
-    var targetInput by rememberSaveable { mutableStateOf("www.bilibili.com") }
+    var targetInput by rememberSaveable { mutableStateOf("chatgpt.com") }
     val quickSamples = listOf(
-        "www.baidu.com",
+        "chatgpt.com",
+        "claude.ai",
+        "github.com",
+        "www.google.com",
         "www.bilibili.com",
         "wx.qq.com",
-        "www.google.com",
-        "github.com",
-        "114.114.114.114",
-        "8.8.8.8",
     )
 
     val filteredRules = remember(state.rules, state.ruleSearchQuery) {
@@ -684,35 +691,60 @@ private fun RuleExplainAndTableTab(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "域名 / IP 分流命中测试（离线与在线均可用）",
+                        text = "为什么这个网站打不开？（分流与连通性诊断）",
                         style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        text = "输入域名或网址，一次看清预计分流路径、DNS、代理隧道、TLS 握手与修复建议。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = targetInput,
+                        onValueChange = { targetInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        placeholder = { Text("如 chatgpt.com、github.com 或 bilibili.com") },
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        OutlinedTextField(
-                            value = targetInput,
-                            onValueChange = { targetInput = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            placeholder = { Text("如 bilibili.com 或 google.com") },
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
                         Button(
-                            onClick = { onExplainTarget(targetInput) },
-                            enabled = !state.isExplaining && targetInput.isNotBlank(),
+                            onClick = { onDiagnoseSite(targetInput) },
+                            enabled = !state.isDiagnosingSite && targetInput.isNotBlank(),
+                            modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = extColors.emerald,
                                 contentColor = Color.White,
                             ),
                         ) {
-                            Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("测试", maxLines = 1)
+                            if (state.isDiagnosingSite) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(15.dp),
+                                    strokeWidth = 2.dp,
+                                    color = Color.White,
+                                )
+                            } else {
+                                Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(if (state.isDiagnosingSite) "实测诊断中…" else "一键实测诊断", maxLines = 1)
+                        }
+
+                        OutlinedButton(
+                            onClick = { onExplainTarget(targetInput) },
+                            enabled = !state.isExplaining && targetInput.isNotBlank(),
+                            border = BorderStroke(1.dp, extColors.hairline),
+                        ) {
+                            Text("仅测规则", maxLines = 1)
                         }
                     }
 
@@ -727,11 +759,147 @@ private fun RuleExplainAndTableTab(
                             TextButton(
                                 onClick = {
                                     targetInput = sample
-                                    onExplainTarget(sample)
+                                    onDiagnoseSite(sample)
                                 },
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                             ) {
                                 Text(sample, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+
+                    val diag = state.siteDiagnosis
+                    if (diag != null) {
+                        HorizontalDivider(color = extColors.hairline, modifier = Modifier.padding(vertical = 10.dp))
+                        val (sevBg, sevFg, sevLabel) = when (diag.severity.lowercase()) {
+                            "ok" -> Triple(extColors.emeraldContainer, extColors.onEmeraldContainer, "连通正常")
+                            "warning" -> Triple(extColors.amberContainer, extColors.onAmberContainer, "存在限制或提醒")
+                            else -> Triple(extColors.dangerContainer, extColors.onDangerContainer, "连接受阻")
+                        }
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = sevBg.copy(alpha = 0.65f),
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Surface(shape = CircleShape, color = sevBg) {
+                                        Text(
+                                            text = sevLabel,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = sevFg,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "${diag.targetHost}:${diag.targetPort}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = sevFg,
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = diag.headlineZh,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                                if (diag.summaryZh.isNotBlank()) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = diag.summaryZh,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+
+                        if (diag.routeSummaryZh.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = diag.routeSummaryZh,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+
+                        if (diag.stageChecks.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                diag.stageChecks.forEach { st ->
+                                    val (dotColor, statusBadge) = when (st.status.lowercase()) {
+                                        "ok" -> extColors.emerald to "正常"
+                                        "warning" -> extColors.amber to "提示"
+                                        "failed" -> extColors.danger to "失败"
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant to "跳过"
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.Top,
+                                    ) {
+                                        Text(
+                                            text = "[$statusBadge]",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = dotColor,
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            val latSuffix = st.latencyMs?.let { " · ${it} ms" } ?: ""
+                                            Text(
+                                                text = "${st.labelZh}$latSuffix",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                            )
+                                            if (st.detailZh.isNotBlank()) {
+                                                Text(
+                                                    text = st.detailZh,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (diag.actionsZh.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "建议操作：",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            diag.actionsZh.forEach { act ->
+                                Text(
+                                    text = "• $act",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (diag.suggestedActionKind == "switch_node") {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                OutlinedButton(
+                                    onClick = onNavigateToNodes,
+                                    border = BorderStroke(1.dp, extColors.emerald),
+                                ) {
+                                    Text("前往节点列表切换节点", color = extColors.emerald)
+                                }
+                            } else if (diag.suggestedActionKind == "switch_mode_rule") {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                OutlinedButton(
+                                    onClick = { onSelectRoutingPreset(RoutingPresetUi.SMART_CN) },
+                                    border = BorderStroke(1.dp, extColors.emerald),
+                                ) {
+                                    Text("切回智能分流模式", color = extColors.emerald)
+                                }
                             }
                         }
                     }
