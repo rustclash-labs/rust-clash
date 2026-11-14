@@ -1157,11 +1157,15 @@ impl ProfileManager {
 
     pub fn routing_snapshot(&self) -> Result<RoutingPresetSnapshot> {
         let (cfg, _) = self.load_active_config()?;
+        Ok(self.routing_snapshot_for_config(&cfg))
+    }
+
+    pub fn routing_snapshot_for_config(&self, cfg: &ClashConfig) -> RoutingPresetSnapshot {
         let idx = self.index.lock();
         let active_meta = idx.profiles.iter().find(|p| p.id == idx.active_profile_id);
         let rule_preset = active_meta
             .and_then(|p| p.rule_preset)
-            .unwrap_or_else(|| classify_rule_preset(&cfg));
+            .unwrap_or_else(|| classify_rule_preset(cfg));
         let has_custom_rules_backup =
             active_meta.is_some_and(|p| !p.custom_rules_backup.is_empty());
         let selected_groups = active_meta
@@ -1175,15 +1179,15 @@ impl ProfileManager {
                 RulePreset::Custom => RoutingPresetChoice::Custom,
             },
         };
-        Ok(RoutingPresetSnapshot {
+        RoutingPresetSnapshot {
             active_choice,
             mode: cfg.mode,
             rule_preset,
-            primary_group: primary_proxy_group_for_config(&cfg),
+            primary_group: primary_proxy_group_for_config(cfg),
             rule_count: active_trimmed_rules(&cfg.rules).len(),
             has_custom_rules_backup,
             selected_groups,
-        })
+        }
     }
 
     /// Return the active custom rules list (or the backed-up custom rules when currently on `smart-cn`,

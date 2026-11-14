@@ -25,7 +25,7 @@ use jni::{
 };
 use parking_lot::Mutex;
 use proxy_core::{
-    api::{parse_explain_target, read_process_rss_bytes},
+    api::{parse_explain_target, read_process_rss_bytes, read_process_total_vmrss_bytes},
     config::{
         ClashConfig, ProxyGroupType, ProxyNodeConfig, REDACTED_SECRET, RunMode,
         uri::redact_sensitive_text,
@@ -1076,6 +1076,8 @@ pub fn android_status_json_core() -> serde_json::Value {
             "running": true,
             "demoActive": rt.engine.demo_info().enabled,
             "mode": router.mode().as_str(),
+            "routerEpoch": router.epoch(),
+            "delaysRevision": router.delays().revision(),
             "effectiveOutbound": eff.effective_outbound,
             "effectiveProtocol": eff.effective_protocol,
             "effectiveDelayMs": active_delay,
@@ -1143,14 +1145,30 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let demo_active = engine.demo_info().enabled;
         let cfg = engine.config_snapshot();
-        let nodes: Vec<ProxyNodeConfig> = if demo_active {
-            cfg.proxies
+        let same_state_dir = engine.state_dir() == state_dir;
+        let (nodes, routing): (Vec<ProxyNodeConfig>, _) = if demo_active || same_state_dir {
+            let redacted = cfg
+                .proxies
                 .iter()
                 .map(ProxyNodeConfig::redacted_clone)
-                .collect()
+                .collect();
+            let route_snap = if demo_active {
+                mgr.routing_snapshot().ok()
+            } else {
+                Some(mgr.routing_snapshot_for_config(&cfg))
+            };
+            (redacted, route_snap)
         } else {
-            mgr.list_active_nodes_redacted()
-                .map_err(|e| redact_sensitive_text(&e.to_string()))?
+            let (disk_cfg, _) = mgr
+                .load_active_config()
+                .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+            let redacted = disk_cfg
+                .proxies
+                .iter()
+                .map(ProxyNodeConfig::redacted_clone)
+                .collect();
+            let route_snap = Some(mgr.routing_snapshot_for_config(&disk_cfg));
+            (redacted, route_snap)
         };
         let router = engine.router();
         sync_delays_from_router(&router);
@@ -1158,12 +1176,13 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
         let groups = build_ordered_groups_json(&cfg, &router);
         let delays = collect_delays_map_from_router(&router);
         let rules = router.rules_snapshot();
-        let routing = mgr.routing_snapshot().ok();
         let geodata = engine.geodata_status();
         return Ok(serde_json::json!({
             "ok": true,
             "vpnRunning": true,
             "demoActive": demo_active,
+            "routerEpoch": router.epoch(),
+            "delaysRevision": router.delays().revision(),
             "activeProfileId": mgr.active_profile_id(),
             "mode": router.mode().as_str(),
             "primaryGroup": primary_selector_group_name(&cfg),
@@ -1191,7 +1210,7 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
         .iter()
         .map(ProxyNodeConfig::redacted_clone)
         .collect();
-    let routing = mgr.routing_snapshot().ok();
+    let routing = Some(mgr.routing_snapshot_for_config(&cfg));
 
     let (eff, groups, delays, rules, geodata) =
         match get_or_build_offline_router(&cfg, &normalized_sel, Some(state_dir)) {
@@ -1218,6 +1237,8 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
         "ok": true,
         "vpnRunning": false,
         "demoActive": false,
+        "routerEpoch": 0,
+        "delaysRevision": 0,
         "activeProfileId": mgr.active_profile_id(),
         "mode": cfg.mode.as_str(),
         "primaryGroup": primary_selector_group_name(&cfg),
@@ -3392,6 +3413,7 @@ pub fn android_collect_debug_snapshot_window_core(
             "uptimeSecs": hub.uptime_secs(),
             "telemetryParked": hub.is_telemetry_parked(),
             "rssBytes": read_process_rss_bytes(),
+            "vmRssBytes": read_process_total_vmrss_bytes(),
             "mode": router.mode().as_str(),
             "routingPreset": routing_preset,
             "effectiveOutbound": redact_sensitive_text(&eff.effective_outbound),
@@ -3468,6 +3490,7 @@ pub fn android_collect_debug_snapshot_window_core(
         "sinceEpochMs": since_epoch_ms,
         "untilEpochMs": until_json,
         "rssBytes": read_process_rss_bytes(),
+        "vmRssBytes": read_process_total_vmrss_bytes(),
         "mode": mode_str,
         "routingPreset": routing_preset,
         "activeProfile": active_profile,
@@ -3869,6 +3892,57 @@ mod tests {
         assert!(engine.router().epoch() > epoch_before);
         assert!(!cache_file.exists());
 
+        drop(engine);
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn live_snapshot_uses_in_memory_config_and_tracks_revisions() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-mem-snap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            true,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        let (_, engine) = live_handle_and_engine().expect("live engine running");
+        let mgr = engine.ensure_profile_manager().expect("profile manager");
+        let yaml_path = mgr.active_profile_path();
+        assert!(yaml_path.exists());
+
+        // Remove on-disk YAML temporarily to prove `android_node_manager_snapshot_core`
+        // reads strictly from the live in-memory `ClashConfig` without touching disk!
+        let backup_bytes = std::fs::read(&yaml_path).expect("read active yaml");
+        std::fs::remove_file(&yaml_path).expect("remove active yaml");
+
+        let snap1 = android_node_manager_snapshot_core(&tmp_dir).expect("in-memory live snapshot");
+        let status1 = android_status_json_core();
+        assert_eq!(snap1["ok"], true);
+        assert_eq!(snap1["vpnRunning"], true);
+        assert_eq!(snap1["routerEpoch"], status1["routerEpoch"]);
+        assert_eq!(snap1["delaysRevision"], status1["delaysRevision"]);
+
+        // Recording a delay bumps `delaysRevision` in both lightweight status and full snapshot
+        let prev_rev = status1["delaysRevision"].as_u64().unwrap_or(0);
+        engine.router().delays().record("DIRECT", 12);
+        let status2 = android_status_json_core();
+        assert!(status2["delaysRevision"].as_u64().unwrap_or(0) > prev_rev);
+
+        std::fs::write(&yaml_path, &backup_bytes).expect("restore active yaml");
+        drop(mgr);
         drop(engine);
         assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);

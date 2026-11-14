@@ -1064,5 +1064,107 @@ class VpnConfigAndLifecycleTest {
         assertTrue(scrubbed.contains("LoopbackIpv6: https://[::1]:8443/s/***REDACTED***?***REDACTED***"))
         assertTrue(scrubbed.contains("Probe: http://www.gstatic.com/generate_204"))
     }
-}
 
+    @Test
+    fun liveSnapshotSyncGateAvoidsSteadyStateChurnAndRespondsToRevisions() {
+        val telemetryJson = """
+            {
+              "running": true,
+              "mode": "rule",
+              "routerEpoch": 3,
+              "delaysRevision": 7,
+              "effectiveOutbound": "HK-Node-01",
+              "effectiveProtocol": "VLESS",
+              "upTotal": 12000,
+              "downTotal": 88000,
+              "rssBytes": 42000000
+            }
+        """.trimIndent()
+        val tel = UiJsonParsers.parseLiveTelemetry(telemetryJson)
+        assertTrue(tel.running)
+        assertEquals(3L, tel.routerEpoch)
+        assertEquals(7L, tel.delaysRevision)
+        assertEquals(42_000_000L, tel.rssBytes)
+
+        val snapJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "routerEpoch": 3,
+              "delaysRevision": 7,
+              "activeProfileId": "default",
+              "mode": "rule",
+              "primaryGroup": "PROXY",
+              "effectiveOutbound": "HK-Node-01",
+              "effectiveProtocol": "VLESS"
+            }
+        """.trimIndent()
+        val snap = UiJsonParsers.parseNodeManagerSnapshot(snapJson)
+        assertTrue(snap.ok)
+        assertTrue(snap.vpnRunning)
+        assertEquals(3L, snap.routerEpoch)
+        assertEquals(7L, snap.delaysRevision)
+
+        // Steady-state browsing on HOME: traffic advances (100_000 != 50_000), but routerEpoch & delaysRevision match -> NO snapshot rebuild!
+        assertFalse(
+            UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = io.github.rustclashlabs.rustclash.ui.model.MainDestination.HOME,
+                telemetry = tel,
+                lastSyncedRouterEpoch = 3L,
+                lastSyncedDelaysRevision = 7L,
+                lastRulesSyncedTrafficTotal = 50_000L,
+            ),
+        )
+
+        // Router hot-reload (routerEpoch 3 != 2) -> MUST sync on any destination
+        assertTrue(
+            UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = io.github.rustclashlabs.rustclash.ui.model.MainDestination.SETTINGS,
+                telemetry = tel,
+                lastSyncedRouterEpoch = 2L,
+                lastSyncedDelaysRevision = 7L,
+                lastRulesSyncedTrafficTotal = 100_000L,
+            ),
+        )
+
+        // Delay probe update (delaysRevision 7 != 6) -> syncs on HOME and NODES, skips on SETTINGS
+        assertTrue(
+            UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = io.github.rustclashlabs.rustclash.ui.model.MainDestination.NODES,
+                telemetry = tel,
+                lastSyncedRouterEpoch = 3L,
+                lastSyncedDelaysRevision = 6L,
+                lastRulesSyncedTrafficTotal = 100_000L,
+            ),
+        )
+        assertFalse(
+            UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = io.github.rustclashlabs.rustclash.ui.model.MainDestination.SETTINGS,
+                telemetry = tel,
+                lastSyncedRouterEpoch = 3L,
+                lastSyncedDelaysRevision = 6L,
+                lastRulesSyncedTrafficTotal = 100_000L,
+            ),
+        )
+
+        // RULES tab: syncs when traffic total advances (rule hits changed), skips when traffic is idle
+        assertTrue(
+            UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = io.github.rustclashlabs.rustclash.ui.model.MainDestination.RULES,
+                telemetry = tel,
+                lastSyncedRouterEpoch = 3L,
+                lastSyncedDelaysRevision = 7L,
+                lastRulesSyncedTrafficTotal = 50_000L,
+            ),
+        )
+        assertFalse(
+            UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = io.github.rustclashlabs.rustclash.ui.model.MainDestination.RULES,
+                telemetry = tel,
+                lastSyncedRouterEpoch = 3L,
+                lastSyncedDelaysRevision = 7L,
+                lastRulesSyncedTrafficTotal = 100_000L,
+            ),
+        )
+    }
+}
