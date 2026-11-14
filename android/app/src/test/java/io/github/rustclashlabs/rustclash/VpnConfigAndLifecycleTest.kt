@@ -1167,4 +1167,117 @@ class VpnConfigAndLifecycleTest {
             ),
         )
     }
+
+    @Test
+    fun debugSliceReportRendersDnsResolverCacheHitsFromSnapshotJson() {
+        val window = io.github.rustclashlabs.rustclash.vpn.DebugLogManager.WindowTelemetryState(
+            windowStartMs = 1_731_150_000_000L,
+            capturedAtMs = 1_731_150_900_000L,
+            sessionStartMs = 1_731_149_000_000L,
+            screenOnMs = 600_000L,
+            screenOffMs = 300_000L,
+            startBatteryPct = 85,
+            events = emptyList(),
+        )
+        val meta = io.github.rustclashlabs.rustclash.vpn.DebugLogManager.SystemMetadata(
+            deviceManufacturer = "Google",
+            deviceModel = "Pixel 8",
+            androidRelease = "15",
+            sdkInt = 35,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.4.3",
+            appVersionCode = 19,
+            battery = io.github.rustclashlabs.rustclash.vpn.DebugLogManager.BatterySnapshot(
+                levelPct = 84,
+                isCharging = false,
+                temperatureCelsius = 31.5,
+            ),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 16L * 1024L * 1024L,
+            jvmMaxBytes = 256L * 1024L * 1024L,
+            nativeHeapBytes = 24L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+        val snapshotJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "mode": "rule",
+              "routingPreset": "smart-cn",
+              "effectiveOutbound": "HK-Node-01",
+              "effectiveProtocol": "VLESS",
+              "effectiveDelayMs": 42,
+              "uptimeSecs": 900,
+              "networkTransitions": 1,
+              "isWifi": true,
+              "dns": {
+                "total_queries": 120,
+                "fake_ip_hits": 75,
+                "cache_hits": 30,
+                "resolver_cache_hits": 19,
+                "resolverCacheHits": 19,
+                "suppressed_queries": 4,
+                "nxdomain_hits": 2,
+                "upstream_queries": 26,
+                "upstream_errors": 0,
+                "upstream_avg_ms": 28,
+                "upstream_max_ms": 91,
+                "active_fake_ip_entries": 64
+              }
+            }
+        """.trimIndent()
+
+        val report = io.github.rustclashlabs.rustclash.vpn.DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = meta,
+            nativeSnapshotRawJson = snapshotJson,
+            crashBreadcrumb = null,
+        )
+        assertTrue(
+            "Expected DNS & Fake-IP line to include cacheHits and resolverCacheHits: $report",
+            report.contains(
+                "- DNS & Fake-IP: queries=`120` fakeIpHits=`75` cacheHits=`30` resolverCacheHits=`19` " +
+                    "aaaaSuppressed=`4` nxdomainCached=`2` upstreamQueries=`26` upstreamErrors=`0` " +
+                    "upstreamAvgMs=`28ms` upstreamMaxMs=`91ms` activeFakeIps=`64`",
+            ),
+        )
+
+        val snakeOnlyJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "dns": {
+                "total_queries": 10,
+                "fake_ip_hits": 4,
+                "cache_hits": 3,
+                "resolver_cache_hits": 7,
+                "suppressed_queries": 0,
+                "upstream_queries": 3,
+                "upstream_errors": 0,
+                "upstream_avg_ms": 15,
+                "upstream_max_ms": 20,
+                "active_fake_ip_entries": 4
+              }
+            }
+        """.trimIndent()
+        val snakeOnlyReport = io.github.rustclashlabs.rustclash.vpn.DebugLogManager.formatSliceReport(
+            trigger = "manual",
+            window = window,
+            systemMeta = meta,
+            nativeSnapshotRawJson = snakeOnlyJson,
+            crashBreadcrumb = null,
+        )
+        assertTrue(
+            "Expected snake_case resolver_cache_hits fallback to render accurately: $snakeOnlyReport",
+            snakeOnlyReport.contains("cacheHits=`3` resolverCacheHits=`7` aaaaSuppressed=`0`"),
+        )
+    }
 }

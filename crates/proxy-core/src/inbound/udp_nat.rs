@@ -20,6 +20,8 @@ use crate::{
 
 const UDP_SESSION_QUEUE_CAPACITY: usize = 256;
 const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const ONE_SHOT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+const NTP_PORT: u16 = 123;
 const MAX_UDP_DESTS_PER_SESSION: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +114,8 @@ struct NatSessionEntry {
     reverse_map: Arc<RwLock<ReverseTargetMap>>,
     conn_entry: Arc<ActiveConnection>,
     last_active_ms: Arc<AtomicU64>,
+    last_active_wall_ms: Arc<AtomicU64>,
+    idle_timeout_ms: u64,
 }
 
 /// Callback invoked whenever an `OutboundUdpSession` yields a response datagram back toward the client.
@@ -136,6 +140,10 @@ impl SessionResetter for UdpNatManager {
     fn reset_sessions(&self) -> usize {
         self.reset_all_sessions()
     }
+
+    fn reap_idle_sessions(&self) -> usize {
+        UdpNatManager::reap_idle_sessions(self)
+    }
 }
 
 impl UdpNatManager {
@@ -145,10 +153,26 @@ impl UdpNatManager {
         hub: Arc<TelemetryHub>,
         reply_sink: UdpReplySink,
     ) -> Arc<Self> {
+        Self::with_idle_timeout(
+            inbound_label,
+            max_sessions,
+            DEFAULT_UDP_IDLE_TIMEOUT,
+            hub,
+            reply_sink,
+        )
+    }
+
+    pub fn with_idle_timeout(
+        inbound_label: &'static str,
+        max_sessions: usize,
+        idle_timeout: Duration,
+        hub: Arc<TelemetryHub>,
+        reply_sink: UdpReplySink,
+    ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             inbound_label,
             max_sessions: max_sessions.max(16),
-            idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
+            idle_timeout,
             boot: Instant::now(),
             sessions: Arc::new(DashMap::new()),
             fast_routes: Arc::new(DashMap::new()),
@@ -159,6 +183,14 @@ impl UdpNatManager {
             Arc::downgrade(&mgr) as std::sync::Weak<dyn SessionResetter>;
         hub.register_session_resetter(weak);
         mgr
+    }
+
+    fn session_idle_timeout(&self, dst_port: u16) -> Duration {
+        if self.idle_timeout == DEFAULT_UDP_IDLE_TIMEOUT && dst_port == NTP_PORT {
+            ONE_SHOT_UDP_IDLE_TIMEOUT
+        } else {
+            self.idle_timeout
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -183,6 +215,37 @@ impl UdpNatManager {
             }
         }
         count
+    }
+
+    /// Reap sessions whose monotonic or wall-clock idle age has reached or exceeded
+    /// `idle_timeout_ms` (e.g. across Android/Linux deep sleep where `CLOCK_MONOTONIC` freezes).
+    pub fn reap_idle_sessions(&self) -> usize {
+        let now_wall = TelemetryHub::now_ms();
+        let now_mono = self.now_ms();
+        let mut evicted: Vec<(NatSessionKey, Arc<ActiveConnection>)> = Vec::new();
+        self.sessions.retain(|key, entry| {
+            let mono_idle = now_mono.saturating_sub(entry.last_active_ms.load(Ordering::Relaxed));
+            let wall_idle =
+                now_wall.saturating_sub(entry.last_active_wall_ms.load(Ordering::Relaxed));
+            let keep = !entry.tx.is_closed()
+                && !entry.conn_entry.is_closed()
+                && mono_idle < entry.idle_timeout_ms
+                && wall_idle < entry.idle_timeout_ms;
+            if !keep {
+                evicted.push((key.clone(), Arc::clone(&entry.conn_entry)));
+            }
+            keep
+        });
+        if evicted.is_empty() {
+            return 0;
+        }
+        for (ek, conn_entry) in &evicted {
+            self.fast_routes
+                .retain(|rk, rv| !(rk.0 == ek.client_src && rv.outbound_name == ek.outbound_name));
+            conn_entry.request_close();
+            self.hub.unregister_connection(&conn_entry.id);
+        }
+        evicted.len()
     }
 
     fn cache_fast_route(
@@ -275,11 +338,17 @@ impl UdpNatManager {
         match entry.tx.try_send((cached.resolved_target, payload)) {
             Ok(()) => {
                 entry.last_active_ms.store(self.now_ms(), Ordering::Relaxed);
+                entry
+                    .last_active_wall_ms
+                    .store(TelemetryHub::now_ms(), Ordering::Relaxed);
                 self.hub.record_upload(&entry.conn_entry, payload_len);
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 entry.last_active_ms.store(self.now_ms(), Ordering::Relaxed);
+                entry
+                    .last_active_wall_ms
+                    .store(TelemetryHub::now_ms(), Ordering::Relaxed);
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed((_, returned_payload))) => Err(returned_payload),
@@ -354,6 +423,7 @@ impl UdpNatManager {
             outbound_name: outbound.name().to_string(),
         };
         let now_ms = self.now_ms();
+        let now_wall_ms = TelemetryHub::now_ms();
         let was_fake_ip = restored_from_fake_ip.is_some();
 
         // Fast-path check before potentially running capacity eviction.
@@ -362,6 +432,9 @@ impl UdpNatManager {
             && !existing.conn_entry.is_closed()
         {
             existing.last_active_ms.store(now_ms, Ordering::Relaxed);
+            existing
+                .last_active_wall_ms
+                .store(now_wall_ms, Ordering::Relaxed);
             let needs_map_update =
                 !existing
                     .reverse_map
@@ -388,23 +461,7 @@ impl UdpNatManager {
         }
 
         if self.sessions.len() >= self.max_sessions {
-            let idle_ms = self.idle_timeout.as_millis() as u64;
-            let mut evicted_keys = Vec::new();
-            self.sessions.retain(|k, v| {
-                let keep = !v.tx.is_closed()
-                    && !v.conn_entry.is_closed()
-                    && now_ms.saturating_sub(v.last_active_ms.load(Ordering::Relaxed)) < idle_ms;
-                if !keep {
-                    v.conn_entry.request_close();
-                    evicted_keys.push(k.clone());
-                }
-                keep
-            });
-            for ek in &evicted_keys {
-                self.fast_routes.retain(|rk, rv| {
-                    !(rk.0 == ek.client_src && rv.outbound_name == ek.outbound_name)
-                });
-            }
+            let _ = self.reap_idle_sessions();
             if self.sessions.len() >= self.max_sessions {
                 let oldest_key = self
                     .sessions
@@ -415,6 +472,7 @@ impl UdpNatManager {
                     && let Some((_, evicted)) = self.sessions.remove(&k)
                 {
                     evicted.conn_entry.request_close();
+                    self.hub.unregister_connection(&evicted.conn_entry.id);
                     self.fast_routes.retain(|rk, rv| {
                         !(rk.0 == k.client_src && rv.outbound_name == k.outbound_name)
                     });
@@ -422,12 +480,21 @@ impl UdpNatManager {
             }
         }
 
+        let session_timeout = self.session_idle_timeout(target.port);
+        let idle_timeout_ms = (session_timeout.as_millis() as u64).max(1);
+
         // Synchronously claim or join the session slot BEFORE any `.await` (`open_udp_session`),
         // preventing concurrent QUIC Initial bursts from opening N parallel upstream sessions!
-        let (rx, conn_entry, reverse_map, last_active_ms) = match self.sessions.entry(key.clone()) {
+        let (rx, conn_entry, reverse_map, last_active_ms, last_active_wall_ms) = match self
+            .sessions
+            .entry(key.clone())
+        {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 if !occ.get().tx.is_closed() && !occ.get().conn_entry.is_closed() {
                     occ.get().last_active_ms.store(now_ms, Ordering::Relaxed);
+                    occ.get()
+                        .last_active_wall_ms
+                        .store(now_wall_ms, Ordering::Relaxed);
                     occ.get()
                         .reverse_map
                         .write()
@@ -462,6 +529,7 @@ impl UdpNatManager {
                     .write()
                     .record_outbound(&target, &raw_dst, was_fake_ip);
                 let last_active_ms = Arc::new(AtomicU64::new(now_ms));
+                let last_active_wall_ms = Arc::new(AtomicU64::new(now_wall_ms));
                 let (tx, rx) = mpsc::channel::<(TargetAddr, Vec<u8>)>(UDP_SESSION_QUEUE_CAPACITY);
                 let _ = tx.try_send((target.clone(), payload));
                 let evicted = occ.insert(NatSessionEntry {
@@ -469,9 +537,18 @@ impl UdpNatManager {
                     reverse_map: Arc::clone(&reverse_map),
                     conn_entry: Arc::clone(&conn_entry),
                     last_active_ms: Arc::clone(&last_active_ms),
+                    last_active_wall_ms: Arc::clone(&last_active_wall_ms),
+                    idle_timeout_ms,
                 });
                 evicted.conn_entry.request_close();
-                (rx, conn_entry, reverse_map, last_active_ms)
+                self.hub.unregister_connection(&evicted.conn_entry.id);
+                (
+                    rx,
+                    conn_entry,
+                    reverse_map,
+                    last_active_ms,
+                    last_active_wall_ms,
+                )
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
                 let conn_entry = self.hub.register_connection_with_outbound(
@@ -491,6 +568,7 @@ impl UdpNatManager {
                     .write()
                     .record_outbound(&target, &raw_dst, was_fake_ip);
                 let last_active_ms = Arc::new(AtomicU64::new(now_ms));
+                let last_active_wall_ms = Arc::new(AtomicU64::new(now_wall_ms));
                 let (tx, rx) = mpsc::channel::<(TargetAddr, Vec<u8>)>(UDP_SESSION_QUEUE_CAPACITY);
                 let _ = tx.try_send((target.clone(), payload));
                 vac.insert(NatSessionEntry {
@@ -498,8 +576,16 @@ impl UdpNatManager {
                     reverse_map: Arc::clone(&reverse_map),
                     conn_entry: Arc::clone(&conn_entry),
                     last_active_ms: Arc::clone(&last_active_ms),
+                    last_active_wall_ms: Arc::clone(&last_active_wall_ms),
+                    idle_timeout_ms,
                 });
-                (rx, conn_entry, reverse_map, last_active_ms)
+                (
+                    rx,
+                    conn_entry,
+                    reverse_map,
+                    last_active_ms,
+                    last_active_wall_ms,
+                )
             }
         };
 
@@ -518,7 +604,6 @@ impl UdpNatManager {
         let fast_routes_map = Arc::clone(&self.fast_routes);
         let sink = Arc::clone(&self.reply_sink);
         let boot = self.boot;
-        let idle_timeout = self.idle_timeout;
 
         tokio::spawn(async move {
             let mut rx = rx;
@@ -575,11 +660,12 @@ impl UdpNatManager {
             let first_outcome = tokio::select! {
                 biased;
                 _ = conn_entry.closed() => FirstPacketOutcome::ClosedOrIdle,
-                res = tokio::time::timeout(idle_timeout, async {
+                res = tokio::time::timeout(session_timeout, async {
                     let Some((first_dst, first_data)) = rx.recv().await else {
                         return Ok(false);
                     };
                     last_active_ms.store(boot.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    last_active_wall_ms.store(TelemetryHub::now_ms(), Ordering::Relaxed);
                     session.send_to(&first_data, &first_dst).await.map(|()| true)
                 }) => {
                     match res {
@@ -630,9 +716,11 @@ impl UdpNatManager {
 
             let session_rx = Arc::clone(&session);
             let writer_last = Arc::clone(&last_active_ms);
+            let writer_last_wall = Arc::clone(&last_active_wall_ms);
             let writer = async move {
                 while let Some((dst, data)) = rx.recv().await {
                     writer_last.store(boot.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    writer_last_wall.store(TelemetryHub::now_ms(), Ordering::Relaxed);
                     if session.send_to(&data, &dst).await.is_err() {
                         break;
                     }
@@ -643,14 +731,46 @@ impl UdpNatManager {
             let hub_dl = Arc::clone(&hub_clone);
             let rev_dl = Arc::clone(&reverse_map);
             let reader_last = Arc::clone(&last_active_ms);
+            let reader_last_wall = Arc::clone(&last_active_wall_ms);
             let reader = async move {
-                while let Ok(Ok((resp, remote_src))) =
-                    tokio::time::timeout(idle_timeout, session_rx.recv_from()).await
-                {
-                    reader_last.store(boot.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    hub_dl.record_download(&conn_dl, resp.len());
-                    let eff_target = rev_dl.read().map_return_source(&remote_src);
-                    sink(client_src, eff_target, resp);
+                loop {
+                    let now_mono = boot.elapsed().as_millis() as u64;
+                    let now_wall = TelemetryHub::now_ms();
+                    let mono_idle = now_mono.saturating_sub(reader_last.load(Ordering::Relaxed));
+                    let wall_idle =
+                        now_wall.saturating_sub(reader_last_wall.load(Ordering::Relaxed));
+                    if mono_idle >= idle_timeout_ms || wall_idle >= idle_timeout_ms {
+                        break;
+                    }
+                    let sleep_ms = (idle_timeout_ms - mono_idle)
+                        .min(idle_timeout_ms - wall_idle)
+                        .max(1);
+                    match tokio::time::timeout(
+                        Duration::from_millis(sleep_ms),
+                        session_rx.recv_from(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((resp, remote_src))) => {
+                            reader_last.store(boot.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            reader_last_wall.store(TelemetryHub::now_ms(), Ordering::Relaxed);
+                            hub_dl.record_download(&conn_dl, resp.len());
+                            let eff_target = rev_dl.read().map_return_source(&remote_src);
+                            sink(client_src, eff_target, resp);
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            let now_mono = boot.elapsed().as_millis() as u64;
+                            let now_wall = TelemetryHub::now_ms();
+                            if now_mono.saturating_sub(reader_last.load(Ordering::Relaxed))
+                                >= idle_timeout_ms
+                                || now_wall.saturating_sub(reader_last_wall.load(Ordering::Relaxed))
+                                    >= idle_timeout_ms
+                            {
+                                break;
+                            }
+                        }
+                    }
                 }
             };
 
@@ -984,5 +1104,180 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].status, "failed");
         assert!(diags[0].connect_duration_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn ntp_port_uses_short_idle_timeout_while_quic_uses_60s_and_custom_timeout_wins() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mgr = UdpNatManager::new("test-udp", 64, Arc::clone(&hub), Arc::new(|_, _, _| {}));
+        let outbound: DynOutbound = Arc::new(SlowMockUdpOutbound {
+            open_calls: Arc::new(AtomicUsize::new(0)),
+            sent: Arc::new(AsyncMutex::new(Vec::new())),
+        });
+
+        let src_ntp: SocketAddr = "198.18.0.2:55123".parse().unwrap();
+        let dst_ntp: TargetAddr = "162.159.200.1:123".parse().unwrap();
+        mgr.send_datagram(
+            src_ntp,
+            dst_ntp.clone(),
+            None,
+            dst_ntp.clone(),
+            "MATCH",
+            "",
+            vec!["mock-quic-node".into()],
+            Arc::clone(&outbound),
+            vec![0x1b],
+        )
+        .await;
+
+        let src_quic: SocketAddr = "198.18.0.2:55443".parse().unwrap();
+        let dst_quic = TargetAddr::new_domain("quic.example.com", 443).unwrap();
+        mgr.send_datagram(
+            src_quic,
+            dst_quic.clone(),
+            None,
+            dst_quic,
+            "MATCH",
+            "",
+            vec!["mock-quic-node".into()],
+            Arc::clone(&outbound),
+            vec![0xc0],
+        )
+        .await;
+
+        let key_ntp = NatSessionKey {
+            client_src: src_ntp,
+            outbound_name: "mock-quic-node".into(),
+        };
+        let key_quic = NatSessionKey {
+            client_src: src_quic,
+            outbound_name: "mock-quic-node".into(),
+        };
+        assert_eq!(mgr.sessions.get(&key_ntp).unwrap().idle_timeout_ms, 12_000);
+        assert_eq!(mgr.sessions.get(&key_quic).unwrap().idle_timeout_ms, 60_000);
+
+        let custom_mgr = UdpNatManager::with_idle_timeout(
+            "test-custom-udp",
+            64,
+            Duration::from_millis(200),
+            Arc::clone(&hub),
+            Arc::new(|_, _, _| {}),
+        );
+        custom_mgr
+            .send_datagram(
+                src_ntp,
+                dst_ntp.clone(),
+                None,
+                dst_ntp,
+                "MATCH",
+                "",
+                vec!["mock-quic-node".into()],
+                outbound,
+                vec![0x1b],
+            )
+            .await;
+        assert_eq!(
+            custom_mgr.sessions.get(&key_ntp).unwrap().idle_timeout_ms,
+            200
+        );
+
+        mgr.reset_all_sessions();
+        custom_mgr.reset_all_sessions();
+    }
+
+    #[tokio::test]
+    async fn reap_idle_sessions_evicts_wall_clock_expired_sessions_when_monotonic_freezes() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mgr = UdpNatManager::new("test-udp", 64, Arc::clone(&hub), Arc::new(|_, _, _| {}));
+        let sent = Arc::new(AsyncMutex::new(Vec::new()));
+        let outbound: DynOutbound = Arc::new(SlowMockUdpOutbound {
+            open_calls: Arc::new(AtomicUsize::new(0)),
+            sent: Arc::clone(&sent),
+        });
+
+        let src_ntp: SocketAddr = "198.18.0.2:56123".parse().unwrap();
+        let ntp_sock: SocketAddr = "162.159.200.1:123".parse().unwrap();
+        let dst_ntp = TargetAddr::from(ntp_sock);
+
+        let src_quic: SocketAddr = "198.18.0.2:56443".parse().unwrap();
+        let quic_sock: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let dst_quic = TargetAddr::from(quic_sock);
+
+        mgr.send_datagram_with_epoch(
+            src_ntp,
+            dst_ntp.clone(),
+            None,
+            dst_ntp,
+            "MATCH",
+            "",
+            vec!["mock-quic-node".into()],
+            Arc::clone(&outbound),
+            vec![0x1b],
+            1,
+        )
+        .await;
+        mgr.send_datagram_with_epoch(
+            src_quic,
+            dst_quic.clone(),
+            None,
+            dst_quic,
+            "MATCH",
+            "",
+            vec!["mock-quic-node".into()],
+            outbound,
+            vec![0xc0],
+            1,
+        )
+        .await;
+
+        for _ in 0..150 {
+            if sent.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.active_session_count(), 2);
+        assert_eq!(hub.active_connection_count(), 2);
+
+        // Simulate 309s Android SCREEN_OFF deep sleep: monotonic `boot.elapsed()` barely advanced,
+        // while wall-clock `last_active_wall_ms` on the NTP session is 309s old.
+        let key_ntp = NatSessionKey {
+            client_src: src_ntp,
+            outbound_name: "mock-quic-node".into(),
+        };
+        let key_quic = NatSessionKey {
+            client_src: src_quic,
+            outbound_name: "mock-quic-node".into(),
+        };
+        mgr.sessions
+            .get(&key_ntp)
+            .unwrap()
+            .last_active_wall_ms
+            .store(
+                TelemetryHub::now_ms().saturating_sub(309_000),
+                Ordering::Relaxed,
+            );
+
+        assert_eq!(hub.reap_idle_sessions(), 1);
+        assert_eq!(mgr.active_session_count(), 1);
+        assert_eq!(hub.active_connection_count(), 1);
+        assert!(mgr.try_send_fast(src_ntp, ntp_sock, 1, vec![0x99]).is_err());
+        assert_eq!(
+            mgr.try_send_fast(src_quic, quic_sock, 1, vec![0x42]),
+            Ok(())
+        );
+
+        // Now backdate the remaining :443 session past its 60s timeout as well.
+        mgr.sessions
+            .get(&key_quic)
+            .unwrap()
+            .last_active_wall_ms
+            .store(
+                TelemetryHub::now_ms().saturating_sub(309_000),
+                Ordering::Relaxed,
+            );
+        assert_eq!(hub.reap_idle_sessions(), 1);
+        assert_eq!(mgr.active_session_count(), 0);
+        assert_eq!(hub.active_connection_count(), 0);
     }
 }

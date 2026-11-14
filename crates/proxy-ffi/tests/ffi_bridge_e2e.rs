@@ -1150,7 +1150,8 @@ rules:
         "PositiveDnsCacheSeed transferred from offline probe must eliminate redundant DNS query on VPN start"
     );
 
-    // 4. Explicit `android_flush_dns_core()` flushes live cache -> next probe re-queries (`dns_queries == 2`)!
+    // 4. Explicit `android_flush_dns_core()` flushes live cache -> next probe re-queries `A` + `AAAA`
+    //    because `start_android_vpn_with_state_dir` enables Dual-Stack (`cfg.dns.ipv6 = true`, `dns_queries == 3`)!
     assert!(android_flush_dns_core());
     let p4 = android_test_latency_core(&state_dir, None, Some(&probe_url), 3000)
         .expect("live latency probe after flush");
@@ -1158,8 +1159,8 @@ rules:
     assert!(p4["delays"]["SS-SEED"].as_u64().unwrap_or(0) > 0);
     assert_eq!(
         dns_queries.load(Ordering::SeqCst),
-        2,
-        "flushing DNS cache must trigger a fresh proxy server resolution on next probe"
+        3,
+        "flushing DNS cache on dual-stack VPN must trigger fresh A + AAAA proxy server resolution on next probe"
     );
 
     assert!(stop_android_vpn_core());

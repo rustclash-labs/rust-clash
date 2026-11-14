@@ -854,11 +854,22 @@ object DebugLogManager {
             }
 
             nativeObj.optJSONObject("dns")?.let { dns ->
+                val cacheHits = if (dns.has("cache_hits")) {
+                    dns.optLong("cache_hits", 0L)
+                } else {
+                    dns.optLong("cacheHits", 0L)
+                }
+                val resolverCacheHits = if (dns.has("resolverCacheHits")) {
+                    dns.optLong("resolverCacheHits", 0L)
+                } else {
+                    dns.optLong("resolver_cache_hits", 0L)
+                }
                 val nxdomainHits = dns.optLong("nxdomain_hits", 0L)
                 val nxdomainPart = if (nxdomainHits > 0L) " nxdomainCached=`$nxdomainHits`" else ""
                 sb.appendLine(
                     "- DNS & Fake-IP: queries=`${dns.optLong("total_queries")}` fakeIpHits=`${dns.optLong("fake_ip_hits")}` " +
-                        "cacheHits=`${dns.optLong("cache_hits")}` aaaaSuppressed=`${dns.optLong("suppressed_queries", 0L)}`$nxdomainPart " +
+                        "cacheHits=`$cacheHits` resolverCacheHits=`$resolverCacheHits` " +
+                        "aaaaSuppressed=`${dns.optLong("suppressed_queries", 0L)}`$nxdomainPart " +
                         "upstreamQueries=`${dns.optLong("upstream_queries")}` " +
                         "upstreamErrors=`${dns.optLong("upstream_errors")}` " +
                         "upstreamAvgMs=`${dns.optLong("upstream_avg_ms")}ms` upstreamMaxMs=`${dns.optLong("upstream_max_ms")}ms` " +

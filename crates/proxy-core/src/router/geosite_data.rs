@@ -159,26 +159,35 @@ impl GeoSiteMatcher {
         self.exact.len() + self.suffixes.len() + self.keywords.len()
     }
 
-    pub fn matches_domain(&self, raw_domain: &str) -> bool {
+    /// Match `raw_domain` and return a specificity score (`exact` = `usize::MAX`, longest matching
+    /// suffix = `suffix.len() + 1`, keyword = `1`), or `None` if unmatched.
+    pub fn match_specificity(&self, raw_domain: &str) -> Option<usize> {
         let domain = raw_domain.trim().trim_end_matches('.').to_ascii_lowercase();
         if domain.is_empty() {
-            return false;
+            return None;
         }
         if self.exact.contains(domain.as_str()) {
-            return true;
+            return Some(usize::MAX);
         }
         // O(labels) suffix walk: `api.sub.example.com` -> `api.sub.example.com`, `sub.example.com`, `example.com`, `com`
         let mut cursor = domain.as_str();
         loop {
             if self.suffixes.contains(cursor) {
-                return true;
+                return Some(cursor.len() + 1);
             }
             match cursor.split_once('.') {
                 Some((_, rest)) if !rest.is_empty() => cursor = rest,
                 _ => break,
             }
         }
-        self.keywords.iter().any(|kw| domain.contains(kw.as_str()))
+        self.keywords
+            .iter()
+            .any(|kw| domain.contains(kw.as_str()))
+            .then_some(1)
+    }
+
+    pub fn matches_domain(&self, raw_domain: &str) -> bool {
+        self.match_specificity(raw_domain).is_some()
     }
 }
 
@@ -673,6 +682,7 @@ static GEOSITE_CN: LazyLock<GeoSiteMatcher> = LazyLock::new(|| {
             "citicbank.com",
             "cebbank.com",
             "psbc.com",
+            "cn.pool.ntp.org",
         ],
         &[],
     )
@@ -1185,3 +1195,39 @@ static GEOSITE_STEAM_CN: LazyLock<GeoSiteMatcher> = LazyLock::new(|| {
         &[],
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_specificity_orders_exact_above_longer_suffix_above_shorter_suffix_above_keyword() {
+        let matcher = GeoSiteMatcher::from_lists(
+            &["exact.cn.pool.ntp.org"],
+            &["cn.pool.ntp.org", "ntp.org"],
+            &["ntp"],
+        );
+
+        let exact_spec = matcher.match_specificity("exact.cn.pool.ntp.org").unwrap();
+        let long_suffix_spec = matcher.match_specificity("0.cn.pool.ntp.org").unwrap();
+        let short_suffix_spec = matcher.match_specificity("pool.ntp.org").unwrap();
+        let keyword_spec = matcher.match_specificity("my-ntp-mirror.example").unwrap();
+
+        assert_eq!(exact_spec, usize::MAX);
+        assert_eq!(long_suffix_spec, "cn.pool.ntp.org".len() + 1);
+        assert_eq!(short_suffix_spec, "ntp.org".len() + 1);
+        assert_eq!(keyword_spec, 1);
+        assert!(exact_spec > long_suffix_spec);
+        assert!(long_suffix_spec > short_suffix_spec);
+        assert!(short_suffix_spec > keyword_spec);
+        assert_eq!(matcher.match_specificity("unrelated.example.com"), None);
+        assert_eq!(matcher.match_specificity("   .  "), None);
+    }
+
+    #[test]
+    fn builtin_geosite_cn_includes_cn_pool_ntp_org() {
+        let cn = lookup_builtin_geosite("cn").unwrap();
+        assert!(cn.matches_domain("cn.pool.ntp.org"));
+        assert!(cn.matches_domain("3.cn.pool.ntp.org"));
+    }
+}

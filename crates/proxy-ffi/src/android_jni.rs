@@ -768,9 +768,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
             cfg.tun.ipv6 = enable_ipv6;
-            if !enable_ipv6 {
-                cfg.dns.ipv6 = false;
-            }
+            cfg.dns.ipv6 = enable_ipv6;
             cfg.secret = Some(ephemeral_secret.clone());
             let yaml = match cfg.to_yaml_string() {
                 Ok(y) => y,
@@ -816,9 +814,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
             cfg.tun.ipv6 = enable_ipv6;
-            if !enable_ipv6 {
-                cfg.dns.ipv6 = false;
-            }
+            cfg.dns.ipv6 = enable_ipv6;
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
                 cfg.secret = Some(ephemeral_secret.clone());
             }
@@ -853,9 +849,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
             cfg.tun.ipv6 = enable_ipv6;
-            if !enable_ipv6 {
-                cfg.dns.ipv6 = false;
-            }
+            cfg.dns.ipv6 = enable_ipv6;
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
                 cfg.secret = Some(ephemeral_secret.clone());
             }
@@ -3364,6 +3358,15 @@ pub fn android_collect_debug_snapshot_window_core(
             .unwrap_or((0, 0));
         let (up_total, down_total) = hub.totals();
         let dns_snap = router.dns().telemetry_snapshot();
+        let cache_hits = dns_snap.cache_hits;
+        let resolver_cache_hits = dns_snap.resolver_cache_hits;
+        let mut dns_json = serde_json::to_value(dns_snap).unwrap_or_default();
+        if let Some(obj) = dns_json.as_object_mut() {
+            let cache_key = "cacheHits".to_string();
+            let resolver_key = "resolverCacheHits".to_string();
+            obj.insert(cache_key, serde_json::json!(cache_hits));
+            obj.insert(resolver_key, serde_json::json!(resolver_cache_hits));
+        }
         let geodata = engine.geodata_status();
 
         let conns = hub.diagnostics_in_window(since_epoch_ms, until_epoch_ms, 1_500);
@@ -3454,7 +3457,7 @@ pub fn android_collect_debug_snapshot_window_core(
                 "protectedUdpSockets": prot_udp,
                 "protectFailures": prot_fail,
             },
-            "dns": dns_snap,
+            "dns": dns_json,
             "outboundStats": sections.outbound_stats_json,
             "topDomains": sections.top_domains_json,
             "topRules": top_rules_json,
@@ -3867,6 +3870,59 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
         let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
 
+        // Starter YAML defaults `dns.ipv6` to `false`; enabling Dual-Stack (`enable_ipv6 = true`)
+        // must sync both `cfg.tun.ipv6` and `cfg.dns.ipv6` to `true`.
+        let starter_yaml = ClashConfig::default_starter_yaml();
+        let starter_cfg = ClashConfig::from_yaml_str(&starter_yaml).unwrap();
+        assert!(!starter_cfg.dns.ipv6);
+
+        let res_v6 = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            true,
+            Arc::clone(&protector),
+        )
+        .expect("start_android_vpn_with_options ipv6=true");
+        assert_eq!(res_v6["ok"], true);
+
+        let (_, engine_v6) = live_handle_and_engine().expect("live engine v6");
+        let cfg_v6 = engine_v6.config_snapshot();
+        assert!(cfg_v6.tun.ipv6);
+        assert!(cfg_v6.dns.ipv6);
+        assert!(engine_v6.router().dns().ipv6_enabled());
+
+        let live_snap = android_collect_debug_snapshot_window_core(&tmp_dir, 0, u64::MAX)
+            .expect("collect live window snapshot");
+        let snake_hits = live_snap["dns"]["resolver_cache_hits"].as_u64();
+        let camel_hits = live_snap["dns"]["resolverCacheHits"].as_u64();
+        assert!(snake_hits.is_some());
+        assert_eq!(camel_hits, snake_hits);
+        drop(engine_v6);
+
+        // Also verify raw YAML (`state_dir = None`) syncs `dns.ipv6` when `enable_ipv6 = true`.
+        let yaml = "mixed-port: 0\ndns:\n  enable: true\n  ipv6: false\n  listen: 127.0.0.1:0";
+        let res_raw = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            None,
+            yaml,
+            false,
+            true,
+            Arc::clone(&protector),
+        )
+        .expect("start_android_vpn_with_options raw ipv6=true");
+        assert_eq!(res_raw["ok"], true);
+        let (_, engine_raw) = live_handle_and_engine().expect("live raw engine");
+        let cfg_raw = engine_raw.config_snapshot();
+        assert!(cfg_raw.tun.ipv6);
+        assert!(cfg_raw.dns.ipv6);
+        assert!(engine_raw.router().dns().ipv6_enabled());
+        drop(engine_raw);
+
+        // Restarting with `enable_ipv6 = false` forces both `tun.ipv6` and `dns.ipv6` to `false`.
         let res = start_android_vpn_with_options(
             #[cfg(unix)]
             None,
