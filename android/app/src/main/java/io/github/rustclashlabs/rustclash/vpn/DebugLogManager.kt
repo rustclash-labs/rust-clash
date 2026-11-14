@@ -772,8 +772,10 @@ object DebugLogManager {
             "- Screen Activity: screenOn=`${window.screenOnMs / 1000}s` screenOff=`${window.screenOffMs / 1000}s` " +
                 "currentlyInteractive=`${systemMeta.isInteractive}`",
         )
+        val vmRssBytes = nativeObj?.optLong("vmRssBytes", 0L) ?: 0L
+        val vmRssNote = if (vmRssBytes > 0L) " vmRss=`${formatBytesCompact(vmRssBytes)}`" else ""
         sb.appendLine(
-            "- Memory & Policy: rss=`${formatBytesCompact(nativeObj?.optLong("rssBytes", 0L) ?: 0L)}` " +
+            "- Memory & Policy: rss=`${formatBytesCompact(nativeObj?.optLong("rssBytes", 0L) ?: 0L)}`$vmRssNote " +
                 "nativeHeap=`${formatBytesCompact(systemMeta.nativeHeapBytes)}` " +
                 "jvmHeap=`${formatBytesCompact(systemMeta.jvmUsedBytes)} / ${formatBytesCompact(systemMeta.jvmMaxBytes)}` " +
                 "perApp=`${systemMeta.perAppMode}(${systemMeta.selectedPackagesCount})` ipv6=`${systemMeta.enableIpv6}` demo=`${systemMeta.demoMode}`",

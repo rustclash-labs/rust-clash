@@ -308,6 +308,8 @@ data class LiveTelemetryUi(
     val running: Boolean = false,
     val demoActive: Boolean = false,
     val mode: String = "rule",
+    val routerEpoch: Long = 0L,
+    val delaysRevision: Long = 0L,
     val effectiveOutbound: String = "DIRECT",
     val effectiveProtocol: String = "DIRECT",
     val effectiveDelayMs: Long? = null,
@@ -465,6 +467,8 @@ object UiJsonParsers {
             running = true,
             demoActive = obj.optBoolean("demoActive", false),
             mode = obj.optString("mode", "rule"),
+            routerEpoch = obj.optLong("routerEpoch", 0L),
+            delaysRevision = obj.optLong("delaysRevision", 0L),
             effectiveOutbound = obj.optString("effectiveOutbound", "DIRECT"),
             effectiveProtocol = obj.optString("effectiveProtocol", "DIRECT"),
             effectiveDelayMs = rawDelay,
@@ -481,11 +485,35 @@ object UiJsonParsers {
         )
     }
 
+    fun shouldSyncLiveSnapshot(
+        dest: MainDestination,
+        telemetry: LiveTelemetryUi,
+        lastSyncedRouterEpoch: Long,
+        lastSyncedDelaysRevision: Long,
+        lastRulesSyncedTrafficTotal: Long,
+    ): Boolean {
+        if (!telemetry.running) return false
+        if (telemetry.routerEpoch != lastSyncedRouterEpoch) return true
+        if ((dest == MainDestination.HOME || dest == MainDestination.NODES) &&
+            telemetry.delaysRevision != lastSyncedDelaysRevision
+        ) {
+            return true
+        }
+        if (dest == MainDestination.RULES &&
+            (telemetry.upTotal + telemetry.downTotal) != lastRulesSyncedTrafficTotal
+        ) {
+            return true
+        }
+        return false
+    }
+
     data class NodeSnapshotParsed(
         val ok: Boolean,
         val error: String? = null,
         val vpnRunning: Boolean = false,
         val demoActive: Boolean = false,
+        val routerEpoch: Long = 0L,
+        val delaysRevision: Long = 0L,
         val activeProfileId: String = "default",
         val mode: String = "rule",
         val primaryGroup: String = "PROXY",
@@ -613,6 +641,8 @@ object UiJsonParsers {
             ok = true,
             vpnRunning = obj.optBoolean("vpnRunning", false),
             demoActive = obj.optBoolean("demoActive", false),
+            routerEpoch = obj.optLong("routerEpoch", 0L),
+            delaysRevision = obj.optLong("delaysRevision", 0L),
             activeProfileId = obj.optString("activeProfileId", "default"),
             mode = mode,
             primaryGroup = obj.optString("primaryGroup", "PROXY"),

@@ -3,7 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -51,9 +51,14 @@ pub struct ProxyInfoSnapshot {
 #[derive(Default)]
 pub struct DelayStore {
     records: DashMap<String, VecDeque<DelayHistoryItem>>,
+    revision: AtomicU64,
 }
 
 impl DelayStore {
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
     pub fn record(&self, name: &str, delay_ms: u64) {
         let mut entry = self.records.entry(name.to_string()).or_default();
         if entry.len() >= 16 {
@@ -63,6 +68,8 @@ impl DelayStore {
             time: TelemetryHub::now_ms(),
             delay: delay_ms,
         });
+        drop(entry);
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
     pub fn record_failure(&self, name: &str) {
@@ -93,6 +100,8 @@ impl DelayStore {
                 time: TelemetryHub::now_ms(),
                 delay: delay_ms,
             });
+            drop(entry);
+            self.revision.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -118,11 +127,16 @@ impl DelayStore {
     }
 
     pub fn import_from(&self, prev: &DelayStore, valid_names: &std::collections::HashSet<String>) {
+        let mut imported = false;
         for item in prev.records.iter() {
             if valid_names.contains(item.key()) {
                 self.records
                     .insert(item.key().clone(), item.value().clone());
+                imported = true;
             }
+        }
+        if imported {
+            self.revision.fetch_add(1, Ordering::Release);
         }
     }
 }

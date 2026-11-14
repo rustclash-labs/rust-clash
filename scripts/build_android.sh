@@ -61,8 +61,10 @@ fi
 
 echo "[android-build] Cross-compiling Rust proxy-ffi ($PROFILE) for aarch64-linux-android & x86_64-linux-android..."
 cd "$REPO_ROOT"
-cargo build --locked -p proxy-ffi --target aarch64-linux-android $CARGO_PROFILE_FLAG
-cargo build --locked -p proxy-ffi --target x86_64-linux-android $CARGO_PROFILE_FLAG
+cargo build --locked -p proxy-ffi \
+    --target aarch64-linux-android \
+    --target x86_64-linux-android \
+    $CARGO_PROFILE_FLAG
 
 mkdir -p "$JNI_LIBS_DIR/arm64-v8a" "$JNI_LIBS_DIR/x86_64" "$ANDROID_DIR/app/src/main/assets/licenses"
 cp "$TARGET_ROOT/aarch64-linux-android/$TARGET_SUBDIR/libproxy_ffi.so" "$JNI_LIBS_DIR/arm64-v8a/libproxy_ffi.so"
@@ -86,7 +88,7 @@ import sys, urllib.parse
 u = urllib.parse.urlparse(sys.argv[1])
 print(u.hostname or "127.0.0.1", u.port or 80)
 ' "$ACTIVE_PROXY")
-    JVM_OPTS="-Xmx2048m -Dfile.encoding=UTF-8 -Dhttp.proxyHost=$PROXY_HOST -Dhttp.proxyPort=$PROXY_PORT -Dhttps.proxyHost=$PROXY_HOST -Dhttps.proxyPort=$PROXY_PORT -Dhttp.nonProxyHosts=localhost"
+    JVM_OPTS="-Xmx3072m -XX:+UseParallelGC -Dfile.encoding=UTF-8 -Dhttp.proxyHost=$PROXY_HOST -Dhttp.proxyPort=$PROXY_PORT -Dhttps.proxyHost=$PROXY_HOST -Dhttps.proxyPort=$PROXY_PORT -Dhttp.nonProxyHosts=localhost"
 
     if [[ -f "/etc/ssl/certs/ca-certificates.crt" ]]; then
         MERGED_TRUSTSTORE="/tmp/rust-clash-java-cacerts.p12"
@@ -118,7 +120,7 @@ for idx, cert in enumerate(certs):
     GRADLE_EXTRA_ARGS+=("-Dorg.gradle.jvmargs=$JVM_OPTS" "-Pkotlin.daemon.jvmargs=$JVM_OPTS")
 fi
 
-echo "[android-build] Bootstrapping Gradle Wrapper & running JUnit tests + Debug APK + Debug AAB bundle..."
+echo "[android-build] Bootstrapping Gradle Wrapper & running Android tasks..."
 cd "$ANDROID_DIR"
 
 WRAPPER_PROPS="$ANDROID_DIR/gradle/wrapper/gradle-wrapper.properties"
@@ -185,7 +187,11 @@ if ! find "$GRADLE_DISTS_DIR" -name "*.ok" 2>/dev/null | grep -q .; then
     fi
 fi
 
-./gradlew --no-daemon "${GRADLE_EXTRA_ARGS[@]}" --version >/dev/null
+if [[ -n "$WRAPPER_PROPS_BAK" ]]; then
+    ./gradlew --no-daemon "${GRADLE_EXTRA_ARGS[@]}" --version >/dev/null
+    cleanup_wrapper_props
+    WRAPPER_PROPS_BAK=""
+fi
 
 VARIANT="${ANDROID_BUILD_VARIANT:-debug}"
 SKIP_CHECKS="${ANDROID_SKIP_CHECKS:-0}"

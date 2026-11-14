@@ -37,6 +37,7 @@ parking_lot.workspace = true
 rand.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+anstyle.workspace = true
 tauri = { version = "2", optional = true, features = ["tray-icon"] }
 
 [target.'cfg(windows)'.dependencies]

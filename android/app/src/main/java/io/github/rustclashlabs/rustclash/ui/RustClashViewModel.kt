@@ -55,6 +55,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     private var importJob: Job? = null
     private var importGeneration: Long = 0L
     private var previousVpnRunning: Boolean = false
+    private var lastSyncedRouterEpoch: Long = -1L
+    private var lastSyncedDelaysRevision: Long = -1L
+    private var lastRulesSyncedTrafficTotal: Long = -1L
 
     init {
         DebugLogManager.installCrashBreadcrumbHook(appContext)
@@ -168,11 +171,26 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 isBatteryOptimizationIgnored = batteryOptIgnored,
             )
         }
-        if (dest == MainDestination.RULES && previousVpnRunning) {
-            viewModelScope.launch {
-                pollLiveStatusAndDiagnostics(includeDiagnostics = true)
+        if (previousVpnRunning) {
+            val needSnapshot = UiJsonParsers.shouldSyncLiveSnapshot(
+                dest = dest,
+                telemetry = _uiState.value.telemetry,
+                lastSyncedRouterEpoch = lastSyncedRouterEpoch,
+                lastSyncedDelaysRevision = lastSyncedDelaysRevision,
+                lastRulesSyncedTrafficTotal = lastRulesSyncedTrafficTotal,
+            )
+            if (dest == MainDestination.RULES || needSnapshot) {
+                viewModelScope.launch {
+                    if (dest == MainDestination.RULES) {
+                        pollLiveStatusAndDiagnostics(includeDiagnostics = true)
+                    }
+                    if (needSnapshot) {
+                        syncSnapshotQuietly()
+                    }
+                }
             }
-        } else if (dest == MainDestination.SETTINGS) {
+        }
+        if (dest == MainDestination.SETTINGS) {
             refreshDebugLogSummary()
         }
     }
@@ -183,11 +201,20 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             var tickCount = 0
             while (isActive) {
                 val dest = _uiState.value.activeDestination
-                val includeDiag = dest == MainDestination.RULES ||
+                val includeDiag = (dest == MainDestination.RULES && tickCount % 2 == 0) ||
                     (dest == MainDestination.HOME && tickCount % 5 == 0)
                 pollLiveStatusAndDiagnostics(includeDiagnostics = includeDiag)
                 if (tickCount > 0 && tickCount % 5 == 0 && previousVpnRunning) {
-                    syncSnapshotQuietly()
+                    if (UiJsonParsers.shouldSyncLiveSnapshot(
+                            dest = _uiState.value.activeDestination,
+                            telemetry = _uiState.value.telemetry,
+                            lastSyncedRouterEpoch = lastSyncedRouterEpoch,
+                            lastSyncedDelaysRevision = lastSyncedDelaysRevision,
+                            lastRulesSyncedTrafficTotal = lastRulesSyncedTrafficTotal,
+                        )
+                    ) {
+                        syncSnapshotQuietly()
+                    }
                 }
                 if (dest == MainDestination.SETTINGS && tickCount % 10 == 0) {
                     refreshDebugLogSummaryQuietly()
@@ -261,7 +288,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             val parsedDiag = if (includeDiagnostics && parsedStatus.running) {
                 UiJsonParsers.parseDiagnosticsResponse(NativeBridge.nativeGetDiagnosticsJson(150))
             } else if (!parsedStatus.running) {
-                emptyList()
+                _uiState.value.diagnostics.takeIf { it.isEmpty() } ?: emptyList()
             } else {
                 _uiState.value.diagnostics
             }
@@ -270,10 +297,17 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
         val transitioned = previousVpnRunning != telemetry.running
         previousVpnRunning = telemetry.running
+        if (!telemetry.running) {
+            lastSyncedRouterEpoch = -1L
+            lastSyncedDelaysRevision = -1L
+            lastRulesSyncedTrafficTotal = -1L
+        }
 
         _uiState.update { prev ->
             val nextHistory = if (telemetry.running) {
                 (prev.rateHistory + (telemetry.upRate + telemetry.downRate)).takeLast(24)
+            } else if (prev.rateHistory.isEmpty()) {
+                prev.rateHistory
             } else {
                 emptyList()
             }
@@ -310,6 +344,15 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 emitMessage(parsed.error)
             }
             return
+        }
+        if (parsed.vpnRunning) {
+            lastSyncedRouterEpoch = parsed.routerEpoch
+            lastSyncedDelaysRevision = parsed.delaysRevision
+            lastRulesSyncedTrafficTotal = _uiState.value.telemetry.let { it.upTotal + it.downTotal }
+        } else {
+            lastSyncedRouterEpoch = -1L
+            lastSyncedDelaysRevision = -1L
+            lastRulesSyncedTrafficTotal = -1L
         }
         _uiState.update { prev ->
             val availableGroupNames = parsed.groups.map { it.name }

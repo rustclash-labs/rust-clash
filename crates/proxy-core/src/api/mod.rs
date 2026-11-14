@@ -1961,7 +1961,19 @@ async fn stream_logs_ws(mut socket: WebSocket, engine: Arc<ProxyEngine>) {
     }
 }
 
-pub fn read_process_rss_bytes() -> u64 {
+pub fn parse_proc_status_anon_rss_bytes(status_text: &str) -> Option<u64> {
+    for line in status_text.lines() {
+        if let Some(rest) = line.strip_prefix("RssAnon:")
+            && let Some(kb_str) = rest.split_whitespace().next()
+            && let Ok(kb) = kb_str.parse::<u64>()
+        {
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+pub fn read_process_total_vmrss_bytes() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
@@ -1975,7 +1987,30 @@ pub fn read_process_rss_bytes() -> u64 {
             } else {
                 4096
             };
-            return pages.saturating_mul(page_bytes);
+            pages.saturating_mul(page_bytes)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        read_process_rss_bytes()
+    }
+}
+
+/// Read the process's private memory footprint (`RssAnon` on Linux/Android so shared Zygote
+/// framework files and GPU `RssShmem` buffers do not inflate reported VPN kernel memory,
+/// falling back to total `VmRSS` if `RssAnon` is unavailable).
+pub fn read_process_rss_bytes() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+            && let Some(anon_bytes) = parse_proc_status_anon_rss_bytes(&status)
+            && anon_bytes > 0
+        {
+            anon_bytes
+        } else {
+            read_process_total_vmrss_bytes()
         }
     }
     #[cfg(target_os = "macos")]
@@ -2012,6 +2047,7 @@ pub fn read_process_rss_bytes() -> u64 {
             }
         }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     0
 }
 
@@ -3472,5 +3508,32 @@ async fn post_diagnostics_site_check_api(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_proc_status_extracts_rss_anon_in_bytes() {
+        let sample = "\
+Name:\trustclash
+VmPeak:\t4250000 kB
+VmRSS:\t  392400 kB
+RssAnon:\t   51200 kB
+RssFile:\t  251100 kB
+RssShmem:\t   90100 kB
+";
+        assert_eq!(
+            parse_proc_status_anon_rss_bytes(sample),
+            Some(51_200 * 1024)
+        );
+        assert_eq!(parse_proc_status_anon_rss_bytes("VmRSS:\t1200 kB\n"), None);
+
+        let rss = read_process_rss_bytes();
+        let total = read_process_total_vmrss_bytes();
+        assert!(rss > 0);
+        assert!(total >= rss || total > 0);
     }
 }
