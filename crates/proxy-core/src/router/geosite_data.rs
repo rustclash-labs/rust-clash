@@ -875,6 +875,14 @@ static GEOSITE_GOOGLE: LazyLock<GeoSiteMatcher> = LazyLock::new(|| {
             "ggpht.com",
             "gvt1.com",
             "gvt2.com",
+            "gvt3.com",
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googletagmanager.com",
+            "googletagservices.com",
+            "googleadservices.com",
+            "withgoogle.com",
+            "firebaseio.com",
             "1e100.net",
             "265.com",
             "app-measurement.com",
@@ -1229,5 +1237,30 @@ mod tests {
         let cn = lookup_builtin_geosite("cn").unwrap();
         assert!(cn.matches_domain("cn.pool.ntp.org"));
         assert!(cn.matches_domain("3.cn.pool.ntp.org"));
+    }
+
+    #[test]
+    fn builtin_geosite_google_includes_gvt_doubleclick_ads_and_firebase_domains() {
+        let google = lookup_builtin_geosite("google").unwrap();
+        for domain in [
+            "beacons.gcp.gvt2.com",
+            "redirector.gvt3.com",
+            "www.gstatic.com",
+            "clientservices.googleapis.com",
+            "googleads.g.doubleclick.net",
+            "pagead2.googlesyndication.com",
+            "www.googletagmanager.com",
+            "www.googletagservices.com",
+            "www.googleadservices.com",
+            "experiments.withgoogle.com",
+            "demo.firebaseio.com",
+        ] {
+            assert!(
+                google.matches_domain(domain),
+                "expected GEOSITE_GOOGLE to match {domain}"
+            );
+        }
+        assert!(!google.matches_domain("www.baidu.com"));
+        assert!(!google.matches_domain("www.qq.com"));
     }
 }

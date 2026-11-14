@@ -650,7 +650,7 @@ impl ClashConfig {
 
     /// Managed default split-tunneling rule template (`smart-cn`):
     /// - LAN / mDNS domains (`local`, `lan`, `home.arpa`) & private IPs -> `DIRECT`
-    /// - Known international websites (`GEOSITE,geolocation-!cn`) -> `<primary_group>` (0 local DNS leak!)
+    /// - Google ecosystem (`GEOSITE,google`) & known international websites (`GEOSITE,geolocation-!cn`) -> `<primary_group>` (0 local DNS leak!)
     /// - Domestic CN websites (`GEOSITE,cn`) & literal CN IPs (`GEOIP,CN,DIRECT,no-resolve`) -> `DIRECT`
     /// - Remaining unmatched traffic -> `<primary_group>` (domain forwarded encrypted, 0 local DNS leak!)
     pub fn smart_cn_rules_for_group(primary_group: &str) -> Vec<String> {
@@ -664,6 +664,7 @@ impl ClashConfig {
             "DOMAIN-SUFFIX,lan,DIRECT".to_string(),
             "DOMAIN-SUFFIX,home.arpa,DIRECT".to_string(),
             "GEOIP,PRIVATE,DIRECT,no-resolve".to_string(),
+            format!("GEOSITE,google,{g}"),
             format!("GEOSITE,geolocation-!cn,{g}"),
             "GEOSITE,cn,DIRECT".to_string(),
             "GEOIP,CN,DIRECT,no-resolve".to_string(),
@@ -715,6 +716,7 @@ rules:
   - DOMAIN-SUFFIX,lan,DIRECT
   - DOMAIN-SUFFIX,home.arpa,DIRECT
   - GEOIP,PRIVATE,DIRECT,no-resolve
+  - GEOSITE,google,PROXY
   - GEOSITE,geolocation-!cn,PROXY
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve

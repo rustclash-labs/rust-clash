@@ -962,6 +962,7 @@ object DebugLogManager {
             appendOutboundStatsSection(sb, nativeObj.optJSONArray("outboundStats"))
             appendTopRulesSection(sb, nativeObj.optJSONArray("topRules"), previousRuleHits)
             appendTopDomainsSection(sb, nativeObj.optJSONArray("topDomains"))
+            appendCarryOverConnectionsSection(sb, nativeObj.optJSONArray("carryOverConnections"))
             appendFailedConnectionsSection(sb, nativeObj.optJSONArray("failedConnections"))
             appendSlowConnectionsSection(sb, nativeObj.optJSONArray("slowConnections"))
             appendRecentConnectionsSection(sb, nativeObj.optJSONArray("recentConnections"))
@@ -1082,6 +1083,38 @@ object DebugLogManager {
                     "up=`${formatBytesCompact(d.optLong("uploadBytes"))}` down=`${formatBytesCompact(d.optLong("downloadBytes"))}`",
             )
         }
+    }
+
+    private fun appendCarryOverConnectionsSection(sb: StringBuilder, arr: JSONArray?) {
+        if (arr == null || arr.length() == 0) return
+        val lines = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) {
+            val c = arr.optJSONObject(i) ?: continue
+            val port = if (c.has("port")) c.optInt("port") else c.optInt("destinationPort")
+            val hostPort = NodeImportSupport.formatHostPort(c.optString("host"), port)
+            val network = c.optString("network", "tcp").lowercase(Locale.ROOT)
+            val status = c.optString("status", "active")
+            val outbound = c.optString("effectiveOutbound", "-")
+            val rawRule = c.optString("rule")
+            val rulePayload = c.optString("rulePayload")
+            val ruleDesc = when {
+                rulePayload.isNotEmpty() && !rawRule.contains(rulePayload) -> "$rawRule,$rulePayload"
+                rawRule.isNotEmpty() -> rawRule
+                else -> "-"
+            }
+            val upBytes = if (c.has("uploadBytes")) c.optLong("uploadBytes") else c.optLong("upload")
+            val downBytes = if (c.has("downloadBytes")) c.optLong("downloadBytes") else c.optLong("download")
+            val ageMs = c.optLong("ageMs", 0L).coerceAtLeast(0L)
+            val ageStr = if (ageMs < 1_000L) "${ageMs}ms" else "${ageMs / 1_000L}s"
+            lines.add(
+                "- `$hostPort` ($network, $status) -> `$outbound` [$ruleDesc] " +
+                    "totalUp=`${formatBytesCompact(upBytes)}` totalDown=`${formatBytesCompact(downBytes)}` age=`$ageStr`",
+            )
+        }
+        if (lines.isEmpty()) return
+        sb.appendLine()
+        sb.appendLine("#### Carry-Over Streams (${lines.size})")
+        lines.forEach { sb.appendLine(it) }
     }
 
     private fun readCoalescedCount(c: JSONObject): Long {

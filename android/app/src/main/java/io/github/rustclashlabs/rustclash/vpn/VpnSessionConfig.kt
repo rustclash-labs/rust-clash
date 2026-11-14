@@ -59,15 +59,34 @@ data class VpnRoutePlan(
 
 /**
  * Pure-Kotlin VPN route planner that excludes private LAN, loopback, link-local, multicast,
- * and limited-broadcast traffic from `tun0` while preserving Fake-IP (`198.18.0.0/15`),
- * TUN DNS (`198.19.255.254/32`), CGNAT (`100.64.0.0/10`), and TUN IPv6 (`fdfe:dcba:9876::/126`).
+ * Class E reserved, and limited-broadcast traffic from `tun0` while preserving Fake-IP
+ * (`198.18.0.0/15`), TUN DNS (`198.19.255.254/32`), CGNAT (`100.64.0.0/10`), global unicast IPv6
+ * (`2000::/3`), and TUN IPv6 (`fdfe:dcba:9876::/126`).
  *
- * - On Android 13+ (API 33 / `TIRAMISU`), routes `0.0.0.0/0` (and `::/0`) with `excludeRoute(...)`.
- * - On Android 8.0–12L (API 26–32), computes the minimal exact bitwise CIDR cover of
- *   `0.0.0.0/0 \ excluded` via binary prefix-trie splitting (and `2000::/3` + `fc00::/7` for IPv6).
+ * Uses positive unicast CIDR `Builder.addRoute(...)` entries across all Android API levels
+ * (API 26–37+). Unlike `Builder.excludeRoute(IpPrefix)` on API 33+, positive unicast routes never
+ * pass loopback (`127.0.0.0/8`, `::1/128` — rejected by AOSP `VpnService.check()` with
+ * `IllegalArgumentException("Bad address")`), unspecified (`0.0.0.0/8`, `::/128`), link-local
+ * (`169.254.0.0/16`, `fe80::/10`), or multicast/broadcast (`224.0.0.0/3`, `ff00::/8`) prefixes to
+ * `VpnService.Builder` or OEM `netd` `RTN_THROW` rules.
  */
 object VpnRoutePlanner {
     const val API_TIRAMISU = 33
+
+    /** Non-unicast IPv4 blocks that can never be added to `VpnService.Builder` under any config. */
+    val NON_ROUTABLE_IPV4_PREFIXES: List<CidrRoute> = listOf(
+        CidrRoute("0.0.0.0", 8),
+        CidrRoute("127.0.0.0", 8),
+        CidrRoute("224.0.0.0", 3),
+    )
+
+    /** Private LAN + link-local IPv4 blocks bypassed from `tun0` unless overlapped by custom TUN/DNS. */
+    val PRIVATE_LAN_IPV4_PREFIXES: List<CidrRoute> = listOf(
+        CidrRoute("10.0.0.0", 8),
+        CidrRoute("169.254.0.0", 16),
+        CidrRoute("172.16.0.0", 12),
+        CidrRoute("192.168.0.0", 16),
+    )
 
     val EXCLUDED_IPV4_PREFIXES: List<CidrRoute> = listOf(
         CidrRoute("0.0.0.0", 8),
@@ -76,22 +95,14 @@ object VpnRoutePlanner {
         CidrRoute("169.254.0.0", 16),
         CidrRoute("172.16.0.0", 12),
         CidrRoute("192.168.0.0", 16),
-        CidrRoute("224.0.0.0", 4),
-        CidrRoute("255.255.255.255", 32),
+        CidrRoute("224.0.0.0", 3),
     )
 
-    val EXCLUDED_IPV6_PREFIXES: List<CidrRoute> = listOf(
-        CidrRoute("::", 128),
-        CidrRoute("::1", 128),
-        CidrRoute("fe80::", 10),
-        CidrRoute("ff00::", 8),
-    )
-
-    val LEGACY_INCLUDED_IPV6_PREFIXES: List<CidrRoute> = listOf(
+    val INCLUDED_IPV6_PREFIXES: List<CidrRoute> = listOf(
         CidrRoute("2000::", 3),
-        CidrRoute("fc00::", 7),
     )
 
+    @Suppress("UNUSED_PARAMETER")
     fun buildPlan(
         sessionCfg: VpnSessionConfig,
         sdkInt: Int,
@@ -101,55 +112,71 @@ object VpnRoutePlanner {
             canonicalizeIpv4Cidr(cfg.ipv4Address, cfg.ipv4PrefixLength)?.let { add(it) }
             canonicalizeIpv4Cidr(cfg.dnsIpv4, 32)?.let { add(it) }
         }
-        val effectiveExcludedIpv4 = if (protectedIpv4.isEmpty()) {
-            EXCLUDED_IPV4_PREFIXES
+        val effectivePrivateExclusions = if (protectedIpv4.isEmpty()) {
+            PRIVATE_LAN_IPV4_PREFIXES
         } else {
-            subtractIpv4Cidrs(EXCLUDED_IPV4_PREFIXES, protectedIpv4)
+            subtractIpv4Cidrs(PRIVATE_LAN_IPV4_PREFIXES, protectedIpv4)
         }
+        val effectiveExcludedIpv4 = NON_ROUTABLE_IPV4_PREFIXES + effectivePrivateExclusions
+        val includedIpv4 = computeIpv4IncludedRoutesExcluding(effectiveExcludedIpv4)
+            .filter { isValidVpnBuilderRoute(it) }
 
         val tunIpv6 = if (cfg.enableIpv6) {
             canonicalizeIpv6Cidr(cfg.ipv6Address, cfg.ipv6PrefixLength)
         } else {
             null
         }
-
-        return if (sdkInt >= API_TIRAMISU) {
-            val effectiveExcludedIpv6 = if (cfg.enableIpv6) {
-                EXCLUDED_IPV6_PREFIXES.filterNot { ex ->
-                    tunIpv6 != null && ipv6CidrsOverlap(ex, tunIpv6)
-                }
-            } else {
-                emptyList()
-            }
-            VpnRoutePlan(
-                useExcludeRoutes = true,
-                includedIpv4 = listOf(CidrRoute("0.0.0.0", 0)),
-                excludedIpv4 = effectiveExcludedIpv4,
-                includedIpv6 = if (cfg.enableIpv6) listOf(CidrRoute("::", 0)) else emptyList(),
-                excludedIpv6 = effectiveExcludedIpv6,
-            )
-        } else {
-            val includedIpv4 = computeIpv4IncludedRoutesExcluding(effectiveExcludedIpv4)
-            val includedIpv6 = if (cfg.enableIpv6) {
-                buildList {
-                    addAll(LEGACY_INCLUDED_IPV6_PREFIXES)
-                    if (tunIpv6 != null && none { inc ->
-                            inc.prefixLength <= tunIpv6.prefixLength && ipv6CidrsOverlap(inc, tunIpv6)
-                        }
-                    ) {
-                        add(tunIpv6)
+        val includedIpv6 = if (cfg.enableIpv6) {
+            buildList {
+                addAll(INCLUDED_IPV6_PREFIXES)
+                if (tunIpv6 != null && none { inc ->
+                        inc.prefixLength <= tunIpv6.prefixLength && ipv6CidrsOverlap(inc, tunIpv6)
                     }
+                ) {
+                    add(tunIpv6)
                 }
-            } else {
-                emptyList()
+            }.filter { isValidVpnBuilderRoute(it) }
+        } else {
+            emptyList()
+        }
+
+        return VpnRoutePlan(
+            useExcludeRoutes = false,
+            includedIpv4 = includedIpv4,
+            excludedIpv4 = emptyList(),
+            includedIpv6 = includedIpv6,
+            excludedIpv6 = emptyList(),
+        )
+    }
+
+    /**
+     * Validates a candidate `CidrRoute` against AOSP `android.net.VpnService.check()` and
+     * `IpPrefix` invariants so `Builder.addRoute` can never throw `IllegalArgumentException("Bad address")`.
+     */
+    fun isValidVpnBuilderRoute(route: CidrRoute): Boolean {
+        val addr = runCatching { InetAddress.getByName(route.address.trim()) }.getOrNull() ?: return false
+        if (addr.isLoopbackAddress) {
+            return false
+        }
+        return if (addr is Inet6Address) {
+            if (route.prefixLength !in 0..128) return false
+            if (route.prefixLength > 0 &&
+                (addr.isAnyLocalAddress || addr.isLinkLocalAddress || addr.isMulticastAddress)
+            ) {
+                return false
             }
-            VpnRoutePlan(
-                useExcludeRoutes = false,
-                includedIpv4 = includedIpv4,
-                excludedIpv4 = emptyList(),
-                includedIpv6 = includedIpv6,
-                excludedIpv6 = emptyList(),
-            )
+            val canonical = canonicalizeIpv6Cidr(route.address, route.prefixLength) ?: return false
+            val canonicalBytes = parseIpv6Bytes(canonical.address) ?: return false
+            addr.address.contentEquals(canonicalBytes)
+        } else {
+            if (route.prefixLength !in 0..32) return false
+            if (route.prefixLength > 0 &&
+                (addr.isAnyLocalAddress || addr.isLinkLocalAddress || addr.isMulticastAddress)
+            ) {
+                return false
+            }
+            val canonical = canonicalizeIpv4Cidr(route.address, route.prefixLength) ?: return false
+            canonical.address == route.address.trim() && canonical.prefixLength == route.prefixLength
         }
     }
 

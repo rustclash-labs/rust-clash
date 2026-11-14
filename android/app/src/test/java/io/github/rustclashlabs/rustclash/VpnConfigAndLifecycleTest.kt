@@ -1453,26 +1453,68 @@ class VpnConfigAndLifecycleTest {
     }
 
     @Test
-    fun vpnRoutePlannerExcludesPrivateLanMulticastLoopbackAndPreservesFakeIpAcrossApiLevels() {
+    fun vpnRoutePlannerExcludesPrivateLanMulticastLoopbackAndNeverEmitsBadAddressAcrossApiLevels() {
         fun matchesTun(ip: String, plan: VpnRoutePlan): Boolean =
             VpnRoutePlanner.matchesTun(ip, plan)
 
+        // Simulate AOSP `android.net.VpnService.check(InetAddress, int)` + `IpPrefix` rules
+        fun assertAospVpnBuilderSafe(route: io.github.rustclashlabs.rustclash.vpn.CidrRoute) {
+            val addr = InetAddress.getByName(route.address)
+            assertFalse(
+                "Route ${route.cidr} is loopback and would throw IllegalArgumentException(\"Bad address\") in VpnService.Builder!",
+                addr.isLoopbackAddress,
+            )
+            if (route.prefixLength > 0) {
+                assertFalse("Route ${route.cidr} must not be unspecified/anyLocal", addr.isAnyLocalAddress)
+                assertFalse("Route ${route.cidr} must not be link-local", addr.isLinkLocalAddress)
+                assertFalse("Route ${route.cidr} must not be multicast", addr.isMulticastAddress)
+            }
+            assertTrue(
+                "Route ${route.cidr} failed VpnRoutePlanner.isValidVpnBuilderRoute()",
+                VpnRoutePlanner.isValidVpnBuilderRoute(route),
+            )
+        }
+
+        // Regression guard for v0.4.5 P0 bug: loopback / unspecified / link-local / multicast prefixes MUST be rejected
+        for (bad in listOf(
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("127.0.0.0", 8),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("127.0.0.1", 32),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("::1", 128),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("0.0.0.0", 8),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("::", 128),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("169.254.0.0", 16),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("fe80::", 10),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("224.0.0.0", 4),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("ff00::", 8),
+            io.github.rustclashlabs.rustclash.vpn.CidrRoute("198.18.0.1", 15), // non-zero host bit
+        )) {
+            assertFalse(
+                "Expected ${bad.cidr} to be rejected by isValidVpnBuilderRoute",
+                VpnRoutePlanner.isValidVpnBuilderRoute(bad),
+            )
+        }
+
         val defaultCfg = VpnSessionConfig(enableIpv6 = true).validated()
+        val api37Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 37)
         val api33Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 33)
         val api32Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 32)
         val api26Plan = VpnRoutePlanner.buildPlan(defaultCfg, sdkInt = 26)
 
-        assertTrue(api33Plan.useExcludeRoutes)
+        assertFalse(api37Plan.useExcludeRoutes)
+        assertFalse(api33Plan.useExcludeRoutes)
         assertFalse(api32Plan.useExcludeRoutes)
         assertFalse(api26Plan.useExcludeRoutes)
+        assertTrue(api37Plan.excludedIpv4.isEmpty())
+        assertTrue(api37Plan.excludedIpv6.isEmpty())
+        assertEquals(api37Plan, api33Plan)
+        assertEquals(api33Plan, api32Plan)
         assertEquals(api32Plan, api26Plan)
-        assertEquals(VpnRoutePlanner.EXCLUDED_IPV4_PREFIXES, api33Plan.excludedIpv4)
-        assertEquals(VpnRoutePlanner.EXCLUDED_IPV6_PREFIXES, api33Plan.excludedIpv6)
 
-        // Verify exact mathematical partition of 2^32 IPv4 space on API 26-32 and zero host bits on all routes
+        // Verify every emitted route passes AOSP VpnService.Builder checks and partitions 2^32 IPv4 space cleanly
         var includedIpCount = 0L
         var prevEnd: UInt? = null
-        for (route in api32Plan.includedIpv4) {
+        for (route in api37Plan.includedIpv4) {
+            assertAospVpnBuilderSafe(route)
             val canonical = VpnRoutePlanner.canonicalizeIpv4Cidr(route.address, route.prefixLength)
             assertEquals("Route ${route.cidr} must have zero host bits", canonical, route)
             val range = VpnRoutePlanner.cidrToIpv4Range(route)!!
@@ -1481,6 +1523,9 @@ class VpnConfigAndLifecycleTest {
             }
             prevEnd = range.last
             includedIpCount += (1L shl (32 - route.prefixLength))
+        }
+        for (route in api37Plan.includedIpv6) {
+            assertAospVpnBuilderSafe(route)
         }
         val excludedIpCount = VpnRoutePlanner.EXCLUDED_IPV4_PREFIXES.sumOf { 1L shl (32 - it.prefixLength) }
         assertEquals(1L shl 32, includedIpCount + excludedIpCount)
@@ -1511,13 +1556,14 @@ class VpnConfigAndLifecycleTest {
             "172.31.255.254",
             "127.0.0.1",
             "169.254.10.20",
-            "224.0.0.251",    // mDNS
+            "224.0.0.251",     // mDNS
             "239.255.255.250", // SSDP
-            "255.255.255.255",
+            "240.0.0.1",       // Class E reserved
+            "255.255.255.255", // Limited broadcast
             "0.0.0.0",
         )
 
-        for ((label, plan) in listOf("API33+" to api33Plan, "API26-32" to api32Plan)) {
+        for ((label, plan) in listOf("API37" to api37Plan, "API33" to api33Plan, "API26" to api26Plan)) {
             for (ip in mustRouteIntoTunIpv4) {
                 assertTrue("[$label] Expected $ip to route into tun0", matchesTun(ip, plan))
             }
@@ -1525,18 +1571,18 @@ class VpnConfigAndLifecycleTest {
                 assertFalse("[$label] Expected $ip to be excluded from tun0", matchesTun(ip, plan))
             }
 
-            // IPv6 inclusion & exclusion parity across API 33+ and API 26-32
+            // IPv6 inclusion & exclusion parity across API 26–37+
             for (v6In in listOf("2409:8c1e::1", "2606:4700:4700::1111", "fdfe:dcba:9876::1", "fdfe:dcba:9876::2")) {
                 assertTrue("[$label] Expected IPv6 $v6In to route into tun0", matchesTun(v6In, plan))
             }
-            for (v6Ex in listOf("::", "::1", "fe80::1", "ff02::fb")) {
+            for (v6Ex in listOf("::", "::1", "fe80::1", "ff02::fb", "fd00::1")) {
                 assertFalse("[$label] Expected IPv6 $v6Ex to be excluded from tun0", matchesTun(v6Ex, plan))
             }
         }
 
         // IPv4-only session disables all IPv6 routes cleanly
         val v4OnlyCfg = VpnSessionConfig(enableIpv6 = false).validated()
-        for (sdk in listOf(28, 34)) {
+        for (sdk in listOf(28, 34, 37)) {
             val v4Plan = VpnRoutePlanner.buildPlan(v4OnlyCfg, sdkInt = sdk)
             assertTrue(v4Plan.includedIpv6.isEmpty())
             assertTrue(v4Plan.excludedIpv6.isEmpty())
@@ -1546,7 +1592,7 @@ class VpnConfigAndLifecycleTest {
     }
 
     @Test
-    fun vpnRoutePlannerNeverExcludesCustomSessionTunSubnetOrDnsIpv4() {
+    fun vpnRoutePlannerNeverExcludesCustomSessionTunSubnetOrDnsIpv4AndNeverEmitsLoopback() {
         val customCfg = VpnSessionConfig(
             ipv4Address = "10.0.0.1",
             ipv4PrefixLength = 24,
@@ -1554,13 +1600,32 @@ class VpnConfigAndLifecycleTest {
             enableIpv6 = true,
         ).validated()
 
-        for (sdk in listOf(29, 34)) {
+        for (sdk in listOf(29, 34, 37)) {
             val plan = VpnRoutePlanner.buildPlan(customCfg, sdkInt = sdk)
             assertTrue("sdk=$sdk must route custom TUN address", plan.matchesTun("10.0.0.1"))
             assertTrue("sdk=$sdk must route custom TUN subnet peer", plan.matchesTun("10.0.0.42"))
             assertTrue("sdk=$sdk must route custom TUN DNS IPv4", plan.matchesTun("192.168.50.53"))
             assertFalse("sdk=$sdk must still exclude outside 10.0.0.0/24", plan.matchesTun("10.0.1.1"))
             assertFalse("sdk=$sdk must still exclude outside 192.168.50.53/32", plan.matchesTun("192.168.1.1"))
+            for (r in plan.includedIpv4 + plan.includedIpv6) {
+                assertTrue("Route ${r.cidr} must pass VpnService.Builder check", VpnRoutePlanner.isValidVpnBuilderRoute(r))
+            }
+        }
+
+        // Even if a caller constructs a bogus loopback session config, buildPlan must NEVER emit a loopback route!
+        val bogusLoopbackCfg = VpnSessionConfig(
+            ipv4Address = "127.0.0.1",
+            ipv4PrefixLength = 8,
+            dnsIpv4 = "127.0.0.53",
+            ipv6Address = "::1",
+            ipv6PrefixLength = 126,
+            enableIpv6 = true,
+        )
+        val safePlan = VpnRoutePlanner.buildPlan(bogusLoopbackCfg, sdkInt = 37)
+        assertFalse(safePlan.matchesTun("127.0.0.1"))
+        assertFalse(safePlan.matchesTun("::1"))
+        for (r in safePlan.includedIpv4 + safePlan.includedIpv6) {
+            assertTrue("Route ${r.cidr} must pass VpnService.Builder check", VpnRoutePlanner.isValidVpnBuilderRoute(r))
         }
     }
 }

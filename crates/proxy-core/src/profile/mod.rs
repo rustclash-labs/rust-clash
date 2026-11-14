@@ -641,15 +641,27 @@ pub fn classify_rule_preset(cfg: &ClashConfig) -> RulePreset {
     }
 }
 
-/// Detect ONLY untouched legacy minimal starter rule lists from <= v0.2.1 so they can be
-/// safely upgraded to `smart-cn` without EVER touching user-customized or subscription rule lists.
+/// Detect ONLY untouched legacy starter / managed `smart-cn` rule lists (<= v0.2.1 6-rule starter
+/// or v0.3–v0.4.5 8-rule `smart-cn` template) so they can be safely upgraded to the latest
+/// `smart-cn` template without EVER touching user-customized or subscription rule lists.
 fn detect_untouched_legacy_starter_group(cfg: &ClashConfig) -> Option<String> {
     if !cfg.rule_providers.is_empty() {
         return None;
     }
     let active = active_trimmed_rules(&cfg.rules);
+    let mut candidates = vec![
+        primary_proxy_group_for_config(cfg),
+        "PROXY".to_string(),
+        "DIRECT".to_string(),
+        "🚀 Proxy".to_string(),
+    ];
+    for g in &cfg.proxy_groups {
+        if !candidates.contains(&g.name) {
+            candidates.push(g.name.clone());
+        }
+    }
 
-    for grp in ["PROXY", "DIRECT", "🚀 Proxy"] {
+    for grp in candidates {
         let legacy_starter = vec![
             "DOMAIN-SUFFIX,local,DIRECT".to_string(),
             "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve".to_string(),
@@ -663,7 +675,7 @@ fn detect_untouched_legacy_starter_group(cfg: &ClashConfig) -> Option<String> {
                 if grp == "DIRECT" && cfg.proxy_groups.iter().any(|g| g.name == "PROXY") {
                     "PROXY".to_string()
                 } else {
-                    grp.to_string()
+                    grp
                 };
             return Some(effective_grp);
         }
@@ -677,7 +689,21 @@ fn detect_untouched_legacy_starter_group(cfg: &ClashConfig) -> Option<String> {
             format!("MATCH,{grp}"),
         ];
         if active == legacy_synth {
-            return Some(grp.to_string());
+            return Some(grp);
+        }
+
+        let legacy_v045_smart_cn = vec![
+            "DOMAIN-SUFFIX,local,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,lan,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,home.arpa,DIRECT".to_string(),
+            "GEOIP,PRIVATE,DIRECT,no-resolve".to_string(),
+            format!("GEOSITE,geolocation-!cn,{grp}"),
+            "GEOSITE,cn,DIRECT".to_string(),
+            "GEOIP,CN,DIRECT,no-resolve".to_string(),
+            format!("MATCH,{grp}"),
+        ];
+        if active == legacy_v045_smart_cn {
+            return Some(grp);
         }
     }
     None
@@ -3869,6 +3895,146 @@ rules:
             upgraded_cfg.rules,
             ClashConfig::smart_cn_rules_for_group("PROXY"),
             "untouched legacy starter rules must migrate to zero-leak smart-cn on open_or_init"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn v045_eight_rule_smart_cn_profile_upgrades_to_nine_rule_template_without_touching_custom()
+     {
+        let dir = std::env::temp_dir().join(format!("rc-v045-smartcn-mig-{}", Uuid::new_v4()));
+        let profiles_dir = dir.join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+
+        let node_uuid = Uuid::new_v4();
+        let v045_rules_for = |grp: &str| {
+            vec![
+                "DOMAIN-SUFFIX,local,DIRECT".to_string(),
+                "DOMAIN-SUFFIX,lan,DIRECT".to_string(),
+                "DOMAIN-SUFFIX,home.arpa,DIRECT".to_string(),
+                "GEOIP,PRIVATE,DIRECT,no-resolve".to_string(),
+                format!("GEOSITE,geolocation-!cn,{grp}"),
+                "GEOSITE,cn,DIRECT".to_string(),
+                "GEOIP,CN,DIRECT,no-resolve".to_string(),
+                format!("MATCH,{grp}"),
+            ]
+        };
+
+        // 1. v0.4.5 ShareUris `smart-cn` profile with `🚀 Proxy` group (8 rules)
+        let mut share_cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        share_cfg.proxies = parse_subscription_uris(&format!(
+            "vless://{node_uuid}@127.0.0.1:18443?security=none#HK-Edge"
+        ))
+        .unwrap();
+        share_cfg.proxy_groups = vec![ProxyGroupConfig {
+            name: "🚀 Proxy".to_string(),
+            group_type: ProxyGroupType::Select,
+            proxies: vec!["HK-Edge".to_string(), "DIRECT".to_string()],
+            url: String::new(),
+            interval: 300,
+            tolerance: 50,
+            strategy: None,
+        }];
+        share_cfg.rules = v045_rules_for("🚀 Proxy");
+        fs::write(
+            profiles_dir.join("share-v045.yaml"),
+            share_cfg.to_yaml_string().unwrap(),
+        )
+        .unwrap();
+
+        // 2. Subscription profile where user had opted into `smart-cn` with custom group `🚀 节点选择`
+        let mut sub_scn_cfg = share_cfg.clone();
+        sub_scn_cfg.proxy_groups[0].name = "🚀 节点选择".to_string();
+        sub_scn_cfg.rules = v045_rules_for("🚀 节点选择");
+        fs::write(
+            profiles_dir.join("sub-smartcn.yaml"),
+            sub_scn_cfg.to_yaml_string().unwrap(),
+        )
+        .unwrap();
+
+        // 3. Explicit `RulePreset::Custom` profile (even if its rules happen to match the 8-rule list!)
+        let mut custom_cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        let untouched_custom_rules = v045_rules_for("PROXY");
+        custom_cfg.rules = untouched_custom_rules.clone();
+        fs::write(
+            profiles_dir.join("explicit-custom.yaml"),
+            custom_cfg.to_yaml_string().unwrap(),
+        )
+        .unwrap();
+
+        fs::write(
+            profiles_dir.join(INDEX_FILE),
+            serde_json::json!({
+                "active_profile_id": "share-v045",
+                "onboarding_completed": true,
+                "selection_defaults_v2": true,
+                "profiles": [
+                    {
+                        "id": "share-v045",
+                        "name": "My v0.4.5 Share Nodes",
+                        "kind": "share-uris",
+                        "last_updated_ms": 1700000000000u64,
+                        "proxy_count": 1,
+                        "group_count": 1,
+                        "rule_count": 8,
+                        "selected_groups": {"🚀 Proxy": "HK-Edge"},
+                        "rule_preset": "smart-cn"
+                    },
+                    {
+                        "id": "sub-smartcn",
+                        "name": "My Subscription (Smart CN)",
+                        "kind": "subscription",
+                        "last_updated_ms": 1700000000000u64,
+                        "proxy_count": 1,
+                        "group_count": 1,
+                        "rule_count": 8,
+                        "selected_groups": {"🚀 节点选择": "HK-Edge"},
+                        "rule_preset": "smart-cn",
+                        "custom_rules_backup": ["MATCH,DIRECT"]
+                    },
+                    {
+                        "id": "explicit-custom",
+                        "name": "User Custom Profile",
+                        "kind": "local-yaml",
+                        "last_updated_ms": 1700000000000u64,
+                        "proxy_count": 0,
+                        "group_count": 1,
+                        "rule_count": 8,
+                        "selected_groups": {"PROXY": "DIRECT"},
+                        "rule_preset": "custom",
+                        "custom_rules_backup": untouched_custom_rules
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+        let snap = mgr.routing_snapshot().unwrap();
+        assert_eq!(snap.rule_preset, RulePreset::SmartCn);
+        assert_eq!(snap.rule_count, 9);
+
+        let upgraded_share = mgr.load_profile_config_by_id("share-v045").unwrap();
+        assert_eq!(
+            upgraded_share.rules,
+            ClashConfig::smart_cn_rules_for_group("🚀 Proxy")
+        );
+        assert_eq!(upgraded_share.rules[4], "GEOSITE,google,🚀 Proxy");
+
+        let upgraded_sub = mgr.load_profile_config_by_id("sub-smartcn").unwrap();
+        assert_eq!(
+            upgraded_sub.rules,
+            ClashConfig::smart_cn_rules_for_group("🚀 节点选择")
+        );
+
+        let preserved_custom = mgr.load_profile_config_by_id("explicit-custom").unwrap();
+        assert_eq!(
+            preserved_custom.rules, untouched_custom_rules,
+            "RulePreset::Custom profile must NEVER be modified by smart-cn template migration"
         );
 
         let _ = fs::remove_dir_all(&dir);
