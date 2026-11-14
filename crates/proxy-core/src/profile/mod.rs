@@ -648,6 +648,7 @@ fn detect_untouched_legacy_starter_group(cfg: &ClashConfig) -> Option<String> {
         return None;
     }
     let active = active_trimmed_rules(&cfg.rules);
+
     for grp in ["PROXY", "DIRECT", "🚀 Proxy"] {
         let legacy_starter = vec![
             "DOMAIN-SUFFIX,local,DIRECT".to_string(),
@@ -902,10 +903,13 @@ impl ProfileManager {
                         p.group_count = cfg.proxy_groups.len();
                         dirty = true;
                     }
-                    if p.rule_preset.is_some() {
+                    if p.rule_preset == Some(RulePreset::Custom) {
                         continue;
                     }
-                    if matches!(p.kind, ProfileKind::Starter | ProfileKind::ShareUris)
+                    let can_upgrade_legacy =
+                        matches!(p.kind, ProfileKind::Starter | ProfileKind::ShareUris)
+                            || p.rule_preset == Some(RulePreset::SmartCn);
+                    if can_upgrade_legacy
                         && let Some(target_grp) = detect_untouched_legacy_starter_group(&cfg)
                     {
                         cfg.rules = ClashConfig::smart_cn_rules_for_group(&target_grp);
@@ -935,6 +939,9 @@ impl ProfileManager {
                             dirty = true;
                             continue;
                         }
+                    }
+                    if p.rule_preset.is_some() {
+                        continue;
                     }
 
                     let detected = classify_rule_preset(&cfg);
@@ -1701,7 +1708,18 @@ impl ProfileManager {
                     .unwrap_or_else(|| {
                         Url::parse(&normalized)
                             .ok()
-                            .and_then(|u| u.host_str().map(|h| format!("Sub ({h})")))
+                            .and_then(|u| match u.host() {
+                                Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => None,
+                                Some(url::Host::Domain(h)) => {
+                                    let clean = h.trim_start_matches('[').trim_end_matches(']');
+                                    if clean.parse::<IpAddr>().is_ok() {
+                                        None
+                                    } else {
+                                        Some(format!("Sub ({h})"))
+                                    }
+                                }
+                                None => None,
+                            })
                             .unwrap_or_else(|| "HTTPS Subscription".to_string())
                     });
 
@@ -2406,16 +2424,17 @@ impl ProfileManager {
         }
     }
 
-    /// Return IDs of subscription profiles whose `auto_update_interval_secs` has elapsed,
-    /// skipping disabled (`None` / `0`) profiles and applying a 10-minute backoff after failures.
+    /// Return IDs of active subscription profiles whose `auto_update_interval_secs` has elapsed,
+    /// skipping inactive or disabled (`None` / `0`) profiles and applying a 10-minute backoff after failures.
     pub fn due_auto_update_ids(&self) -> Vec<String> {
         const FAILURE_BACKOFF_MS: u64 = 10 * 60 * 1000;
         let now_ms = now_unix_ms();
         let attempts = self.last_attempt_ms.lock().clone();
         let idx = self.index.lock();
+        let active_id = idx.active_profile_id.as_str();
         idx.profiles
             .iter()
-            .filter(|p| p.kind == ProfileKind::Subscription)
+            .filter(|p| p.kind == ProfileKind::Subscription && p.id == active_id)
             .filter_map(|p| {
                 let secs = p.auto_update_interval_secs?;
                 if secs == 0 {
@@ -2857,9 +2876,9 @@ fn is_loopback_host(host: &str) -> bool {
 async fn connect_protected_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
     let addrs = crate::router::geodata::resolve_host_bypassing_fake_ip(host, port).await?;
     if addrs.is_empty() {
-        return Err(ProxyError::Config(format!(
-            "unable to resolve subscription host '{host}'"
-        )));
+        return Err(ProxyError::Config(
+            "unable to resolve subscription host".into(),
+        ));
     }
 
     let mut last_err = None;
@@ -2900,7 +2919,7 @@ async fn connect_protected_tcp(host: &str, port: u16) -> Result<tokio::net::TcpS
     }
 
     Err(last_err
-        .unwrap_or_else(|| ProxyError::Config(format!("failed connecting to '{host}:{port}'"))))
+        .unwrap_or_else(|| ProxyError::Config("failed connecting to subscription server".into())))
 }
 
 /// Fetch a subscription URL via `rustls` HTTPS (with strict certificate verification; cleartext
@@ -2996,9 +3015,7 @@ pub async fn fetch_subscription_http_with_proxy(
                             .parse::<IpAddr>()
                             .map(|ip| TargetAddr::new_ip(ip, port))
                             .map_err(|_| {
-                                ProxyError::Config(format!(
-                                    "invalid subscription target host '{host}'"
-                                ))
+                                ProxyError::Config("invalid subscription target host".into())
                             })
                     })?;
                     match tokio::time::timeout(
@@ -3146,7 +3163,7 @@ where
     let connector = TlsConnector::from(tls_cfg);
     let clean_host = host.trim_start_matches('[').trim_end_matches(']');
     let server_name = rustls::pki_types::ServerName::try_from(clean_host.to_string())
-        .map_err(|e| ProxyError::Config(format!("invalid TLS SNI '{clean_host}': {e}")))?;
+        .map_err(|e| ProxyError::Config(format!("invalid subscription TLS server name: {e}")))?;
     let mut tls_stream = tokio::time::timeout(
         Duration::from_secs(10),
         connector.connect(server_name, stream),
@@ -3719,6 +3736,135 @@ rules:
                 .get("📺 Bilibili")
                 .map(String::as_str),
             Some("DIRECT")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn active_only_due_auto_update_and_legacy_smart_cn_migration_work() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("rc-active-due-mig-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Spin up local TLS server with self-signed CA on 127.0.0.1 (IP literal) and localhost (domain)
+        let (server_tls_cfg, ca_der) =
+            generate_self_signed_server_config(&["localhost".into(), "127.0.0.1".into()], &[])
+                .unwrap();
+        let acceptor = TlsAcceptor::from(server_tls_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let psk = STANDARD.encode([0x44u8; 32]);
+        let valid_uri = format!(
+            "ss://{}@127.0.0.1:8388#Due-Node",
+            STANDARD.encode(format!("2022-blake3-aes-256-gcm:{psk}"))
+        );
+        let b64_sub = STANDARD.encode(&valid_uri);
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                let body = b64_sub.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acc.accept(tcp).await else {
+                        return;
+                    };
+                    let mut req_buf = [0u8; 2048];
+                    let _ = tls.read(&mut req_buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        let mgr = ProfileManager::open_or_init_with_ca(&dir, vec![ca_der]).unwrap();
+        let ip_sub_url = format!("https://127.0.0.1:{}/sub?token=t1", addr.port());
+        let dom_sub_url = format!("https://localhost:{}/sub?token=t2", addr.port());
+
+        // Import unnamed IP-host subscription -> must default to "HTTPS Subscription" (never raw IP)
+        mgr.import_unified_input_with_options(&ip_sub_url, None, true, true, Some(60))
+            .await
+            .unwrap();
+        let ip_prof = mgr
+            .snapshot()
+            .profiles
+            .into_iter()
+            .find(|p| p.id == mgr.active_profile_id())
+            .unwrap();
+        assert_eq!(ip_prof.name, "HTTPS Subscription");
+
+        // Import unnamed domain-host subscription -> becomes active
+        mgr.import_unified_input_with_options(&dom_sub_url, None, true, true, Some(60))
+            .await
+            .unwrap();
+        let dom_prof = mgr
+            .snapshot()
+            .profiles
+            .into_iter()
+            .find(|p| p.id == mgr.active_profile_id())
+            .unwrap();
+        assert_eq!(dom_prof.name, "Sub (localhost)");
+
+        // Backdate BOTH subscriptions so both are overdue, while only `dom_prof` is active
+        {
+            let mut idx = mgr.index.lock();
+            for p in &mut idx.profiles {
+                if p.kind == ProfileKind::Subscription {
+                    p.last_updated_ms = 1;
+                }
+            }
+        }
+        assert_eq!(
+            mgr.due_auto_update_ids(),
+            vec![dom_prof.id.clone()],
+            "due_auto_update_ids must return ONLY the active subscription and skip overdue inactive subscriptions"
+        );
+
+        // Switch active profile to starter -> neither subscription is active, so due list is empty!
+        let starter_id = mgr
+            .snapshot()
+            .profiles
+            .into_iter()
+            .find(|p| p.kind == ProfileKind::Starter)
+            .unwrap()
+            .id;
+        mgr.set_active_profile(&starter_id).unwrap();
+        assert!(
+            mgr.due_auto_update_ids().is_empty(),
+            "inactive subscriptions must not be scheduled when starter profile is active"
+        );
+
+        // Switch active profile to `ip_prof` -> now only `ip_prof` is returned!
+        mgr.set_active_profile(&ip_prof.id).unwrap();
+        assert_eq!(mgr.due_auto_update_ids(), vec![ip_prof.id.clone()]);
+
+        // Verify legacy <= v0.2.1 `GEOIP,CN,DIRECT` starter rules migrate to zero-leak `smart-cn`
+        mgr.set_active_profile(&starter_id).unwrap();
+        let starter_yaml_path = mgr.profile_yaml_path(&starter_id);
+        drop(mgr);
+
+        let mut legacy_cfg = ClashConfig::from_file(&starter_yaml_path).unwrap();
+        legacy_cfg.rules = vec![
+            "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve".to_string(),
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve".to_string(),
+            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve".to_string(),
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve".to_string(),
+            "GEOIP,CN,DIRECT".to_string(),
+            "MATCH,PROXY".to_string(),
+        ];
+        fs::write(&starter_yaml_path, legacy_cfg.to_yaml_string().unwrap()).unwrap();
+
+        let mgr_upgraded = ProfileManager::open_or_init(&dir).unwrap();
+        let (upgraded_cfg, _) = mgr_upgraded.load_active_config().unwrap();
+        assert_eq!(
+            upgraded_cfg.rules,
+            ClashConfig::smart_cn_rules_for_group("PROXY"),
+            "untouched legacy starter rules must migrate to zero-leak smart-cn on open_or_init"
         );
 
         let _ = fs::remove_dir_all(&dir);

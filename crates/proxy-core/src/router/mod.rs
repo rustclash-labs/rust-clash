@@ -11,7 +11,10 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -36,7 +39,10 @@ use crate::{
         rules::{CompiledRule, RuleMatcher, RuleSnapshot},
         ruleset::build_rule_sets_with_state_dir,
     },
+    tracker::TelemetryHub,
 };
+
+static ROUTER_EPOCH_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveOutboundSummary {
@@ -131,7 +137,8 @@ impl FastRuleIndex {
 
 pub struct Router {
     mode: RwLock<RunMode>,
-    unified_delay: std::sync::atomic::AtomicBool,
+    epoch: AtomicU64,
+    unified_delay: AtomicBool,
     outbounds: HashMap<String, DynOutbound>,
     groups: HashMap<String, Arc<ProxyGroup>>,
     group_order: Vec<String>,
@@ -262,7 +269,8 @@ impl Router {
 
         Ok(Self {
             mode: RwLock::new(initial_mode),
-            unified_delay: std::sync::atomic::AtomicBool::new(true),
+            epoch: AtomicU64::new(ROUTER_EPOCH_SEQ.fetch_add(1, Ordering::Relaxed)),
+            unified_delay: AtomicBool::new(true),
             outbounds,
             groups,
             group_order,
@@ -273,22 +281,47 @@ impl Router {
         })
     }
 
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn bump_epoch(&self) {
+        self.epoch.store(
+            ROUTER_EPOCH_SEQ.fetch_add(1, Ordering::Relaxed),
+            Ordering::Release,
+        );
+    }
+
+    pub fn seed_delay_if_absent(&self, name: &str, delay_ms: u64) {
+        self.delays.seed_if_absent(name, delay_ms);
+    }
+
+    pub fn latest_delay_age_ms(&self, name: &str) -> Option<u64> {
+        self.delays
+            .latest_delay_with_time(name)
+            .map(|(t, _)| TelemetryHub::now_ms().saturating_sub(t))
+    }
+
+    pub fn record_passive_delay_if_stale(&self, name: &str, rtt_ms: u64, max_age_ms: u64) {
+        self.delays
+            .record_passive_if_stale(name, rtt_ms, max_age_ms);
+    }
+
     pub fn mode(&self) -> RunMode {
         *self.mode.read()
     }
 
     pub fn set_mode(&self, mode: RunMode) {
         *self.mode.write() = mode;
+        self.bump_epoch();
     }
 
     pub fn unified_delay(&self) -> bool {
-        self.unified_delay
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.unified_delay.load(Ordering::Relaxed)
     }
 
     pub fn set_unified_delay(&self, enabled: bool) {
-        self.unified_delay
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.unified_delay.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_low_power_mode(&self, enabled: bool) {
@@ -333,6 +366,7 @@ impl Router {
     /// pooled/multiplexed sockets bound to a previous network interface.
     pub fn notify_network_change(&self) -> usize {
         self.dns.flush_cache();
+        self.bump_epoch();
         self.outbounds.values().map(|o| o.on_network_change()).sum()
     }
 
@@ -768,7 +802,9 @@ impl Router {
             .groups
             .get(group_name)
             .ok_or_else(|| ProxyError::Routing(format!("proxy group '{group_name}' not found")))?;
-        grp.select_manual(proxy_name)
+        grp.select_manual(proxy_name)?;
+        self.bump_epoch();
+        Ok(())
     }
 
     /// Return the current effective leaf outbound name for `group_name` (if the group exists).
@@ -791,12 +827,17 @@ impl Router {
     }
 
     pub fn apply_saved_selections(&self, saved: &HashMap<String, String>) {
+        let mut applied = false;
         for (group_name, chosen) in saved {
             if let Some(grp) = self.groups.get(group_name)
                 && grp.group_type == ProxyGroupType::Select
+                && grp.select_manual(chosen).is_ok()
             {
-                let _ = grp.select_manual(chosen);
+                applied = true;
             }
+        }
+        if applied || !saved.is_empty() {
+            self.bump_epoch();
         }
     }
 
@@ -884,13 +925,20 @@ impl Router {
     pub async fn test_delay(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
         let unified = self.unified_delay();
         if let Some(outbound) = self.outbounds.get(name) {
+            let was_alive = self.delays.latest_delay(name).is_some();
             match outbound.latency_test_with_mode(url, timeout, unified).await {
                 Ok(ms) => {
                     self.delays.record(name, ms);
+                    if !was_alive {
+                        self.bump_epoch();
+                    }
                     return Ok(ms);
                 }
                 Err(e) => {
                     self.delays.record_failure(name);
+                    if was_alive {
+                        self.bump_epoch();
+                    }
                     return Err(ProxyError::Io(e));
                 }
             }
@@ -905,6 +953,7 @@ impl Router {
                     unified,
                 )
                 .await;
+            self.bump_epoch();
             let chosen = group.current();
             if let Some(Some(ms)) = map.get(&chosen) {
                 self.delays.record(name, *ms);
@@ -998,6 +1047,7 @@ impl Router {
             grp.mark_evaluated(evaluated_at);
             grp.apply_probe_results(&group_map, &self.delays);
         }
+        self.bump_epoch();
     }
 
     pub fn proxies_snapshot(&self) -> HashMap<String, ProxyInfoSnapshot> {
@@ -1129,5 +1179,39 @@ mod tests {
             .await;
         assert_eq!(d_suffix.rule_type, "DomainSuffix");
         assert_eq!(d_suffix.outbound.name(), "DIRECT");
+    }
+
+    #[test]
+    fn router_epoch_and_delay_helpers_advance_monotonically() {
+        let dns = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+        let grp = ProxyGroupConfig {
+            name: "PROXY".to_string(),
+            group_type: ProxyGroupType::Select,
+            proxies: vec!["DIRECT".to_string(), "REJECT".to_string()],
+            url: "http://www.gstatic.com/generate_204".to_string(),
+            interval: 300,
+            tolerance: 50,
+            strategy: None,
+        };
+        let rules = vec!["MATCH,PROXY".to_string()];
+        let router = Router::new(RunMode::Rule, HashMap::new(), &[grp], &rules, dns).unwrap();
+
+        let e0 = router.epoch();
+        assert!(e0 > 0);
+        router.set_mode(RunMode::Global);
+        let e1 = router.epoch();
+        assert!(e1 > e0);
+        router.select_group("PROXY", "REJECT").unwrap();
+        let e2 = router.epoch();
+        assert!(e2 > e1);
+
+        assert!(router.latest_delay_age_ms("DIRECT").is_none());
+        router.seed_delay_if_absent("DIRECT", 42);
+        assert_eq!(router.delays().latest_delay("DIRECT"), Some(42));
+        assert!(router.latest_delay_age_ms("DIRECT").is_some());
+        router.seed_delay_if_absent("DIRECT", 99);
+        assert_eq!(router.delays().latest_delay("DIRECT"), Some(42));
+        router.record_passive_delay_if_stale("DIRECT", 21, 0);
+        assert_eq!(router.delays().latest_delay("DIRECT"), Some(21));
     }
 }

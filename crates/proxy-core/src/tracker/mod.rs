@@ -26,6 +26,16 @@ const MAX_RECENT_DIAGNOSTICS: usize = 200;
 const MAX_DEBUG_DIAGNOSTICS: usize = 1_500;
 const MAX_RECENT_LOGS: usize = 300;
 const MAX_DEBUG_LOGS: usize = 1_500;
+const MAX_IMPORTANT_LOGS: usize = 500;
+
+/// Format `host` and `port` as `host:port` for IPv4/domains or `[host]:port` for bare IPv6 literals.
+pub fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 fn log_level_severity(level: &str) -> u8 {
     match level.trim().to_ascii_lowercase().as_str() {
@@ -36,6 +46,21 @@ fn log_level_severity(level: &str) -> u8 {
         "silent" | "off" | "none" => 4,
         _ => 1,
     }
+}
+
+fn is_routine_connection_log(payload: &str) -> bool {
+    payload.starts_with("[TUN] ")
+        || payload.starts_with("[SOCKS5] ")
+        || payload.starts_with("[HTTP-CONNECT] ")
+        || payload.starts_with("[HTTP] ")
+}
+
+fn is_important_log(level: &str, payload: &str) -> bool {
+    let sev = log_level_severity(level);
+    if sev == 0 || sev >= 4 {
+        return false;
+    }
+    sev >= 2 || !is_routine_connection_log(payload)
 }
 
 /// Hook implemented by stateful session managers (such as `UdpNatManager`) so
@@ -92,6 +117,8 @@ pub struct ConnectionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_duration_ms: Option<u64>,
 }
+
+pub type DiagnosticEntry = ConnectionSnapshot;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TrafficPoint {
@@ -212,6 +239,7 @@ pub struct TelemetryHub {
     session_resetters: Mutex<Vec<Weak<dyn SessionResetter>>>,
     history: Mutex<VecDeque<TrafficPoint>>,
     recent_logs: Mutex<VecDeque<LogEntry>>,
+    important_logs: Mutex<VecDeque<LogEntry>>,
     traffic_tx: broadcast::Sender<TrafficPoint>,
     log_tx: broadcast::Sender<LogEntry>,
 }
@@ -223,6 +251,10 @@ impl Default for TelemetryHub {
 }
 
 impl TelemetryHub {
+    pub fn format_host_port(host: &str, port: u16) -> String {
+        format_host_port(host, port)
+    }
+
     pub fn new() -> Self {
         let (traffic_tx, _) = broadcast::channel(256);
         let (log_tx, _) = broadcast::channel(512);
@@ -246,6 +278,7 @@ impl TelemetryHub {
             session_resetters: Mutex::new(Vec::new()),
             history: Mutex::new(VecDeque::with_capacity(120)),
             recent_logs: Mutex::new(VecDeque::with_capacity(MAX_RECENT_LOGS)),
+            important_logs: Mutex::new(VecDeque::with_capacity(MAX_IMPORTANT_LOGS)),
             traffic_tx,
             log_tx,
         }
@@ -554,9 +587,8 @@ impl TelemetryHub {
             self.push_log(
                 "warn",
                 format!(
-                    "[DIAG] {}:{} [{}] -> {} ({}) failed: {}",
-                    snap.metadata.host,
-                    snap.metadata.destination_port,
+                    "[DIAG] {} [{}] -> {} ({}) failed: {}",
+                    format_host_port(&snap.metadata.host, snap.metadata.destination_port),
                     snap.rule,
                     snap.effective_outbound,
                     snap.exit_type,
@@ -768,12 +800,27 @@ impl TelemetryHub {
     /// Return active + archived connection snapshots overlapping `[since_epoch_ms, now]`,
     /// sorted newest-first and capped at `MAX_DEBUG_DIAGNOSTICS`.
     pub fn diagnostics_since(&self, since_epoch_ms: u64, limit: usize) -> Vec<ConnectionSnapshot> {
+        self.diagnostics_in_window(since_epoch_ms, u64::MAX, limit)
+    }
+
+    /// Return active + archived connection snapshots overlapping `[since_epoch_ms, until_epoch_ms]`,
+    /// sorted newest-first and capped at `MAX_DEBUG_DIAGNOSTICS`.
+    pub fn diagnostics_in_window(
+        &self,
+        since_epoch_ms: u64,
+        until_epoch_ms: u64,
+        limit: usize,
+    ) -> Vec<DiagnosticEntry> {
+        if since_epoch_ms > until_epoch_ms {
+            return Vec::new();
+        }
         let cap = limit.clamp(1, MAX_DEBUG_DIAGNOSTICS);
         let matches_window = |s: &ConnectionSnapshot| -> bool {
-            s.start_epoch_ms >= since_epoch_ms
-                || s.end_epoch_ms.is_none_or(|end| end >= since_epoch_ms)
+            s.start_epoch_ms <= until_epoch_ms
+                && (s.start_epoch_ms >= since_epoch_ms
+                    || s.end_epoch_ms.is_none_or(|end| end >= since_epoch_ms))
         };
-        let mut combined: Vec<ConnectionSnapshot> = self
+        let mut combined: Vec<DiagnosticEntry> = self
             .connections
             .iter()
             .map(|entry| entry.value().snapshot())
@@ -861,12 +908,20 @@ impl TelemetryHub {
             level: level_str,
             payload: payload.into(),
         };
+        let important = is_important_log(&entry.level, &entry.payload);
         {
             let mut logs = self.recent_logs.lock();
             while logs.len() >= max_logs {
                 logs.pop_front();
             }
             logs.push_back(entry.clone());
+        }
+        if important {
+            let mut imp = self.important_logs.lock();
+            while imp.len() >= MAX_IMPORTANT_LOGS {
+                imp.pop_front();
+            }
+            imp.push_back(entry.clone());
         }
         let _ = self.log_tx.send(entry);
     }
@@ -876,21 +931,60 @@ impl TelemetryHub {
     }
 
     pub fn logs_since(&self, since_epoch_ms: u64, limit: usize) -> Vec<LogEntry> {
+        self.logs_in_window(since_epoch_ms, u64::MAX, limit)
+    }
+
+    /// Return structured logs in `[since_epoch_ms, until_epoch_ms]` in chronological order,
+    /// prioritizing `important_logs` (warnings, errors, and non-routine lifecycle events) so
+    /// high-volume `[TUN]`/`[SOCKS5]`/`[HTTP]` traffic bursts never evict diagnostic events.
+    pub fn logs_in_window(
+        &self,
+        since_epoch_ms: u64,
+        until_epoch_ms: u64,
+        limit: usize,
+    ) -> Vec<LogEntry> {
+        if since_epoch_ms > until_epoch_ms {
+            return Vec::new();
+        }
         let cap = limit.clamp(1, MAX_DEBUG_LOGS);
-        let logs = self.recent_logs.lock();
-        let mut out: Vec<LogEntry> = logs
-            .iter()
-            .rev()
-            .filter(|e| e.timestamp_ms >= since_epoch_ms)
-            .take(cap)
-            .cloned()
-            .collect();
-        out.reverse();
-        out
+        let in_window = |e: &LogEntry| -> bool {
+            e.timestamp_ms >= since_epoch_ms && e.timestamp_ms <= until_epoch_ms
+        };
+
+        let mut selected: Vec<LogEntry> = {
+            let imp = self.important_logs.lock();
+            let mut v: Vec<LogEntry> = imp
+                .iter()
+                .rev()
+                .filter(|e| in_window(e))
+                .take(cap)
+                .cloned()
+                .collect();
+            v.reverse();
+            v
+        };
+
+        let remaining = cap.saturating_sub(selected.len());
+        if remaining > 0 {
+            let logs = self.recent_logs.lock();
+            let mut routine: Vec<LogEntry> = logs
+                .iter()
+                .rev()
+                .filter(|e| in_window(e) && !is_important_log(&e.level, &e.payload))
+                .take(remaining)
+                .cloned()
+                .collect();
+            routine.reverse();
+            selected.extend(routine);
+        }
+
+        selected.sort_by_key(|e| e.timestamp_ms);
+        selected
     }
 
     pub fn clear_logs(&self) {
         self.recent_logs.lock().clear();
+        self.important_logs.lock().clear();
     }
 
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogEntry> {
@@ -1093,5 +1187,93 @@ mod tests {
         guard.record_failed("connect timeout");
         assert_eq!(hub.active_connection_count(), 0);
         assert_eq!(hub.failed_connections_total(), 1);
+    }
+
+    #[test]
+    fn format_host_port_brackets_bare_ipv6_and_preserves_domains_and_ipv4() {
+        assert_eq!(format_host_port("1.1.1.1", 443), "1.1.1.1:443");
+        assert_eq!(format_host_port("chatgpt.com", 443), "chatgpt.com:443");
+        assert_eq!(
+            format_host_port("2606:4700:4700::1111", 443),
+            "[2606:4700:4700::1111]:443"
+        );
+        assert_eq!(
+            TelemetryHub::format_host_port("[2606:4700:4700::1111]", 443),
+            "[2606:4700:4700::1111]:443"
+        );
+
+        let hub = Arc::new(TelemetryHub::new());
+        let v6_target: TargetAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let guard = hub.register_connection_guard(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &v6_target,
+            None,
+            "MATCH",
+            "",
+            vec!["PROXY".into()],
+        );
+        guard.record_failed("network unreachable");
+        let logs = hub.recent_logs();
+        assert_eq!(logs.len(), 1);
+        assert!(
+            logs[0]
+                .payload
+                .contains("[DIAG] [2606:4700:4700::1111]:443")
+        );
+    }
+
+    #[test]
+    fn important_logs_survive_tun_flood_and_window_bounds_filter_cleanly() {
+        let hub = TelemetryHub::new();
+        let since = TelemetryHub::now_ms();
+
+        hub.push_log("info", "Switched routing mode to 'rule'");
+        hub.push_log(
+            "warn",
+            "[DIAG] chatgpt.com:443 [MATCH] -> Node-A (PROXY) failed: handshake timeout",
+        );
+
+        for i in 0..2_000 {
+            hub.push_log(
+                "info",
+                format!(
+                    "[TUN] 198.18.0.1:{} -> example.com:443 (raw 198.18.0.10:443) [MATCH] via Node-A (PROXY)",
+                    30_000 + (i % 20_000)
+                ),
+            );
+        }
+
+        let until = TelemetryHub::now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        hub.push_log("warn", "Post-window warning after until_epoch_ms");
+
+        let windowed = hub.logs_in_window(since, until, 250);
+        assert_eq!(windowed.len(), 250);
+        assert!(
+            windowed
+                .iter()
+                .any(|e| e.payload == "Switched routing mode to 'rule'"),
+            "non-routine lifecycle info log must survive [TUN] flood"
+        );
+        assert!(
+            windowed
+                .iter()
+                .any(|e| e.payload.contains("[DIAG] chatgpt.com:443")),
+            "warn diagnostic log must survive [TUN] flood"
+        );
+        assert!(
+            !windowed
+                .iter()
+                .any(|e| e.payload == "Post-window warning after until_epoch_ms"),
+            "logs after until_epoch_ms must be excluded"
+        );
+        assert!(
+            windowed
+                .windows(2)
+                .all(|w| w[0].timestamp_ms <= w[1].timestamp_ms),
+            "logs_in_window must return entries in chronological order"
+        );
     }
 }

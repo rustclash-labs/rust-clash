@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.PowerManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
@@ -61,6 +62,11 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         refreshAll()
     }
 
+    private fun queryIsBatteryOptimizationIgnored(): Boolean = runCatching {
+        appContext.getSystemService(PowerManager::class.java)
+            ?.isIgnoringBatteryOptimizations(appContext.packageName) ?: true
+    }.getOrDefault(true)
+
     private fun loadInitialPrefsState(): AppUiState {
         val theme = ThemePreference.fromWire(prefs.getString(RustClashVpnService.KEY_THEME_MODE, null))
         val perApp = PerAppMode.fromWire(prefs.getString(RustClashVpnService.KEY_PER_APP_MODE, null))
@@ -97,6 +103,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             defaultSubAutoUpdateSecs = defaultSubSecs,
             enableIpv6 = ipv6,
             demoMode = demo,
+            isBatteryOptimizationIgnored = queryIsBatteryOptimizationIgnored(),
             debugLog = DebugLogManager.getStorageSummary(appContext),
         )
     }
@@ -150,7 +157,17 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setActiveDestination(dest: MainDestination) {
         if (_uiState.value.activeDestination == dest) return
-        _uiState.update { it.copy(activeDestination = dest) }
+        val batteryOptIgnored = if (dest == MainDestination.SETTINGS) {
+            queryIsBatteryOptimizationIgnored()
+        } else {
+            _uiState.value.isBatteryOptimizationIgnored
+        }
+        _uiState.update {
+            it.copy(
+                activeDestination = dest,
+                isBatteryOptimizationIgnored = batteryOptIgnored,
+            )
+        }
         if (dest == MainDestination.RULES && previousVpnRunning) {
             viewModelScope.launch {
                 pollLiveStatusAndDiagnostics(includeDiagnostics = true)
@@ -197,10 +214,18 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun refreshAll() {
+        val batteryOptIgnored = queryIsBatteryOptimizationIgnored()
         if (!NativeBridge.ensureLoaded()) {
-            _uiState.update { it.copy(nativeLoaded = false, debugLog = DebugLogManager.getStorageSummary(appContext)) }
+            _uiState.update {
+                it.copy(
+                    nativeLoaded = false,
+                    isBatteryOptimizationIgnored = batteryOptIgnored,
+                    debugLog = DebugLogManager.getStorageSummary(appContext),
+                )
+            }
             return
         }
+        _uiState.update { it.copy(isBatteryOptimizationIgnored = batteryOptIgnored) }
         viewModelScope.launch {
             syncSnapshotQuietly()
             refreshProfilesQuietly()

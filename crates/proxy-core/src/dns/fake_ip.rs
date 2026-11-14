@@ -42,6 +42,8 @@ const MIN_NEGATIVE_TTL_SECS: u64 = 5;
 const MAX_NEGATIVE_TTL_SECS: u64 = 60;
 const MAX_CONCURRENT_DNS_UDP_TASKS: usize = 256;
 const MAX_CONCURRENT_DNS_TCP_CONNS: usize = 128;
+const MAX_PERSISTED_FAKE_IP_ENTRIES: usize = 2048;
+const MAX_FAKE_IP_PERSIST_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 struct InflightLookupGuard<'a> {
     map: &'a DashMap<String, watch::Sender<bool>>,
@@ -62,11 +64,30 @@ pub struct FakeIpEntry {
     pub domain: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedFakeIpState {
+    version: u32,
+    fake_ip_range: String,
+    saved_at_epoch_ms: u64,
+    entries: Vec<FakeIpEntry>,
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct DnsTelemetrySnapshot {
     pub total_queries: u64,
     pub fake_ip_hits: u64,
     pub cache_hits: u64,
+    #[serde(default)]
+    pub suppressed_queries: u64,
+    #[serde(default)]
+    pub nxdomain_hits: u64,
     pub upstream_queries: u64,
     pub upstream_errors: u64,
     pub upstream_avg_ms: u64,
@@ -181,14 +202,19 @@ impl PoolInner {
         ip
     }
 
-    fn insert_preserved(&mut self, ip: Ipv4Addr, domain: &str, net: Ipv4Net) {
+    fn insert_preserved(&mut self, ip: Ipv4Addr, domain: &str, net: Ipv4Net) -> bool {
         let ip_u32 = u32::from(ip);
         if !net.contains(&ip) || ip_u32 < self.start_host || ip_u32 > self.end_host {
-            return;
+            return false;
         }
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized.is_empty() {
-            return;
+            return false;
+        }
+        if let Some(prev_ip) = self.domain_to_ip.remove(&normalized)
+            && prev_ip != ip
+        {
+            self.ip_to_domain.pop(&prev_ip);
         }
         if let Some((_evicted_ip, evicted_domain)) = self.ip_to_domain.push(ip, normalized.clone())
             && evicted_domain != normalized
@@ -203,6 +229,7 @@ impl PoolInner {
                 ip_u32 + 1
             };
         }
+        true
     }
 
     fn lookup_domain(&mut self, ip: Ipv4Addr) -> Option<String> {
@@ -450,6 +477,8 @@ pub struct FakeIpDnsEngine {
     total_queries: AtomicU64,
     fake_ip_hits: AtomicU64,
     cache_hits: AtomicU64,
+    suppressed_queries: AtomicU64,
+    nxdomain_hits: AtomicU64,
     upstream_queries: AtomicU64,
     upstream_errors: AtomicU64,
     upstream_total_ms: AtomicU64,
@@ -688,6 +717,8 @@ impl FakeIpDnsEngine {
             total_queries: AtomicU64::new(0),
             fake_ip_hits: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            suppressed_queries: AtomicU64::new(0),
+            nxdomain_hits: AtomicU64::new(0),
             upstream_queries: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
             upstream_total_ms: AtomicU64::new(0),
@@ -703,6 +734,14 @@ impl FakeIpDnsEngine {
             .store(prev.fake_ip_hits.load(Ordering::Relaxed), Ordering::Relaxed);
         self.cache_hits
             .store(prev.cache_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.suppressed_queries.store(
+            prev.suppressed_queries.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.nxdomain_hits.store(
+            prev.nxdomain_hits.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.upstream_queries.store(
             prev.upstream_queries.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -728,7 +767,7 @@ impl FakeIpDnsEngine {
             if let Ok(v4) = entry.ip.parse::<Ipv4Addr>()
                 && !self.should_bypass_fake_ip(&entry.domain)
             {
-                guard.insert_preserved(v4, &entry.domain, self.net);
+                let _ = guard.insert_preserved(v4, &entry.domain, self.net);
             }
         }
     }
@@ -1236,6 +1275,15 @@ impl FakeIpDnsEngine {
         }
     }
 
+    async fn exchange_single_upstream(
+        &self,
+        upstream: &DnsUpstream,
+        raw_query: &[u8],
+    ) -> Result<Vec<u8>> {
+        let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
+        Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await
+    }
+
     async fn exchange_with_upstream_slice(
         &self,
         slice: &[DnsUpstream],
@@ -1243,22 +1291,64 @@ impl FakeIpDnsEngine {
     ) -> Result<Vec<u8>> {
         self.upstream_queries.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        let record_ok = |resp: Vec<u8>| -> Result<Vec<u8>> {
+            let ms = started.elapsed().as_millis() as u64;
+            self.upstream_total_ms.fetch_add(ms, Ordering::Relaxed);
+            self.upstream_max_ms.fetch_max(ms, Ordering::Relaxed);
+            Ok(resp)
+        };
+
         let mut last_err = ProxyError::Dns("no DNS upstreams configured".into());
-        for upstream in slice {
-            let ips = match self.resolve_bootstrap_host(&upstream.endpoint_host()).await {
-                Ok(v) => v,
-                Err(e) => {
-                    last_err = e;
-                    continue;
+        let remaining = if slice.len() >= 2
+            && matches!(
+                (&slice[0], &slice[1]),
+                (DnsUpstream::Udp(_), DnsUpstream::Udp(_))
+            ) {
+            let mut fut0 = Box::pin(self.exchange_single_upstream(&slice[0], raw_query));
+            let mut hedge_delay = std::pin::pin!(tokio::time::sleep(Duration::from_millis(250)));
+
+            tokio::select! {
+                res0 = &mut fut0 => {
+                    match res0 {
+                        Ok(resp) => return record_ok(resp),
+                        Err(_e0) => match Box::pin(self.exchange_single_upstream(&slice[1], raw_query)).await {
+                            Ok(resp) => return record_ok(resp),
+                            Err(e1) => last_err = e1,
+                        },
+                    }
                 }
-            };
-            match upstream.exchange(&ips, raw_query, &self.extra_ca_der).await {
-                Ok(resp) => {
-                    let ms = started.elapsed().as_millis() as u64;
-                    self.upstream_total_ms.fetch_add(ms, Ordering::Relaxed);
-                    self.upstream_max_ms.fetch_max(ms, Ordering::Relaxed);
-                    return Ok(resp);
+                _ = &mut hedge_delay => {
+                    let mut fut1 = Box::pin(self.exchange_single_upstream(&slice[1], raw_query));
+                    tokio::select! {
+                        res0 = &mut fut0 => {
+                            match res0 {
+                                Ok(resp) => return record_ok(resp),
+                                Err(_e0) => match fut1.await {
+                                    Ok(resp) => return record_ok(resp),
+                                    Err(e1) => last_err = e1,
+                                },
+                            }
+                        }
+                        res1 = &mut fut1 => {
+                            match res1 {
+                                Ok(resp) => return record_ok(resp),
+                                Err(e1) => match fut0.await {
+                                    Ok(resp) => return record_ok(resp),
+                                    Err(_e0) => last_err = e1,
+                                },
+                            }
+                        }
+                    }
                 }
+            }
+            &slice[2..]
+        } else {
+            slice
+        };
+
+        for upstream in remaining {
+            match Box::pin(self.exchange_single_upstream(upstream, raw_query)).await {
+                Ok(resp) => return record_ok(resp),
                 Err(e) => last_err = e,
             }
         }
@@ -1592,7 +1682,7 @@ impl FakeIpDnsEngine {
             return cached;
         }
 
-        let (resolved, min_pos_ttl, _, _, _) = self
+        let (resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata) = self
             .query_slice_ips(&self.direct_upstreams, &normalized)
             .await;
 
@@ -1606,6 +1696,23 @@ impl FakeIpDnsEngine {
                 },
             );
             return Ok(resolved);
+        }
+
+        if saw_nxdomain || saw_nodata {
+            let neg_ttl_secs = min_neg_ttl.unwrap_or(5).clamp(2, 60);
+            self.direct_ip_cache.lock().put(
+                normalized.clone(),
+                CachedIpResolution::Negative {
+                    expires_at: Instant::now() + Duration::from_secs(neg_ttl_secs),
+                    nxdomain: saw_nxdomain,
+                },
+            );
+            drop(inflight_guard);
+            return Err(ProxyError::Dns(if saw_nxdomain {
+                format!("DNS NXDOMAIN for '{normalized}'")
+            } else {
+                format!("DNS resolution failed for '{normalized}'")
+            }));
         }
 
         drop(inflight_guard);
@@ -1751,9 +1858,9 @@ impl FakeIpDnsEngine {
                     },
                 );
             }
-            return Err(ProxyError::Dns(format!(
-                "nameserver-policy DNS resolution failed for proxy server '{clean}'"
-            )));
+            return Err(ProxyError::Dns(
+                "nameserver-policy DNS resolution failed for proxy server".into(),
+            ));
         }
 
         // 4. Configured `nameserver` / `fallback` & `direct-nameserver`
@@ -1785,9 +1892,9 @@ impl FakeIpDnsEngine {
             .filter(|ip| !self.is_fake_ip(*ip))
             .collect();
         if ips.is_empty() {
-            return Err(ProxyError::Dns(format!(
-                "unable to resolve real IP for proxy server '{clean}'"
-            )));
+            return Err(ProxyError::Dns(
+                "unable to resolve real IP for proxy server".into(),
+            ));
         }
         cache_and_return(ips, Some(60))
     }
@@ -1798,6 +1905,63 @@ impl FakeIpDnsEngine {
 
     pub fn entry_count(&self) -> usize {
         self.pool.lock().ip_to_domain.len()
+    }
+
+    /// Persist up to `2048` MRU Fake-IP <-> domain mappings atomically via a sibling `.json.tmp` file.
+    pub fn save_to_path(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let mut entries = self.entries_snapshot();
+        entries.truncate(MAX_PERSISTED_FAKE_IP_ENTRIES);
+        let saved_count = entries.len();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let payload = PersistedFakeIpState {
+            version: 1,
+            fake_ip_range: self.net.to_string(),
+            saved_at_epoch_ms: current_epoch_ms(),
+            entries,
+        };
+        let encoded = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, &encoded)?;
+        if let Err(err) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        Ok(saved_count)
+    }
+
+    /// Restore persisted Fake-IP <-> domain mappings from `path`, preserving MRU order and
+    /// skipping missing/corrupt files, mismatched `fake-ip-range`, entries older than 7 days, or bypassed domains.
+    pub fn load_from_path(&self, path: &std::path::Path) -> usize {
+        let Ok(raw) = std::fs::read(path) else {
+            return 0;
+        };
+        let Ok(parsed) = serde_json::from_slice::<PersistedFakeIpState>(&raw) else {
+            return 0;
+        };
+        if parsed.version != 1 || parsed.fake_ip_range != self.net.to_string() {
+            return 0;
+        }
+        let now_ms = current_epoch_ms();
+        if now_ms > parsed.saved_at_epoch_ms
+            && (now_ms - parsed.saved_at_epoch_ms) > MAX_FAKE_IP_PERSIST_AGE_MS
+        {
+            return 0;
+        }
+        let mut loaded = 0usize;
+        let mut guard = self.pool.lock();
+        for entry in parsed.entries.into_iter().rev() {
+            if let Ok(v4) = entry.ip.parse::<Ipv4Addr>()
+                && !self.should_bypass_fake_ip(&entry.domain)
+                && guard.insert_preserved(v4, &entry.domain, self.net)
+            {
+                loaded += 1;
+            }
+        }
+        loaded
     }
 
     pub fn total_queries(&self) -> u64 {
@@ -1814,12 +1978,35 @@ impl FakeIpDnsEngine {
             total_queries: self.total_queries.load(Ordering::Relaxed),
             fake_ip_hits: self.fake_ip_hits.load(Ordering::Relaxed),
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            suppressed_queries: self.suppressed_queries.load(Ordering::Relaxed),
+            nxdomain_hits: self.nxdomain_hits.load(Ordering::Relaxed),
             upstream_queries: up_q,
             upstream_errors: up_err,
             upstream_avg_ms: avg_ms,
             upstream_max_ms: self.upstream_max_ms.load(Ordering::Relaxed),
             active_fake_ip_entries: self.entry_count(),
         }
+    }
+
+    fn has_cached_nxdomain(&self, normalized: &str) -> bool {
+        let now = Instant::now();
+        let in_direct = matches!(
+            self.direct_ip_cache.lock().peek(normalized),
+            Some(CachedIpResolution::Negative {
+                expires_at,
+                nxdomain: true,
+            }) if *expires_at > now
+        );
+        if in_direct {
+            return true;
+        }
+        matches!(
+            self.real_ip_cache.lock().peek(normalized),
+            Some(CachedIpResolution::Negative {
+                expires_at,
+                nxdomain: true,
+            }) if *expires_at > now
+        )
     }
 
     /// Process a raw RFC 1035 DNS request packet, returning the encoded DNS response packet.
@@ -1831,6 +2018,7 @@ impl FakeIpDnsEngine {
 
         // Built-in localhost resolution
         if normalized == "localhost" {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return match query.question.qtype {
                 QTYPE_A => Ok(query.build_response(
                     raw_query,
@@ -1850,11 +2038,13 @@ impl FakeIpDnsEngine {
 
         // Enforce `dns.ipv6: false` across ALL modes so IPv6 queries never leak or stall Happy-Eyeballs
         if !self.ipv6 && query.question.qtype == QTYPE_AAAA {
+            self.suppressed_queries.fetch_add(1, Ordering::Relaxed);
             return Ok(query.build_response(raw_query, 0, 5, &[]));
         }
 
         // Static `hosts` lookup takes precedence before Fake-IP allocation (matching Clash Meta / Mihomo)
         if let Some(static_ips) = self.lookup_static_hosts_raw(&normalized) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return match query.question.qtype {
                 QTYPE_A => {
                     let answers: Vec<DnsAnswerData> = static_ips
@@ -1892,11 +2082,20 @@ impl FakeIpDnsEngine {
                 self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(query.build_ptr_response(raw_query, 1, &host));
             }
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.nxdomain_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(query.build_response(raw_query, 3, 1, &[]));
         }
 
         if self.enabled && self.fake_ip_mode && !self.should_bypass_fake_ip(&normalized) {
             match query.question.qtype {
+                QTYPE_A | QTYPE_AAAA | QTYPE_SVCB | QTYPE_HTTPS
+                    if self.has_cached_nxdomain(&normalized) =>
+                {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    self.nxdomain_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(query.build_response(raw_query, 3, 5, &[]));
+                }
                 QTYPE_A => {
                     self.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
                     let fake_ip = self.assign_fake_ip(&normalized);
@@ -2123,7 +2322,7 @@ fn parse_in_addr_arpa_v4(normalized: &str) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
     use crate::dns::wire::{
-        QCLASS_IN, QTYPE_MX, QTYPE_TXT, decode_domain_name, encode_domain_name,
+        QCLASS_IN, QTYPE_MX, QTYPE_TXT, decode_domain_name, dns_response_rcode, encode_domain_name,
     };
 
     #[tokio::test]
@@ -2261,5 +2460,204 @@ mod tests {
         for (domain, &ip) in &pool.domain_to_ip {
             assert_eq!(pool.ip_to_domain.peek(&ip), Some(domain));
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_direct_ips_caches_nxdomain_without_falling_back_to_real_ips() {
+        let direct_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_sock.local_addr().unwrap();
+        let real_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let real_addr = real_sock.local_addr().unwrap();
+
+        let direct_hits = Arc::new(AtomicU64::new(0));
+        let real_hits = Arc::new(AtomicU64::new(0));
+
+        let direct_hits_bg = Arc::clone(&direct_hits);
+        let direct_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = direct_sock.recv_from(&mut buf).await {
+                direct_hits_bg.fetch_add(1, Ordering::Relaxed);
+                let req = &buf[..n];
+                let parsed = DnsQueryPacket::parse(req).unwrap();
+                let resp = parsed.build_response(req, 3, 30, &[]);
+                let _ = direct_sock.send_to(&resp, peer).await;
+            }
+        });
+
+        let real_hits_bg = Arc::clone(&real_hits);
+        let real_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = real_sock.recv_from(&mut buf).await {
+                real_hits_bg.fetch_add(1, Ordering::Relaxed);
+                let req = &buf[..n];
+                let parsed = DnsQueryPacket::parse(req).unwrap();
+                let resp = parsed.build_response(
+                    req,
+                    0,
+                    60,
+                    &[DnsAnswerData::A(Ipv4Addr::new(198, 51, 100, 42))],
+                );
+                let _ = real_sock.send_to(&resp, peer).await;
+            }
+        });
+
+        let cfg = DnsConfig {
+            ipv6: false,
+            direct_nameserver: vec![direct_addr.to_string()],
+            nameserver: vec![real_addr.to_string()],
+            fallback: Vec::new(),
+            ..DnsConfig::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        let err1 = engine
+            .resolve_direct_ips("missing-cn.example.test")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err1.contains("NXDOMAIN"), "unexpected error: {err1}");
+        assert_eq!(direct_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            real_hits.load(Ordering::Relaxed),
+            0,
+            "authoritative NXDOMAIN from direct-nameserver must not leak to nameserver"
+        );
+
+        // Second lookup must hit direct_ip_cache without re-querying direct_sock or real_sock
+        let err2 = engine
+            .resolve_direct_ips("missing-cn.example.test")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("NXDOMAIN"), "unexpected cached error: {err2}");
+        assert_eq!(direct_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(real_hits.load(Ordering::Relaxed), 0);
+
+        direct_task.abort();
+        real_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fake_ip_short_circuits_cached_nxdomain_and_assigns_fake_ip_otherwise() {
+        let nx_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nx_addr = nx_sock.local_addr().unwrap();
+
+        let nx_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = nx_sock.recv_from(&mut buf).await {
+                let req = &buf[..n];
+                let parsed = DnsQueryPacket::parse(req).unwrap();
+                let resp = parsed.build_response(req, 3, 30, &[]);
+                let _ = nx_sock.send_to(&resp, peer).await;
+            }
+        });
+
+        let mut policy = HashMap::new();
+        policy.insert(
+            "+.real-nx.example.test".to_string(),
+            vec![nx_addr.to_string()],
+        );
+        let cfg = DnsConfig {
+            ipv6: false,
+            direct_nameserver: vec![nx_addr.to_string()],
+            nameserver: vec![nx_addr.to_string()],
+            nameserver_policy: policy,
+            fallback: Vec::new(),
+            ..DnsConfig::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        // Populate direct_ip_cache and real_ip_cache with active NXDOMAIN entries
+        assert!(
+            engine
+                .resolve_direct_ips("dead1.example.test")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .resolve_real_ips("sub.real-nx.example.test")
+                .await
+                .is_err()
+        );
+
+        // Fake-IP DNS packet handler must return RCODE=3 (NXDOMAIN) for both cached NXDOMAINs
+        let q_dead1 = build_dns_query(0x2001, "dead1.example.test", QTYPE_A);
+        let r_dead1 = engine.handle_dns_packet(&q_dead1).await.unwrap();
+        assert_eq!(dns_response_rcode(&r_dead1).unwrap(), 3);
+        assert!(extract_ip_answers(&r_dead1).unwrap().is_empty());
+
+        let q_dead2 = build_dns_query(0x2002, "sub.real-nx.example.test", QTYPE_A);
+        let r_dead2 = engine.handle_dns_packet(&q_dead2).await.unwrap();
+        assert_eq!(dns_response_rcode(&r_dead2).unwrap(), 3);
+
+        // Normal domain without cached NXDOMAIN still receives a Fake-IP
+        let q_ok = build_dns_query(0x2003, "healthy.example.test", QTYPE_A);
+        let r_ok = engine.handle_dns_packet(&q_ok).await.unwrap();
+        assert_eq!(dns_response_rcode(&r_ok).unwrap(), 0);
+        let answers = extract_ip_answers(&r_ok).unwrap();
+        assert_eq!(
+            answers,
+            vec![DnsAnswerData::A(Ipv4Addr::new(198, 18, 0, 2))]
+        );
+
+        let snap = engine.telemetry_snapshot();
+        assert_eq!(snap.nxdomain_hits, 2);
+
+        // Also verify proxy server DNS error string scrubs sensitive proxy hostname
+        let proxy_err = engine
+            .resolve_proxy_server_ips("secret-node.real-nx.example.test")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!proxy_err.contains("secret-node.real-nx.example.test"));
+
+        nx_task.abort();
+    }
+
+    #[test]
+    fn save_and_load_from_path_round_trips_fake_ip_mappings_across_restart() {
+        let persist_path = std::env::temp_dir().join(format!(
+            "rust-clash-fakeip-persist-{:032x}.json",
+            rand::random::<u128>()
+        ));
+
+        let engine1 = FakeIpDnsEngine::new(&DnsConfig::default()).unwrap();
+        let ip_a = engine1.assign_fake_ip("alpha.example.com");
+        let ip_b = engine1.assign_fake_ip("beta.example.com");
+        let ip_c = engine1.assign_fake_ip("gamma.example.com");
+        // Touch alpha so MRU order is: alpha, gamma, beta
+        assert_eq!(engine1.assign_fake_ip("alpha.example.com"), ip_a);
+
+        let saved = engine1.save_to_path(&persist_path).unwrap();
+        assert_eq!(saved, 3);
+
+        let engine2 = FakeIpDnsEngine::new(&DnsConfig::default()).unwrap();
+        let loaded = engine2.load_from_path(&persist_path);
+        assert_eq!(loaded, 3);
+
+        // MRU order preserved immediately on load (alpha is first in snapshot before lookups mutate recency)
+        let snap = engine2.entries_snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].domain, "alpha.example.com");
+        assert_eq!(snap[1].domain, "gamma.example.com");
+        assert_eq!(snap[2].domain, "beta.example.com");
+
+        assert_eq!(engine2.lookup_ip("alpha.example.com"), Some(ip_a));
+        assert_eq!(engine2.lookup_ip("beta.example.com"), Some(ip_b));
+        assert_eq!(engine2.lookup_ip("gamma.example.com"), Some(ip_c));
+        assert_eq!(
+            engine2.lookup_domain(IpAddr::V4(ip_b)).as_deref(),
+            Some("beta.example.com")
+        );
+
+        // Subsequent new assignment advances cursor past restored IPs without collision
+        let ip_d = engine2.assign_fake_ip("delta.example.com");
+        assert_ne!(ip_d, ip_a);
+        assert_ne!(ip_d, ip_b);
+        assert_ne!(ip_d, ip_c);
+        assert_eq!(engine2.assign_fake_ip("alpha.example.com"), ip_a);
+
+        let _ = std::fs::remove_file(&persist_path);
     }
 }

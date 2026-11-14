@@ -1227,6 +1227,7 @@ pub struct ProxyEngine {
     last_tun_error: RwLock<Option<String>>,
     virtual_tun: Mutex<Option<VirtualTunHandle>>,
     state_dir: RwLock<PathBuf>,
+    persist_fake_ip: std::sync::atomic::AtomicBool,
     profile_manager: RwLock<Option<Arc<crate::profile::ProfileManager>>>,
     geodata_manager: RwLock<Option<Arc<crate::router::geodata::GeoDataManager>>>,
     extra_ca_der: RwLock<Vec<CertificateDer<'static>>>,
@@ -1241,11 +1242,12 @@ pub struct ProxyEngine {
 
 impl ProxyEngine {
     pub async fn start(cfg: ClashConfig) -> Result<Arc<Self>> {
-        Self::start_internal(cfg, None, None, default_state_dir()).await
+        Self::start_internal(cfg, None, None, default_state_dir(), false).await
     }
 
     pub async fn start_with_state_dir(cfg: ClashConfig, state_dir: PathBuf) -> Result<Arc<Self>> {
-        Self::start_internal(cfg, None, None, state_dir).await
+        let persist = !state_dir.as_os_str().is_empty();
+        Self::start_internal(cfg, None, None, state_dir, persist).await
     }
 
     pub async fn start_with_options(
@@ -1255,11 +1257,13 @@ impl ProxyEngine {
         dns_seed: Option<crate::dns::PositiveDnsCacheSeed>,
         initial_selections: Option<HashMap<String, String>>,
     ) -> Result<Arc<Self>> {
+        let persist = !state_dir.as_os_str().is_empty();
         Self::start_internal_with_options(
             cfg,
             None,
             None,
             state_dir,
+            persist,
             preconnect_policy,
             dns_seed,
             initial_selections,
@@ -1271,13 +1275,14 @@ impl ProxyEngine {
         cfg: ClashConfig,
         config_path: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
-        Self::start_internal(cfg, None, config_path, default_state_dir()).await
+        let persist = config_path.is_some();
+        Self::start_internal(cfg, None, config_path, default_state_dir(), persist).await
     }
 
     pub async fn start_from_file(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let p = path.as_ref().to_path_buf();
         let cfg = ClashConfig::from_file(&p)?;
-        Self::start_internal(cfg, None, Some(p), default_state_dir()).await
+        Self::start_internal(cfg, None, Some(p), default_state_dir(), true).await
     }
 
     pub async fn start_demo(
@@ -1295,7 +1300,7 @@ impl ProxyEngine {
         if let Some(dns_l) = override_dns_listen {
             cfg.dns.listen = dns_l;
         }
-        Self::start_internal(cfg, Some(demo), None, default_state_dir()).await
+        Self::start_internal(cfg, Some(demo), None, default_state_dir(), false).await
     }
 
     /// Build a standalone [`Router`] + [`FakeIpDnsEngine`] + outbounds from `cfg` without binding
@@ -1335,24 +1340,32 @@ impl ProxyEngine {
         demo_cluster: Option<DemoCluster>,
         config_path: Option<PathBuf>,
         state_dir: PathBuf,
+        persist_fake_ip: bool,
     ) -> Result<Arc<Self>> {
         Self::start_internal_with_options(
             cfg,
             demo_cluster,
             config_path,
             state_dir,
+            persist_fake_ip,
             PreconnectPolicy::platform_default(),
             None,
             None,
         )
         .await
     }
+}
 
+const FAKE_IP_CACHE_FILENAME: &str = "fake_ip_cache.json";
+
+impl ProxyEngine {
+    #[allow(clippy::too_many_arguments)]
     async fn start_internal_with_options(
         mut cfg: ClashConfig,
         demo_cluster: Option<DemoCluster>,
         config_path: Option<PathBuf>,
         state_dir: PathBuf,
+        persist_fake_ip: bool,
         preconnect_policy: PreconnectPolicy,
         dns_seed: Option<crate::dns::PositiveDnsCacheSeed>,
         initial_selections: Option<HashMap<String, String>>,
@@ -1381,6 +1394,9 @@ impl ProxyEngine {
             &cfg.dns_with_merged_hosts(),
             &extra_ca_der,
         )?);
+        if persist_fake_ip && !state_dir.as_os_str().is_empty() && demo_cluster.is_none() {
+            let _ = dns_engine.load_from_path(&state_dir.join(FAKE_IP_CACHE_FILENAME));
+        }
         if let Some(seed) = dns_seed {
             dns_engine.seed_positive_proxy_cache(seed);
         }
@@ -1542,7 +1558,6 @@ impl ProxyEngine {
             let mut last_was_nonzero = true;
             loop {
                 if lp_tick.load(std::sync::atomic::Ordering::SeqCst)
-                    && hub_tick.active_connection_count() == 0
                     && !last_was_nonzero
                     && !hub_tick.has_unsampled_traffic()
                 {
@@ -1553,7 +1568,6 @@ impl ProxyEngine {
                     wake_lp.as_mut().enable();
                     wake_act.as_mut().enable();
                     if lp_tick.load(std::sync::atomic::Ordering::SeqCst)
-                        && hub_tick.active_connection_count() == 0
                         && !last_was_nonzero
                         && !hub_tick.has_unsampled_traffic()
                     {
@@ -1582,7 +1596,6 @@ impl ProxyEngine {
                     }
                     _ = interval.tick() => {
                         if lp_tick.load(std::sync::atomic::Ordering::SeqCst)
-                            && hub_tick.active_connection_count() == 0
                             && !last_was_nonzero
                             && !hub_tick.has_unsampled_traffic()
                         {
@@ -1707,6 +1720,7 @@ impl ProxyEngine {
             last_tun_error: RwLock::new(None),
             virtual_tun: Mutex::new(virtual_tun_opt),
             state_dir: RwLock::new(state_dir),
+            persist_fake_ip: std::sync::atomic::AtomicBool::new(persist_fake_ip),
             profile_manager: RwLock::new(None),
             geodata_manager: RwLock::new(geodata_mgr),
             extra_ca_der: RwLock::new(extra_ca_der),
@@ -2155,7 +2169,45 @@ impl ProxyEngine {
         engine._bg_tasks.lock().push(handle);
     }
 
+    pub fn is_demo_sandbox(&self) -> bool {
+        self.demo_cluster.read().is_some()
+    }
+
+    fn persist_fake_ip_cache(&self) {
+        if !self
+            .persist_fake_ip
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let dir = self.state_dir();
+        if !dir.as_os_str().is_empty() && !self.is_demo_sandbox() {
+            let _ = self
+                .router()
+                .dns()
+                .save_to_path(&dir.join(FAKE_IP_CACHE_FILENAME));
+        }
+    }
+
+    pub fn flush_dns(&self) {
+        let router = self.router();
+        router.dns().flush_cache();
+        router.bump_epoch();
+        if self
+            .persist_fake_ip
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let dir = self.state_dir();
+            if !dir.as_os_str().is_empty() {
+                let _ = std::fs::remove_file(dir.join(FAKE_IP_CACHE_FILENAME));
+            }
+        }
+    }
+
     pub fn set_low_power_mode(&self, enabled: bool) {
+        if enabled {
+            self.persist_fake_ip_cache();
+        }
         self.router().set_low_power_mode(enabled);
         let prev = self
             .low_power_mode
@@ -2248,6 +2300,10 @@ impl ProxyEngine {
     }
 
     pub fn set_state_dir_for_test(&self, dir: PathBuf) {
+        self.persist_fake_ip.store(
+            !dir.as_os_str().is_empty(),
+            std::sync::atomic::Ordering::Release,
+        );
         *self.state_dir.write() = dir;
     }
 
@@ -2348,6 +2404,10 @@ impl ProxyEngine {
             gm.attach_router_slot(Arc::downgrade(&self.router_slot));
             *self.geodata_manager.write() = Some(gm);
         }
+        if !new_dir.as_os_str().is_empty() && self.demo_cluster.read().is_none() {
+            self.persist_fake_ip
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         *self.profile_manager.write() = Some(Arc::clone(&mgr));
         if self.demo_cluster.read().is_none() {
             let prof_sel = mgr.active_selected_groups();
@@ -2374,6 +2434,8 @@ impl ProxyEngine {
             return;
         }
         let weak_eng = Arc::downgrade(self);
+        let lp = Arc::clone(&self.low_power_mode);
+        let lp_wake = Arc::clone(&self.low_power_wake);
         let mut stop_rx = self.shutdown_tx.subscribe();
 
         let handle = tokio::spawn(async move {
@@ -2382,6 +2444,25 @@ impl ProxyEngine {
             interval.tick().await;
             let mut ticks: u64 = 0;
             loop {
+                while lp.load(std::sync::atomic::Ordering::SeqCst) {
+                    let wake = lp_wake.notified();
+                    tokio::pin!(wake);
+                    wake.as_mut().enable();
+                    if !lp.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::select! {
+                        changed = stop_rx.changed() => {
+                            if changed.is_err() || *stop_rx.borrow() {
+                                return;
+                            }
+                        }
+                        _ = &mut wake => {
+                            interval.reset();
+                        }
+                    }
+                }
+
                 tokio::select! {
                     changed = stop_rx.changed() => {
                         if changed.is_err() || *stop_rx.borrow() {
@@ -2398,9 +2479,14 @@ impl ProxyEngine {
                             for id in due_ids {
                                 match mgr.refresh_subscription(&id).await {
                                     Ok((meta, cfg, is_active)) => {
+                                        let safe_name =
+                                            crate::config::uri::redact_sensitive_text(&meta.name);
                                         eng.hub.push_log(
                                             "info",
-                                            format!("Auto-updated subscription profile '{}' ({} nodes)", meta.name, meta.proxy_count),
+                                            format!(
+                                                "Auto-updated subscription profile '{safe_name}' ({} nodes)",
+                                                meta.proxy_count
+                                            ),
                                         );
                                         if is_active
                                             && eng.demo_cluster.read().is_none()
@@ -2413,15 +2499,14 @@ impl ProxyEngine {
                                         {
                                             tracing::warn!(
                                                 profile_id = %id,
-                                                profile_name = %meta.name,
+                                                profile_name = %safe_name,
                                                 error = %err,
                                                 "Failed to activate auto-updated subscription profile"
                                             );
                                             eng.hub.push_log(
                                                 "warn",
                                                 format!(
-                                                    "Auto-updated subscription '{}' could not be activated live: {err}",
-                                                    meta.name
+                                                    "Auto-updated subscription '{safe_name}' could not be activated live: {err}"
                                                 ),
                                             );
                                         }
@@ -2513,6 +2598,9 @@ impl ProxyEngine {
                 } else {
                     target_cfg.dns.listen = prev.dns.listen.clone();
                 }
+                if prev.tun.enable && !prev.tun.ipv6 {
+                    target_cfg.dns.ipv6 = false;
+                }
                 target_cfg.tun = prev.tun.clone();
                 (target_cfg, None)
             })
@@ -2562,6 +2650,9 @@ impl ProxyEngine {
                         demo_cfg.dns.enable = false;
                     } else {
                         demo_cfg.dns.listen = prev.dns.listen.clone();
+                    }
+                    if prev.tun.enable && !prev.tun.ipv6 {
+                        demo_cfg.dns.ipv6 = false;
                     }
                     demo_cfg.tun = prev.tun.clone();
                     (demo_cfg, None)
@@ -2858,6 +2949,7 @@ impl ProxyEngine {
             &extra_ca,
         )?);
         new_dns.import_entries_from(prev_router.dns());
+        self.persist_fake_ip_cache();
         let new_outbounds =
             build_outbounds_with_dns(&new_cfg.proxies, &extra_ca, Some(Arc::clone(&new_dns)))?;
         let mmdb = match load_optional_mmdb(&new_cfg)? {
@@ -3380,6 +3472,7 @@ impl ProxyEngine {
     }
 
     pub fn shutdown(&self) {
+        self.persist_fake_ip_cache();
         let _ = self.shutdown_tx.send(true);
         if let Some(os_guard) = self.active_os_tun.write().take() {
             os_guard.stop_now();

@@ -74,6 +74,7 @@ import io.github.rustclashlabs.rustclash.ui.model.DiagnosticsFilter
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
+import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -794,7 +795,7 @@ private fun RuleExplainAndTableTab(
                                     }
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = "${diag.targetHost}:${diag.targetPort}",
+                                        text = NodeImportSupport.formatHostPort(diag.targetHost, diag.targetPort),
                                         style = MaterialTheme.typography.labelMedium,
                                         color = sevFg,
                                     )

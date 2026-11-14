@@ -65,13 +65,7 @@ pub fn redact_sensitive_text(raw: &str) -> String {
         let mut cursor = 0usize;
         while let Some(rel) = out[cursor..].to_ascii_lowercase().find(scheme) {
             let start = cursor + rel;
-            let end = out[start..]
-                .find(|c: char| {
-                    c.is_whitespace()
-                        || matches!(c, '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';')
-                })
-                .map(|len| start + len)
-                .unwrap_or(out.len());
+            let end = start + find_inline_uri_end(&out[start..], scheme.len());
             let candidate = &out[start..end];
             if candidate.len() <= scheme.len() {
                 cursor = end;
@@ -84,6 +78,22 @@ pub fn redact_sensitive_text(raw: &str) -> String {
             };
             out.replace_range(start..end, &replacement);
             cursor = start + replacement.len();
+        }
+    }
+
+    // Scrub default subscription titles `Sub (<host_or_ip>)` so provider hosts/IPs never leak
+    let sub_prefix = "Sub (";
+    let mut sub_cursor = 0usize;
+    while let Some(rel) = out[sub_cursor..].find(sub_prefix) {
+        let inner_start = sub_cursor + rel + sub_prefix.len();
+        if let Some(end_rel) = out[inner_start..].find(['\r', '\n', ')'])
+            && out.as_bytes().get(inner_start + end_rel) == Some(&b')')
+        {
+            let inner_end = inner_start + end_rel;
+            out.replace_range(inner_start..inner_end, REDACTED_SECRET);
+            sub_cursor = inner_start + REDACTED_SECRET.len() + 1;
+        } else {
+            sub_cursor = inner_start;
         }
     }
 
@@ -176,6 +186,30 @@ pub fn redact_sensitive_text(raw: &str) -> String {
     out
 }
 
+fn find_inline_uri_end(slice_from_scheme: &str, scheme_len: usize) -> usize {
+    let mut in_authority = true;
+    let mut in_ipv6_host = false;
+    for (rel, c) in slice_from_scheme[scheme_len..].char_indices() {
+        if in_authority {
+            if c == '[' {
+                in_ipv6_host = true;
+                continue;
+            }
+            if c == ']' && in_ipv6_host {
+                in_ipv6_host = false;
+                continue;
+            }
+            if matches!(c, '/' | '?' | '#') {
+                in_authority = false;
+            }
+        }
+        if c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';') {
+            return scheme_len + rel;
+        }
+    }
+    slice_from_scheme.len()
+}
+
 fn redact_non_nil_uuids(input: &str) -> String {
     let bytes = input.as_bytes();
     if bytes.len() < 36 {
@@ -217,10 +251,26 @@ fn redact_non_nil_uuids(input: &str) -> String {
 }
 
 fn redact_url_inline(raw: &str) -> String {
-    let Ok(parsed) = Url::parse(raw.trim()) else {
+    let trimmed = raw.trim();
+    if let Some(scheme) = trimmed.strip_suffix("://***REDACTED***")
+        && matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+    {
+        return format!("{}://{REDACTED_SECRET}", scheme.to_ascii_lowercase());
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
         return "***REDACTED_URL***".to_string();
     };
     let scheme = parsed.scheme();
+    let is_non_loopback_ip = match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => !v4.is_loopback(),
+        Some(url::Host::Ipv6(v6)) => {
+            !(v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
+        }
+        _ => false,
+    };
+    if is_non_loopback_ip {
+        return format!("{scheme}://{REDACTED_SECRET}");
+    }
     let Some(host) = parsed.host_str() else {
         return "***REDACTED_URL***".to_string();
     };
@@ -1982,5 +2032,35 @@ socks5://127.0.0.1:1080#Local-Socks\n";
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].name(), "Node-A");
         assert_eq!(parsed[1].name(), "Node-B");
+    }
+
+    #[test]
+    fn redact_sensitive_text_scrubs_sub_titles_and_ip_literal_urls_while_preserving_loopback_and_domains()
+     {
+        let sub_ip_title = redact_sensitive_text("Auto-updated profile 'Sub (203.0.113.124)'");
+        assert_eq!(sub_ip_title, "Auto-updated profile 'Sub (***REDACTED***)'");
+        assert!(!sub_ip_title.contains("203.0.113.124"));
+
+        let sub_domain_title = redact_sensitive_text("Sub (sub.provider.com)");
+        assert_eq!(sub_domain_title, "Sub (***REDACTED***)");
+        assert!(!sub_domain_title.contains("sub.provider.com"));
+
+        let ip_url = redact_sensitive_text("fetch https://203.0.113.124:8443/sub?token=abc failed");
+        assert_eq!(ip_url, "fetch https://***REDACTED*** failed");
+        assert!(!ip_url.contains("203.0.113.124"));
+        assert!(!ip_url.contains("abc"));
+        // Verify idempotency when redacted twice
+        assert_eq!(redact_sensitive_text(&ip_url), ip_url);
+
+        let ipv6_url =
+            redact_sensitive_text("fetch https://[2400:3200::1]:8443/sub?token=abc failed");
+        assert_eq!(ipv6_url, "fetch https://***REDACTED*** failed");
+        assert!(!ipv6_url.contains("2400:3200::1"));
+
+        let loopback_url = redact_sensitive_text("http://127.0.0.1:18080/sub?token=abc");
+        assert_eq!(loopback_url, "http://127.0.0.1:18080/***REDACTED***");
+
+        let domain_url = redact_sensitive_text("https://sub.example.com:8443/sub?token=abc");
+        assert_eq!(domain_url, "https://sub.example.com:8443/***REDACTED***");
     }
 }

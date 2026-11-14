@@ -53,6 +53,30 @@ class RustClashVpnService : VpnService() {
     @Volatile
     private var serviceDestroyedOrRevoked: Boolean = false
 
+    private val openPendingIntent: PendingIntent by lazy {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        PendingIntent.getActivity(
+            this,
+            1,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    private val stopPendingIntent: PendingIntent by lazy {
+        val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
+            action = ACTION_STOP_VPN
+        }
+        PendingIntent.getService(
+            this,
+            2,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
     companion object {
         const val ACTION_START_VPN = "io.github.rustclashlabs.rustclash.action.START_VPN"
         const val ACTION_STOP_VPN = "io.github.rustclashlabs.rustclash.action.STOP_VPN"
@@ -255,6 +279,7 @@ class RustClashVpnService : VpnService() {
                 stateDir = filesDir.absolutePath,
                 yamlConfig = storedYaml,
                 demoMode = sessionCfg.demoMode,
+                enableIpv6 = sessionCfg.enableIpv6,
             )
 
             // Guard against `onRevoke()` / `onDestroy()` / `ACTION_STOP_VPN` arriving while
@@ -302,8 +327,10 @@ class RustClashVpnService : VpnService() {
 
             registerScreenStateObserver()
             registerNetworkHandoffObserver()
-            startNotificationTicker()
-            startDebugSliceTicker()
+            if (isScreenInteractive) {
+                startNotificationTicker()
+                startDebugSliceTicker()
+            }
             RustClashTileService.requestTileSync(this)
         } catch (t: Throwable) {
             telemetryJob?.cancel()
@@ -341,6 +368,10 @@ class RustClashVpnService : VpnService() {
                         if (NativeBridge.isNativeLoaded) {
                             runCatching { NativeBridge.nativeSetLowPowerMode(true) }
                         }
+                        telemetryJob?.cancel()
+                        telemetryJob = null
+                        debugSliceJob?.cancel()
+                        debugSliceJob = null
                     }
                     Intent.ACTION_SCREEN_ON -> {
                         isScreenInteractive = true
@@ -348,16 +379,24 @@ class RustClashVpnService : VpnService() {
                         if (NativeBridge.isNativeLoaded) {
                             runCatching { NativeBridge.nativeSetLowPowerMode(false) }
                         }
-                        if (DebugLogManager.isEnabled(this@RustClashVpnService)) {
+                        if (!serviceDestroyedOrRevoked && isSessionRunningOrReconnecting()) {
+                            startNotificationTicker()
+                            startDebugSliceTicker()
+                        }
+                        if (stateTracker.state != VpnLifecycleState.RECONNECTING &&
+                            DebugLogManager.isEnabled(this@RustClashVpnService)
+                        ) {
                             val intervalMs = DebugLogManager.getSliceIntervalSecs(this@RustClashVpnService) * 1000L
                             if (DebugLogManager.currentWindowAgeMs() >= intervalMs) {
                                 serviceScope.launch {
-                                    runCatching {
-                                        DebugLogManager.captureSlice(
-                                            context = this@RustClashVpnService,
-                                            stateDir = filesDir.absolutePath,
-                                            trigger = "screen-on",
-                                        )
+                                    if (stateTracker.state != VpnLifecycleState.RECONNECTING) {
+                                        runCatching {
+                                            DebugLogManager.captureSlice(
+                                                context = this@RustClashVpnService,
+                                                stateDir = filesDir.absolutePath,
+                                                trigger = "screen-on",
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -485,10 +524,13 @@ class RustClashVpnService : VpnService() {
     private fun startDebugSliceTicker() {
         debugSliceJob?.cancel()
         debugSliceJob = serviceScope.launch {
-            while (isActive && isSessionRunningOrReconnecting()) {
+            while (isActive && isScreenInteractive && isSessionRunningOrReconnecting()) {
                 delay(30_000L)
-                if (!isScreenInteractive || stateTracker.state == VpnLifecycleState.RECONNECTING) {
-                    // Doze-friendly & reconnect-safe: stay alive across temporary underlying network loss
+                if (!isScreenInteractive) {
+                    break
+                }
+                if (stateTracker.state == VpnLifecycleState.RECONNECTING) {
+                    // Reconnect-safe: stay alive across temporary underlying network loss
                     // and flush overdue slices once RUNNING & interactive or upon disconnect.
                     continue
                 }
@@ -514,12 +556,7 @@ class RustClashVpnService : VpnService() {
         telemetryJob = serviceScope.launch {
             var lastTitle = ""
             var lastBody = ""
-            while (isActive && isSessionRunningOrReconnecting()) {
-                if (!isScreenInteractive) {
-                    // Screen is off: skip JNI status polling & SystemUI Binder IPC wakeups
-                    delay(5_000L)
-                    continue
-                }
+            while (isActive && isScreenInteractive && isSessionRunningOrReconnecting()) {
                 if (stateTracker.state == VpnLifecycleState.RECONNECTING) {
                     val nextTitle = "RustClash 网络重连中…"
                     val nextBody = "正在等待底层物理网络恢复"
@@ -532,7 +569,7 @@ class RustClashVpnService : VpnService() {
                             buildNotification(title = nextTitle, body = nextBody),
                         )
                     }
-                    delay(2_000L)
+                    delay(5_000L)
                     continue
                 }
                 val raw = NativeBridge.nativeGetStatusJson()
@@ -562,7 +599,7 @@ class RustClashVpnService : VpnService() {
                         )
                     }
                 }
-                delay(2_000L)
+                delay(5_000L)
             }
         }
     }
@@ -684,26 +721,6 @@ class RustClashVpnService : VpnService() {
     }
 
     private fun buildNotification(title: String, body: String): Notification {
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val openPending = PendingIntent.getActivity(
-            this,
-            1,
-            openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
-            action = ACTION_STOP_VPN
-        }
-        val stopPending = PendingIntent.getService(
-            this,
-            2,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(io.github.rustclashlabs.rustclash.R.drawable.ic_stat_rustclash_vpn)
             .setColor(0xFF059669.toInt())
@@ -711,13 +728,14 @@ class RustClashVpnService : VpnService() {
             .setContentText(body)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setShowWhen(false)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setContentIntent(openPending)
+            .setContentIntent(openPendingIntent)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 getString(R.string.vpn_action_disconnect),
-                stopPending,
+                stopPendingIntent,
             )
             .build()
     }

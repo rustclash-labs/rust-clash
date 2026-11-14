@@ -440,8 +440,10 @@ pub fn global_socket_protector() -> Arc<dyn SocketProtector> {
     Arc::clone(&protector_slot().read())
 }
 
-const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const HAPPY_EYEBALLS_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_HAPPY_EYEBALLS_CANDIDATES: usize = 6;
+const HAPPY_EYEBALLS_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Open a protected non-blocking TCP connection to a resolved `SocketAddr` with connect timeout and TCP keepalive.
 pub async fn protected_tcp_connect_addr(remote: SocketAddr) -> io::Result<TcpStream> {
@@ -461,12 +463,7 @@ pub async fn protected_tcp_connect_addr(remote: SocketAddr) -> io::Result<TcpStr
     let tcp_sock = TcpSocket::from_std_stream(std_stream);
     let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, tcp_sock.connect(remote))
         .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("TCP connect to {remote} timed out"),
-            )
-        })??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
@@ -522,56 +519,67 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
         _ => {}
     }
 
-    let ordered = interleave_happy_eyeballs_addrs(addrs);
-    let mut join_set = tokio::task::JoinSet::new();
-    join_set.spawn(protected_tcp_connect_addr(ordered[0]));
-    let mut next_idx = 1usize;
-    let mut last_err: Option<io::Error> = None;
+    let mut ordered = interleave_happy_eyeballs_addrs(addrs);
+    ordered.truncate(MAX_HAPPY_EYEBALLS_CANDIDATES);
 
-    while !join_set.is_empty() || next_idx < ordered.len() {
-        if join_set.is_empty() {
-            join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
-            next_idx += 1;
-        }
-        if next_idx < ordered.len() {
-            tokio::select! {
-                biased;
-                joined = join_set.join_next() => {
-                    match joined {
-                        Some(Ok(Ok(stream))) => {
-                            join_set.abort_all();
-                            return Ok(stream);
+    tokio::time::timeout(HAPPY_EYEBALLS_TOTAL_TIMEOUT, async move {
+        let mut join_set = tokio::task::JoinSet::new();
+        join_set.spawn(protected_tcp_connect_addr(ordered[0]));
+        let mut next_idx = 1usize;
+        let mut last_err: Option<io::Error> = None;
+
+        while !join_set.is_empty() || next_idx < ordered.len() {
+            if join_set.is_empty() {
+                join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
+                next_idx += 1;
+            }
+            if next_idx < ordered.len() {
+                tokio::select! {
+                    biased;
+                    joined = join_set.join_next() => {
+                        match joined {
+                            Some(Ok(Ok(stream))) => {
+                                join_set.abort_all();
+                                return Ok(stream);
+                            }
+                            Some(Ok(Err(e))) => {
+                                last_err = Some(e);
+                                join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
+                                next_idx += 1;
+                            }
+                            Some(Err(_)) | None => {}
                         }
-                        Some(Ok(Err(e))) => {
-                            last_err = Some(e);
-                            join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
-                            next_idx += 1;
-                        }
-                        Some(Err(_)) | None => {}
+                    }
+                    _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
+                        join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
+                        next_idx += 1;
                     }
                 }
-                _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
-                    join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
-                    next_idx += 1;
+            } else {
+                match join_set.join_next().await {
+                    Some(Ok(Ok(stream))) => {
+                        join_set.abort_all();
+                        return Ok(stream);
+                    }
+                    Some(Ok(Err(e))) => {
+                        last_err = Some(e);
+                    }
+                    Some(Err(_)) => {}
+                    None => break,
                 }
-            }
-        } else {
-            match join_set.join_next().await {
-                Some(Ok(Ok(stream))) => {
-                    join_set.abort_all();
-                    return Ok(stream);
-                }
-                Some(Ok(Err(e))) => {
-                    last_err = Some(e);
-                }
-                Some(Err(_)) => {}
-                None => break,
             }
         }
-    }
 
-    Err(last_err
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::HostUnreachable, "unable to connect")))
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::HostUnreachable, "unable to connect")))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TCP connect timed out",
+        ))
+    })
 }
 
 /// Resolve `host:port` for outbound proxy server dials while strictly rejecting `198.18.0.0/15` Fake-IPs
@@ -619,7 +627,7 @@ pub async fn protected_tcp_connect_host_with_dns(
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::HostUnreachable,
-            format!("DNS lookup returned no addresses for '{host}:{port}'"),
+            "DNS lookup returned no addresses for target host",
         ));
     }
     connect_protected_addrs_happy_eyeballs(&addrs).await
