@@ -18,15 +18,17 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    addr::TargetAddr,
+    addr::{HostName, TargetAddr},
     error::{ProxyError, Result},
+    outbound::{BoxedStream, OutboundHandler},
     router::Router,
-    tracker::{TelemetryHub, TrackedStream},
+    tracker::{ActiveConnection, TelemetryHub},
 };
 
 const MAX_MIXED_CONNECTIONS: usize = 1024;
 const MAX_UDP_ASSOC_INFLIGHT: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Dynamic access-control and authentication policy for the Mixed (HTTP + SOCKS5) inbound listener.
 #[derive(Clone, Debug)]
@@ -36,6 +38,8 @@ pub struct MixedInboundPolicy {
     pub credentials: Vec<(String, String)>,
     /// Allowed client source CIDRs when `allow_lan` is true. Defaults to RFC1918/CGNAT/ULA/link-local LAN subnets.
     pub lan_allowed_nets: Vec<IpNet>,
+    /// Host-local daemon ports (e.g., `external-controller`, `dns.listen`) blocked on loopback/unspecified proxy targets.
+    pub blocked_local_ports: Vec<u16>,
 }
 
 impl Default for MixedInboundPolicy {
@@ -44,6 +48,7 @@ impl Default for MixedInboundPolicy {
             allow_lan: false,
             credentials: Vec::new(),
             lan_allowed_nets: default_private_lan_nets(),
+            blocked_local_ports: Vec::new(),
         }
     }
 }
@@ -81,7 +86,13 @@ impl MixedInboundPolicy {
             allow_lan,
             credentials,
             lan_allowed_nets,
+            blocked_local_ports: Vec::new(),
         })
+    }
+
+    pub fn with_blocked_local_ports(mut self, blocked_local_ports: Vec<u16>) -> Self {
+        self.blocked_local_ports = blocked_local_ports;
+        self
     }
 
     pub fn allows_peer(&self, peer_ip: IpAddr) -> bool {
@@ -176,6 +187,7 @@ pub async fn spawn_mixed_inbound_with_policy(
         ))
     })?;
     let local_addr = listener.local_addr()?;
+    let local_mixed_port = local_addr.port();
     let conn_sem = Arc::new(Semaphore::new(MAX_MIXED_CONNECTIONS));
 
     let handle = tokio::spawn(async move {
@@ -211,7 +223,16 @@ pub async fn spawn_mixed_inbound_with_policy(
                     let hub_clone = Arc::clone(&hub);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(err) = handle_mixed_conn(tcp, peer, current_router, snap_policy, hub_clone).await {
+                        if let Err(err) = handle_mixed_conn(
+                            tcp,
+                            peer,
+                            local_mixed_port,
+                            current_router,
+                            snap_policy,
+                            hub_clone,
+                        )
+                        .await
+                        {
                             tracing::debug!("mixed connection from {peer} ended: {err}");
                         }
                     });
@@ -223,9 +244,86 @@ pub async fn spawn_mixed_inbound_with_policy(
     Ok((local_addr, handle))
 }
 
+fn is_loopback_or_unspecified_target(target: &TargetAddr) -> bool {
+    match &target.host {
+        HostName::Ip(ip) => {
+            let canon = canonical_ip(*ip);
+            canon.is_loopback() || canon.is_unspecified()
+        }
+        HostName::Domain(domain) => {
+            let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if d == "localhost" || d.ends_with(".localhost") {
+                return true;
+            }
+            if let Ok(ip) = d.parse::<IpAddr>() {
+                let canon = canonical_ip(ip);
+                return canon.is_loopback() || canon.is_unspecified();
+            }
+            false
+        }
+    }
+}
+
+fn reject_forbidden_proxy_target(
+    peer_addr: SocketAddr,
+    local_mixed_port: u16,
+    policy: &MixedInboundPolicy,
+    target: &TargetAddr,
+) -> io::Result<()> {
+    if !is_loopback_or_unspecified_target(target) {
+        return Ok(());
+    }
+    if !canonical_ip(peer_addr.ip()).is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("LAN peer {peer_addr} is forbidden from targeting host-local address {target}"),
+        ));
+    }
+    if (local_mixed_port != 0 && target.port == local_mixed_port)
+        || policy.blocked_local_ports.contains(&target.port)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "proxy self-loop to local daemon port {} ({target}) is forbidden",
+                target.port
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn connect_outbound_with_timeout(
+    outbound: &dyn OutboundHandler,
+    target: &TargetAddr,
+    conn: &ActiveConnection,
+) -> io::Result<BoxedStream> {
+    tokio::select! {
+        biased;
+        _ = conn.closed() => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "connection closed by controller during outbound dial",
+        )),
+        res = tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, outbound.connect_tcp(target)) => {
+            match res {
+                Ok(inner) => inner,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "outbound dial+handshake to {target} via '{}' timed out after {}s",
+                        outbound.name(),
+                        OUTBOUND_CONNECT_TIMEOUT.as_secs()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
 async fn handle_mixed_conn(
     mut tcp: TcpStream,
     peer: SocketAddr,
+    local_mixed_port: u16,
     router: Arc<Router>,
     policy: MixedInboundPolicy,
     hub: Arc<TelemetryHub>,
@@ -239,9 +337,9 @@ async fn handle_mixed_conn(
     }
 
     if first[0] == 0x05 {
-        handle_socks5(&mut tcp, peer, router, &policy, hub).await
+        handle_socks5(&mut tcp, peer, local_mixed_port, router, &policy, hub).await
     } else {
-        handle_http_proxy(&mut tcp, peer, router, &policy, hub).await
+        handle_http_proxy(&mut tcp, peer, local_mixed_port, router, &policy, hub).await
     }
 }
 
@@ -361,6 +459,7 @@ async fn negotiate_socks5_and_read_target(
 async fn handle_socks5(
     tcp: &mut TcpStream,
     peer: SocketAddr,
+    local_mixed_port: u16,
     router: Arc<Router>,
     policy: &MixedInboundPolicy,
     hub: Arc<TelemetryHub>,
@@ -375,6 +474,19 @@ async fn handle_socks5(
     match cmd {
         0x01 => {
             // TCP CONNECT
+            if let Err(err) =
+                reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
+            {
+                hub.push_log(
+                    "warn",
+                    format!("[SOCKS5] Blocked forbidden target {raw_target} from {peer}: {err}"),
+                );
+                let rep = socks5_reply_code_for_io_error(&err);
+                let _ = tcp
+                    .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                return Err(err);
+            }
             let decision = router
                 .route_async_with_context(
                     Some(peer.ip()),
@@ -383,7 +495,23 @@ async fn handle_socks5(
                     &raw_target,
                 )
                 .await;
-            let conn_entry = hub.register_connection_with_outbound(
+            if let Err(err) =
+                reject_forbidden_proxy_target(peer, local_mixed_port, policy, &decision.target)
+            {
+                hub.push_log(
+                    "warn",
+                    format!(
+                        "[SOCKS5] Blocked forbidden resolved target {} from {peer}: {err}",
+                        decision.target
+                    ),
+                );
+                let rep = socks5_reply_code_for_io_error(&err);
+                let _ = tcp
+                    .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                return Err(err);
+            }
+            let conn_guard = hub.register_connection_with_outbound_guard(
                 "Mixed(SOCKS5)",
                 "tcp",
                 Some(peer),
@@ -394,6 +522,7 @@ async fn handle_socks5(
                 decision.chains.clone(),
                 decision.outbound.as_ref(),
             );
+            let conn_entry = Arc::clone(conn_guard.connection());
             hub.push_log(
                 "info",
                 format!(
@@ -406,10 +535,16 @@ async fn handle_socks5(
                 ),
             );
 
-            let outbound_stream = match decision.outbound.connect_tcp(&decision.target).await {
+            let outbound_stream = match connect_outbound_with_timeout(
+                decision.outbound.as_ref(),
+                &decision.target,
+                &conn_entry,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(err) => {
-                    hub.record_connection_failed(&conn_entry.id, &err.to_string());
+                    conn_guard.record_failed(&err.to_string());
                     let rep = socks5_reply_code_for_io_error(&err);
                     let _ = tcp
                         .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -417,13 +552,12 @@ async fn handle_socks5(
                     return Err(err);
                 }
             };
-            conn_entry.mark_established();
+            conn_guard.mark_established();
 
             // Success reply: BND.ADDR 0.0.0.0:0
             tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await?;
-            let mut tracked =
-                TrackedStream::new(outbound_stream, Arc::clone(&hub), Arc::clone(&conn_entry));
+            let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
 
             tokio::select! {
                 res = tokio::io::copy_bidirectional_with_sizes(tcp, &mut tracked, 64 * 1024, 64 * 1024) => {
@@ -487,6 +621,7 @@ async fn handle_socks5(
                 let router_clone = Arc::clone(&router);
                 let inflight_sem = Arc::new(Semaphore::new(MAX_UDP_ASSOC_INFLIGHT));
                 let nat_clone = Arc::clone(&udp_nat);
+                let policy_for_udp = Arc::new(policy.clone());
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     let mut locked_client_port: Option<u16> = initial_port_lock;
@@ -507,6 +642,17 @@ async fn handle_socks5(
                         else {
                             continue;
                         };
+                        if let Err(err) = reject_forbidden_proxy_target(
+                            peer,
+                            local_mixed_port,
+                            &policy_for_udp,
+                            &raw_dst,
+                        ) {
+                            tracing::debug!(
+                                "[SOCKS5-UDP] dropped forbidden target {raw_dst} from {peer}: {err}"
+                            );
+                            continue;
+                        }
                         if locked_client_port.is_none() {
                             locked_client_port = Some(client_udp_addr.port());
                         }
@@ -517,6 +663,7 @@ async fn handle_socks5(
                         let payload = buf[3 + hdr_used..n].to_vec();
                         let router_for_pkt = Arc::clone(&router_clone);
                         let nat_inner = Arc::clone(&nat_clone);
+                        let policy_for_pkt = Arc::clone(&policy_for_udp);
                         tokio::spawn(async move {
                             let _permit = permit;
                             let decision = router_for_pkt
@@ -527,6 +674,16 @@ async fn handle_socks5(
                                     &raw_dst,
                                 )
                                 .await;
+                            if reject_forbidden_proxy_target(
+                                peer,
+                                local_mixed_port,
+                                &policy_for_pkt,
+                                &decision.target,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
                             nat_inner
                                 .send_datagram(
                                     client_udp_addr,
@@ -601,6 +758,7 @@ fn check_http_proxy_auth<'a>(
 async fn handle_http_proxy(
     tcp: &mut TcpStream,
     peer: SocketAddr,
+    local_mixed_port: u16,
     router: Arc<Router>,
     policy: &MixedInboundPolicy,
     hub: Arc<TelemetryHub>,
@@ -670,6 +828,15 @@ async fn handle_http_proxy(
         } else {
             TargetAddr::new_domain(uri_part, 443)?
         };
+        if let Err(err) = reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
+        {
+            hub.push_log(
+                "warn",
+                format!("[HTTP-CONNECT] Blocked forbidden target {raw_target} from {peer}: {err}"),
+            );
+            let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+            return Err(err);
+        }
         let decision = router
             .route_async_with_context(
                 Some(peer.ip()),
@@ -678,7 +845,20 @@ async fn handle_http_proxy(
                 &raw_target,
             )
             .await;
-        let conn_entry = hub.register_connection_with_outbound(
+        if let Err(err) =
+            reject_forbidden_proxy_target(peer, local_mixed_port, policy, &decision.target)
+        {
+            hub.push_log(
+                "warn",
+                format!(
+                    "[HTTP-CONNECT] Blocked forbidden resolved target {} from {peer}: {err}",
+                    decision.target
+                ),
+            );
+            let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+            return Err(err);
+        }
+        let conn_guard = hub.register_connection_with_outbound_guard(
             "Mixed(HTTP-CONNECT)",
             "tcp",
             Some(peer),
@@ -689,6 +869,7 @@ async fn handle_http_proxy(
             decision.chains.clone(),
             decision.outbound.as_ref(),
         );
+        let conn_entry = Arc::clone(conn_guard.connection());
         hub.push_log(
             "info",
             format!(
@@ -701,20 +882,25 @@ async fn handle_http_proxy(
             ),
         );
 
-        let outbound_stream = match decision.outbound.connect_tcp(&decision.target).await {
+        let outbound_stream = match connect_outbound_with_timeout(
+            decision.outbound.as_ref(),
+            &decision.target,
+            &conn_entry,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(err) => {
-                hub.record_connection_failed(&conn_entry.id, &err.to_string());
+                conn_guard.record_failed(&err.to_string());
                 let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
                 return Err(err);
             }
         };
-        conn_entry.mark_established();
+        conn_guard.mark_established();
 
         tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
-        let mut tracked =
-            TrackedStream::new(outbound_stream, Arc::clone(&hub), Arc::clone(&conn_entry));
+        let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
         if !trailing_body.is_empty() {
             tracked.write_all(trailing_body).await?;
         }
@@ -742,7 +928,7 @@ async fn handle_http_proxy(
                         "missing host in HTTP proxy URL",
                     )
                 })?;
-                let port = url.port().unwrap_or(80);
+                let port = url.port_or_known_default().unwrap_or(80);
                 let mut p = if url.path().is_empty() {
                     "/".to_string()
                 } else {
@@ -779,6 +965,16 @@ async fn handle_http_proxy(
                 (target, uri_part.to_string())
             };
 
+        if let Err(err) = reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
+        {
+            hub.push_log(
+                "warn",
+                format!("[HTTP] Blocked forbidden target {raw_target} from {peer}: {err}"),
+            );
+            let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+            return Err(err);
+        }
+
         let decision = router
             .route_async_with_context(
                 Some(peer.ip()),
@@ -787,7 +983,20 @@ async fn handle_http_proxy(
                 &raw_target,
             )
             .await;
-        let conn_entry = hub.register_connection_with_outbound(
+        if let Err(err) =
+            reject_forbidden_proxy_target(peer, local_mixed_port, policy, &decision.target)
+        {
+            hub.push_log(
+                "warn",
+                format!(
+                    "[HTTP] Blocked forbidden resolved target {} from {peer}: {err}",
+                    decision.target
+                ),
+            );
+            let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+            return Err(err);
+        }
+        let conn_guard = hub.register_connection_with_outbound_guard(
             "Mixed(HTTP)",
             "tcp",
             Some(peer),
@@ -798,6 +1007,7 @@ async fn handle_http_proxy(
             decision.chains.clone(),
             decision.outbound.as_ref(),
         );
+        let conn_entry = Arc::clone(conn_guard.connection());
         hub.push_log(
             "info",
             format!(
@@ -810,15 +1020,21 @@ async fn handle_http_proxy(
             ),
         );
 
-        let outbound_stream = match decision.outbound.connect_tcp(&decision.target).await {
+        let outbound_stream = match connect_outbound_with_timeout(
+            decision.outbound.as_ref(),
+            &decision.target,
+            &conn_entry,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(err) => {
-                hub.record_connection_failed(&conn_entry.id, &err.to_string());
+                conn_guard.record_failed(&err.to_string());
                 let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
                 return Err(err);
             }
         };
-        conn_entry.mark_established();
+        conn_guard.mark_established();
 
         let mut rewritten = String::with_capacity(header_text.len());
         rewritten.push_str(&format!("{method} {origin_path} {version}\r\n"));
@@ -836,8 +1052,7 @@ async fn handle_http_proxy(
         }
         rewritten.push_str("\r\n");
 
-        let mut tracked =
-            TrackedStream::new(outbound_stream, Arc::clone(&hub), Arc::clone(&conn_entry));
+        let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
         tracked.write_all(rewritten.as_bytes()).await?;
         if !trailing_body.is_empty() {
             tracked.write_all(trailing_body).await?;
@@ -855,4 +1070,83 @@ async fn handle_http_proxy(
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_forbidden_proxy_target_blocks_lan_loopback_pivot_and_self_loops() {
+        let policy = MixedInboundPolicy::from_config(true, &[], &[])
+            .unwrap()
+            .with_blocked_local_ports(vec![9090, 1053]);
+        let lan_peer: SocketAddr = "192.168.1.25:50123".parse().unwrap();
+        let lo_peer: SocketAddr = "127.0.0.1:50124".parse().unwrap();
+
+        // LAN peer cannot pivot to ANY loopback or unspecified address/domain.
+        for forbidden in [
+            "127.0.0.1:9090".parse::<TargetAddr>().unwrap(),
+            "127.0.0.1:8080".parse::<TargetAddr>().unwrap(),
+            "127.25.0.1:22".parse::<TargetAddr>().unwrap(),
+            "[::1]:9090".parse::<TargetAddr>().unwrap(),
+            "0.0.0.0:9090".parse::<TargetAddr>().unwrap(),
+            "[::]:80".parse::<TargetAddr>().unwrap(),
+            "[::ffff:127.0.0.1]:9090".parse::<TargetAddr>().unwrap(),
+            TargetAddr::new_domain("localhost", 9090).unwrap(),
+            TargetAddr::new_domain("LOCALHOST.", 3000).unwrap(),
+            TargetAddr::new_domain("admin.localhost", 8080).unwrap(),
+        ] {
+            let err = reject_forbidden_proxy_target(lan_peer, 7890, &policy, &forbidden)
+                .expect_err("LAN peer loopback/unspecified pivot must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        // LAN peer can still reach normal external targets.
+        assert!(
+            reject_forbidden_proxy_target(
+                lan_peer,
+                7890,
+                &policy,
+                &"93.184.216.34:443".parse().unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            reject_forbidden_proxy_target(
+                lan_peer,
+                7890,
+                &policy,
+                &TargetAddr::new_domain("example.com", 443).unwrap()
+            )
+            .is_ok()
+        );
+
+        // Loopback peer is blocked on self mixed port and blocked_local_ports (controller & DNS),
+        // while still allowed to reach arbitrary local mock test servers on other ephemeral ports!
+        for self_loop in [
+            "127.0.0.1:7890".parse::<TargetAddr>().unwrap(),
+            "0.0.0.0:7890".parse::<TargetAddr>().unwrap(),
+            TargetAddr::new_domain("localhost", 7890).unwrap(),
+            "127.0.0.1:9090".parse::<TargetAddr>().unwrap(),
+            "[::1]:9090".parse::<TargetAddr>().unwrap(),
+            TargetAddr::new_domain("api.localhost", 9090).unwrap(),
+            "127.0.0.1:1053".parse::<TargetAddr>().unwrap(),
+        ] {
+            let err = reject_forbidden_proxy_target(lo_peer, 7890, &policy, &self_loop)
+                .expect_err("loopback self-loop / controller port must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        assert!(
+            reject_forbidden_proxy_target(
+                lo_peer,
+                7890,
+                &policy,
+                &"127.0.0.1:43210".parse().unwrap()
+            )
+            .is_ok(),
+            "loopback client must still reach non-daemon local test servers"
+        );
+    }
 }

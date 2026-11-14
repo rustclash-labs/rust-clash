@@ -25,7 +25,7 @@ on:
         description: "Re-run Android JUnit/Robolectric + Lint during Release packaging"
         required: false
         type: boolean
-        default: false
+        default: true
       allow_ephemeral_debug_signing:
         description: "Allow ephemeral debug APK signing when ANDROID_KEYSTORE_* secrets are absent (WARNING: breaks future Android in-place upgrades)"
         required: false
@@ -45,7 +45,7 @@ env:
 
 jobs:
   prepare:
-    name: Validate Tag, Versions, Signing Key & Build Web UI
+    name: Validate Tag, Versions, Signing Key, Quality Gate & Build Web UI
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
@@ -62,10 +62,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate Release Tag, Version Alignment, Identity Privacy & Android Keystore
+      - name: Validate Release Tag, Main Branch, Version Alignment, Identity Privacy & Android Keystore
         id: validate
         env:
           EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_PLATFORMS: ${{ inputs.target_platforms }}
           REF_NAME: ${{ github.ref_name }}
@@ -78,6 +79,10 @@ jobs:
           set -euo pipefail
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+              echo "::error::ERROR: workflow_dispatch releases are only permitted from refs/heads/main (got '$WORKFLOW_REF')." >&2
+              exit 1
+            fi
             TAG="${INPUT_TAG}"
             PLATFORMS="${INPUT_PLATFORMS:-all}"
           else
@@ -94,19 +99,55 @@ jobs:
           VERSION="${TAG#v}"
           BASE_VERSION="${VERSION%%-*}"
 
-          python3 - "$BASE_VERSION" <<'PY'
+          python3 - "$BASE_VERSION" "$TAG" <<'PY'
           import json, pathlib, plistlib, re, subprocess, sys, tomllib
 
-          allowed_emails = {"rustclash.labs@proton.me", "noreply@github.com"}
-          for role, fmt in [("author", "%ae"), ("committer", "%ce")]:
-              email = subprocess.check_output(["git", "log", "-1", f"--format={fmt}", "HEAD"], text=True).strip().lower()
-              if email not in allowed_emails and not email.endswith("[bot]@users.noreply.github.com"):
-                  raise SystemExit(
-                      f"Privacy gate failed: HEAD commit {role} uses personal email '{email}'. "
-                      "Run ./scripts/setup_git_identity.sh ('RustClash Labs <rustclash.labs@proton.me>') before committing."
-                  )
-
           expected = sys.argv[1]
+          release_tag = sys.argv[2]
+
+          allowed_emails = {"rustclash.labs@proton.me", "noreply@github.com"}
+          allowed_names = {"rustclash labs", "github"}
+
+          tags_out = subprocess.check_output(
+              ["git", "tag", "--list", "v*.*.*", "--sort=-v:refname"], text=True
+          ).splitlines()
+          prev_tag = next((t.strip() for t in tags_out if t.strip() and t.strip() != release_tag), "")
+
+          rev_spec = "HEAD"
+          if prev_tag:
+              anc = subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", prev_tag, "HEAD"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              if anc.returncode == 0:
+                  rev_spec = f"{prev_tag}..HEAD"
+
+          cmd = (
+              ["git", "log", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce", rev_spec]
+              if ".." in rev_spec
+              else ["git", "log", "-1", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce", "HEAD"]
+          )
+          raw = subprocess.check_output(cmd, text=True).strip()
+          if not raw:
+              raw = subprocess.check_output(
+                  ["git", "log", "-1", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce", "HEAD"],
+                  text=True,
+              ).strip()
+
+          for line in [ln for ln in raw.splitlines() if ln.strip()]:
+              sha, an, ae, cn, ce = line.split("\x1f")
+              for role, name, email in [("author", an, ae), ("committer", cn, ce)]:
+                  norm_email = email.strip().lower()
+                  norm_name = name.strip().lower()
+                  email_ok = norm_email in allowed_emails or norm_email.endswith("[bot]@users.noreply.github.com")
+                  name_ok = norm_name in allowed_names or norm_name.endswith("[bot]")
+                  if not email_ok or not name_ok:
+                      raise SystemExit(
+                          f"Privacy gate failed: commit {sha[:12]} {role} '{name} <{email}>' exposes a personal identity. "
+                          "Run ./scripts/setup_git_identity.sh ('RustClash Labs <rustclash.labs@proton.me>') before committing."
+                      )
+
           cargo_ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
           tauri_ver = json.loads(pathlib.Path("crates/tauri-app/tauri.conf.json").read_text())["version"]
           ui_ver = json.loads(pathlib.Path("ui/package.json").read_text())["version"]
@@ -182,7 +223,7 @@ jobs:
           raw = "".join(os.environ["KS_B64"].split())
           pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(raw))
           PY
-              CERT_FP="$(keytool -list -v -keystore "$TMP_KS" -storepass "$KS_PASS" -alias "$KS_ALIAS" | grep -i 'SHA256:' | head -n 1 | sed 's/^[[:space:]]*//')"
+              CERT_FP="$(keytool -list -v -keystore "$TMP_KS" -storepass:env KS_PASS -alias "$KS_ALIAS" | grep -i 'SHA256:' | head -n 1 | sed 's/^[[:space:]]*//')"
               if [[ -z "$CERT_FP" ]]; then
                 echo "::error::Failed reading signing certificate for alias '$KS_ALIAS' from ANDROID_KEYSTORE_BASE64." >&2
                 exit 1
@@ -224,11 +265,27 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - name: Build Production Embedded Web Console Once
+      - name: Test & Build Production Embedded Web Console Once
         working-directory: ui
         run: |
           npm ci
+          npm test
           npm run build
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "release-quality-gate"
+
+      - name: Workspace Format, Clippy & Unit/Integration Quality Gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --exclude tauri-app --all-targets -- -D warnings
+          cargo test --locked --workspace --exclude tauri-app
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -256,6 +313,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
+          components: rustfmt, clippy
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -269,6 +327,10 @@ jobs:
             librsvg2-dev \
             patchelf \
             rpm
+      - name: Verify Tauri Desktop Lint & Unit Tests
+        run: |
+          cargo clippy --locked -p tauri-app --all-targets --features desktop -- -D warnings
+          cargo test --locked -p tauri-app --features desktop
       - name: Build Standalone CLI & Tauri Linux Packages (deb + rpm)
         run: |
           set -euo pipefail
@@ -464,6 +526,7 @@ jobs:
       - name: Build & Verify Signed Android Split APKs, Universal APK & AAB Packages
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           SIGNING_MODE: ${{ needs.prepare.outputs.android_signing_mode }}
           RUN_ANDROID_TESTS: ${{ inputs.run_android_tests }}
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -473,10 +536,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-out
-          if [[ "${RUN_ANDROID_TESTS:-false}" == "true" ]]; then
-            export ANDROID_SKIP_CHECKS="0"
-          else
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "${RUN_ANDROID_TESTS}" == "false" ]]; then
             export ANDROID_SKIP_CHECKS="1"
+          else
+            export ANDROID_SKIP_CHECKS="0"
           fi
 
           if [[ "$SIGNING_MODE" == "release" ]]; then

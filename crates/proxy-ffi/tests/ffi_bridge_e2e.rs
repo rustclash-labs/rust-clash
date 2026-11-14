@@ -69,6 +69,15 @@ fn macos_ne_c_abi_lifecycle_and_l3_packet_pump_e2e() {
     let raw_l3 = build_raw_ipv4_udp_packet([198, 18, 0, 9], [198, 18, 0, 1], 53000, 53, &dns_q);
     assert!(unsafe { rc_ne_push_inbound_packet(handle, raw_l3.as_ptr(), raw_l3.len()) });
 
+    // Undersized buffer MUST return `-2` WITHOUT dropping the queued outbound packet!
+    let mut tiny_buf = [0u8; 16];
+    let too_small =
+        unsafe { rc_ne_wait_outbound_packet(handle, tiny_buf.as_mut_ptr(), tiny_buf.len(), 2000) };
+    assert_eq!(
+        too_small, -2,
+        "rc_ne_wait_outbound_packet must return -2 instead of dropping oversized packet"
+    );
+
     let mut out_buf = vec![0u8; 4096];
     let got_len =
         unsafe { rc_ne_wait_outbound_packet(handle, out_buf.as_mut_ptr(), out_buf.len(), 2000) };
@@ -1445,6 +1454,9 @@ fn android_debug_diagnostic_snapshot_live_offline_and_redaction_e2e() {
         let sub_srv_addr = sub_listener.local_addr().unwrap();
         let sub_yaml = format!(
             r#"mixed-port: 0
+allow-lan: true
+bind-address: "0.0.0.0"
+secret: "YAML_CONTROLLER_SECRET_7777"
 mode: rule
 unified-delay: true
 dns:
@@ -1532,6 +1544,7 @@ rules:
     assert!(!offline_raw_str.contains(sub_secret_token));
     assert!(!offline_raw_str.contains(socks_secret_pass));
     assert!(!offline_raw_str.contains(vless_secret_uuid));
+    assert!(!offline_raw_str.contains("YAML_CONTROLLER_SECRET_7777"));
 
     // Start Android VPN -> debugMode propagates automatically onto live TelemetryHub
     let since_ms = proxy_core::tracker::TelemetryHub::now_ms().saturating_sub(50);
@@ -1550,7 +1563,15 @@ rules:
     )
     .expect("start Android VPN with debug logging enabled");
     assert_eq!(started["ok"], true);
-    let live_api_secret = started["apiSecret"].as_str().unwrap().to_string();
+    assert_eq!(
+        started["apiPort"], 0,
+        "Android VPN runtime must NOT expose a loopback HTTP API server"
+    );
+    assert_eq!(started["apiUrl"], "");
+    assert!(
+        started.get("apiSecret").is_none(),
+        "Android VPN start payload must not include an HTTP API secret"
+    );
     let mixed_port = started["mixedPort"].as_u64().unwrap() as u16;
     assert!(mixed_port > 0);
 
@@ -1691,7 +1712,7 @@ rules:
         "failedConnections must capture fail.broken.example -> Dead-VLESS-Node"
     );
 
-    // Secrets, UUIDs, passwords, subscription tokens, and ephemeral apiSecret MUST be 100% absent
+    // Secrets, UUIDs, passwords, subscription tokens, and YAML controller secrets MUST be 100% absent
     assert!(
         !live_str.contains(sub_secret_token),
         "subscription token must be redacted"
@@ -1705,8 +1726,8 @@ rules:
         "VLESS UUID must be redacted"
     );
     assert!(
-        !live_str.contains(&live_api_secret),
-        "ephemeral apiSecret must never appear in debug snapshot"
+        !live_str.contains("YAML_CONTROLLER_SECRET_7777"),
+        "YAML controller secret must never appear in debug snapshot"
     );
 
     android_set_debug_logging_core(false);

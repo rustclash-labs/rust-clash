@@ -373,7 +373,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
     try {
       if (plan.action === "disable") {
-        saveTakeoverPref(plan.nextSavedPref);
         let sysproxyDisabled = false;
         try {
           if (sysproxyEnabled) {
@@ -383,6 +382,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           if (tunEnabled) {
             await patchConfig({ tun: { enable: false } });
           }
+          saveTakeoverPref(plan.nextSavedPref);
         } catch (stepErr) {
           // Roll back partial SysProxy mutation if TUN teardown failed
           if (sysproxyDisabled) {

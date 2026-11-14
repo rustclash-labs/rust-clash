@@ -630,6 +630,24 @@ impl ClashConfig {
             .map_err(|e| ProxyError::Config(format!("YAML serialize error: {e}")))
     }
 
+    /// Ensures `self.secret` contains a non-empty controller secret, generating a
+    /// 256-bit OS CSPRNG hex secret if `self.secret` is `None` or whitespace-only.
+    pub fn ensure_ephemeral_secret(&mut self) -> String {
+        if let Some(existing) = self
+            .secret
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let normalized = existing.to_string();
+            self.secret = Some(normalized.clone());
+            return normalized;
+        }
+        let secret = crate::api::generate_ephemeral_secret();
+        self.secret = Some(secret.clone());
+        secret
+    }
+
     /// Managed default split-tunneling rule template (`smart-cn`):
     /// - LAN / mDNS domains (`local`, `lan`, `home.arpa`) & private IPs -> `DIRECT`
     /// - Known international websites (`GEOSITE,geolocation-!cn`) -> `<primary_group>` (0 local DNS leak!)
@@ -724,10 +742,38 @@ rules:
         for prov in copy.rule_providers.values_mut() {
             if let Some(ref mut u) = prov.url
                 && let Ok(mut parsed) = url::Url::parse(u)
-                && (!parsed.username().is_empty() || parsed.password().is_some())
             {
-                let _ = parsed.set_password(Some(REDACTED_SECRET));
-                *u = parsed.to_string();
+                let mut changed = false;
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    let _ = parsed.set_password(Some(REDACTED_SECRET));
+                    changed = true;
+                }
+                if parsed.query().is_some() {
+                    let pairs: Vec<(String, String)> = parsed
+                        .query_pairs()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect();
+                    if pairs
+                        .iter()
+                        .any(|(k, v)| !v.is_empty() && is_sensitive_url_query_key(k))
+                    {
+                        {
+                            let mut qp = parsed.query_pairs_mut();
+                            qp.clear();
+                            for (k, v) in pairs {
+                                if !v.is_empty() && is_sensitive_url_query_key(&k) {
+                                    qp.append_pair(&k, REDACTED_SECRET);
+                                } else {
+                                    qp.append_pair(&k, &v);
+                                }
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+                if changed {
+                    *u = parsed.to_string();
+                }
             }
         }
         copy
@@ -757,7 +803,7 @@ rules:
             if prov
                 .url
                 .as_deref()
-                .is_some_and(|u| u.contains(REDACTED_SECRET))
+                .is_some_and(url_contains_redacted_placeholder)
                 && let Some(prev_prov) = prev.rule_providers.get(k)
             {
                 prov.url = prev_prov.url.clone();
@@ -847,6 +893,9 @@ rules:
                     "rule-provider '{pname}' has unsupported behavior '{}'",
                     pcfg.behavior
                 )));
+            }
+            if let Some(ref raw_path) = pcfg.path {
+                validate_rule_provider_path(pname, &pt, raw_path)?;
             }
         }
 
@@ -2004,7 +2053,101 @@ fn break_subscription_group_cycles(groups: &mut [ProxyGroupConfig], remaining_co
     }
 }
 
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "token"
+            | "secret"
+            | "key"
+            | "password"
+            | "auth"
+            | "access_token"
+            | "passkey"
+            | "apikey"
+            | "api_key"
+            | "sig"
+            | "signature"
+    )
+}
+
+fn url_contains_redacted_placeholder(url: &str) -> bool {
+    url.contains(REDACTED_SECRET)
+        || url.contains("%2A%2A%2AREDACTED%2A%2A%2A")
+        || url.contains("%2a%2a%2aredacted%2a%2a%2a")
+}
+
+fn validate_rule_provider_path(pname: &str, pt: &str, raw_path: &str) -> Result<()> {
+    if raw_path.chars().any(|c| c.is_control()) {
+        return Err(ProxyError::Config(format!(
+            "rule-provider '{pname}' path contains control or null bytes"
+        )));
+    }
+    let has_parent_traversal = Path::new(raw_path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+        || raw_path.split(['/', '\\']).any(|seg| seg == "..");
+    if has_parent_traversal {
+        return Err(ProxyError::Config(format!(
+            "rule-provider '{pname}' path '{raw_path}' must not contain parent-directory ('..') traversal"
+        )));
+    }
+    if pt == "http" && !raw_path.is_empty() {
+        let trimmed = raw_path.trim();
+        let p_obj = Path::new(trimmed);
+        let has_root_or_prefix = trimmed.is_empty()
+            || Path::new(raw_path).is_absolute()
+            || p_obj.is_absolute()
+            || trimmed.starts_with('/')
+            || trimmed.starts_with('\\')
+            || (trimmed.len() >= 2
+                && trimmed.as_bytes()[0].is_ascii_alphabetic()
+                && trimmed.as_bytes()[1] == b':')
+            || p_obj.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::ParentDir
+                )
+            });
+        if has_root_or_prefix {
+            return Err(ProxyError::Config(format!(
+                "http rule-provider '{pname}' path '{raw_path}' must be a confined relative path"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn sanitize_loopback_external_controller(raw: &str, mixed_port: u16) -> String {
+    let trimmed = raw.trim();
+    let parsed_port = trimmed
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|sa| sa.port())
+        .or_else(|| {
+            trimmed
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.trim().parse::<u16>().ok())
+        })
+        .filter(|p| *p > 0);
+    let mut port = parsed_port.unwrap_or(9090);
+    if mixed_port > 0 && port == mixed_port {
+        port = if mixed_port == 9090 { 9091 } else { 9090 };
+    }
+    format!("127.0.0.1:{port}")
+}
+
 fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: &HashSet<String>) {
+    // Neutralize dangerous listener, authentication, secret, and privilege-escalation fields
+    // from untrusted remote subscription payloads.
+    cfg.secret = None;
+    cfg.allow_lan = false;
+    cfg.bind_address = "127.0.0.1".to_string();
+    cfg.lan_allowed_ips.clear();
+    cfg.authentication.clear();
+    cfg.tun.enable = false;
+
     if !(576..=65535).contains(&cfg.tun.mtu) {
         cfg.tun.mtu = 1500;
     }
@@ -2015,16 +2158,8 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
     {
         cfg.mmdb_path = None;
     }
-    if let Ok(ec_sa) = cfg.external_controller.trim().parse::<SocketAddr>()
-        && cfg.mixed_port > 0
-        && ec_sa.port() == cfg.mixed_port
-    {
-        cfg.external_controller = if cfg.mixed_port == 9090 {
-            "127.0.0.1:9091".to_string()
-        } else {
-            "127.0.0.1:9090".to_string()
-        };
-    }
+    cfg.external_controller =
+        sanitize_loopback_external_controller(&cfg.external_controller, cfg.mixed_port);
 
     // 0. Uniquify duplicate or reserved node names in `proxies` and deduplicate colliding `proxy-groups`
     let mut used_names: HashSet<String> = [
@@ -2099,7 +2234,8 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
         true
     });
 
-    // 1. Prune unsupported or broken rule-provider types/behaviors/formats (e.g. binary `mrs`, missing local `file`)
+    // 1. Prune unsupported, local-filesystem (`file`), or broken rule-providers;
+    // strip custom `path` on `http` providers so remote subscriptions always cache inside `<state_dir>/rulesets/`.
     cfg.rule_providers.retain(|pname, pcfg| {
         if pname.trim().is_empty() {
             return false;
@@ -2114,8 +2250,9 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
             return false;
         }
         match pt.as_str() {
-            "file" => pcfg.path.as_deref().is_some_and(|p| Path::new(p).is_file()),
+            "file" => false,
             "http" => {
+                pcfg.path = None;
                 let valid_url = pcfg.url.as_deref().is_some_and(|u| {
                     let ul = u.trim().to_ascii_lowercase();
                     (ul.starts_with("https://") || ul.starts_with("http://"))
@@ -3338,11 +3475,23 @@ impl ProxyNodeConfig {
                     *encryption = REDACTED_SECRET.to_string();
                 }
             }
-            Self::Socks5 { password, .. } | Self::Http { password, .. } => {
+            Self::Socks5 { password, .. } => {
                 if let Some(p) = password
                     && !p.is_empty()
                 {
                     *p = REDACTED_SECRET.to_string();
+                }
+            }
+            Self::Http {
+                password, headers, ..
+            } => {
+                if let Some(p) = password
+                    && !p.is_empty()
+                {
+                    *p = REDACTED_SECRET.to_string();
+                }
+                for v in headers.values_mut() {
+                    *v = REDACTED_SECRET.to_string();
                 }
             }
         }
@@ -3406,13 +3555,30 @@ impl ProxyNodeConfig {
                 *password = orig_pass.clone();
             }
             (
-                Self::Http { password, .. },
+                Self::Http {
+                    password, headers, ..
+                },
                 Self::Http {
                     password: orig_pass,
+                    headers: orig_headers,
                     ..
                 },
-            ) if password.as_deref() == Some(REDACTED_SECRET) => {
-                *password = orig_pass.clone();
+            ) => {
+                if password.as_deref() == Some(REDACTED_SECRET) {
+                    *password = orig_pass.clone();
+                }
+                for (hk, hv) in headers.iter_mut() {
+                    if hv == REDACTED_SECRET
+                        && let Some(orig_val) = orig_headers.get(hk).or_else(|| {
+                            orig_headers
+                                .iter()
+                                .find(|(ok, _)| ok.eq_ignore_ascii_case(hk))
+                                .map(|(_, ov)| ov)
+                        })
+                    {
+                        *hv = orig_val.clone();
+                    }
+                }
             }
             _ => {}
         }
@@ -3773,13 +3939,18 @@ rules:
             .expect("Mihomo/V2Board YAML with tun.dns-hijack sequence must parse cleanly");
         assert!(skipped.is_empty(), "unexpected skipped: {skipped:?}");
         assert!(sanitized.tun.dns_hijack);
+        assert!(!sanitized.tun.enable);
         assert_eq!(
             sanitized.tun.inet6_address.as_deref(),
             Some("fdfe:dcba:9876::1/126")
         );
         assert_eq!(sanitized.tun.mtu, 1400);
         assert_eq!(sanitized.mixed_port, 7890);
-        assert_eq!(sanitized.secret.as_deref(), Some("987654"));
+        assert!(sanitized.secret.is_none());
+        assert!(!sanitized.allow_lan);
+        assert_eq!(sanitized.bind_address, "127.0.0.1");
+        assert!(sanitized.lan_allowed_ips.is_empty());
+        assert_eq!(sanitized.external_controller, "127.0.0.1:9090");
         assert_eq!(sanitized.proxies.len(), 3);
         assert_eq!(sanitized.proxies[0].name(), "10086");
         assert_eq!(sanitized.proxies[1].name(), "HK-Dup");
@@ -3792,6 +3963,7 @@ rules:
             sanitized.rule_providers["reject_list"].provider_type,
             "http"
         );
+        assert!(sanitized.rule_providers["reject_list"].path.is_none());
 
         // Persisted YAML must also pass strict `ClashConfig::from_yaml_str` reload!
         let persisted = sanitized.to_yaml_string().expect("serialize sanitized");
@@ -3800,9 +3972,10 @@ rules:
         assert!(reloaded.tun.dns_hijack);
         assert_eq!(reloaded.proxies.len(), 3);
 
-        // Direct strict `from_yaml_str` must ALSO accept `tun.dns-hijack` & `tun.inet6-address` sequences
-        // when proxy names are already unique:
+        // Direct strict `from_yaml_str` must ALSO accept `tun.dns-hijack`, `tun.inet6-address` sequences,
+        // and numeric `secret` scalars when proxy names are already unique:
         let strict_mihomo = r#"
+secret: 987654
 tun:
   enable: true
   dns-hijack:
@@ -3815,6 +3988,7 @@ rules:
 "#;
         let strict_cfg =
             ClashConfig::from_yaml_str(strict_mihomo).expect("strict tun sequence parse");
+        assert_eq!(strict_cfg.secret.as_deref(), Some("987654"));
         assert!(strict_cfg.tun.dns_hijack);
         assert_eq!(
             strict_cfg.tun.inet6_address.as_deref(),
@@ -3835,5 +4009,133 @@ rules:
             bad_err.contains("mixed-port"),
             "expected field path in YAML parse error, got: {bad_err}"
         );
+    }
+
+    #[test]
+    fn rule_provider_path_validation_and_subscription_sanitization_enforce_confinement() {
+        let abs_http = r#"
+rule-providers:
+  evil_http:
+    type: http
+    behavior: domain
+    url: https://example.com/rules.yaml
+    path: /tmp/evil_cron
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(ClashConfig::from_yaml_str(abs_http).is_err());
+
+        let traversal_http = r#"
+rule-providers:
+  trav_http:
+    type: http
+    behavior: domain
+    url: https://example.com/rules.yaml
+    path: ../../.bashrc
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(ClashConfig::from_yaml_str(traversal_http).is_err());
+
+        let traversal_file = r#"
+rule-providers:
+  trav_file:
+    type: file
+    behavior: domain
+    path: ../outside.yaml
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(ClashConfig::from_yaml_str(traversal_file).is_err());
+
+        let sub_yaml = r#"
+mixed-port: 9090
+allow-lan: true
+bind-address: 0.0.0.0
+external-controller: 0.0.0.0:9090
+secret: attacker-secret
+authentication:
+  - admin:pass123
+tun:
+  enable: true
+proxies:
+  - name: Node1
+    type: trojan
+    server: n1.example.com
+    port: 443
+    password: p1
+rule-providers:
+  local_leak:
+    type: file
+    behavior: domain
+    path: /etc/hosts
+  remote_ok:
+    type: http
+    behavior: domain
+    url: https://example.com/list.yaml
+    path: /tmp/pwn.sh
+rules:
+  - RULE-SET,local_leak,DIRECT
+  - RULE-SET,remote_ok,REJECT
+  - MATCH,Node1
+"#;
+        let (sanitized, _) =
+            ClashConfig::from_yaml_str_sanitized(sub_yaml).expect("sanitized subscription");
+        assert!(sanitized.secret.is_none());
+        assert!(!sanitized.allow_lan);
+        assert_eq!(sanitized.bind_address, "127.0.0.1");
+        assert!(sanitized.authentication.is_empty());
+        assert!(!sanitized.tun.enable);
+        assert_eq!(sanitized.mixed_port, 9090);
+        assert_eq!(sanitized.external_controller, "127.0.0.1:9091");
+        assert!(!sanitized.rule_providers.contains_key("local_leak"));
+        assert!(sanitized.rule_providers["remote_ok"].path.is_none());
+    }
+
+    #[test]
+    fn redacted_config_masks_query_tokens_and_http_proxy_headers_and_restores_cleanly() {
+        let raw_yaml = r#"
+secret: super-secret-ctrl
+proxies:
+  - name: Corp-Proxy
+    type: http
+    server: proxy.corp.internal
+    port: 8443
+    tls: true
+    headers:
+      Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=
+      X-Api-Token: tok_live_999
+rule-providers:
+  priv_rules:
+    type: http
+    behavior: domain
+    url: https://rules.example.com/list.yaml?token=sub_tok_123&format=yaml&sig=deadbeef
+rules:
+  - MATCH,Corp-Proxy
+"#;
+        let orig = ClashConfig::from_yaml_str(raw_yaml).expect("parse original");
+        let redacted = orig.redacted();
+        let redacted_yaml = redacted.to_yaml_string().expect("serialize redacted");
+        assert!(!redacted_yaml.contains("super-secret-ctrl"));
+        assert!(!redacted_yaml.contains("dXNlcjpzZWNyZXQ="));
+        assert!(!redacted_yaml.contains("tok_live_999"));
+        assert!(!redacted_yaml.contains("sub_tok_123"));
+        assert!(!redacted_yaml.contains("deadbeef"));
+        assert!(redacted_yaml.contains("format=yaml"));
+
+        let mut roundtrip = ClashConfig::from_yaml_str(&redacted_yaml).expect("parse redacted");
+        roundtrip.restore_redacted_from(&orig);
+        assert_eq!(roundtrip.secret, orig.secret);
+        assert_eq!(
+            roundtrip.rule_providers["priv_rules"].url,
+            orig.rule_providers["priv_rules"].url
+        );
+        match (&roundtrip.proxies[0], &orig.proxies[0]) {
+            (
+                ProxyNodeConfig::Http { headers: h_new, .. },
+                ProxyNodeConfig::Http { headers: h_old, .. },
+            ) => assert_eq!(h_new, h_old),
+            _ => panic!("expected Http proxy node"),
+        }
     }
 }

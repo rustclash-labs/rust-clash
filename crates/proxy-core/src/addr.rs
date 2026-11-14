@@ -114,11 +114,16 @@ impl TargetAddr {
     }
 
     pub fn new_domain(domain: impl Into<String>, port: u16) -> io::Result<Self> {
-        let domain = domain
-            .into()
-            .trim()
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
+        let raw = domain.into();
+        if raw.bytes().any(|b| {
+            b <= 0x1f || b == 0x7f || b.is_ascii_whitespace() || matches!(b, b'/' | b'\\' | b'@')
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "domain contains invalid control, whitespace, or delimiter characters",
+            ));
+        }
+        let domain = raw.trim_end_matches('.').to_ascii_lowercase();
         if domain.is_empty() || domain.len() > 255 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -127,6 +132,17 @@ impl TargetAddr {
         }
         if let Ok(ip) = domain.parse::<IpAddr>() {
             return Ok(Self::new_ip(ip, port));
+        }
+        if let Some(v6_str) = domain.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+            && let Ok(v6) = v6_str.parse::<Ipv6Addr>()
+        {
+            return Ok(Self::new_ip(IpAddr::V6(v6), port));
+        }
+        if domain.bytes().any(|b| matches!(b, b':' | b'[' | b']')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "domain must not contain ':' or bracket characters",
+            ));
         }
         Ok(Self {
             host: HostName::Domain(domain),
@@ -355,5 +371,29 @@ mod tests {
             assert_eq!(used, socks.len());
             assert_eq!(decoded, addr);
         }
+    }
+
+    #[test]
+    fn new_domain_rejects_header_injection_and_delimiters() {
+        assert!(TargetAddr::new_domain("evil.com\r\nX-Injected: 1", 80).is_err());
+        assert!(TargetAddr::new_domain("evil.com\r\n", 80).is_err());
+        assert!(TargetAddr::new_domain("evil.com\nHost: bad", 80).is_err());
+        assert!(TargetAddr::new_domain("evil.com\x00", 80).is_err());
+        assert!(TargetAddr::new_domain("evil .com", 80).is_err());
+        assert!(TargetAddr::new_domain("evil.com/path", 80).is_err());
+        assert!(TargetAddr::new_domain("evil.com\\path", 80).is_err());
+        assert!(TargetAddr::new_domain("user@evil.com", 80).is_err());
+        assert!(TargetAddr::new_domain("evil.com:8080", 80).is_err());
+
+        // Valid IPv4 / IPv6 literals and normal domains remain accepted
+        assert_eq!(
+            TargetAddr::new_domain("127.0.0.1", 80).unwrap(),
+            TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)
+        );
+        assert_eq!(
+            TargetAddr::new_domain("[::1]", 80).unwrap(),
+            TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 80)
+        );
+        assert!(TargetAddr::new_domain("sp.v2.udp-over-tcp.arpa", 0).is_ok());
     }
 }

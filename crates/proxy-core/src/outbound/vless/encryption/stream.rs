@@ -29,6 +29,11 @@ enum InboundInitState {
         random_mode: bool,
         on_ticket_rejected: ZeroRttInvalidationHook,
     },
+    /// 0-RTT Client has read `serverRandom (16B)` and awaits the first 5-byte `RECORD_HEADER_LEN`
+    /// (which may arrive in a separate TCP segment / `poll_read` call).
+    Pending0RttFirstHeader {
+        on_ticket_rejected: ZeroRttInvalidationHook,
+    },
     Ready,
 }
 
@@ -37,6 +42,7 @@ enum ReadRecordState {
     NeedCiphertext {
         unmasked_hdr: [u8; RECORD_HEADER_LEN],
         cipher_len: usize,
+        on_0rtt_rejected: Option<ZeroRttInvalidationHook>,
     },
 }
 
@@ -155,6 +161,28 @@ impl<S> VlessEncryptedStream<S> {
         }
     }
 
+    fn fire_0rtt_rejection_on_eof(&mut self) {
+        match &self.init_state {
+            InboundInitState::Pending0RttServerRandom {
+                on_ticket_rejected, ..
+            }
+            | InboundInitState::Pending0RttFirstHeader { on_ticket_rejected } => {
+                if let Some(cb) = on_ticket_rejected.lock().take() {
+                    cb();
+                }
+            }
+            _ => {}
+        }
+        if let ReadRecordState::NeedCiphertext {
+            on_0rtt_rejected: Some(hook),
+            ..
+        } = &self.record_state
+            && let Some(cb) = hook.lock().take()
+        {
+            cb();
+        }
+    }
+
     fn process_inbound_records(&mut self) -> io::Result<()> {
         loop {
             match &mut self.init_state {
@@ -177,46 +205,63 @@ impl<S> VlessEncryptedStream<S> {
                     if self.raw_in.len() < 16 {
                         return Ok(());
                     }
+                    let use_aes_val = *use_aes;
+                    let random_mode_val = *random_mode;
                     let srv_rand_bytes = self.raw_in.split_to(16);
                     let srv_rand: [u8; 16] = srv_rand_bytes.as_ref().try_into().unwrap();
-                    let read_aead = VlessAead::new(&srv_rand, self.united_key.as_ref(), *use_aes)?;
-                    if *random_mode {
+                    let read_aead =
+                        VlessAead::new(&srv_rand, self.united_key.as_ref(), use_aes_val)?;
+                    if random_mode_val {
                         self.in_ctr = Some(VlessCtr::new(self.united_key.as_ref(), &srv_rand));
                     }
                     self.read_aead = Some(read_aead);
-                    // Keep hook briefly in case the very next 5-byte header is server's random rejection noise!
                     let prev = std::mem::replace(&mut self.init_state, InboundInitState::Ready);
                     if let InboundInitState::Pending0RttServerRandom {
                         on_ticket_rejected, ..
                     } = prev
-                        && self.raw_in.len() >= RECORD_HEADER_LEN
                     {
-                        // Peek-validate first header right below; if invalid, fire invalidation hook
-                        let mut hdr: [u8; RECORD_HEADER_LEN] = self
-                            .raw_in
-                            .split_to(RECORD_HEADER_LEN)
-                            .as_ref()
-                            .try_into()
-                            .unwrap();
-                        if let Some(ctr) = self.in_ctr.as_mut() {
-                            ctr.xor_keystream(&mut hdr)?;
+                        self.init_state =
+                            InboundInitState::Pending0RttFirstHeader { on_ticket_rejected };
+                    }
+                }
+                InboundInitState::Pending0RttFirstHeader { .. } => {
+                    if self.raw_in.len() < RECORD_HEADER_LEN {
+                        return Ok(());
+                    }
+                    let mut hdr: [u8; RECORD_HEADER_LEN] = self
+                        .raw_in
+                        .split_to(RECORD_HEADER_LEN)
+                        .as_ref()
+                        .try_into()
+                        .unwrap();
+                    if let Some(ctr) = self.in_ctr.as_mut() {
+                        ctr.xor_keystream(&mut hdr)?;
+                    }
+                    let prev = std::mem::replace(&mut self.init_state, InboundInitState::Ready);
+                    let hook = match prev {
+                        InboundInitState::Pending0RttFirstHeader { on_ticket_rejected } => {
+                            Some(on_ticket_rejected)
                         }
-                        match decode_record_header(&hdr) {
-                            Ok(cipher_len) => {
-                                self.record_state = ReadRecordState::NeedCiphertext {
-                                    unmasked_hdr: hdr,
-                                    cipher_len,
-                                };
+                        _ => None,
+                    };
+                    match decode_record_header(&hdr) {
+                        Ok(cipher_len) => {
+                            self.record_state = ReadRecordState::NeedCiphertext {
+                                unmasked_hdr: hdr,
+                                cipher_len,
+                                on_0rtt_rejected: hook,
+                            };
+                        }
+                        Err(_) => {
+                            if let Some(h) = hook
+                                && let Some(cb) = h.lock().take()
+                            {
+                                cb();
                             }
-                            Err(_) => {
-                                if let Some(cb) = on_ticket_rejected.lock().take() {
-                                    cb();
-                                }
-                                return Err(io::Error::new(
-                                    io::ErrorKind::ConnectionReset,
-                                    "new handshake needed (0-RTT ticket rejected by server)",
-                                ));
-                            }
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionReset,
+                                "new handshake needed (0-RTT ticket rejected by server)",
+                            ));
                         }
                     }
                 }
@@ -225,7 +270,7 @@ impl<S> VlessEncryptedStream<S> {
         }
 
         loop {
-            match self.record_state {
+            match &mut self.record_state {
                 ReadRecordState::NeedHeader => {
                     if self.raw_in.len() < RECORD_HEADER_LEN {
                         return Ok(());
@@ -243,22 +288,37 @@ impl<S> VlessEncryptedStream<S> {
                     self.record_state = ReadRecordState::NeedCiphertext {
                         unmasked_hdr: hdr,
                         cipher_len,
+                        on_0rtt_rejected: None,
                     };
                 }
                 ReadRecordState::NeedCiphertext {
                     unmasked_hdr,
                     cipher_len,
+                    on_0rtt_rejected,
                 } => {
-                    if self.raw_in.len() < cipher_len {
+                    let need = *cipher_len;
+                    if self.raw_in.len() < need {
                         return Ok(());
                     }
-                    let body = self.raw_in.split_to(cipher_len);
+                    let hdr_copy = *unmasked_hdr;
+                    let hook = on_0rtt_rejected.take();
+                    let body = self.raw_in.split_to(need);
                     let aead = self.read_aead.as_mut().expect("read_aead initialized");
                     let ratchet = aead.is_at_max_nonce();
-                    let plain = aead.open(&body, &unmasked_hdr)?;
+                    let plain = match aead.open(&body, &hdr_copy) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if let Some(h) = hook
+                                && let Some(cb) = h.lock().take()
+                            {
+                                cb();
+                            }
+                            return Err(e);
+                        }
+                    };
                     if ratchet {
                         let mut full_rec = Vec::with_capacity(RECORD_HEADER_LEN + body.len());
-                        full_rec.extend_from_slice(&unmasked_hdr);
+                        full_rec.extend_from_slice(&hdr_copy);
                         full_rec.extend_from_slice(&body);
                         *aead = VlessAead::new(&full_rec, self.united_key.as_ref(), aead.use_aes)?;
                     }
@@ -334,6 +394,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for VlessEncryptedStream<S> {
                 Poll::Ready(Ok(())) => {
                     let filled = rbuf.filled();
                     if filled.is_empty() {
+                        if !self.raw_in.is_empty()
+                            || matches!(
+                                self.init_state,
+                                InboundInitState::Pending1RttPeerPadding { .. }
+                                    | InboundInitState::Pending0RttFirstHeader { .. }
+                            )
+                            || matches!(self.record_state, ReadRecordState::NeedCiphertext { .. })
+                        {
+                            self.fire_0rtt_rejection_on_eof();
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "truncated encrypted frame before EOF",
+                            )));
+                        }
                         return Poll::Ready(Ok(()));
                     }
                     self.raw_in.extend_from_slice(filled);
@@ -424,5 +498,93 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessEncryptedStream<S> {
             Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn zero_rtt_split_reads_still_fire_on_ticket_rejected() {
+        let (client_io, mut server_io) = tokio::io::duplex(256);
+        let united_key = Zeroizing::new([0x42u8; 96]);
+        let write_aead = VlessAead::new(&[0x11u8; 16], united_key.as_ref(), true).unwrap();
+
+        let rejected_flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&rejected_flag);
+        let hook: ZeroRttInvalidationHook = Arc::new(Mutex::new(Some(Box::new(move || {
+            flag_clone.store(true, Ordering::SeqCst);
+        }))));
+
+        let mut stream = VlessEncryptedStream::new_0rtt_client(
+            client_io,
+            united_key,
+            write_aead,
+            None,
+            Vec::new(),
+            true,
+            false,
+            hook,
+        );
+
+        let writer = tokio::spawn(async move {
+            // Deliver 16-byte server_random in TCP segment #1
+            server_io.write_all(&[0x55u8; 16]).await.unwrap();
+            server_io.flush().await.unwrap();
+            tokio::task::yield_now().await;
+            // Deliver invalid 5-byte record header in TCP segment #2
+            server_io
+                .write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01])
+                .await
+                .unwrap();
+            server_io.flush().await.unwrap();
+        });
+
+        let mut buf = [0u8; 32];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert!(rejected_flag.load(Ordering::SeqCst));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vless_encrypted_stream_detects_truncated_frame_before_eof() {
+        let united_key = Zeroizing::new([0x24u8; 96]);
+
+        // 1. Clean 0-byte EOF when raw_in is empty -> Ok(0)
+        let (c_io1, s_io1) = tokio::io::duplex(256);
+        drop(s_io1);
+        let w_aead1 = VlessAead::new(&[1u8; 16], united_key.as_ref(), true).unwrap();
+        let r_aead1 = VlessAead::new(&[2u8; 16], united_key.as_ref(), true).unwrap();
+        let mut clean_stream = VlessEncryptedStream::new_1rtt_client(
+            c_io1,
+            united_key.clone(),
+            w_aead1,
+            r_aead1,
+            None,
+            None,
+            0,
+        );
+        let mut out = Vec::new();
+        assert_eq!(clean_stream.read_to_end(&mut out).await.unwrap(), 0);
+
+        // 2. Partial AEAD record before EOF -> UnexpectedEof
+        let (c_io2, mut s_io2) = tokio::io::duplex(256);
+        // Valid 5-byte header claiming 21 bytes of ciphertext, but only 4 bytes follow before EOF
+        s_io2
+            .write_all(&[0x17, 0x03, 0x03, 0x00, 21, 0xAA, 0xBB, 0xCC, 0xDD])
+            .await
+            .unwrap();
+        drop(s_io2);
+        let w_aead2 = VlessAead::new(&[1u8; 16], united_key.as_ref(), true).unwrap();
+        let r_aead2 = VlessAead::new(&[2u8; 16], united_key.as_ref(), true).unwrap();
+        let mut trunc_stream = VlessEncryptedStream::new_1rtt_client(
+            c_io2, united_key, w_aead2, r_aead2, None, None, 0,
+        );
+        let err = trunc_stream.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

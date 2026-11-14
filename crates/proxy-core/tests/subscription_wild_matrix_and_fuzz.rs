@@ -188,7 +188,14 @@ fn wild_mihomo_v2board_xboard_nested_anchors_merges_bom_crlf_and_cycles() {
     assert_eq!(cfg.external_controller, "127.0.0.1:9091");
     cfg.validate()
         .expect("auto-healed config must pass validate()");
-    assert_eq!(cfg.bind_address, "::");
+    // Untrusted subscription `bind-address: "[::]"` is sanitized to local loopback `127.0.0.1`
+    assert_eq!(cfg.bind_address, "127.0.0.1");
+    assert!(!cfg.allow_lan);
+    assert!(cfg.secret.is_none());
+    // Trusted local YAML parsing still normalizes bracketed IPv6 `"[::]"` -> `"::"`
+    let local_v6_bind =
+        ClashConfig::from_yaml_str("bind-address: \"[::]\"\nrules:\n  - MATCH,DIRECT\n").unwrap();
+    assert_eq!(local_v6_bind.bind_address, "::");
     assert_eq!(cfg.dns.fake_ip_range, "198.18.0.1/16");
 
     // `exclude-type: ss` excluded SG-SS-01 from `🚀 Proxy`, and `type: smart` normalized to `UrlTest`

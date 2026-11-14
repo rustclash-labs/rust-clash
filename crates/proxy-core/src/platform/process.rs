@@ -100,11 +100,17 @@ pub fn find_local_process(
 fn is_potentially_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 198
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
-                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_potentially_local_ip(IpAddr::V4(v4)))
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
@@ -625,6 +631,40 @@ mod tests {
             assert_eq!(info.pid, std::process::id());
             assert!(!info.name.is_empty());
             assert!(info.matches_name(&info.name));
+        }
+    }
+
+    #[test]
+    fn potentially_local_ip_restricts_198_to_rfc2544_subnet() {
+        for local_ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.20",
+            "198.18.0.1",
+            "198.19.255.254",
+            "::ffff:198.18.1.2",
+            "::1",
+            "fe80::1",
+        ] {
+            assert!(
+                is_potentially_local_ip(local_ip.parse().unwrap()),
+                "expected {local_ip} to be recognized as potentially local"
+            );
+        }
+
+        for public_ip in [
+            "198.0.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "198.51.100.10",
+            "::ffff:198.51.100.10",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(
+                !is_potentially_local_ip(public_ip.parse().unwrap()),
+                "expected public IP {public_ip} NOT to be treated as local"
+            );
         }
     }
 }

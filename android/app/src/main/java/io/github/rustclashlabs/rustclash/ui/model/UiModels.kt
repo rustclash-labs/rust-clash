@@ -386,6 +386,7 @@ data class AppUiState(
     val rateHistory: List<Long> = emptyList(),
     val debugLog: DebugLogSummaryUi = DebugLogSummaryUi(),
     val isExportingDebugLog: Boolean = false,
+    val pendingExternalImportPayload: String? = null,
 ) {
     fun resolveProfileDisplayName(profile: ProfileUiItem): String {
         val customAlias = profileAliases[profile.id]?.trim()

@@ -223,17 +223,33 @@ sudo ip netns exec "${NS_WAN}" ./target/debug/rust-clash server ss \
     --password "${SS_PASS}" &
 SS_PID=$!
 
-for _ in $(seq 1 30); do
+WAN_READY=0
+for _ in $(seq 1 50); do
+    if ! kill -0 "${WAN_PID}" 2>/dev/null; then
+        echo "[netns-tun] ERROR: Mock WAN server process (PID ${WAN_PID}) exited prematurely before listening on 10.200.1.1:18082." >&2
+        exit 1
+    fi
+    if ! kill -0 "${SS_PID}" 2>/dev/null; then
+        echo "[netns-tun] ERROR: rust-clash SS-2022 server process (PID ${SS_PID}) exited prematurely before listening on 10.200.1.1:18388." >&2
+        exit 1
+    fi
     if sudo ip netns exec "${NS_WAN}" python3 -c '
 import socket
 for port in (18082, 18388):
     with socket.create_connection(("10.200.1.1", port), timeout=0.2):
         pass
 ' 2>/dev/null; then
+        WAN_READY=1
         break
     fi
     sleep 0.1
 done
+
+if [[ "${WAN_READY}" -ne 1 ]]; then
+    echo "[netns-tun] ERROR: Readiness loop exhausted 50 retries without mock WAN (10.200.1.1:18082) and SS-2022 (10.200.1.1:18388) servers listening inside ${NS_WAN}." >&2
+    sudo ip netns exec "${NS_WAN}" ss -tuln >&2 || true
+    exit 1
+fi
 
 echo "[netns-tun] Executing comprehensive real kernel /dev/net/tun E2E suite inside ${NS_CLI}..."
 sudo ip netns exec "${NS_CLI}" env \

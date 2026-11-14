@@ -32,6 +32,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncStream for T {}
 
 pub type BoxedStream = Box<dyn AsyncStream>;
 
+pub(crate) const OUTBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
+
+pub(crate) async fn with_handshake_timeout<T, F>(label: &'static str, fut: F) -> io::Result<T>
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
+    tokio::time::timeout(OUTBOUND_HANDSHAKE_TIMEOUT, fut)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} timed out after {}s",
+                    OUTBOUND_HANDSHAKE_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+}
+
 /// Persistent bidirectional UDP NAT session over an outbound proxy or direct socket.
 /// Preserves NAT port bindings and avoids per-datagram handshakes for multi-packet flows (QUIC/HTTP3, WebRTC, gaming).
 #[async_trait]

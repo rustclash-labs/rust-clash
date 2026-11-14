@@ -3078,7 +3078,7 @@ dependencies = [
  "clap",
  "libc",
  "proxy-core",
- "serde",
+ "rand 0.9.5",
  "serde-saphyr",
  "serde_json",
  "smoltcp",
@@ -3093,7 +3093,6 @@ dependencies = [
 name = "proxy-core"
 version = "0.4.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-lc-rs",
  "axum",
@@ -3129,7 +3128,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
  "webpki-roots",
@@ -3147,7 +3145,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "proxy-core",
- "serde",
+ "rand 0.9.5",
  "serde_json",
  "tokio",
  "tracing",
@@ -4234,6 +4232,7 @@ dependencies = [
  "anyhow",
  "parking_lot",
  "proxy-core",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "tauri",

@@ -12,7 +12,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use zeroize::Zeroize;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 const KEYCHAIN_SERVICE: &str = "io.github.rustclashlabs.rust-clash";
 const MASTER_KEY_FILE: &str = "vault.master.key";
 
@@ -195,7 +195,14 @@ impl SecretVault {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&self.vault_dir, fs::Permissions::from_mode(0o700));
+            if let Err(err) =
+                fs::set_permissions(&self.vault_dir, fs::Permissions::from_mode(0o700))
+            {
+                tracing::warn!(
+                    "Failed setting 0700 permissions on vault directory '{}': {err}",
+                    self.vault_dir.display()
+                );
+            }
         }
         Ok(())
     }
@@ -224,11 +231,14 @@ impl SecretVault {
             .vault_dir
             .join(format!("{MASTER_KEY_FILE}.tmp.{}", std::process::id()));
         {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -265,11 +275,14 @@ impl SecretVault {
         let target = self.entry_path(key_id, "enc");
         let tmp = target.with_extension(format!("enc.tmp.{}", std::process::id()));
         {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)?;
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -423,20 +436,26 @@ impl SecretVault {
 
     #[cfg(target_os = "macos")]
     fn try_put_macos_keychain(&self, key_id: &str, plaintext: &str) -> io::Result<()> {
-        let encoded = hex::encode(plaintext.as_bytes());
-        let out = std::process::Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                key_id,
-                "-w",
-                &encoded,
-            ])
-            .output()?;
-        if out.status.success() {
+        use std::process::Stdio;
+        let mut cmd_line = build_macos_security_stdin_command(key_id, plaintext)?;
+        let mut child = std::process::Command::new("/usr/bin/security")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .inspect_err(|_| cmd_line.zeroize())?;
+        let write_res = if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(cmd_line.as_bytes())
+                .and_then(|()| stdin.flush())
+        } else {
+            Err(io::Error::other("macOS security -i stdin unavailable"))
+        };
+        cmd_line.zeroize();
+        write_res?;
+        let status = child.wait()?;
+        if status.success() {
             Ok(())
         } else {
             Err(io::Error::other(
@@ -537,9 +556,51 @@ impl SecretVault {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn build_macos_security_stdin_command(key_id: &str, plaintext: &str) -> io::Result<String> {
+    if key_id.is_empty()
+        || key_id
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"' | '\\'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid macOS Keychain key_id (must not contain whitespace, quotes, backslashes, or control characters)",
+        ));
+    }
+    let mut encoded = hex::encode(plaintext.as_bytes());
+    let cmd = format!("add-generic-password -U -s {KEYCHAIN_SERVICE} -a {key_id} -w {encoded}\n");
+    encoded.zeroize();
+    Ok(cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_security_stdin_command_encodes_secret_and_rejects_shell_chars_in_key_id() {
+        let cmd = build_macos_security_stdin_command("sub:alpha_1", "my-secret-token").unwrap();
+        let expected_prefix =
+            format!("add-generic-password -U -s {KEYCHAIN_SERVICE} -a sub:alpha_1 -w ");
+        assert!(cmd.starts_with(&expected_prefix));
+        assert!(cmd.ends_with('\n'));
+        assert!(!cmd.contains("my-secret-token"));
+
+        for bad_id in [
+            "",
+            "bad space",
+            "quote\"id",
+            "single'id",
+            "back\\slash",
+            "line\ninject",
+        ] {
+            assert!(
+                build_macos_security_stdin_command(bad_id, "secret").is_err(),
+                "expected bad key_id '{bad_id:?}' to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn secret_vault_roundtrip_tamper_detection_and_0600_permissions() {

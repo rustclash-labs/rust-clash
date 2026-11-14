@@ -558,9 +558,9 @@ const TW_CIDRS: &[&str] = &[
 const JP_CIDRS: &[&str] = &[
     "14.8.0.0/13",
     "27.80.0.0/12",
-    "49.96.0.0/11",
+    "49.96.0.0/12",
     "60.32.0.0/11",
-    "106.128.0.0/9",
+    "106.128.0.0/10",
     "126.0.0.0/8",
     "133.0.0.0/8",
     "210.128.0.0/11",
@@ -576,7 +576,10 @@ const SG_CIDRS: &[&str] = &[
 
 const US_CIDRS: &[&str] = &[
     "3.0.0.0/9",
-    "8.0.0.0/8",
+    "8.8.4.0/24",
+    "8.8.8.0/24",
+    "8.34.208.0/20",
+    "8.35.192.0/20",
     "13.32.0.0/12",
     "34.64.0.0/10",
     "35.184.0.0/13",
@@ -615,3 +618,41 @@ const TELEGRAM_CIDRS: &[&str] = &[
     "2001:b28:f23d::/48",
     "2001:67c:4e8::/48",
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn builtin_jp_and_us_cidrs_avoid_cn_and_apac_supernet_false_positives() {
+        let cn = lookup_builtin_geoip("CN").unwrap();
+        let jp = lookup_builtin_geoip("JP").unwrap();
+        let us = lookup_builtin_geoip("US").unwrap();
+
+        // NTT Docomo (49.96.0.0/12) & KDDI (106.128.0.0/10) match JP, while CN 49.112/13 & 49.120/14 do not.
+        assert!(jp.contains(IpAddr::V4(Ipv4Addr::new(49, 96, 0, 1))));
+        assert!(jp.contains(IpAddr::V4(Ipv4Addr::new(106, 128, 0, 1))));
+        assert!(!jp.contains(IpAddr::V4(Ipv4Addr::new(49, 112, 0, 1))));
+        assert!(!jp.contains(IpAddr::V4(Ipv4Addr::new(49, 120, 0, 1))));
+        assert!(!jp.contains(IpAddr::V4(Ipv4Addr::new(106, 192, 0, 1))));
+        assert!(cn.contains(IpAddr::V4(Ipv4Addr::new(49, 112, 0, 1))));
+        assert!(cn.contains(IpAddr::V4(Ipv4Addr::new(49, 120, 0, 1))));
+
+        // Ensure zero IPv4 range overlap between built-in CN and JP tables.
+        for &(cn_s, cn_e) in &cn.v4_ranges {
+            for &(jp_s, jp_e) in &jp.v4_ranges {
+                assert!(
+                    cn_e < jp_s || jp_e < cn_s,
+                    "CN range {cn_s}..={cn_e} overlaps JP range {jp_s}..={jp_e}"
+                );
+            }
+        }
+
+        // Google US DNS remains in US, while non-US 8.x allocations (e.g. 8.210.0.1) are excluded.
+        assert!(us.contains(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(us.contains(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))));
+        assert!(!us.contains(IpAddr::V4(Ipv4Addr::new(8, 210, 0, 1))));
+    }
+}

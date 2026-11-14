@@ -76,8 +76,13 @@ impl SsCipherKind {
     /// Derive or decode the master key (`EVP_BytesToKey` for legacy AEAD; Standard Base64 PSK for SS-2022).
     pub fn master_key(self, password: &str) -> io::Result<Zeroizing<Vec<u8>>> {
         if self.is_ss2022() {
-            // Take last user PSK if EIH colon-chain is supplied, or single PSK
-            let upsk_b64 = password.rsplit(':').next().unwrap_or(password).trim();
+            let upsk_b64 = password.trim();
+            if upsk_b64.contains(':') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Shadowsocks-2022 multi-user EIH (colon-separated PSK chain) is not supported; configure a single base64 user PSK",
+                ));
+            }
             let raw = crate::config::uri::decode_b64_flexible(upsk_b64)
                 .or_else(|| STANDARD.decode(upsk_b64).ok())
                 .ok_or_else(|| {
@@ -413,5 +418,27 @@ mod tests {
         let ct = xchacha20_poly1305_seal(&key, &nonce, msg).unwrap();
         let opened = xchacha20_poly1305_open(&key, &nonce, &ct).unwrap();
         assert_eq!(opened, msg);
+    }
+
+    #[test]
+    fn ss2022_rejects_colon_eih_chain_while_legacy_allows_colons() {
+        let psk1 = STANDARD.encode([0x11u8; 32]);
+        let psk2 = STANDARD.encode([0x22u8; 32]);
+        let eih_pw = format!("{psk1}:{psk2}");
+        let err = SsCipherKind::Ss2022Blake3Aes256Gcm
+            .master_key(&eih_pw)
+            .unwrap_err();
+        assert!(err.to_string().contains("multi-user EIH"));
+
+        assert!(
+            SsCipherKind::Ss2022Blake3Aes256Gcm
+                .master_key(&psk1)
+                .is_ok()
+        );
+        assert!(
+            SsCipherKind::Aes256Gcm
+                .master_key("legacy:password:with:colons")
+                .is_ok()
+        );
     }
 }

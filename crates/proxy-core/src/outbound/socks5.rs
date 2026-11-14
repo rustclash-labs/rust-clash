@@ -301,15 +301,26 @@ impl OutboundHandler for Socks5Outbound {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(self.inner.cfg.server.as_str());
             let sni = crate::crypto::tls::parse_server_name(sni_str)?;
-            Box::new(connector.connect(sni, tcp).await?)
+            let tls = crate::outbound::with_handshake_timeout(
+                "SOCKS5 TLS handshake",
+                connector.connect(sni, tcp),
+            )
+            .await?;
+            Box::new(tls)
         } else {
             Box::new(tcp)
         };
 
-        self.inner.negotiate_auth(&mut stream).await?;
-        self.inner
-            .send_socks5_command(&mut stream, 0x01, target)
-            .await?;
+        crate::outbound::with_handshake_timeout(
+            "SOCKS5 auth handshake",
+            self.inner.negotiate_auth(&mut stream),
+        )
+        .await?;
+        crate::outbound::with_handshake_timeout(
+            "SOCKS5 command handshake",
+            self.inner.send_socks5_command(&mut stream, 0x01, target),
+        )
+        .await?;
         Ok(stream)
     }
 
@@ -329,16 +340,21 @@ impl OutboundHandler for Socks5Outbound {
         .await?;
         let peer_ip = ctrl_tcp.peer_addr()?.ip();
 
-        self.inner.negotiate_auth(&mut ctrl_tcp).await?;
+        crate::outbound::with_handshake_timeout(
+            "SOCKS5 UDP auth handshake",
+            self.inner.negotiate_auth(&mut ctrl_tcp),
+        )
+        .await?;
         let unspec = if peer_ip.is_ipv4() {
             TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
             TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
-        let bnd = self
-            .inner
-            .send_socks5_command(&mut ctrl_tcp, 0x03, &unspec)
-            .await?;
+        let bnd = crate::outbound::with_handshake_timeout(
+            "SOCKS5 UDP associate handshake",
+            self.inner.send_socks5_command(&mut ctrl_tcp, 0x03, &unspec),
+        )
+        .await?;
 
         let relay_ip = match bnd.host {
             HostName::Ip(ip) if !ip.is_unspecified() => ip,

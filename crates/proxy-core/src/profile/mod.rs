@@ -785,8 +785,16 @@ pub fn parse_subscription_payload_sanitized(
     match kind {
         ImportInputKind::ClashYaml => {
             let (mut cfg, skipped) = ClashConfig::from_yaml_str_sanitized(&normalized)?;
-            let had_tun_enabled = cfg.tun.enable;
+            cfg.secret = None;
+            cfg.allow_lan = false;
+            cfg.bind_address = "127.0.0.1".to_string();
+            cfg.lan_allowed_ips.clear();
+            cfg.authentication.clear();
             cfg.tun.enable = false;
+            cfg.external_controller = crate::config::sanitize_loopback_external_controller(
+                &cfg.external_controller,
+                cfg.mixed_port,
+            );
             if cfg.proxies.is_empty() {
                 let detail = if skipped.is_empty() {
                     "subscription Clash YAML contains 0 proxy nodes".to_string()
@@ -799,18 +807,21 @@ pub fn parse_subscription_payload_sanitized(
                 return Err(ProxyError::Config(detail));
             }
             validate_profile_config(&cfg, extra_ca_der)?;
-            let persisted_yaml = if !had_tun_enabled
-                && skipped.is_empty()
-                && ClashConfig::from_yaml_str(&normalized).is_ok()
-            {
-                normalized
-            } else {
-                cfg.to_yaml_string()?
-            };
+            let persisted_yaml = cfg.to_yaml_string()?;
             Ok((cfg, persisted_yaml, skipped))
         }
         ImportInputKind::ShareUris | ImportInputKind::Base64UriList => {
-            let (cfg, skipped) = synthesize_config_from_uris_sanitized(&normalized)?;
+            let (mut cfg, skipped) = synthesize_config_from_uris_sanitized(&normalized)?;
+            cfg.secret = None;
+            cfg.allow_lan = false;
+            cfg.bind_address = "127.0.0.1".to_string();
+            cfg.lan_allowed_ips.clear();
+            cfg.authentication.clear();
+            cfg.tun.enable = false;
+            cfg.external_controller = crate::config::sanitize_loopback_external_controller(
+                &cfg.external_controller,
+                cfg.mixed_port,
+            );
             validate_profile_config(&cfg, extra_ca_der)?;
             let yaml = cfg.to_yaml_string()?;
             Ok((cfg, yaml, skipped))
@@ -854,7 +865,12 @@ impl ProfileManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&profiles_dir, fs::Permissions::from_mode(0o700));
+            if let Err(e) = fs::set_permissions(&profiles_dir, fs::Permissions::from_mode(0o700)) {
+                tracing::warn!(
+                    "failed setting 0700 permissions on '{}': {e}",
+                    profiles_dir.display()
+                );
+            }
         }
 
         let vault = SecretVault::new(state_dir);
@@ -954,8 +970,11 @@ impl ProfileManager {
                 idx.selection_defaults_v2 = true;
                 dirty = true;
             }
-            if dirty {
-                let _ = save_index_atomic(&index_path, &idx);
+            if dirty && let Err(e) = save_index_atomic(&index_path, &idx) {
+                tracing::warn!(
+                    "failed saving migrated profile index '{}': {e}",
+                    index_path.display()
+                );
             }
             idx
         } else {
@@ -1597,7 +1616,11 @@ impl ProfileManager {
                         let mut idx = self.index.lock();
                         if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == meta.id) {
                             p.last_skipped_count = skipped_unsupported.len();
-                            let _ = save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx);
+                            if let Err(e) =
+                                save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)
+                            {
+                                tracing::warn!("failed saving profile index skipped count: {e}");
+                            }
                         }
                     }
                     return Ok(NodeMutationReport {
@@ -2155,16 +2178,8 @@ impl ProfileManager {
             {
                 let (mut parsed_cfg, skipped) = ClashConfig::from_yaml_str_sanitized(raw_yaml)
                     .map_err(|e| ProxyError::config_clean(redact_sensitive_text(&e.to_string())))?;
-                let had_tun_enabled = parsed_cfg.tun.enable;
                 parsed_cfg.tun.enable = false;
-                let persisted_yaml = if !had_tun_enabled
-                    && skipped.is_empty()
-                    && ClashConfig::from_yaml_str(raw_yaml).is_ok()
-                {
-                    raw_yaml.to_string()
-                } else {
-                    parsed_cfg.to_yaml_string()?
-                };
+                let persisted_yaml = parsed_cfg.to_yaml_string()?;
                 (
                     ProfileKind::LocalYaml,
                     parsed_cfg,
@@ -2383,7 +2398,9 @@ impl ProfileManager {
                         break;
                     }
                 }
-                let _ = save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx);
+                if let Err(e) = save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx) {
+                    tracing::warn!("failed saving subscription error state to index: {e}");
+                }
                 Err(cleaned_err)
             }
         }
@@ -2763,22 +2780,36 @@ fn write_atomic_with_backup(target: &Path, content: &str) -> Result<()> {
     let seq = ATOMIC_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = target.with_extension(format!("yaml.tmp.{}.{seq}", std::process::id()));
     {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+            if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    "failed setting 0600 permissions on '{}': {e}",
+                    tmp.display()
+                );
+            }
         }
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
     }
     if target.exists() {
         let bak = target.with_extension("yaml.bak");
-        let _ = fs::copy(target, bak);
+        if fs::copy(target, &bak).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+            }
+        }
     }
     fs::rename(&tmp, target)?;
     Ok(())
@@ -2790,15 +2821,23 @@ fn save_index_atomic(index_path: &Path, index: &ProfileIndex) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(index)
         .map_err(|e| ProxyError::Config(format!("serialize profile index: {e}")))?;
     {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+            if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    "failed setting 0600 permissions on '{}': {e}",
+                    tmp.display()
+                );
+            }
         }
         f.write_all(&bytes)?;
         f.sync_all()?;

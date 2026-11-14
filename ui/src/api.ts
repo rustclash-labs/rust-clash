@@ -75,21 +75,66 @@ let discoveredDesktopSecret: string | null = null;
 let capturedBootSecret: string | null = null;
 let desktopDiscoveryPromise: Promise<string> | null = null;
 
+function readSessionSecret(): string {
+  try {
+    const val = sessionStorage.getItem(SESSION_SECRET_KEY)?.trim();
+    if (val) return val;
+  } catch {
+    // ignore sessionStorage restrictions
+  }
+  return capturedBootSecret || "";
+}
+
+function writeSessionSecret(secret: string): void {
+  const clean = secret.trim();
+  capturedBootSecret = clean || null;
+  try {
+    if (clean) {
+      sessionStorage.setItem(SESSION_SECRET_KEY, clean);
+    } else {
+      sessionStorage.removeItem(SESSION_SECRET_KEY);
+    }
+  } catch {
+    // ignore sessionStorage restrictions in sandboxed webviews
+  }
+}
+
+function migrateAndScrubLegacyLocalStorage(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) return "";
+    const parsed = JSON.parse(saved) as Partial<ControllerSettings> &
+      Record<string, unknown>;
+    const cleanBaseUrl =
+      typeof parsed.baseUrl === "string"
+        ? parsed.baseUrl.replace(/\/+$/, "")
+        : "";
+    if ("secret" in parsed) {
+      const legacySecret =
+        typeof parsed.secret === "string" ? parsed.secret.trim() : "";
+      if (legacySecret && !readSessionSecret()) {
+        writeSessionSecret(legacySecret);
+      }
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ baseUrl: cleanBaseUrl }),
+      );
+    }
+    return cleanBaseUrl;
+  } catch {
+    return "";
+  }
+}
+
 function captureSecretFromUrlOnBoot(): void {
   if (typeof window === "undefined") return;
+  migrateAndScrubLegacyLocalStorage();
   try {
     const params = new URLSearchParams(window.location.search);
+    const hasUrlToken = params.has("secret") || params.has("token");
     const urlSecret = (params.get("secret") ?? params.get("token"))?.trim();
-    if (urlSecret) {
-      capturedBootSecret = urlSecret;
-      try {
-        sessionStorage.setItem(SESSION_SECRET_KEY, urlSecret);
-      } catch {
-        // ignore sessionStorage restrictions
-      }
-      const existing = loadControllerSettings();
-      saveControllerSettings({ ...existing, secret: urlSecret });
-
+    if (hasUrlToken) {
       params.delete("secret");
       params.delete("token");
       const restQuery = params.toString();
@@ -97,15 +142,14 @@ function captureSecretFromUrlOnBoot(): void {
         window.location.pathname +
         (restQuery ? `?${restQuery}` : "") +
         window.location.hash;
-      window.history.replaceState({}, document.title, cleanUrl);
+      window.history.replaceState(window.history.state, document.title, cleanUrl);
+    }
+    if (urlSecret) {
+      writeSessionSecret(urlSecret);
     } else {
-      try {
-        const fromSession = sessionStorage.getItem(SESSION_SECRET_KEY);
-        if (fromSession) {
-          capturedBootSecret = fromSession;
-        }
-      } catch {
-        // ignore
+      const existingSession = readSessionSecret();
+      if (existingSession) {
+        capturedBootSecret = existingSession;
       }
     }
   } catch {
@@ -277,32 +321,21 @@ export async function ensureRuntimeApiReady(): Promise<void> {
 }
 
 export function loadControllerSettings(): ControllerSettings {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const parsed = JSON.parse(saved) as Partial<ControllerSettings>;
-      return {
-        baseUrl: (parsed.baseUrl ?? "").replace(/\/+$/, ""),
-        secret: parsed.secret || capturedBootSecret || "",
-      };
-    }
-  } catch {
-    // ignore storage errors
-  }
-  return { baseUrl: "", secret: capturedBootSecret || "" };
+  const baseUrl = migrateAndScrubLegacyLocalStorage();
+  return {
+    baseUrl,
+    secret: readSessionSecret(),
+  };
 }
 
 export function saveControllerSettings(settings: ControllerSettings): void {
-  const cleanSecret = settings.secret.trim();
-  if (cleanSecret) {
-    capturedBootSecret = cleanSecret;
-  }
+  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, "");
+  writeSessionSecret(settings.secret);
   try {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
-        baseUrl: settings.baseUrl.replace(/\/+$/, ""),
-        secret: cleanSecret,
+        baseUrl: cleanBaseUrl,
       }),
     );
   } catch {
@@ -313,7 +346,7 @@ export function saveControllerSettings(settings: ControllerSettings): void {
 function effectiveSecret(settings: ControllerSettings): string {
   return (
     settings.secret ||
-    capturedBootSecret ||
+    readSessionSecret() ||
     discoveredDesktopSecret ||
     ""
   );

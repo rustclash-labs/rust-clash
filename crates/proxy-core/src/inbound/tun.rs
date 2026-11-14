@@ -25,23 +25,26 @@ use smoltcp::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Notify, Semaphore, mpsc, watch},
-    task::JoinHandle,
+    task::{AbortHandle, JoinHandle},
 };
 
 use crate::{
     addr::{HostName, TargetAddr},
     inbound::udp_nat::UdpNatManager,
     router::Router,
-    tracker::{TelemetryHub, TrackedStream},
+    tracker::TelemetryHub,
 };
 
 pub const TUN_PACKET_QUEUE_CAPACITY: usize = 4096;
 const TUN_DEVICE_RX_MAX_PACKETS: usize = 4096;
 const TUN_FLOW_STREAM_CAPACITY: usize = 256;
+const TUN_TCP_SOCKET_BUF_SIZE: usize = 64 * 1024;
 const MAX_TUN_TCP_FLOWS: usize = 2048;
+const MAX_HALF_OPEN_SYN_FLOWS: usize = 256;
 const MAX_TUN_UDP_INFLIGHT: usize = 512;
 const MAX_TUN_UDP_SESSIONS: usize = 512;
 const TCP_SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const TCP_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -136,6 +139,7 @@ struct BridgeFlow {
     to_remote_tx: Option<mpsc::Sender<Vec<u8>>>,
     remote_eof: bool,
     remote_failed: Arc<AtomicBool>,
+    task_abort: AbortHandle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -294,7 +298,7 @@ pub fn spawn_userspace_tun(
                 }
 
                 // Read client bytes from smoltcp ONLY when `to_remote_tx` has bounded capacity,
-                // preserving TCP receive-window backpressure inside `smoltcp`'s 256 KiB RX buffer!
+                // preserving TCP receive-window backpressure inside `smoltcp`'s 64 KiB RX buffer!
                 if sock.can_recv() {
                     if let Some(tx) = &flow.to_remote_tx {
                         let mut aborted = false;
@@ -392,6 +396,7 @@ pub fn spawn_userspace_tun(
                     && flow.pending_tx.is_empty();
 
                 if syn_timed_out || idle_timed_out || fin_timed_out {
+                    flow.task_abort.abort();
                     sock.abort();
                     finished_keys.push(*tuple);
                     continue;
@@ -638,11 +643,29 @@ fn register_syn_flow(
     router: &Arc<RwLock<Arc<Router>>>,
     hub: &Arc<TelemetryHub>,
 ) {
-    if flows.contains_key(&tuple) || flows.len() >= MAX_TUN_TCP_FLOWS {
+    if flows.contains_key(&tuple) {
         return;
     }
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; 256 * 1024]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; 256 * 1024]);
+    let half_open_count = flows.values().filter(|f| !f.established).count();
+    if half_open_count >= MAX_HALF_OPEN_SYN_FLOWS
+        && let Some(oldest_tuple) = flows
+            .iter()
+            .filter(|(_, f)| !f.established)
+            .min_by_key(|(_, f)| f.created_at)
+            .map(|(k, _)| *k)
+        && let Some(evicted) = flows.remove(&oldest_tuple)
+    {
+        evicted.task_abort.abort();
+        let evicted_sock = sockets.get_mut::<tcp::Socket>(evicted.handle);
+        evicted_sock.abort();
+        sockets.remove(evicted.handle);
+    }
+    if flows.len() >= MAX_TUN_TCP_FLOWS {
+        return;
+    }
+
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);
     sock.set_nagle_enabled(false);
     sock.set_timeout(Some(SmolDuration::from_secs(120)));
@@ -665,25 +688,9 @@ fn register_syn_flow(
     let wake_task = Arc::clone(wake_notify);
     let now = Instant::now();
 
-    flows.insert(
-        tuple,
-        BridgeFlow {
-            handle,
-            established: false,
-            created_at: now,
-            last_active: now,
-            fin_started_at: None,
-            pending_tx: BytesMut::new(),
-            from_remote_rx,
-            to_remote_tx: Some(to_remote_tx),
-            remote_eof: false,
-            remote_failed,
-        },
-    );
-
     let current_router = Arc::clone(&router.read());
     let hub_clone = Arc::clone(hub);
-    tokio::spawn(async move {
+    let flow_task = tokio::spawn(async move {
         // Port 53 (`any:53`) Fake-IP DNS-over-TCP Hijack (RFC 1035 / RFC 7766 2-byte length prefix).
         // Prevents Android/OS virtual VPN DNS (`198.18.0.2:53`) TCP fallback queries from hitting
         // `UNMAPPED-FAKE-IP` when UDP DNS responses are truncated (`TC=1`) or retried over TCP.
@@ -708,7 +715,7 @@ fn register_syn_flow(
                 &raw_target,
             )
             .await;
-        let conn_entry = hub_clone.register_connection_with_outbound(
+        let conn_guard = hub_clone.register_connection_with_outbound_guard(
             "TUN(smoltcp)",
             "tcp",
             Some(tuple.src),
@@ -719,6 +726,7 @@ fn register_syn_flow(
             decision.chains.clone(),
             decision.outbound.as_ref(),
         );
+        let conn_entry = Arc::clone(conn_guard.connection());
         hub_clone.push_log(
             "info",
             format!(
@@ -732,7 +740,33 @@ fn register_syn_flow(
             ),
         );
 
-        let outbound = match decision.outbound.connect_tcp(&decision.target).await {
+        let dial_res = tokio::select! {
+            biased;
+            _ = conn_entry.closed() => {
+                remote_failed_task.store(true, Ordering::Release);
+                wake_task.notify_one();
+                return;
+            }
+            res = tokio::time::timeout(
+                OUTBOUND_CONNECT_TIMEOUT,
+                decision.outbound.connect_tcp(&decision.target),
+            ) => {
+                match res {
+                    Ok(inner) => inner,
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "outbound dial+handshake to {} via '{}' timed out after {}s",
+                            decision.target,
+                            decision.outbound.name(),
+                            OUTBOUND_CONNECT_TIMEOUT.as_secs()
+                        ),
+                    )),
+                }
+            }
+        };
+
+        let outbound = match dial_res {
             Ok(s) => s,
             Err(err) => {
                 tracing::debug!(
@@ -741,15 +775,15 @@ fn register_syn_flow(
                     decision.target,
                     err
                 );
+                conn_guard.record_failed(&err.to_string());
                 remote_failed_task.store(true, Ordering::Release);
                 wake_task.notify_one();
-                hub_clone.record_connection_failed(&conn_entry.id, &err.to_string());
                 return;
             }
         };
-        conn_entry.mark_established();
+        conn_guard.mark_established();
 
-        let tracked = TrackedStream::new(outbound, Arc::clone(&hub_clone), Arc::clone(&conn_entry));
+        let tracked = conn_guard.into_tracked_stream(outbound);
         let (mut rd, mut wr) = tokio::io::split(tracked);
 
         let writer_fut = async move {
@@ -797,6 +831,23 @@ fn register_syn_flow(
             }
         }
     });
+
+    flows.insert(
+        tuple,
+        BridgeFlow {
+            handle,
+            established: false,
+            created_at: now,
+            last_active: now,
+            fin_started_at: None,
+            pending_tx: BytesMut::new(),
+            from_remote_rx,
+            to_remote_tx: Some(to_remote_tx),
+            remote_eof: false,
+            remote_failed,
+            task_abort: flow_task.abort_handle(),
+        },
+    );
 }
 
 async fn serve_tun_tcp_dns_flow(

@@ -541,6 +541,11 @@ async fn forward_udp_dns_raw(ns: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
         return Err(ProxyError::Dns("DNS query shorter than 12 bytes".into()));
     }
     let expected_id = [query[0], query[1]];
+    let expected_query = if u16::from_be_bytes([query[4], query[5]]) >= 1 {
+        crate::dns::wire::DnsQueryPacket::parse(query).ok()
+    } else {
+        None
+    };
     let bind_addr: SocketAddr = if ns.is_ipv4() {
         "0.0.0.0:0".parse().expect("valid v4 bind")
     } else {
@@ -550,7 +555,7 @@ async fn forward_udp_dns_raw(ns: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
     sock.connect(ns).await?;
     sock.send(query).await?;
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 8192];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -565,6 +570,23 @@ async fn forward_udp_dns_raw(ns: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
         }
         if (buf[2] & 0x80) == 0 || [buf[0], buf[1]] != expected_id {
             continue;
+        }
+        let resp_qdcount = u16::from_be_bytes([buf[4], buf[5]]);
+        if resp_qdcount >= 1
+            && let Some(ref exp) = expected_query
+        {
+            let Ok(resp_pkt) = crate::dns::wire::DnsQueryPacket::parse(&buf[..n]) else {
+                continue;
+            };
+            if resp_pkt.question.qtype != exp.question.qtype
+                || !resp_pkt
+                    .question
+                    .name
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(exp.question.name.trim_end_matches('.'))
+            {
+                continue;
+            }
         }
         return Ok(buf[..n].to_vec());
     }
@@ -961,6 +983,8 @@ fn parse_http_response_body(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(raw[hdr_end + 4..].to_vec())
 }
 
+const MAX_DNS_MESSAGE_SIZE: usize = 65_535;
+
 fn decode_chunked_if_complete(mut input: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     loop {
@@ -975,18 +999,38 @@ fn decode_chunked_if_complete(mut input: &[u8]) -> Result<Option<Vec<u8>>> {
             .trim();
         let chunk_len = usize::from_str_radix(len_str, 16)
             .map_err(|_| ProxyError::Dns("invalid hex chunk size".into()))?;
-        input = &input[crlf + 2..];
+        if chunk_len > MAX_DNS_MESSAGE_SIZE {
+            return Err(ProxyError::Dns(
+                "DoH chunk exceeds maximum DNS message size".into(),
+            ));
+        }
+        let after_hdr = crlf
+            .checked_add(2)
+            .ok_or_else(|| ProxyError::Dns("DoH chunk header offset overflow".into()))?;
+        input = &input[after_hdr..];
         if chunk_len == 0 {
             if input.len() < 2 {
                 return Ok(None);
             }
             return Ok(Some(out));
         }
-        if input.len() < chunk_len + 2 {
+        let total_len = out
+            .len()
+            .checked_add(chunk_len)
+            .filter(|&n| n <= MAX_DNS_MESSAGE_SIZE)
+            .ok_or_else(|| ProxyError::Dns("DoH chunk exceeds maximum DNS message size".into()))?;
+        let chunk_end = chunk_len
+            .checked_add(2)
+            .ok_or_else(|| ProxyError::Dns("DoH chunk exceeds maximum DNS message size".into()))?;
+        if input.len() < chunk_end {
             return Ok(None);
         }
+        if &input[chunk_len..chunk_end] != b"\r\n" {
+            return Err(ProxyError::Dns("invalid DoH chunk delimiter".into()));
+        }
+        out.reserve(total_len.saturating_sub(out.len()));
         out.extend_from_slice(&input[..chunk_len]);
-        input = &input[chunk_len + 2..];
+        input = &input[chunk_end..];
     }
 }
 
@@ -2061,5 +2105,38 @@ mod tests {
         assert!(BootstrapDnsServer::parse("https://198.51.100.10:8080/dns-query").is_ok());
         assert!(BootstrapDnsServer::parse("tls://203.0.113.5:853").is_ok());
         assert!(BootstrapDnsServer::parse("https://doh.example.com/dns-query").is_err());
+    }
+
+    #[test]
+    fn doh_chunked_decoder_rejects_integer_overflow_and_oversized_chunks() {
+        // Wraparound vectors that previously bypassed `input.len() < chunk_len + 2` in 64-bit release
+        assert!(decode_chunked_if_complete(b"ffffffffffffffff\r\n\r\n").is_err());
+        assert!(decode_chunked_if_complete(b"fffffffffffffffe\r\n").is_err());
+
+        // Single chunk exceeding 65,535-byte DNS maximum
+        let err = decode_chunked_if_complete(b"10000\r\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DoH chunk exceeds maximum DNS message size")
+        );
+
+        // Multi-chunk cumulative payload exceeding 65,535 bytes (32768 + 32768 = 65536)
+        let mut two_chunks = Vec::new();
+        two_chunks.extend_from_slice(b"8000\r\n");
+        two_chunks.extend(std::iter::repeat_n(0x41u8, 0x8000));
+        two_chunks.extend_from_slice(b"\r\n8000\r\n");
+        let cum_err = decode_chunked_if_complete(&two_chunks).unwrap_err();
+        assert!(
+            cum_err
+                .to_string()
+                .contains("DoH chunk exceeds maximum DNS message size")
+        );
+
+        // Valid chunked DNS payload still decodes cleanly
+        let decoded =
+            decode_chunked_if_complete(b"4\r\n\x12\x34\x81\x80\r\n2\r\n\x00\x01\r\n0\r\n\r\n")
+                .unwrap()
+                .unwrap();
+        assert_eq!(decoded, vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x01]);
     }
 }

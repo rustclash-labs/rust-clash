@@ -63,20 +63,31 @@ impl EgressSyncQueue {
         self.space_notify.notify_waiters();
     }
 
-    /// Pop the next outbound packet:
-    /// - `Ok(Some(pkt))`: packet popped
+    /// Pop the next outbound packet if it fits within `buf_cap`:
+    /// - `Ok(Some(pkt))`: packet popped (`pkt.len() <= buf_cap`)
     /// - `Ok(None)`: empty (non-blocking) or timed out while still open
-    /// - `Err(())`: queue closed / engine stopped
-    fn pop_packet(&self, timeout: Option<Duration>, blocking: bool) -> Result<Option<Vec<u8>>, ()> {
+    /// - `Err(PopPacketError::Closed)`: queue closed / engine stopped
+    /// - `Err(PopPacketError::BufferTooSmall { required })`: front packet exceeds `buf_cap` (kept in queue)
+    fn pop_packet(
+        &self,
+        buf_cap: usize,
+        timeout: Option<Duration>,
+        blocking: bool,
+    ) -> Result<Option<Vec<u8>>, PopPacketError> {
         let mut st = self.inner.lock();
         loop {
-            if let Some(pkt) = st.packets.pop_front() {
+            if let Some(front) = st.packets.front() {
+                let pkt_len = front.len();
+                if pkt_len > buf_cap || pkt_len > isize::MAX as usize {
+                    return Err(PopPacketError::BufferTooSmall { required: pkt_len });
+                }
+                let pkt = st.packets.pop_front().expect("front packet checked");
                 drop(st);
                 self.space_notify.notify_one();
                 return Ok(Some(pkt));
             }
             if st.closed {
-                return Err(());
+                return Err(PopPacketError::Closed);
             }
             if !blocking {
                 return Ok(None);
@@ -89,12 +100,24 @@ impl EgressSyncQueue {
                 Some(dur) => {
                     let wait_res = self.ready_cv.wait_for(&mut st, dur);
                     if wait_res.timed_out() && st.packets.is_empty() {
-                        return if st.closed { Err(()) } else { Ok(None) };
+                        return if st.closed {
+                            Err(PopPacketError::Closed)
+                        } else {
+                            Ok(None)
+                        };
                     }
                 }
             }
         }
     }
+}
+
+enum PopPacketError {
+    Closed,
+    #[allow(dead_code)]
+    BufferTooSmall {
+        required: usize,
+    },
 }
 
 struct NeEngineContext {
@@ -167,6 +190,16 @@ fn write_c_error(out_error: *mut *mut c_char, msg: impl Into<String>) {
     }
 }
 
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unexpected FFI panic".to_string()
+    }
+}
+
 /// Start an embedded `ProxyEngine` in virtual `smoltcp` L3 packet mode for Apple `NEPacketTunnelProvider`.
 ///
 /// # Safety
@@ -177,109 +210,127 @@ pub unsafe extern "C" fn rc_ne_start_engine(
     mtu: u16,
     out_error: *mut *mut c_char,
 ) -> *mut RcNeEngineHandle {
-    if yaml_config.is_null() {
-        write_c_error(out_error, "yaml_config pointer is NULL");
-        return ptr::null_mut();
-    }
-    // SAFETY: Caller guarantees `yaml_config` is a NUL-terminated string.
-    let yaml_str = match unsafe { CStr::from_ptr(yaml_config) }.to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            write_c_error(out_error, format!("yaml_config is not valid UTF-8: {e}"));
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if yaml_config.is_null() {
+            write_c_error(out_error, "yaml_config pointer is NULL");
             return ptr::null_mut();
         }
-    };
-
-    let mut cfg = match ClashConfig::from_yaml_str(yaml_str) {
-        Ok(c) => c,
-        Err(e) => {
-            write_c_error(out_error, format!("invalid Clash YAML config: {e}"));
-            return ptr::null_mut();
-        }
-    };
-
-    // Inside `NEPacketTunnelProvider`, Apple owns the system interface (`NEPacketTunnelFlow`)
-    // and passes raw L3 packets over FFI, so `smoltcp` runs in virtual channel mode (`auto_route = false`),
-    // and internal listeners must use ephemeral ports (`0`) so the System Extension never collides
-    // with the host desktop app's `mixed-port` (`7890`) or rapid tunnel restarts.
-    cfg.mixed_port = 0;
-    cfg.dns.listen = "127.0.0.1:0".to_string();
-    cfg.tun.enable = true;
-    cfg.tun.auto_route = false;
-    cfg.tun.mtu = usize::from(mtu.max(1280));
-
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .thread_name("rc-ne-worker")
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            write_c_error(out_error, format!("failed building Tokio runtime: {e}"));
-            return ptr::null_mut();
-        }
-    };
-
-    let engine = match rt.block_on(ProxyEngine::start(cfg)) {
-        Ok(eng) => eng,
-        Err(e) => {
-            rt.shutdown_timeout(Duration::from_millis(250));
-            write_c_error(out_error, format!("failed starting ProxyEngine: {e}"));
-            return ptr::null_mut();
-        }
-    };
-
-    let Some(VirtualTunHandle {
-        ingress_tx,
-        mut egress_rx,
-    }) = engine.take_virtual_tun_handle()
-    else {
-        engine.shutdown();
-        rt.shutdown_timeout(Duration::from_millis(250));
-        write_c_error(out_error, "virtual smoltcp handle unavailable");
-        return ptr::null_mut();
-    };
-
-    // Spawn event-driven egress bridge (`0 Hz` wakeups when idle; bounded 1024-packet backpressure).
-    // IMPORTANT: The task holds ONLY `Arc<EgressSyncQueue>`, never `Arc<NeEngineContext>`, so
-    // `NeEngineContext::drop` never executes inside `rt` worker threads.
-    let egress_queue = EgressSyncQueue::new();
-    let queue_for_pump = Arc::clone(&egress_queue);
-    let pump_task = rt.spawn(async move {
-        while let Some(pkt) = egress_rx.recv().await {
-            loop {
-                let notified = queue_for_pump.space_notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                {
-                    let mut st = queue_for_pump.inner.lock();
-                    if st.closed {
-                        return;
-                    }
-                    if st.packets.len() < MAX_EGRESS_QUEUE_PACKETS {
-                        st.packets.push_back(pkt);
-                        queue_for_pump.ready_cv.notify_one();
-                        break;
-                    }
-                }
-                notified.await;
+        // SAFETY: Caller guarantees `yaml_config` is a NUL-terminated string.
+        let yaml_str = match unsafe { CStr::from_ptr(yaml_config) }.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_c_error(out_error, format!("yaml_config is not valid UTF-8: {e}"));
+                return ptr::null_mut();
             }
+        };
+
+        let mut cfg = match ClashConfig::from_yaml_str(yaml_str) {
+            Ok(c) => c,
+            Err(e) => {
+                write_c_error(out_error, format!("invalid Clash YAML config: {e}"));
+                return ptr::null_mut();
+            }
+        };
+
+        // Inside `NEPacketTunnelProvider`, Apple owns the system interface (`NEPacketTunnelFlow`)
+        // and passes raw L3 packets over FFI, so `smoltcp` runs in virtual channel mode (`auto_route = false`),
+        // and internal listeners must use ephemeral loopback ports (`127.0.0.1:0`) so the System Extension
+        // never exposes LAN ports or collides with the host desktop app's `mixed-port` (`7890`).
+        cfg.allow_lan = false;
+        cfg.bind_address = "127.0.0.1".to_string();
+        cfg.lan_allowed_ips.clear();
+        cfg.authentication.clear();
+        cfg.mixed_port = 0;
+        cfg.dns.listen = "127.0.0.1:0".to_string();
+        cfg.tun.enable = true;
+        cfg.tun.auto_route = false;
+        cfg.tun.mtu = usize::from(mtu.max(1280));
+
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("rc-ne-worker")
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                write_c_error(out_error, format!("failed building Tokio runtime: {e}"));
+                return ptr::null_mut();
+            }
+        };
+
+        let engine = match rt.block_on(ProxyEngine::start(cfg)) {
+            Ok(eng) => eng,
+            Err(e) => {
+                rt.shutdown_timeout(Duration::from_millis(250));
+                write_c_error(out_error, format!("failed starting ProxyEngine: {e}"));
+                return ptr::null_mut();
+            }
+        };
+
+        let Some(VirtualTunHandle {
+            ingress_tx,
+            mut egress_rx,
+        }) = engine.take_virtual_tun_handle()
+        else {
+            engine.shutdown();
+            rt.shutdown_timeout(Duration::from_millis(250));
+            write_c_error(out_error, "virtual smoltcp handle unavailable");
+            return ptr::null_mut();
+        };
+
+        // Spawn event-driven egress bridge (`0 Hz` wakeups when idle; bounded 1024-packet backpressure).
+        // IMPORTANT: The task holds ONLY `Arc<EgressSyncQueue>`, never `Arc<NeEngineContext>`, so
+        // `NeEngineContext::drop` never executes inside `rt` worker threads.
+        let egress_queue = EgressSyncQueue::new();
+        let queue_for_pump = Arc::clone(&egress_queue);
+        let pump_task = rt.spawn(async move {
+            while let Some(pkt) = egress_rx.recv().await {
+                loop {
+                    let notified = queue_for_pump.space_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    {
+                        let mut st = queue_for_pump.inner.lock();
+                        if st.closed {
+                            return;
+                        }
+                        if st.packets.len() < MAX_EGRESS_QUEUE_PACKETS {
+                            st.packets.push_back(pkt);
+                            queue_for_pump.ready_cv.notify_one();
+                            break;
+                        }
+                    }
+                    notified.await;
+                }
+            }
+            queue_for_pump.close();
+        });
+
+        let ctx = Arc::new(NeEngineContext {
+            runtime: Mutex::new(Some(rt)),
+            engine,
+            ingress_tx,
+            egress_queue,
+            pump_task: Mutex::new(Some(pump_task)),
+        });
+
+        let id = allocate_handle_id();
+        NE_ENGINES.lock().insert(id, ctx);
+        ptr::without_provenance_mut(id)
+    })) {
+        Ok(ptr_out) => ptr_out,
+        Err(p) => {
+            write_c_error(
+                out_error,
+                format!(
+                    "internal panic in rc_ne_start_engine: {}",
+                    panic_payload_to_string(p)
+                ),
+            );
+            ptr::null_mut()
         }
-        queue_for_pump.close();
-    });
-
-    let ctx = Arc::new(NeEngineContext {
-        runtime: Mutex::new(Some(rt)),
-        engine,
-        ingress_tx,
-        egress_queue,
-        pump_task: Mutex::new(Some(pump_task)),
-    });
-
-    let id = allocate_handle_id();
-    NE_ENGINES.lock().insert(id, ctx);
-    ptr::without_provenance_mut(id)
+    }
 }
 
 /// Push a raw L3 IPv4/IPv6 packet from `NEPacketTunnelFlow` into `smoltcp`.
@@ -294,18 +345,21 @@ pub unsafe extern "C" fn rc_ne_push_inbound_packet(
     packet_ptr: *const u8,
     packet_len: usize,
 ) -> bool {
-    if packet_ptr.is_null() || packet_len == 0 || packet_len > 65535 {
-        return false;
-    }
-    let Some(ctx) = lookup_context(handle) else {
-        return false;
-    };
-    if ctx.egress_queue.inner.lock().closed {
-        return false;
-    }
-    // SAFETY: Caller guarantees `packet_ptr[..packet_len]` is valid for the duration of this call.
-    let pkt = unsafe { std::slice::from_raw_parts(packet_ptr, packet_len) }.to_vec();
-    ctx.ingress_tx.try_send(pkt).is_ok()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if packet_ptr.is_null() || packet_len == 0 || packet_len > 65535 {
+            return false;
+        }
+        let Some(ctx) = lookup_context(handle) else {
+            return false;
+        };
+        if ctx.egress_queue.inner.lock().closed {
+            return false;
+        }
+        // SAFETY: Caller guarantees `packet_ptr[..packet_len]` is valid for the duration of this call.
+        let pkt = unsafe { std::slice::from_raw_parts(packet_ptr, packet_len) }.to_vec();
+        ctx.ingress_tx.try_send(pkt).is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 /// Event-driven blocking/timed outbound packet wait for `NEPacketTunnelProvider` (`0 Hz` idle wakeups!).
@@ -317,8 +371,9 @@ pub unsafe extern "C" fn rc_ne_push_inbound_packet(
 ///
 /// Return values:
 /// - `> 0`: byte length copied into `out_buf`
-/// - `0`: timeout elapsed (or queue empty when `timeout_ms == 0`, or buffer smaller than packet)
+/// - `0`: timeout elapsed (or queue empty when `timeout_ms == 0`)
 /// - `-1`: invalid/stopped `handle` or invalid buffer arguments
+/// - `-2`: `buf_cap` is smaller than the queued front packet (packet remains queued at front)
 ///
 /// # Safety
 /// `out_buf` must point to at least `buf_cap` writable bytes.
@@ -329,35 +384,40 @@ pub unsafe extern "C" fn rc_ne_wait_outbound_packet(
     buf_cap: usize,
     timeout_ms: i32,
 ) -> isize {
-    if out_buf.is_null() || buf_cap == 0 {
-        return -1;
-    }
-    let Some(ctx) = lookup_context(handle) else {
-        return -1;
-    };
-    let pop_res = if timeout_ms < 0 {
-        ctx.egress_queue.pop_packet(None, true)
-    } else if timeout_ms == 0 {
-        ctx.egress_queue.pop_packet(None, false)
-    } else {
-        ctx.egress_queue
-            .pop_packet(Some(Duration::from_millis(timeout_ms as u64)), true)
-    };
-
-    match pop_res {
-        Ok(Some(pkt)) => {
-            if pkt.len() > buf_cap || pkt.len() > isize::MAX as usize {
-                return 0;
-            }
-            // SAFETY: `pkt.len() <= buf_cap` and `out_buf` has `buf_cap` writable bytes.
-            unsafe {
-                ptr::copy_nonoverlapping(pkt.as_ptr(), out_buf, pkt.len());
-            }
-            pkt.len() as isize
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_buf.is_null() || buf_cap == 0 {
+            return -1;
         }
-        Ok(None) => 0,
-        Err(()) => -1,
-    }
+        let Some(ctx) = lookup_context(handle) else {
+            return -1;
+        };
+        let pop_res = if timeout_ms < 0 {
+            ctx.egress_queue.pop_packet(buf_cap, None, true)
+        } else if timeout_ms == 0 {
+            ctx.egress_queue.pop_packet(buf_cap, None, false)
+        } else {
+            ctx.egress_queue.pop_packet(
+                buf_cap,
+                Some(Duration::from_millis(timeout_ms as u64)),
+                true,
+            )
+        };
+
+        match pop_res {
+            Ok(Some(pkt)) => {
+                // SAFETY: `pop_packet` verified `pkt.len() <= buf_cap` and `pkt.len() <= isize::MAX`,
+                // and caller guarantees `out_buf` has `buf_cap` writable bytes.
+                unsafe {
+                    ptr::copy_nonoverlapping(pkt.as_ptr(), out_buf, pkt.len());
+                }
+                pkt.len() as isize
+            }
+            Ok(None) => 0,
+            Err(PopPacketError::BufferTooSmall { .. }) => -2,
+            Err(PopPacketError::Closed) => -1,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Non-blockingly pop the next outbound L3 packet from `smoltcp` into `out_buf` (used for batch draining).
@@ -370,59 +430,70 @@ pub unsafe extern "C" fn rc_ne_pop_outbound_packet(
     out_buf: *mut u8,
     buf_cap: usize,
 ) -> usize {
-    // SAFETY: Same buffer contract as `rc_ne_wait_outbound_packet`.
-    let n = unsafe { rc_ne_wait_outbound_packet(handle, out_buf, buf_cap, 0) };
-    if n > 0 { n as usize } else { 0 }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: Same buffer contract as `rc_ne_wait_outbound_packet`.
+        let n = unsafe { rc_ne_wait_outbound_packet(handle, out_buf, buf_cap, 0) };
+        if n > 0 { n as usize } else { 0 }
+    }))
+    .unwrap_or(0)
 }
 
 /// Flush DNS positive/negative caches on wake or minor path update.
 #[unsafe(no_mangle)]
 pub extern "C" fn rc_ne_flush_dns(handle: *mut RcNeEngineHandle) {
-    if let Some(ctx) = lookup_context(handle) {
-        ctx.engine.router().dns().flush_cache();
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(ctx) = lookup_context(handle) {
+            ctx.engine.router().dns().flush_cache();
+        }
+    }));
 }
 
 /// Perform full session recovery (UDP NAT reset + AnyTLS session pool eviction + active TCP abort + DNS flush)
 /// on macOS sleep/wake (`NEPacketTunnelProvider.wake()`) or physical interface handoffs.
 #[unsafe(no_mangle)]
 pub extern "C" fn rc_ne_notify_network_change(handle: *mut RcNeEngineHandle) -> bool {
-    let Some(ctx) = lookup_context(handle) else {
-        return false;
-    };
-    let _ = ctx.engine.notify_network_change();
-    true
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(ctx) = lookup_context(handle) else {
+            return false;
+        };
+        let _ = ctx.engine.notify_network_change();
+        true
+    }))
+    .unwrap_or(false)
 }
 
 /// Return a newly allocated JSON status string (free with `rc_ne_free_string`), or NULL if stopped.
 #[unsafe(no_mangle)]
 pub extern "C" fn rc_ne_get_status_json(handle: *mut RcNeEngineHandle) -> *mut c_char {
-    let Some(ctx) = lookup_context(handle) else {
-        return ptr::null_mut();
-    };
-    let (up, down) = ctx
-        .engine
-        .hub()
-        .traffic_history()
-        .last()
-        .map(|p| (p.up, p.down))
-        .unwrap_or((0, 0));
-    let (up_tot, down_tot) = ctx.engine.hub().totals();
-    let payload = serde_json::json!({
-        "mode": ctx.engine.router().mode().as_str(),
-        "tunMode": ctx.engine.tun_mode().as_str(),
-        "upRate": up,
-        "downRate": down,
-        "upTotal": up_tot,
-        "downTotal": down_tot,
-        "rssBytes": read_process_rss_bytes(),
-        "activeConnections": ctx.engine.hub().list_connections().len(),
-        "fakeIpEntries": ctx.engine.router().dns().entry_count(),
-    });
-    match CString::new(payload.to_string()) {
-        Ok(cs) => cs.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(ctx) = lookup_context(handle) else {
+            return ptr::null_mut();
+        };
+        let (up, down) = ctx
+            .engine
+            .hub()
+            .traffic_history()
+            .last()
+            .map(|p| (p.up, p.down))
+            .unwrap_or((0, 0));
+        let (up_tot, down_tot) = ctx.engine.hub().totals();
+        let payload = serde_json::json!({
+            "mode": ctx.engine.router().mode().as_str(),
+            "tunMode": ctx.engine.tun_mode().as_str(),
+            "upRate": up,
+            "downRate": down,
+            "upTotal": up_tot,
+            "downTotal": down_tot,
+            "rssBytes": read_process_rss_bytes(),
+            "activeConnections": ctx.engine.hub().list_connections().len(),
+            "fakeIpEntries": ctx.engine.router().dns().entry_count(),
+        });
+        match CString::new(payload.to_string()) {
+            Ok(cs) => cs.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Gracefully stop and unregister an `RcNeEngineHandle`.
@@ -434,13 +505,15 @@ pub extern "C" fn rc_ne_get_status_json(handle: *mut RcNeEngineHandle) -> *mut c
 /// - Underlying `NeEngineContext` & Tokio runtime are dropped only after all in-flight `Arc` borrows return.
 #[unsafe(no_mangle)]
 pub extern "C" fn rc_ne_stop_engine(handle: *mut RcNeEngineHandle) {
-    let Some(id) = handle_to_id(handle) else {
-        return;
-    };
-    let removed = NE_ENGINES.lock().remove(&id);
-    if let Some(ctx) = removed {
-        ctx.initiate_stop();
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(id) = handle_to_id(handle) else {
+            return;
+        };
+        let removed = NE_ENGINES.lock().remove(&id);
+        if let Some(ctx) = removed {
+            ctx.initiate_stop();
+        }
+    }));
 }
 
 /// Free a C string returned by `rc_ne_*`.
@@ -449,10 +522,12 @@ pub extern "C" fn rc_ne_stop_engine(handle: *mut RcNeEngineHandle) {
 /// `ptr` must be NULL or a pointer previously allocated via `CString::into_raw` by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rc_ne_free_string(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        // SAFETY: Reclaiming `CString` allocated by `CString::into_raw`.
-        unsafe {
-            let _ = CString::from_raw(ptr);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !ptr.is_null() {
+            // SAFETY: Reclaiming `CString` allocated by `CString::into_raw`.
+            unsafe {
+                let _ = CString::from_raw(ptr);
+            }
         }
-    }
+    }));
 }

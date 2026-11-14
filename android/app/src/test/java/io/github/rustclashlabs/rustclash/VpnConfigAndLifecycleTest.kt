@@ -864,4 +864,119 @@ class VpnConfigAndLifecycleTest {
         assertEquals("A", refreshSum.auditGrade)
         assertEquals(2, refreshSum.manualProtectedCount)
     }
+
+    @Test
+    fun externalImportPreviewClassifiesClashDeepLinksSubscriptionsAndShareUrisWithRedaction() {
+        val clashDeepLink =
+            "clash://install-config?url=https%3A%2F%2Fsub.provider.example%3A8443%2Fapi%2Fv1%2Fclient%2Fsubscribe%3Ftoken%3DTOP_SECRET_SUB_TOKEN_999&name=My%20Provider"
+        val clashPreview = NodeImportSupport.classifyExternalImportPreview(clashDeepLink)
+        assertEquals(NodeImportSupport.ExternalImportKind.REMOTE_SUBSCRIPTION, clashPreview.kind)
+        assertTrue(clashPreview.isRemoteSubscription)
+        assertEquals("sub.provider.example:8443", clashPreview.targetHost)
+        assertEquals("My Provider", clashPreview.profileDisplayHint)
+        assertFalse(clashPreview.sanitizedSummary.contains("TOP_SECRET_SUB_TOKEN_999"))
+        assertFalse(clashPreview.sanitizedPayloadPreview.contains("TOP_SECRET_SUB_TOKEN_999"))
+        assertTrue(clashPreview.sanitizedPayloadPreview.contains("***REDACTED***"))
+        assertNotNull(clashPreview.securityWarning)
+        assertTrue(clashPreview.securityWarning!!.contains("sub.provider.example:8443"))
+        assertTrue(clashPreview.securityWarning!!.contains("分流规则"))
+
+        val cleartextUserInfoSub = "http://admin:SuperSecretPass@insecure.sub.example/s/abcdef1234567890"
+        val httpPreview = NodeImportSupport.classifyExternalImportPreview(cleartextUserInfoSub)
+        assertEquals(NodeImportSupport.ExternalImportKind.REMOTE_SUBSCRIPTION, httpPreview.kind)
+        assertTrue(httpPreview.isRemoteSubscription)
+        assertEquals("insecure.sub.example", httpPreview.targetHost)
+        assertFalse(httpPreview.sanitizedPayloadPreview.contains("SuperSecretPass"))
+        assertFalse(httpPreview.sanitizedPayloadPreview.contains("abcdef1234567890"))
+        assertTrue(httpPreview.securityWarning!!.contains("HTTP"))
+
+        val shareLinks = """
+            vless://11111111-2222-3333-4444-555555555555@hk.example.com:443?security=reality&pbk=REALITY_PBK_SECRET#HK-01
+            ss://YWVzLTI1Ni1nY206c2VjcmV0X3Bhc3M@jp.example.com:8388#JP-02
+            trojan://TROJAN_SECRET_PASS@sg.example.com:443#SG-03
+        """.trimIndent()
+        val uriPreview = NodeImportSupport.classifyExternalImportPreview(shareLinks)
+        assertEquals(NodeImportSupport.ExternalImportKind.PROXY_SHARE_URIS, uriPreview.kind)
+        assertFalse(uriPreview.isRemoteSubscription)
+        assertEquals(3, uriPreview.proxyUriCount)
+        assertEquals(listOf("VLESS", "Shadowsocks", "Trojan"), uriPreview.protocols)
+        assertFalse(uriPreview.sanitizedPayloadPreview.contains("11111111-2222-3333-4444-555555555555"))
+        assertFalse(uriPreview.sanitizedPayloadPreview.contains("REALITY_PBK_SECRET"))
+        assertFalse(uriPreview.sanitizedPayloadPreview.contains("TROJAN_SECRET_PASS"))
+        assertTrue(uriPreview.sanitizedPayloadPreview.contains("#HK-01"))
+
+        val b64Payload = java.util.Base64.getEncoder()
+            .encodeToString(shareLinks.toByteArray(Charsets.UTF_8))
+        val b64Preview = NodeImportSupport.classifyExternalImportPreview(b64Payload)
+        assertEquals(NodeImportSupport.ExternalImportKind.BASE64_SUBSCRIPTION, b64Preview.kind)
+        assertEquals(3, b64Preview.proxyUriCount)
+        assertFalse(b64Preview.sanitizedPayloadPreview.contains("TROJAN_SECRET_PASS"))
+
+        val yamlPayload = """
+            proxies:
+              - name: HK-YAML
+                type: ss
+                server: hk.example.com
+                port: 8388
+                password: "YAML_TOP_SECRET_PASSWORD"
+            rules:
+              - MATCH,PROXY
+        """.trimIndent()
+        val yamlPreview = NodeImportSupport.classifyExternalImportPreview(yamlPayload)
+        assertEquals(NodeImportSupport.ExternalImportKind.YAML_CONFIG, yamlPreview.kind)
+        assertFalse(yamlPreview.sanitizedPayloadPreview.contains("YAML_TOP_SECRET_PASSWORD"))
+    }
+
+    @Test
+    fun redactSecretsScrubsJsonAndYamlDoubleQuotedSingleQuotedAndUnquotedSecrets() {
+        val jsonSnippet = """
+            {
+              "name": "HK-Node",
+              "server": "hk.example.com",
+              "port": 443,
+              "password": "hunter2_json_double",
+              "api_key": "sk-live-secret-999",
+              "client-secret": "cs_my_quoted_secret",
+              "socks_password": "prefixed_key_secret"
+            }
+        """.trimIndent()
+        val scrubbedJson = NodeImportSupport.redactSecretsForUi(jsonSnippet)
+        assertFalse(scrubbedJson.contains("hunter2_json_double"))
+        assertFalse(scrubbedJson.contains("sk-live-secret-999"))
+        assertFalse(scrubbedJson.contains("cs_my_quoted_secret"))
+        assertFalse(scrubbedJson.contains("prefixed_key_secret"))
+        assertTrue(scrubbedJson.contains("\"password\": \"***REDACTED***\""))
+        assertTrue(scrubbedJson.contains("\"api_key\": \"***REDACTED***\""))
+        assertTrue(scrubbedJson.contains("\"client-secret\": \"***REDACTED***\""))
+        assertTrue(scrubbedJson.contains("\"socks_password\": \"***REDACTED***\""))
+        assertTrue(scrubbedJson.contains("\"server\": \"hk.example.com\""))
+
+        val escapedJson = """{"nested": "{\"password\": \"escaped_hunter2\", \"host\": \"jp.example.com\"}"}"""
+        val scrubbedEscaped = NodeImportSupport.redactSecretsForUi(escapedJson)
+        assertFalse(scrubbedEscaped.contains("escaped_hunter2"))
+        assertTrue(scrubbedEscaped.contains("""\"password\": \"***REDACTED***\""""))
+        assertTrue(scrubbedEscaped.contains("""\"host\": \"jp.example.com\""""))
+
+        val yamlAndKv = """
+            password: "yaml_double_quoted_pass"
+            secret: 'yaml_single_quoted_secret'
+            'private-key': 'wg_single_quoted_privkey'
+            auth_str: 'it''s_escaped_single_quote'
+            password: yaml_unquoted_pass
+            token=query_unquoted_token
+        """.trimIndent()
+        val scrubbedYaml = NodeImportSupport.redactSecretsForUi(yamlAndKv)
+        assertFalse(scrubbedYaml.contains("yaml_double_quoted_pass"))
+        assertFalse(scrubbedYaml.contains("yaml_single_quoted_secret"))
+        assertFalse(scrubbedYaml.contains("wg_single_quoted_privkey"))
+        assertFalse(scrubbedYaml.contains("escaped_single_quote"))
+        assertFalse(scrubbedYaml.contains("yaml_unquoted_pass"))
+        assertFalse(scrubbedYaml.contains("query_unquoted_token"))
+        assertTrue(scrubbedYaml.contains("password: \"***REDACTED***\""))
+        assertTrue(scrubbedYaml.contains("secret: '***REDACTED***'"))
+        assertTrue(scrubbedYaml.contains("'private-key': '***REDACTED***'"))
+        assertTrue(scrubbedYaml.contains("password: ***REDACTED***"))
+        assertTrue(scrubbedYaml.contains("token=***REDACTED***"))
+    }
 }
+
