@@ -2,7 +2,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -320,6 +320,17 @@ async fn connect_outbound_with_timeout(
     }
 }
 
+fn record_passive_proxy_delay(router: &Router, outbound: &dyn OutboundHandler, elapsed: Duration) {
+    let leaf_outbound = outbound.name();
+    if outbound.exit_category() == "PROXY" && !matches!(leaf_outbound, "DIRECT" | "REJECT") {
+        router.record_passive_delay_if_stale(
+            leaf_outbound,
+            elapsed.as_millis().max(1) as u64,
+            180_000,
+        );
+    }
+}
+
 async fn handle_mixed_conn(
     mut tcp: TcpStream,
     peer: SocketAddr,
@@ -535,6 +546,7 @@ async fn handle_socks5(
                 ),
             );
 
+            let dial_start = Instant::now();
             let outbound_stream = match connect_outbound_with_timeout(
                 decision.outbound.as_ref(),
                 &decision.target,
@@ -553,6 +565,7 @@ async fn handle_socks5(
                 }
             };
             conn_guard.mark_established();
+            record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
             // Success reply: BND.ADDR 0.0.0.0:0
             tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -656,16 +669,33 @@ async fn handle_socks5(
                         if locked_client_port.is_none() {
                             locked_client_port = Some(client_udp_addr.port());
                         }
+
+                        let payload = buf[3 + hdr_used..n].to_vec();
+                        let payload = if let HostName::Ip(dst_ip) = raw_dst.host {
+                            let raw_dst_sock = SocketAddr::new(dst_ip, raw_dst.port);
+                            match nat_clone.try_send_fast(
+                                client_udp_addr,
+                                raw_dst_sock,
+                                router_clone.epoch(),
+                                payload,
+                            ) {
+                                Ok(()) => continue,
+                                Err(payload) => payload,
+                            }
+                        } else {
+                            payload
+                        };
+
                         let Ok(permit) = Arc::clone(&inflight_sem).try_acquire_owned() else {
                             continue;
                         };
 
-                        let payload = buf[3 + hdr_used..n].to_vec();
                         let router_for_pkt = Arc::clone(&router_clone);
                         let nat_inner = Arc::clone(&nat_clone);
                         let policy_for_pkt = Arc::clone(&policy_for_udp);
                         tokio::spawn(async move {
                             let _permit = permit;
+                            let route_epoch = router_for_pkt.epoch();
                             let decision = router_for_pkt
                                 .route_async_with_context(
                                     Some(client_udp_addr.ip()),
@@ -685,7 +715,7 @@ async fn handle_socks5(
                                 return;
                             }
                             nat_inner
-                                .send_datagram(
+                                .send_datagram_with_epoch(
                                     client_udp_addr,
                                     raw_dst,
                                     decision.restored_from_fake_ip,
@@ -695,6 +725,7 @@ async fn handle_socks5(
                                     decision.chains,
                                     decision.outbound,
                                     payload,
+                                    route_epoch,
                                 )
                                 .await;
                         });
@@ -882,6 +913,7 @@ async fn handle_http_proxy(
             ),
         );
 
+        let dial_start = Instant::now();
         let outbound_stream = match connect_outbound_with_timeout(
             decision.outbound.as_ref(),
             &decision.target,
@@ -897,6 +929,7 @@ async fn handle_http_proxy(
             }
         };
         conn_guard.mark_established();
+        record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
         tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
@@ -1020,6 +1053,7 @@ async fn handle_http_proxy(
             ),
         );
 
+        let dial_start = Instant::now();
         let outbound_stream = match connect_outbound_with_timeout(
             decision.outbound.as_ref(),
             &decision.target,
@@ -1035,6 +1069,7 @@ async fn handle_http_proxy(
             }
         };
         conn_guard.mark_established();
+        record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
         let mut rewritten = String::with_capacity(header_text.len());
         rewritten.push_str(&format!("{method} {origin_path} {version}\r\n"));

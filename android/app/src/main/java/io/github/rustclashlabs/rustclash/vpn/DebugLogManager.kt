@@ -67,6 +67,8 @@ object DebugLogManager {
     val SLICE_INTERVAL_CHOICES = listOf(900L, 1800L, 3600L)
 
     private val crashHookInstalled = AtomicBoolean(false)
+    private val SAFE_TRIGGER_REGEX = Regex("[^a-z0-9_-]")
+    private const val SLICE_REPORT_HEADER_PREFIX = "### RustClash Android Diagnostic Slice ("
     private val lock = Any()
     private val sliceWriteLock = Any()
 
@@ -79,6 +81,7 @@ object DebugLogManager {
     private var windowStartBatteryPct: Int? = null
     private var lastNetworkLostMs: Long = 0L
     private var lastNetStateFingerprint: String = ""
+    private var lastCumulativeRuleHits: Map<String, Long> = emptyMap()
     private val timelineEvents = ArrayDeque<MobileTimelineEvent>(MAX_TIMELINE_EVENTS)
 
     fun isEnabled(context: Context): Boolean {
@@ -171,6 +174,7 @@ object DebugLogManager {
             windowStartBatteryPct = battery.levelPct
             lastNetworkLostMs = 0L
             lastNetStateFingerprint = ""
+            lastCumulativeRuleHits = emptyMap()
             pushEventLocked(
                 now,
                 "VPN_START",
@@ -315,10 +319,11 @@ object DebugLogManager {
         stateDir: String = context.filesDir.absolutePath,
         trigger: String,
     ): File? = synchronized(sliceWriteLock) {
-        val now = System.currentTimeMillis()
         val batteryEnd = readBatterySnapshot(context)
+        val systemMeta = collectSystemMetadata(context, batteryEnd)
 
-        val windowSnap = synchronized(lock) {
+        val (windowSnap, prevRuleHitsSnap) = synchronized(lock) {
+            val now = System.currentTimeMillis()
             flushScreenDurationLocked(now)
             val snap = WindowTelemetryState(
                 windowStartMs = windowStartMs,
@@ -334,15 +339,25 @@ object DebugLogManager {
             screenOffAccumMs = 0L
             lastScreenTransitionMs = now
             windowStartBatteryPct = batteryEnd.levelPct
-            snap
+            snap to lastCumulativeRuleHits
         }
 
         val nativeJsonStr = if (NativeBridge.ensureLoaded()) {
             runCatching {
-                NativeBridge.nativeCollectDebugSnapshotJson(stateDir, windowSnap.windowStartMs)
+                NativeBridge.nativeCollectDebugSnapshotJson(
+                    stateDir,
+                    windowSnap.windowStartMs,
+                    windowSnap.capturedAtMs,
+                )
             }.getOrDefault("{\"ok\":false,\"error\":\"nativeCollectDebugSnapshotJson threw\"}")
         } else {
             "{\"ok\":false,\"vpnRunning\":false,\"error\":\"native library not loaded\"}"
+        }
+
+        extractCumulativeRuleHits(nativeJsonStr)?.let { latestHits ->
+            synchronized(lock) {
+                lastCumulativeRuleHits = latestHits
+            }
         }
 
         val dir = File(context.filesDir, DEBUG_DIR_NAME).apply { mkdirs() }
@@ -350,20 +365,20 @@ object DebugLogManager {
             .takeIf { it.isFile }
             ?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
 
-        val systemMeta = collectSystemMetadata(context, batteryEnd)
         val formatted = formatSliceReport(
             trigger = trigger,
             window = windowSnap,
             systemMeta = systemMeta,
             nativeSnapshotRawJson = nativeJsonStr,
             crashBreadcrumb = crashBreadcrumb,
+            previousRuleHits = prevRuleHitsSnap,
         )
 
         val safeTrigger = trigger.lowercase(Locale.ROOT)
-            .replace(Regex("[^a-z0-9_-]"), "-")
+            .replace(SAFE_TRIGGER_REGEX, "-")
             .trim('-')
             .ifEmpty { "slice" }
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date(now))
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date(windowSnap.capturedAtMs))
         val outFile = File(dir, "$SLICE_PREFIX$stamp-$safeTrigger$SLICE_SUFFIX")
         val tmpFile = File(dir, "${outFile.name}.tmp")
         return runCatching {
@@ -380,15 +395,19 @@ object DebugLogManager {
     }
 
     /**
-     * Flushes a fresh live slice first, then builds a single combined report file in `cacheDir/debug_exports`
+     * Flushes a fresh live slice first (unless one was captured within the last 15 seconds),
+     * then builds a single combined report file in `cacheDir/debug_exports`
      * suitable for Android Share Sheet (`FileProvider`) or SAF Save (`CreateDocument`).
      */
     fun buildCombinedReportFile(
         context: Context,
         stateDir: String = context.filesDir.absolutePath,
     ): File? {
-        captureSlice(context = context, stateDir = stateDir, trigger = "export")
         val sliceDir = File(context.filesDir, DEBUG_DIR_NAME)
+        val newest = listSliceFilesNewestFirst(sliceDir).firstOrNull()
+        if (newest == null || System.currentTimeMillis() - newest.lastModified() >= 15_000L) {
+            captureSlice(context = context, stateDir = stateDir, trigger = "export")
+        }
         val exportDir = File(context.cacheDir, EXPORT_CACHE_DIR_NAME).apply { mkdirs() }
         // Clean up stale export files older than 1 hour
         val cutoff = System.currentTimeMillis() - 3_600_000L
@@ -424,21 +443,31 @@ object DebugLogManager {
         }
 
         val selectedBodies = ArrayList<Pair<String, String>>()
-        var usedChars = header.length
+        var usedBytes = header.toByteArray(Charsets.UTF_8).size
+        val separatorBytes = 200
         for (file in newestFirst) {
             val content = runCatching { file.readText(Charsets.UTF_8) }.getOrNull() ?: continue
-            val sanitized = NodeImportSupport.redactSecretsForUi(content)
-            val separatorLen = 80
-            if (selectedBodies.isNotEmpty() && usedChars + sanitized.length + separatorLen > maxBytes) {
+            // Slices written by formatSliceReport are already scrubbed once on disk; avoid a second full-file regex pass
+            val sanitized = if (content.startsWith(SLICE_REPORT_HEADER_PREFIX)) {
+                content
+            } else {
+                NodeImportSupport.redactSecretsForUi(content)
+            }
+            val sanitizedUtf8Bytes = sanitized.toByteArray(Charsets.UTF_8)
+            if (selectedBodies.isNotEmpty() && usedBytes + sanitizedUtf8Bytes.size + separatorBytes > maxBytes) {
                 break
             }
-            val bounded = if (usedChars + sanitized.length + separatorLen > maxBytes) {
-                sanitized.take((maxBytes - usedChars - separatorLen).coerceAtLeast(1024)) + "\n...[truncated]...\n"
+            val (bounded, boundedByteLen) = if (usedBytes + sanitizedUtf8Bytes.size + separatorBytes > maxBytes) {
+                val suffix = "\n...[truncated]...\n"
+                val suffixByteLen = suffix.toByteArray(Charsets.UTF_8).size
+                val budgetBytes = (maxBytes - usedBytes - separatorBytes - suffixByteLen).coerceAtLeast(1024)
+                val truncated = truncateUtf8BytesSafe(sanitizedUtf8Bytes, budgetBytes) + suffix
+                truncated to truncated.toByteArray(Charsets.UTF_8).size
             } else {
-                sanitized
+                sanitized to sanitizedUtf8Bytes.size
             }
             selectedBodies.add(file.name to bounded)
-            usedChars += bounded.length + separatorLen
+            usedBytes += boundedByteLen + separatorBytes
         }
 
         // Order chronologically (oldest -> newest among selected recent slices) for natural timeline analysis
@@ -462,6 +491,35 @@ object DebugLogManager {
         }.getOrNull()
     }
 
+    private fun truncateUtf8BytesSafe(bytes: ByteArray, maxBytes: Int): String {
+        if (bytes.size <= maxBytes) {
+            return String(bytes, Charsets.UTF_8)
+        }
+        var end = maxBytes.coerceAtLeast(0)
+        while (end > 0 && (bytes[end].toInt() and 0xC0) == 0x80) {
+            end--
+        }
+        return String(bytes, 0, end, Charsets.UTF_8)
+    }
+
+    private fun extractCumulativeRuleHits(nativeSnapshotRawJson: String): Map<String, Long>? {
+        val obj = runCatching { JSONObject(nativeSnapshotRawJson) }.getOrNull() ?: return null
+        if (!obj.optBoolean("ok", false)) return null
+        val arr = obj.optJSONArray("topRules") ?: return emptyMap()
+        val map = LinkedHashMap<String, Long>(arr.length() * 2)
+        for (i in 0 until arr.length()) {
+            val r = arr.optJSONObject(i) ?: continue
+            val type = r.optString("type")
+            val payload = r.optString("payload")
+            val proxy = r.optString("proxy")
+            val label = if (payload.isEmpty()) type else "$type,$payload"
+            val hits = r.optLong("hits", 0L)
+            map["$label->$proxy"] = hits
+            map.putIfAbsent(label, hits)
+        }
+        return map
+    }
+
     fun clearAllLogs(context: Context) {
         synchronized(sliceWriteLock) {
             val dir = File(context.filesDir, DEBUG_DIR_NAME)
@@ -476,6 +534,7 @@ object DebugLogManager {
             screenOnAccumMs = 0L
             screenOffAccumMs = 0L
             lastScreenTransitionMs = now
+            lastCumulativeRuleHits = emptyMap()
         }
         if (NativeBridge.isNativeLoaded) {
             runCatching { NativeBridge.nativeClearDiagnostics() }
@@ -680,6 +739,7 @@ object DebugLogManager {
         systemMeta: SystemMetadata,
         nativeSnapshotRawJson: String,
         crashBreadcrumb: String?,
+        previousRuleHits: Map<String, Long> = emptyMap(),
     ): String {
         val windowDurationSecs = ((window.capturedAtMs - window.windowStartMs).coerceAtLeast(0L)) / 1000L
         val nativeObj = runCatching { JSONObject(nativeSnapshotRawJson) }.getOrNull()
@@ -731,7 +791,7 @@ object DebugLogManager {
             sb.appendLine()
             sb.appendLine("#### Last JVM Crash Breadcrumb")
             sb.appendLine("```text")
-            sb.appendLine(NodeImportSupport.redactSecretsForUi(crashBreadcrumb.trim()))
+            sb.appendLine(crashBreadcrumb.trim())
             sb.appendLine("```")
         }
 
@@ -739,7 +799,7 @@ object DebugLogManager {
             val vpnRunning = nativeObj.optBoolean("vpnRunning", false)
             val mode = nativeObj.optString("mode", "rule")
             val preset = nativeObj.optString("routingPreset", "")
-            val effOut = NodeImportSupport.redactSecretsForUi(nativeObj.optString("effectiveOutbound", "DIRECT"))
+            val effOut = nativeObj.optString("effectiveOutbound", "DIRECT")
             val effProto = nativeObj.optString("effectiveProtocol", "-")
             val effDelay = nativeObj.optLong("effectiveDelayMs", -1L)
             val uptime = nativeObj.optLong("uptimeSecs", 0L)
@@ -755,22 +815,29 @@ object DebugLogManager {
             )
 
             nativeObj.optJSONObject("activeProfile")?.let { prof ->
+                val rawSubHost = if (prof.isNull("subscriptionHost")) {
+                    "-"
+                } else {
+                    prof.optString("subscriptionHost", "-").ifBlank { "-" }
+                }
                 sb.appendLine(
-                    "- Active Profile: name=`${NodeImportSupport.redactSecretsForUi(prof.optString("name"))}` " +
+                    "- Active Profile: name=`${prof.optString("name")}` " +
                         "kind=`${prof.optString("kind")}` nodes=`${prof.optInt("proxyCount")}` " +
                         "manualNodes=`${prof.optInt("manualProxyCount")}` rules=`${prof.optInt("ruleCount")}` " +
                         "autoUpdateSecs=`${prof.optLong("autoUpdateIntervalSecs", 0L)}` " +
-                        "subHost=`${NodeImportSupport.redactSecretsForUi(prof.optString("subscriptionHost", "-"))}`",
+                        "subHost=`$rawSubHost`",
                 )
             }
 
             nativeObj.optJSONObject("traffic")?.let { tr ->
+                val carryOver = tr.optLong("carryOverActiveConnections", 0L)
+                val carryOverPart = if (carryOver > 0L) " carryOverActive=`$carryOver`" else ""
                 sb.appendLine(
                     "- Session Traffic & Conns: upTotal=`${formatBytesCompact(tr.optLong("upTotal"))}` " +
                         "downTotal=`${formatBytesCompact(tr.optLong("downTotal"))}` " +
                         "activeConns=`${tr.optInt("activeConnections")}` totalConns=`${tr.optLong("totalConnections")}` " +
                         "established=`${tr.optLong("establishedConnections")}` failed=`${tr.optLong("failedConnections")}` " +
-                        "zeroRxClosed=`${tr.optLong("zeroRxClosedConnections")}`",
+                        "zeroRxClosed=`${tr.optLong("zeroRxClosedConnections")}`$carryOverPart",
                 )
             }
 
@@ -785,9 +852,12 @@ object DebugLogManager {
             }
 
             nativeObj.optJSONObject("dns")?.let { dns ->
+                val nxdomainHits = dns.optLong("nxdomain_hits", 0L)
+                val nxdomainPart = if (nxdomainHits > 0L) " nxdomainCached=`$nxdomainHits`" else ""
                 sb.appendLine(
                     "- DNS & Fake-IP: queries=`${dns.optLong("total_queries")}` fakeIpHits=`${dns.optLong("fake_ip_hits")}` " +
-                        "cacheHits=`${dns.optLong("cache_hits")}` upstreamQueries=`${dns.optLong("upstream_queries")}` " +
+                        "cacheHits=`${dns.optLong("cache_hits")}` aaaaSuppressed=`${dns.optLong("suppressed_queries", 0L)}`$nxdomainPart " +
+                        "upstreamQueries=`${dns.optLong("upstream_queries")}` " +
                         "upstreamErrors=`${dns.optLong("upstream_errors")}` " +
                         "upstreamAvgMs=`${dns.optLong("upstream_avg_ms")}ms` upstreamMaxMs=`${dns.optLong("upstream_max_ms")}ms` " +
                         "activeFakeIps=`${dns.optInt("active_fake_ip_entries")}`",
@@ -795,7 +865,7 @@ object DebugLogManager {
             }
 
             appendOutboundStatsSection(sb, nativeObj.optJSONArray("outboundStats"))
-            appendTopRulesSection(sb, nativeObj.optJSONArray("topRules"))
+            appendTopRulesSection(sb, nativeObj.optJSONArray("topRules"), previousRuleHits)
             appendTopDomainsSection(sb, nativeObj.optJSONArray("topDomains"))
             appendFailedConnectionsSection(sb, nativeObj.optJSONArray("failedConnections"))
             appendSlowConnectionsSection(sb, nativeObj.optJSONArray("slowConnections"))
@@ -804,7 +874,7 @@ object DebugLogManager {
         } else {
             sb.appendLine()
             sb.appendLine("#### Rust Engine Snapshot")
-            sb.appendLine("- Unavailable: `${NodeImportSupport.redactSecretsForUi(nativeSnapshotRawJson)}`")
+            sb.appendLine("- Unavailable: `$nativeSnapshotRawJson`")
         }
 
         if (window.events.isNotEmpty()) {
@@ -824,7 +894,7 @@ object DebugLogManager {
         sb.appendLine("#### Outbound Node Performance (Window)")
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val name = NodeImportSupport.redactSecretsForUi(o.optString("outbound"))
+            val name = o.optString("outbound")
             val proto = o.optString("protocol")
             val probe = if (o.isNull("latestProbeDelayMs")) "N/A" else "${o.optLong("latestProbeDelayMs")}ms"
             val p50 = if (o.isNull("handshakeP50Ms")) "-" else "${o.optLong("handshakeP50Ms")}ms"
@@ -838,16 +908,70 @@ object DebugLogManager {
         }
     }
 
-    private fun appendTopRulesSection(sb: StringBuilder, arr: JSONArray?) {
+    private data class RuleWindowEntry(
+        val label: String,
+        val proxy: String,
+        val windowHits: Long,
+        val cumulativeHits: Long,
+        val hasPriorBaseline: Boolean,
+    )
+
+    private fun appendTopRulesSection(
+        sb: StringBuilder,
+        arr: JSONArray?,
+        previousRuleHits: Map<String, Long>,
+    ) {
         if (arr == null || arr.length() == 0) return
         sb.appendLine()
         sb.appendLine("#### Top Matched Routing Rules")
+        if (previousRuleHits.isEmpty()) {
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                val type = r.optString("type")
+                val payload = r.optString("payload")
+                val label = if (payload.isEmpty()) type else "$type,$payload"
+                sb.appendLine("- `$label` -> `${r.optString("proxy")}` (hits=`${r.optLong("hits")}`)")
+            }
+            return
+        }
+
+        val entries = ArrayList<RuleWindowEntry>(arr.length())
         for (i in 0 until arr.length()) {
             val r = arr.optJSONObject(i) ?: continue
             val type = r.optString("type")
             val payload = r.optString("payload")
+            val proxy = r.optString("proxy")
             val label = if (payload.isEmpty()) type else "$type,$payload"
-            sb.appendLine("- `$label` -> `${r.optString("proxy")}` (hits=`${r.optLong("hits")}`)")
+            val cumHits = r.optLong("hits", 0L)
+            val prevHits = previousRuleHits["$label->$proxy"] ?: previousRuleHits[label]
+            val hasValidBaseline = prevHits != null && cumHits >= prevHits
+            val windowHits = if (hasValidBaseline) {
+                (cumHits - prevHits!!).coerceAtLeast(0L)
+            } else {
+                cumHits
+            }
+            entries.add(
+                RuleWindowEntry(
+                    label = label,
+                    proxy = proxy,
+                    windowHits = windowHits,
+                    cumulativeHits = cumHits,
+                    hasPriorBaseline = hasValidBaseline && prevHits!! > 0L,
+                ),
+            )
+        }
+        entries.sortWith(
+            compareByDescending<RuleWindowEntry> { it.windowHits }
+                .thenByDescending { it.cumulativeHits },
+        )
+        for (entry in entries) {
+            if (entry.hasPriorBaseline) {
+                sb.appendLine(
+                    "- `${entry.label}` -> `${entry.proxy}` (hits=`${entry.windowHits}` (total=`${entry.cumulativeHits}`))",
+                )
+            } else {
+                sb.appendLine("- `${entry.label}` -> `${entry.proxy}` (hits=`${entry.windowHits}`)")
+            }
         }
     }
 
@@ -874,11 +998,12 @@ object DebugLogManager {
             val rulePayload = c.optString("rulePayload")
             val ruleDesc = if (rulePayload.isEmpty()) c.optString("rule") else "${c.optString("rule")}($rulePayload)"
             val fakeNote = c.optString("fakeIp").takeIf { it.isNotEmpty() && it != "null" }?.let { " fakeIp=$it" } ?: ""
+            val hostPort = NodeImportSupport.formatHostPort(c.optString("host"), c.optInt("destinationPort"))
             sb.appendLine(
                 "- `[${formatShortTime(c.optLong("startEpochMs"))}]` `${c.optString("network").uppercase(Locale.ROOT)}` " +
-                    "`${c.optString("host")}:${c.optInt("destinationPort")}`$fakeNote · rule=`$ruleDesc` -> " +
+                    "`$hostPort`$fakeNote · rule=`$ruleDesc` -> " +
                     "`${c.optString("effectiveOutbound")}` (${c.optString("effectiveProtocol")}) · " +
-                    "error=`${NodeImportSupport.redactSecretsForUi(c.optString("error", "unknown"))}`",
+                    "error=`${c.optString("error", "unknown")}`",
             )
         }
     }
@@ -893,8 +1018,9 @@ object DebugLogManager {
             if (ms < 0L) continue
             val rulePayload = c.optString("rulePayload")
             val ruleDesc = if (rulePayload.isEmpty()) c.optString("rule") else "${c.optString("rule")}($rulePayload)"
+            val hostPort = NodeImportSupport.formatHostPort(c.optString("host"), c.optInt("destinationPort"))
             sb.appendLine(
-                "- `${ms}ms` · `${c.optString("network").uppercase(Locale.ROOT)}` `${c.optString("host")}:${c.optInt("destinationPort")}` · " +
+                "- `${ms}ms` · `${c.optString("network").uppercase(Locale.ROOT)}` `$hostPort` · " +
                     "rule=`$ruleDesc` -> `${c.optString("effectiveOutbound")}` · " +
                     "up=`${formatBytesCompact(c.optLong("upload"))}` down=`${formatBytesCompact(c.optLong("download"))}` (${c.optString("status")})",
             )
@@ -910,9 +1036,10 @@ object DebugLogManager {
             val hs = if (c.isNull("connectDurationMs")) "-" else "${c.optLong("connectDurationMs")}ms"
             val rulePayload = c.optString("rulePayload")
             val ruleDesc = if (rulePayload.isEmpty()) c.optString("rule") else "${c.optString("rule")}($rulePayload)"
+            val hostPort = NodeImportSupport.formatHostPort(c.optString("host"), c.optInt("destinationPort"))
             sb.appendLine(
                 "- `[${formatShortTime(c.optLong("startEpochMs"))}]` `${c.optString("network").uppercase(Locale.ROOT)}` " +
-                    "`${c.optString("host")}:${c.optInt("destinationPort")}` · `$ruleDesc` -> `${c.optString("effectiveOutbound")}` · " +
+                    "`$hostPort` · `$ruleDesc` -> `${c.optString("effectiveOutbound")}` · " +
                     "hs=`$hs` up=`${formatBytesCompact(c.optLong("upload"))}` down=`${formatBytesCompact(c.optLong("download"))}` status=`${c.optString("status")}`",
             )
         }
@@ -925,7 +1052,7 @@ object DebugLogManager {
         for (i in 0 until arr.length()) {
             val e = arr.optJSONObject(i) ?: continue
             val lvl = e.optString("level", "info").uppercase(Locale.ROOT)
-            val msg = NodeImportSupport.redactSecretsForUi(e.optString("payload"))
+            val msg = e.optString("payload")
             sb.appendLine("- `[${formatShortTime(e.optLong("timestampMs"))}]` [$lvl] $msg")
         }
     }

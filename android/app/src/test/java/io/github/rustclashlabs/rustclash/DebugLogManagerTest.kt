@@ -319,4 +319,170 @@ class DebugLogManagerTest {
             exportDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun formatSliceReportHandlesNullSubHostIpv6EndpointsDnsCountersAndRuleWindowDeltas() {
+        val t0 = 1_763_000_000_000L
+        val t1 = t0 + 900_000L
+        val window = DebugLogManager.WindowTelemetryState(
+            windowStartMs = t0,
+            capturedAtMs = t1,
+            sessionStartMs = t0 - 900_000L,
+            screenOnMs = 300_000L,
+            screenOffMs = 600_000L,
+            startBatteryPct = 80,
+            events = emptyList(),
+        )
+        val sysMeta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "HONOR",
+            deviceModel = "PGT-AN10",
+            androidRelease = "15",
+            sdkInt = 35,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.3.9",
+            appVersionCode = 15,
+            battery = DebugLogManager.BatterySnapshot(levelPct = 79, isCharging = false, temperatureCelsius = 32.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = false,
+            jvmUsedBytes = 20L * 1024L * 1024L,
+            jvmMaxBytes = 256L * 1024L * 1024L,
+            nativeHeapBytes = 16L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+        val nativeJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "debugMode": true,
+              "uptimeSecs": 1800,
+              "rssBytes": 41943040,
+              "mode": "rule",
+              "routingPreset": "smart-cn",
+              "effectiveOutbound": "HK-Node-01",
+              "effectiveProtocol": "VLESS",
+              "effectiveDelayMs": 38,
+              "networkTransitions": 0,
+              "isWifi": true,
+              "activeProfile": {
+                "name": "Sub (203.0.113.124)",
+                "kind": "subscription",
+                "proxyCount": 16,
+                "manualProxyCount": 0,
+                "ruleCount": 80,
+                "autoUpdateIntervalSecs": 86400,
+                "subscriptionHost": null
+              },
+              "traffic": {
+                "upTotal": 1048576,
+                "downTotal": 10485760,
+                "activeConnections": 5,
+                "carryOverActiveConnections": 3,
+                "totalConnections": 60,
+                "establishedConnections": 58,
+                "failedConnections": 2,
+                "zeroRxClosedConnections": 0
+              },
+              "dns": {
+                "total_queries": 120,
+                "fake_ip_hits": 60,
+                "cache_hits": 10,
+                "suppressed_queries": 35,
+                "nxdomain_hits": 5,
+                "upstream_queries": 10,
+                "upstream_errors": 0,
+                "upstream_avg_ms": 22,
+                "upstream_max_ms": 90,
+                "active_fake_ip_entries": 48
+              },
+              "topRules": [
+                { "type": "GeoSite", "payload": "cn", "proxy": "DIRECT", "hits": 100 },
+                { "type": "GeoSite", "payload": "geolocation-!cn", "proxy": "PROXY", "hits": 120 }
+              ],
+              "failedConnections": [
+                {
+                  "host": "2001:4860:4864:4:8000::",
+                  "destinationPort": 3478,
+                  "network": "udp",
+                  "rule": "Match",
+                  "rulePayload": "",
+                  "effectiveOutbound": "HK-Node-01",
+                  "effectiveProtocol": "VLESS",
+                  "error": "udp relay timeout",
+                  "startEpochMs": 1763000100000
+                }
+              ],
+              "slowConnections": [
+                {
+                  "host": "2408:8756:c50:101d::443",
+                  "destinationPort": 443,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "connectDurationMs": 620,
+                  "upload": 1024,
+                  "download": 8192,
+                  "status": "closed"
+                }
+              ],
+              "recentConnections": [
+                {
+                  "host": "2408:8756::443",
+                  "destinationPort": 443,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "connectDurationMs": 24,
+                  "upload": 512,
+                  "download": 2048,
+                  "status": "active",
+                  "startEpochMs": 1763000200000
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val previousHits = mapOf(
+            "GeoSite,cn->DIRECT" to 90L,
+            "GeoSite,geolocation-!cn->PROXY" to 60L,
+        )
+
+        val report = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = nativeJson,
+            crashBreadcrumb = null,
+            previousRuleHits = previousHits,
+        )
+
+        // 1. JSONObject.NULL subscriptionHost renders as `-`, never `null`, and Sub (<ip>) is scrubbed
+        assertTrue(report.contains("subHost=`-`"))
+        assertFalse(report.contains("subHost=`null`"))
+        assertTrue(report.contains("name=`Sub (***REDACTED***)`"))
+        assertFalse(report.contains("203.0.113.124"))
+
+        // 2. Carry-over active connections & DNS suppressed/NXDOMAIN counters are included
+        assertTrue(report.contains("carryOverActive=`3`"))
+        assertTrue(report.contains("aaaaSuppressed=`35`"))
+        assertTrue(report.contains("nxdomainCached=`5`"))
+
+        // 3. Bare IPv6 literals are bracketed cleanly in failed, slow, and recent connections
+        assertTrue(report.contains("`[2001:4860:4864:4:8000::]:3478`"))
+        assertTrue(report.contains("`[2408:8756:c50:101d::443]:443`"))
+        assertTrue(report.contains("`[2408:8756::443]:443`"))
+
+        // 4. Window rule hit deltas sort `geolocation-!cn` (delta=60) ahead of `cn` (delta=10)
+        val idxNonCn = report.indexOf("`GeoSite,geolocation-!cn` -> `PROXY` (hits=`60` (total=`120`))")
+        val idxCn = report.indexOf("`GeoSite,cn` -> `DIRECT` (hits=`10` (total=`100`))")
+        assertTrue(idxNonCn >= 0 && idxCn > idxNonCn)
+    }
 }
+

@@ -70,10 +70,44 @@ impl DelayStore {
     }
 
     pub fn latest_delay(&self, name: &str) -> Option<u64> {
+        self.latest_delay_with_time(name).map(|(_, d)| d)
+    }
+
+    pub fn latest_delay_with_time(&self, name: &str) -> Option<(u64, u64)> {
         self.records
             .get(name)
-            .and_then(|q| q.back().map(|item| item.delay))
-            .filter(|d| *d > 0)
+            .and_then(|q| q.back().map(|item| (item.time, item.delay)))
+            .filter(|(_, d)| *d > 0)
+    }
+
+    pub fn seed_if_absent(&self, name: &str, delay_ms: u64) {
+        if delay_ms == 0 {
+            return;
+        }
+        if self.records.get(name).is_some_and(|q| !q.is_empty()) {
+            return;
+        }
+        let mut entry = self.records.entry(name.to_string()).or_default();
+        if entry.is_empty() {
+            entry.push_back(DelayHistoryItem {
+                time: TelemetryHub::now_ms(),
+                delay: delay_ms,
+            });
+        }
+    }
+
+    pub fn record_passive_if_stale(&self, name: &str, rtt_ms: u64, max_age_ms: u64) {
+        if rtt_ms == 0 {
+            return;
+        }
+        let now_ms = TelemetryHub::now_ms();
+        let should_record = match self.latest_delay_with_time(name) {
+            None => true,
+            Some((last_time, _)) => now_ms.saturating_sub(last_time) >= max_age_ms,
+        };
+        if should_record {
+            self.record(name, rtt_ms);
+        }
     }
 
     pub fn history(&self, name: &str) -> Vec<DelayHistoryItem> {
@@ -348,5 +382,41 @@ impl ProxyGroup {
             chains: None,
             history: delays.history(&self.name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delay_store_seed_if_absent_and_passive_stale_refresh() {
+        let store = DelayStore::default();
+        store.seed_if_absent("node-a", 0);
+        assert!(store.latest_delay("node-a").is_none());
+
+        store.seed_if_absent("node-a", 120);
+        assert_eq!(store.latest_delay("node-a"), Some(120));
+        assert!(store.latest_delay_with_time("node-a").is_some());
+
+        // Subsequent seed_if_absent must NOT overwrite an existing entry.
+        store.seed_if_absent("node-a", 45);
+        assert_eq!(store.latest_delay("node-a"), Some(120));
+
+        // Passive RTT should NOT overwrite a fresh sample (< 180_000ms old).
+        store.record_passive_if_stale("node-a", 80, 180_000);
+        assert_eq!(store.latest_delay("node-a"), Some(120));
+
+        // Passive RTT SHOULD record when max_age_ms == 0 or absent.
+        store.record_passive_if_stale("node-a", 80, 0);
+        assert_eq!(store.latest_delay("node-a"), Some(80));
+
+        store.record_passive_if_stale("node-b", 65, 180_000);
+        assert_eq!(store.latest_delay("node-b"), Some(65));
+
+        // Failed probe should not be overwritten by offline cache seed.
+        store.record_failure("node-c");
+        store.seed_if_absent("node-c", 99);
+        assert_eq!(store.latest_delay("node-c"), None);
     }
 }

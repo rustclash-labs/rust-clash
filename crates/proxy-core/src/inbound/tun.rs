@@ -37,7 +37,7 @@ use crate::{
 
 pub const TUN_PACKET_QUEUE_CAPACITY: usize = 4096;
 const TUN_DEVICE_RX_MAX_PACKETS: usize = 4096;
-const TUN_FLOW_STREAM_CAPACITY: usize = 256;
+const TUN_FLOW_STREAM_CAPACITY: usize = 64;
 const TUN_TCP_SOCKET_BUF_SIZE: usize = 64 * 1024;
 const MAX_TUN_TCP_FLOWS: usize = 2048;
 const MAX_HALF_OPEN_SYN_FLOWS: usize = 256;
@@ -45,8 +45,8 @@ const MAX_TUN_UDP_INFLIGHT: usize = 512;
 const MAX_TUN_UDP_SESSIONS: usize = 512;
 const TCP_SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const TCP_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const TCP_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded handle to interact with the userspace `smoltcp` TUN stack via raw L3 IPv4/IPv6 packets.
 /// Uses bounded `mpsc` channels to enforce end-to-end memory limits and backpressure.
@@ -303,12 +303,12 @@ pub fn spawn_userspace_tun(
                     if let Some(tx) = &flow.to_remote_tx {
                         let mut aborted = false;
                         let mut drained_bytes = 0usize;
-                        while sock.can_recv() && drained_bytes < 64 * 1024 {
+                        while sock.can_recv() && drained_bytes < 32 * 1024 {
                             match tx.try_reserve() {
                                 Ok(permit) => {
                                     let mut chunk = Vec::with_capacity(32 * 1024);
                                     let _ = sock.recv(|data| {
-                                        let take = data.len().min(64 * 1024 - drained_bytes);
+                                        let take = data.len().min(32 * 1024 - drained_bytes);
                                         chunk.extend_from_slice(&data[..take]);
                                         (take, ())
                                     });
@@ -590,6 +590,16 @@ fn spawn_tun_udp_handler(
     udp_nat: &Arc<UdpNatManager>,
     router: &Arc<RwLock<Arc<Router>>>,
 ) {
+    let payload = if dst.port() != 53 {
+        let epoch = router.read().epoch();
+        match udp_nat.try_send_fast(src, dst, epoch, payload) {
+            Ok(()) => return,
+            Err(payload) => payload,
+        }
+    } else {
+        payload
+    };
+
     let Ok(permit) = Arc::clone(udp_sem).try_acquire_owned() else {
         return;
     };
@@ -610,6 +620,7 @@ fn spawn_tun_udp_handler(
         }
 
         // 2. General non-53 UDP datagram stateful NAT session forwarding!
+        let route_epoch = current_router.epoch();
         let raw_target = TargetAddr::from(dst);
         let decision = current_router
             .route_async_with_context(
@@ -619,7 +630,7 @@ fn spawn_tun_udp_handler(
                 &raw_target,
             )
             .await;
-        nat.send_datagram(
+        nat.send_datagram_with_epoch(
             src,
             raw_target,
             decision.restored_from_fake_ip,
@@ -629,6 +640,7 @@ fn spawn_tun_udp_handler(
             decision.chains,
             decision.outbound,
             payload,
+            route_epoch,
         )
         .await;
     });
@@ -740,6 +752,7 @@ fn register_syn_flow(
             ),
         );
 
+        let dial_start = Instant::now();
         let dial_res = tokio::select! {
             biased;
             _ = conn_entry.closed() => {
@@ -782,6 +795,16 @@ fn register_syn_flow(
             }
         };
         conn_guard.mark_established();
+        let leaf_outbound = decision.outbound.name();
+        if decision.outbound.exit_category() == "PROXY"
+            && !matches!(leaf_outbound, "DIRECT" | "REJECT")
+        {
+            current_router.record_passive_delay_if_stale(
+                leaf_outbound,
+                dial_start.elapsed().as_millis().max(1) as u64,
+                180_000,
+            );
+        }
 
         let tracked = conn_guard.into_tracked_stream(outbound);
         let (mut rd, mut wr) = tokio::io::split(tracked);

@@ -281,6 +281,7 @@ class MainActivity : AppCompatActivity() {
                             runCatching { safExportDebugLogLauncher.launch(reportFile.name) }
                         }
                     },
+                    onOpenBatteryOptimizationSettings = ::openBatteryOptimizationSettings,
                 )
             }
         }
@@ -491,6 +492,24 @@ class MainActivity : AppCompatActivity() {
             viewModel.emitUiMessage("无法打开系统分享面板，请使用「保存到手机」导出")
         }
     }
+
+    private fun openBatteryOptimizationSettings() {
+        val launchedIgnoreList = runCatching {
+            val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            startActivity(intent)
+        }.isSuccess
+        if (!launchedIgnoreList) {
+            runCatching {
+                val fallback = Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", packageName, null),
+                )
+                startActivity(fallback)
+            }.onFailure {
+                viewModel.emitUiMessage("无法打开系统电池优化设置页面，请前往系统设置手动开启后台不受限制")
+            }
+        }
+    }
 }
 
 @Composable
@@ -506,6 +525,7 @@ internal fun RustClashAppScaffold(
     onExportYamlFile: () -> Unit = {},
     onShareDebugReport: () -> Unit = {},
     onSaveDebugReportToFile: () -> Unit = {},
+    onOpenBatteryOptimizationSettings: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var currentDestination by rememberSaveable { mutableStateOf(MainDestination.HOME) }
@@ -715,6 +735,7 @@ internal fun RustClashAppScaffold(
                     onSaveDebugReportToFile = onSaveDebugReportToFile,
                     onClearDebugLogs = viewModel::clearAllDebugLogs,
                     onRefreshDebugSummary = viewModel::refreshDebugLogSummary,
+                    onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
                 )
             }
         }

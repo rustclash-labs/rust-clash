@@ -978,5 +978,91 @@ class VpnConfigAndLifecycleTest {
         assertTrue(scrubbedYaml.contains("password: ***REDACTED***"))
         assertTrue(scrubbedYaml.contains("token=***REDACTED***"))
     }
+
+    @Test
+    fun formatHostPortBracketsIpv6LiteralsAndPreservesDomainsAndIpv4() {
+        assertEquals(
+            "[2001:4860:4864:4:8000::]:3478",
+            NodeImportSupport.formatHostPort("2001:4860:4864:4:8000::", 3478),
+        )
+        assertEquals(
+            "[2408:8756:c50:101d::443]:443",
+            NodeImportSupport.formatHostPort("2408:8756:c50:101d::443", 443),
+        )
+        assertEquals(
+            "[2408:8756::443]:443",
+            NodeImportSupport.formatHostPort("2408:8756::443", 443),
+        )
+        assertEquals(
+            "[2001:db8::1]:8443",
+            NodeImportSupport.formatHostPort("[2001:db8::1]", 8443),
+        )
+        assertEquals(
+            "[2001:db8::1]:8443",
+            NodeImportSupport.formatHostPort("[2001:db8::1]:8443", 8443),
+        )
+        assertEquals("api.bilibili.com:443", NodeImportSupport.formatHostPort("api.bilibili.com", 443))
+        assertEquals("api.bilibili.com:443", NodeImportSupport.formatHostPort("api.bilibili.com:443", 443))
+        assertEquals("1.1.1.1:53", NodeImportSupport.formatHostPort("1.1.1.1", 53))
+        assertEquals("2001:db8::1", NodeImportSupport.formatHostPort("2001:db8::1", 0))
+        assertEquals("unknown:443", NodeImportSupport.formatHostPort("   ", 443))
+        assertEquals("unknown", NodeImportSupport.formatHostPort("", 0))
+
+        // Verify DiagnosticEntryUi.displayTarget uses formatHostPort for IPv6 destinations
+        val ipv6DiagJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "diagnostics": [
+                {
+                  "id": "ipv6-1",
+                  "metadata": {
+                    "network": "tcp",
+                    "type": "TUN",
+                    "host": "",
+                    "destination_ip": "2408:8756:c50:101d::443",
+                    "destination_port": 443
+                  },
+                  "rule": "GeoIP",
+                  "rule_payload": "cn",
+                  "chains": ["DIRECT"],
+                  "effective_outbound": "DIRECT",
+                  "effective_protocol": "DIRECT",
+                  "exit_type": "DIRECT",
+                  "status": "active"
+                }
+              ]
+            }
+        """.trimIndent()
+        val parsedDiag = UiJsonParsers.parseDiagnosticsResponse(ipv6DiagJson)
+        assertEquals(1, parsedDiag.size)
+        assertEquals("[2408:8756:c50:101d::443]:443", parsedDiag[0].displayTarget)
+    }
+
+    @Test
+    fun redactSecretsScrubsSubIpLabelsAndIpv4Ipv6SubscriptionUrls() {
+        val raw = buildString {
+            appendLine("Profile: Sub (203.0.113.124) active")
+            appendLine("Ipv4Sub: https://203.0.113.124:8443/s/abcd")
+            appendLine("Ipv6Sub: https://[2001:db8::1]:8443/s/secret123?token=xyz")
+            appendLine("ShortDomainPathSub: https://panel.example.com/s/abcd")
+            appendLine("LoopbackIpv6: https://[::1]:8443/s/secret123?token=xyz")
+            appendLine("Probe: http://www.gstatic.com/generate_204")
+        }
+        val scrubbed = NodeImportSupport.redactSecretsForUi(raw)
+
+        assertFalse(scrubbed.contains("203.0.113.124"))
+        assertFalse(scrubbed.contains("2001:db8::1"))
+        assertFalse(scrubbed.contains("abcd"))
+        assertFalse(scrubbed.contains("secret123"))
+        assertFalse(scrubbed.contains("xyz"))
+
+        assertTrue(scrubbed.contains("Profile: Sub (***REDACTED***) active"))
+        assertTrue(scrubbed.contains("Ipv4Sub: https://***REDACTED***"))
+        assertTrue(scrubbed.contains("Ipv6Sub: https://***REDACTED***"))
+        assertTrue(scrubbed.contains("ShortDomainPathSub: https://panel.example.com/s/***REDACTED***"))
+        assertTrue(scrubbed.contains("LoopbackIpv6: https://[::1]:8443/s/***REDACTED***?***REDACTED***"))
+        assertTrue(scrubbed.contains("Probe: http://www.gstatic.com/generate_204"))
+    }
 }
 

@@ -31,6 +31,7 @@ object NativeBridge {
         stateDir: String,
         yamlConfig: String,
         demoMode: Boolean,
+        enableIpv6: Boolean,
     ): String
 
     external fun nativeStopVpn(): Boolean
@@ -155,6 +156,7 @@ object NativeBridge {
     external fun nativeCollectDebugSnapshotJson(
         stateDir: String,
         sinceEpochMs: Long,
+        untilEpochMs: Long,
     ): String
 
     external fun nativeDiagnoseSiteJson(

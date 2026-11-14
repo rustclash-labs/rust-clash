@@ -194,12 +194,8 @@ data class DiagnosticEntryUi(
 ) {
     val displayTarget: String
         get() {
-            val base = host.ifBlank { destinationIp ?: "unknown" }
-            return if (destinationPort > 0 && !base.endsWith(":$destinationPort")) {
-                "$base:$destinationPort"
-            } else {
-                base
-            }
+            val base = host.ifBlank { destinationIp.orEmpty() }
+            return NodeImportSupport.formatHostPort(base, destinationPort)
         }
 
     val matchedRuleSummary: String
@@ -387,6 +383,7 @@ data class AppUiState(
     val debugLog: DebugLogSummaryUi = DebugLogSummaryUi(),
     val isExportingDebugLog: Boolean = false,
     val pendingExternalImportPayload: String? = null,
+    val isBatteryOptimizationIgnored: Boolean = true,
 ) {
     fun resolveProfileDisplayName(profile: ProfileUiItem): String {
         val customAlias = profileAliases[profile.id]?.trim()

@@ -122,12 +122,47 @@ fn sync_delays_from_router(router: &Router) {
     }
 }
 
+const DEFAULT_PROBE_URL: &str = "http://www.gstatic.com/generate_204";
+const STALE_ACTIVE_DELAY_MAX_AGE_MS: u64 = 300_000;
+
 fn seed_delays_into_router(router: &Router) {
     let cache = OFFLINE_DELAY_CACHE.lock();
     for (name, &delay) in cache.iter() {
         if delay > 0 {
-            router.delays().record(name, delay);
+            router.seed_delay_if_absent(name, delay);
         }
+    }
+}
+
+fn maybe_spawn_active_leaf_delay_probe(
+    handle: &tokio::runtime::Handle,
+    engine: &Arc<ProxyEngine>,
+    stale_after_ms: Option<u64>,
+) {
+    if engine.is_demo_sandbox() {
+        return;
+    }
+    let router = engine.router();
+    let leaf = router.effective_primary_outbound().effective_outbound;
+    if leaf.is_empty() || leaf.eq_ignore_ascii_case("DIRECT") || leaf.eq_ignore_ascii_case("REJECT")
+    {
+        return;
+    }
+    let age = router.latest_delay_age_ms(&leaf);
+    let should_probe = match stale_after_ms {
+        None => age.is_none(),
+        Some(max_age) => age.is_none_or(|a| a >= max_age),
+    };
+    if should_probe {
+        handle.spawn(async move {
+            if router
+                .test_delay(&leaf, DEFAULT_PROBE_URL, Duration::from_millis(4000))
+                .await
+                .is_ok()
+            {
+                sync_delays_from_router(&router);
+            }
+        });
     }
 }
 
@@ -411,6 +446,7 @@ fn dns_config_fingerprint(cfg: &ClashConfig) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut dns = cfg.dns_with_merged_hosts();
     dns.listen.clear();
+    dns.ipv6 = false;
     if let Ok(val) = serde_json::to_value(&dns) {
         hash_canonical_json(&val, &mut hasher);
     }
@@ -625,22 +661,44 @@ pub fn start_android_vpn_with_state_dir(
     is_demo: bool,
     protector: Arc<CallbackSocketProtector>,
 ) -> Result<serde_json::Value, String> {
+    start_android_vpn_with_options(
+        #[cfg(unix)]
+        owned_tun_fd,
+        state_dir,
+        yaml_str,
+        is_demo,
+        true,
+        protector,
+    )
+}
+
+pub fn start_android_vpn_with_options(
+    #[cfg(unix)] owned_tun_fd: Option<OwnedFd>,
+    state_dir: Option<&Path>,
+    yaml_str: &str,
+    is_demo: bool,
+    enable_ipv6: bool,
+    protector: Arc<CallbackSocketProtector>,
+) -> Result<serde_json::Value, String> {
     start_android_vpn_with_state_dir_and_jvm(
         #[cfg(unix)]
         owned_tun_fd,
         state_dir,
         yaml_str,
         is_demo,
+        enable_ipv6,
         protector,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_android_vpn_with_state_dir_and_jvm(
     #[cfg(unix)] owned_tun_fd: Option<OwnedFd>,
     state_dir: Option<&Path>,
     yaml_str: &str,
     is_demo: bool,
+    enable_ipv6: bool,
     protector: Arc<CallbackSocketProtector>,
     jvm: Option<Arc<JavaVM>>,
 ) -> Result<serde_json::Value, String> {
@@ -668,6 +726,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             })
         });
     drop(cached_offline);
+    clear_offline_router_cache();
 
     // 1. Install `VpnService.protect(fd)` global SocketProtector BEFORE starting ProxyEngine!
     set_global_socket_protector(Arc::clone(&protector) as _);
@@ -708,7 +767,10 @@ fn start_android_vpn_with_state_dir_and_jvm(
             enforce_android_local_only_config(&mut cfg);
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
-            cfg.tun.ipv6 = true;
+            cfg.tun.ipv6 = enable_ipv6;
+            if !enable_ipv6 {
+                cfg.dns.ipv6 = false;
+            }
             cfg.secret = Some(ephemeral_secret.clone());
             let yaml = match cfg.to_yaml_string() {
                 Ok(y) => y,
@@ -753,7 +815,10 @@ fn start_android_vpn_with_state_dir_and_jvm(
             cfg.dns.listen = "127.0.0.1:0".to_string();
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
-            cfg.tun.ipv6 = true;
+            cfg.tun.ipv6 = enable_ipv6;
+            if !enable_ipv6 {
+                cfg.dns.ipv6 = false;
+            }
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
                 cfg.secret = Some(ephemeral_secret.clone());
             }
@@ -787,7 +852,10 @@ fn start_android_vpn_with_state_dir_and_jvm(
             enforce_android_local_only_config(&mut cfg);
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
-            cfg.tun.ipv6 = true;
+            cfg.tun.ipv6 = enable_ipv6;
+            if !enable_ipv6 {
+                cfg.dns.ipv6 = false;
+            }
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
                 cfg.secret = Some(ephemeral_secret.clone());
             }
@@ -859,6 +927,8 @@ fn start_android_vpn_with_state_dir_and_jvm(
     let mixed_port = engine.mixed_addr().port();
     let dns_listen = engine.dns_addr().map(|a| a.to_string());
     let eff = engine.router().effective_primary_outbound();
+    let probe_handle = rt.handle().clone();
+    let probe_engine = Arc::clone(&engine);
 
     let candidate = AndroidVpnRuntime {
         runtime: rt,
@@ -884,6 +954,14 @@ fn start_android_vpn_with_state_dir_and_jvm(
     if let Some(aborted) = cancelled {
         shutdown_runtime_outside_lock(aborted);
         return Err("VPN startup cancelled by concurrent stop request".to_string());
+    }
+
+    if !is_demo {
+        maybe_spawn_active_leaf_delay_probe(
+            &probe_handle,
+            &probe_engine,
+            Some(STALE_ACTIVE_DELAY_MAX_AGE_MS),
+        );
     }
 
     Ok(serde_json::json!({
@@ -1437,6 +1515,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             None,
             &yaml_str,
             demo_mode == JNI_TRUE,
+            true,
             protector,
             Some(jvm),
         )
@@ -1444,6 +1523,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeStartVpnWithStateDir<
     'local,
 >(
@@ -1454,6 +1534,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     state_dir_jstr: JString<'local>,
     yaml_config: JString<'local>,
     demo_mode: jboolean,
+    enable_ipv6: jboolean,
 ) -> jstring {
     ensure_tracing_initialized();
 
@@ -1471,6 +1552,8 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 
     #[cfg(not(unix))]
     let _ = tun_fd;
+
+    let enable_ipv6 = enable_ipv6 != JNI_FALSE;
 
     jni_json_guarded(env, move |env| {
         #[cfg(unix)]
@@ -1500,6 +1583,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             opt_dir,
             &yaml_str,
             demo_mode == JNI_TRUE,
+            enable_ipv6,
             protector,
             Some(jvm),
         )
@@ -1726,6 +1810,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         parsed.restore_redacted_from(&prev);
         enforce_android_local_only_config(&mut parsed);
+        parsed.dns.ipv6 = prev.dns.ipv6;
         parsed.tun = prev.tun;
         parsed.tun.enable = true;
         parsed.tun.auto_route = false;
@@ -1766,10 +1851,19 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 }
 
 pub fn android_flush_dns_core() -> bool {
+    let offline_dir = OFFLINE_ROUTER_CACHE
+        .lock()
+        .as_ref()
+        .and_then(|c| c.state_dir.clone());
     clear_offline_router_cache();
+    if let Some(dir) = offline_dir
+        && !dir.as_os_str().is_empty()
+    {
+        let _ = std::fs::remove_file(dir.join("fake_ip_cache.json"));
+    }
     proxy_core::dns::upstream::clear_dns_upstream_pools();
     if let Some((_, engine)) = live_handle_and_engine() {
-        engine.router().dns().flush_cache();
+        engine.flush_dns();
         true
     } else {
         false
@@ -2701,8 +2795,15 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 
 /// Toggle low-power / screen-off Doze battery saver mode on the live Android `ProxyEngine`.
 pub fn android_set_low_power_mode_core(enabled: bool) -> bool {
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((handle, engine)) = live_handle_and_engine() {
         engine.set_low_power_mode(enabled);
+        if !enabled {
+            maybe_spawn_active_leaf_delay_probe(
+                &handle,
+                &engine,
+                Some(STALE_ACTIVE_DELAY_MAX_AGE_MS),
+            );
+        }
         true
     } else {
         false
@@ -2855,6 +2956,11 @@ fn build_redacted_active_profile_summary(
         .into_iter()
         .find(|p| p.id == snap.active_profile_id)
         .map(|meta| {
+            let subscription_host = if meta.subscription_url_redacted.is_some() {
+                serde_json::Value::String("<redacted>".to_string())
+            } else {
+                serde_json::Value::Null
+            };
             serde_json::json!({
                 "name": redact_sensitive_text(&meta.name),
                 "kind": meta.kind,
@@ -2864,11 +2970,285 @@ fn build_redacted_active_profile_summary(
                 "ruleCount": meta.rule_count,
                 "autoUpdateIntervalSecs": meta.auto_update_interval_secs,
                 "lastUpdatedMs": meta.last_updated_ms,
-                "subscriptionHost": meta.subscription_url_redacted,
+                "subscriptionHost": subscription_host,
                 "lastError": meta.last_error.as_deref().map(redact_sensitive_text),
             })
         });
     (routing_preset, active_profile)
+}
+
+struct WindowDiagnosticSections {
+    carry_over_count: usize,
+    window_connections: usize,
+    window_tcp: usize,
+    window_udp: usize,
+    window_failed: usize,
+    window_zero_rx: usize,
+    window_fake_ip_restored: usize,
+    outbound_stats_json: Vec<serde_json::Value>,
+    top_domains_json: Vec<serde_json::Value>,
+    failed_connections_json: Vec<serde_json::Value>,
+    slow_connections_json: Vec<serde_json::Value>,
+    recent_connections_json: Vec<serde_json::Value>,
+}
+
+fn build_window_diagnostic_sections(
+    conns: &[proxy_core::tracker::ConnectionSnapshot],
+    since_epoch_ms: u64,
+    until_epoch_ms: u64,
+    delays_map: &HashMap<String, u64>,
+) -> WindowDiagnosticSections {
+    let mut carry_over_count = 0usize;
+    let mut window_conns = Vec::with_capacity(conns.len());
+    for c in conns {
+        if c.start_epoch_ms < since_epoch_ms {
+            carry_over_count += 1;
+        } else if c.start_epoch_ms <= until_epoch_ms {
+            window_conns.push(c);
+        }
+    }
+
+    let mut window_tcp = 0usize;
+    let mut window_udp = 0usize;
+    let mut window_failed = 0usize;
+    let mut window_zero_rx = 0usize;
+    let mut window_fake_ip_restored = 0usize;
+
+    #[derive(Default)]
+    struct OutboundAgg {
+        protocol: String,
+        exit_type: String,
+        connections: usize,
+        failures: usize,
+        zero_rx_count: usize,
+        upload_bytes: u64,
+        download_bytes: u64,
+        handshakes: Vec<u64>,
+    }
+
+    #[derive(Default)]
+    struct DomainAgg {
+        connections: usize,
+        failures: usize,
+        upload_bytes: u64,
+        download_bytes: u64,
+        primary_rule: String,
+        primary_outbound: String,
+    }
+
+    let mut by_outbound: HashMap<String, OutboundAgg> = HashMap::new();
+    let mut by_domain: HashMap<String, DomainAgg> = HashMap::new();
+
+    for c in &window_conns {
+        if c.metadata.network.eq_ignore_ascii_case("udp") {
+            window_udp += 1;
+        } else {
+            window_tcp += 1;
+        }
+        if c.status == "failed" || c.error.is_some() {
+            window_failed += 1;
+        }
+        let is_zero_rx = c.status == "closed" && c.download == 0 && c.upload > 0;
+        if is_zero_rx {
+            window_zero_rx += 1;
+        }
+        if c.metadata.fake_ip.is_some() {
+            window_fake_ip_restored += 1;
+        }
+
+        let ob_entry = by_outbound.entry(c.effective_outbound.clone()).or_default();
+        if ob_entry.protocol.is_empty() {
+            ob_entry.protocol.clone_from(&c.effective_protocol);
+            ob_entry.exit_type.clone_from(&c.exit_type);
+        }
+        ob_entry.connections += 1;
+        if c.status == "failed" || c.error.is_some() {
+            ob_entry.failures += 1;
+        }
+        if is_zero_rx {
+            ob_entry.zero_rx_count += 1;
+        }
+        ob_entry.upload_bytes = ob_entry.upload_bytes.saturating_add(c.upload);
+        ob_entry.download_bytes = ob_entry.download_bytes.saturating_add(c.download);
+        if c.metadata.network.eq_ignore_ascii_case("tcp")
+            && let Some(ms) = c.connect_duration_ms
+        {
+            ob_entry.handshakes.push(ms);
+        }
+
+        let safe_host = redact_sensitive_text(&c.metadata.host);
+        let dom_entry = by_domain.entry(safe_host).or_default();
+        dom_entry.connections += 1;
+        if c.status == "failed" || c.error.is_some() {
+            dom_entry.failures += 1;
+        }
+        dom_entry.upload_bytes = dom_entry.upload_bytes.saturating_add(c.upload);
+        dom_entry.download_bytes = dom_entry.download_bytes.saturating_add(c.download);
+        if dom_entry.primary_rule.is_empty() {
+            dom_entry.primary_rule = if c.rule_payload.is_empty() {
+                c.rule.clone()
+            } else {
+                format!("{},{}", c.rule, redact_sensitive_text(&c.rule_payload))
+            };
+            dom_entry.primary_outbound.clone_from(&c.effective_outbound);
+        }
+    }
+
+    let mut outbound_stats: Vec<(usize, serde_json::Value)> = by_outbound
+        .into_iter()
+        .map(|(outbound_name, mut agg)| {
+            agg.handshakes.sort_unstable();
+            let p50 = percentile_u64(&agg.handshakes, 50);
+            let p95 = percentile_u64(&agg.handshakes, 95);
+            let max_hs = agg.handshakes.last().copied();
+            let probe_delay = delays_map.get(&outbound_name).copied();
+            let safe_name = redact_sensitive_text(&outbound_name);
+            (
+                agg.connections,
+                serde_json::json!({
+                    "outbound": safe_name,
+                    "protocol": agg.protocol,
+                    "exitType": agg.exit_type,
+                    "latestProbeDelayMs": probe_delay,
+                    "connections": agg.connections,
+                    "failures": agg.failures,
+                    "zeroRxCount": agg.zero_rx_count,
+                    "handshakeSamples": agg.handshakes.len(),
+                    "handshakeP50Ms": p50,
+                    "handshakeP95Ms": p95,
+                    "handshakeMaxMs": max_hs,
+                    "uploadBytes": agg.upload_bytes,
+                    "downloadBytes": agg.download_bytes,
+                }),
+            )
+        })
+        .collect();
+    outbound_stats.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
+    let outbound_stats_json: Vec<serde_json::Value> =
+        outbound_stats.into_iter().map(|(_, v)| v).collect();
+
+    let mut top_domains: Vec<(usize, serde_json::Value)> = by_domain
+        .into_iter()
+        .map(|(host, agg)| {
+            (
+                agg.connections,
+                serde_json::json!({
+                    "host": host,
+                    "connections": agg.connections,
+                    "failures": agg.failures,
+                    "uploadBytes": agg.upload_bytes,
+                    "downloadBytes": agg.download_bytes,
+                    "primaryRule": agg.primary_rule,
+                    "primaryOutbound": redact_sensitive_text(&agg.primary_outbound),
+                }),
+            )
+        })
+        .collect();
+    top_domains.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
+    let top_domains_json: Vec<serde_json::Value> =
+        top_domains.into_iter().take(25).map(|(_, v)| v).collect();
+
+    let failed_in_window: Vec<_> = conns
+        .iter()
+        .filter(|c| {
+            (c.error.is_some() || c.status == "failed") && {
+                let fail_ts = c.end_epoch_ms.unwrap_or(c.start_epoch_ms);
+                fail_ts >= since_epoch_ms && fail_ts <= until_epoch_ms
+            }
+        })
+        .collect();
+    window_failed = window_failed.max(failed_in_window.len());
+
+    let failed_connections_json: Vec<serde_json::Value> = failed_in_window
+        .into_iter()
+        .take(80)
+        .map(|c| {
+            serde_json::json!({
+                "host": redact_sensitive_text(&c.metadata.host),
+                "destinationPort": c.metadata.destination_port,
+                "network": c.metadata.network,
+                "fakeIp": c.metadata.fake_ip,
+                "rule": c.rule,
+                "rulePayload": redact_sensitive_text(&c.rule_payload),
+                "chains": c.chains.iter().map(|ch| redact_sensitive_text(ch)).collect::<Vec<_>>(),
+                "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                "effectiveProtocol": c.effective_protocol,
+                "exitType": c.exit_type,
+                "error": c.error.as_deref().map(redact_sensitive_text),
+                "startEpochMs": c.start_epoch_ms,
+                "endEpochMs": c.end_epoch_ms,
+            })
+        })
+        .collect();
+
+    let mut slow_candidates: Vec<_> = window_conns
+        .iter()
+        .copied()
+        .filter(|c| {
+            c.metadata.network.eq_ignore_ascii_case("tcp") && c.connect_duration_ms.is_some()
+        })
+        .collect();
+    slow_candidates.sort_by_key(|c| std::cmp::Reverse(c.connect_duration_ms.unwrap_or(0)));
+    let slow_connections_json: Vec<serde_json::Value> = slow_candidates
+        .into_iter()
+        .take(40)
+        .map(|c| {
+            serde_json::json!({
+                "host": redact_sensitive_text(&c.metadata.host),
+                "destinationPort": c.metadata.destination_port,
+                "network": c.metadata.network,
+                "rule": c.rule,
+                "rulePayload": redact_sensitive_text(&c.rule_payload),
+                "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                "effectiveProtocol": c.effective_protocol,
+                "connectDurationMs": c.connect_duration_ms,
+                "upload": c.upload,
+                "download": c.download,
+                "status": c.status,
+                "startEpochMs": c.start_epoch_ms,
+            })
+        })
+        .collect();
+
+    let recent_connections_json: Vec<serde_json::Value> = window_conns
+        .iter()
+        .take(80)
+        .map(|c| {
+            serde_json::json!({
+                "host": redact_sensitive_text(&c.metadata.host),
+                "destinationPort": c.metadata.destination_port,
+                "network": c.metadata.network,
+                "fakeIp": c.metadata.fake_ip,
+                "rule": c.rule,
+                "rulePayload": redact_sensitive_text(&c.rule_payload),
+                "chains": c.chains.iter().map(|ch| redact_sensitive_text(ch)).collect::<Vec<_>>(),
+                "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
+                "effectiveProtocol": c.effective_protocol,
+                "exitType": c.exit_type,
+                "connectDurationMs": c.connect_duration_ms,
+                "upload": c.upload,
+                "download": c.download,
+                "status": c.status,
+                "error": c.error.as_deref().map(redact_sensitive_text),
+                "startEpochMs": c.start_epoch_ms,
+            })
+        })
+        .collect();
+
+    WindowDiagnosticSections {
+        carry_over_count,
+        window_connections: window_conns.len(),
+        window_tcp,
+        window_udp,
+        window_failed,
+        window_zero_rx,
+        window_fake_ip_restored,
+        outbound_stats_json,
+        top_domains_json,
+        failed_connections_json,
+        slow_connections_json,
+        recent_connections_json,
+    }
 }
 
 /// Collect a credential-redacted mobile diagnostic slice (`[since_epoch_ms, now]`) preserving
@@ -2877,8 +3257,24 @@ pub fn android_collect_debug_snapshot_core(
     state_dir: &Path,
     since_epoch_ms: u64,
 ) -> Result<serde_json::Value, String> {
+    android_collect_debug_snapshot_window_core(state_dir, since_epoch_ms, u64::MAX)
+}
+
+/// Collect a credential-redacted mobile diagnostic slice (`[since_epoch_ms, until_epoch_ms]`)
+/// filtering out pre-existing carry-over active connections from window statistics and isolating
+/// TCP handshake percentiles from local `0ms` UDP socket binds.
+pub fn android_collect_debug_snapshot_window_core(
+    state_dir: &Path,
+    since_epoch_ms: u64,
+    until_epoch_ms: u64,
+) -> Result<serde_json::Value, String> {
     let captured_at_ms = proxy_core::tracker::TelemetryHub::now_ms();
     let debug_mode = ANDROID_DEBUG_LOGGING.load(Ordering::Acquire);
+    let until_json = if until_epoch_ms == u64::MAX {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(until_epoch_ms)
+    };
 
     let live_ctx = {
         let guard = ANDROID_RUNTIME.lock();
@@ -2949,144 +3345,9 @@ pub fn android_collect_debug_snapshot_core(
         let dns_snap = router.dns().telemetry_snapshot();
         let geodata = engine.geodata_status();
 
-        let conns = hub.diagnostics_since(since_epoch_ms, 1_500);
-        let mut window_tcp = 0usize;
-        let mut window_udp = 0usize;
-        let mut window_failed = 0usize;
-        let mut window_zero_rx = 0usize;
-        let mut window_fake_ip_restored = 0usize;
-
-        #[derive(Default)]
-        struct OutboundAgg {
-            protocol: String,
-            exit_type: String,
-            connections: usize,
-            failures: usize,
-            zero_rx_count: usize,
-            upload_bytes: u64,
-            download_bytes: u64,
-            handshakes: Vec<u64>,
-        }
-
-        #[derive(Default)]
-        struct DomainAgg {
-            connections: usize,
-            failures: usize,
-            upload_bytes: u64,
-            download_bytes: u64,
-            primary_rule: String,
-            primary_outbound: String,
-        }
-
-        let mut by_outbound: HashMap<String, OutboundAgg> = HashMap::new();
-        let mut by_domain: HashMap<String, DomainAgg> = HashMap::new();
-
-        for c in &conns {
-            if c.metadata.network.eq_ignore_ascii_case("udp") {
-                window_udp += 1;
-            } else {
-                window_tcp += 1;
-            }
-            if c.status == "failed" {
-                window_failed += 1;
-            }
-            let is_zero_rx = c.status == "closed" && c.download == 0 && c.upload > 0;
-            if is_zero_rx {
-                window_zero_rx += 1;
-            }
-            if c.metadata.fake_ip.is_some() {
-                window_fake_ip_restored += 1;
-            }
-
-            let ob_entry = by_outbound.entry(c.effective_outbound.clone()).or_default();
-            if ob_entry.protocol.is_empty() {
-                ob_entry.protocol.clone_from(&c.effective_protocol);
-                ob_entry.exit_type.clone_from(&c.exit_type);
-            }
-            ob_entry.connections += 1;
-            if c.status == "failed" {
-                ob_entry.failures += 1;
-            }
-            if is_zero_rx {
-                ob_entry.zero_rx_count += 1;
-            }
-            ob_entry.upload_bytes = ob_entry.upload_bytes.saturating_add(c.upload);
-            ob_entry.download_bytes = ob_entry.download_bytes.saturating_add(c.download);
-            if let Some(ms) = c.connect_duration_ms {
-                ob_entry.handshakes.push(ms);
-            }
-
-            let safe_host = redact_sensitive_text(&c.metadata.host);
-            let dom_entry = by_domain.entry(safe_host).or_default();
-            dom_entry.connections += 1;
-            if c.status == "failed" {
-                dom_entry.failures += 1;
-            }
-            dom_entry.upload_bytes = dom_entry.upload_bytes.saturating_add(c.upload);
-            dom_entry.download_bytes = dom_entry.download_bytes.saturating_add(c.download);
-            if dom_entry.primary_rule.is_empty() {
-                dom_entry.primary_rule = if c.rule_payload.is_empty() {
-                    c.rule.clone()
-                } else {
-                    format!("{},{}", c.rule, redact_sensitive_text(&c.rule_payload))
-                };
-                dom_entry.primary_outbound.clone_from(&c.effective_outbound);
-            }
-        }
-
-        let mut outbound_stats: Vec<(usize, serde_json::Value)> = by_outbound
-            .into_iter()
-            .map(|(outbound_name, mut agg)| {
-                agg.handshakes.sort_unstable();
-                let p50 = percentile_u64(&agg.handshakes, 50);
-                let p95 = percentile_u64(&agg.handshakes, 95);
-                let max_hs = agg.handshakes.last().copied();
-                let probe_delay = delays_map.get(&outbound_name).copied();
-                let safe_name = redact_sensitive_text(&outbound_name);
-                (
-                    agg.connections,
-                    serde_json::json!({
-                        "outbound": safe_name,
-                        "protocol": agg.protocol,
-                        "exitType": agg.exit_type,
-                        "latestProbeDelayMs": probe_delay,
-                        "connections": agg.connections,
-                        "failures": agg.failures,
-                        "zeroRxCount": agg.zero_rx_count,
-                        "handshakeSamples": agg.handshakes.len(),
-                        "handshakeP50Ms": p50,
-                        "handshakeP95Ms": p95,
-                        "handshakeMaxMs": max_hs,
-                        "uploadBytes": agg.upload_bytes,
-                        "downloadBytes": agg.download_bytes,
-                    }),
-                )
-            })
-            .collect();
-        outbound_stats.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
-        let outbound_stats_json: Vec<serde_json::Value> =
-            outbound_stats.into_iter().map(|(_, v)| v).collect();
-
-        let mut top_domains: Vec<(usize, serde_json::Value)> = by_domain
-            .into_iter()
-            .map(|(host, agg)| {
-                (
-                    agg.connections,
-                    serde_json::json!({
-                        "host": host,
-                        "connections": agg.connections,
-                        "failures": agg.failures,
-                        "uploadBytes": agg.upload_bytes,
-                        "downloadBytes": agg.download_bytes,
-                        "primaryRule": agg.primary_rule,
-                        "primaryOutbound": redact_sensitive_text(&agg.primary_outbound),
-                    }),
-                )
-            })
-            .collect();
-        top_domains.sort_by_key(|(cnt, _)| std::cmp::Reverse(*cnt));
-        let top_domains_json: Vec<serde_json::Value> =
-            top_domains.into_iter().take(25).map(|(_, v)| v).collect();
+        let conns = hub.diagnostics_in_window(since_epoch_ms, until_epoch_ms, 1_500);
+        let sections =
+            build_window_diagnostic_sections(&conns, since_epoch_ms, until_epoch_ms, &delays_map);
 
         let mut rules_with_hits: Vec<_> = router
             .rules_snapshot()
@@ -3107,81 +3368,8 @@ pub fn android_collect_debug_snapshot_core(
             })
             .collect();
 
-        let failed_connections_json: Vec<serde_json::Value> = conns
-            .iter()
-            .filter(|c| c.status == "failed")
-            .take(80)
-            .map(|c| {
-                serde_json::json!({
-                    "host": redact_sensitive_text(&c.metadata.host),
-                    "destinationPort": c.metadata.destination_port,
-                    "network": c.metadata.network,
-                    "fakeIp": c.metadata.fake_ip,
-                    "rule": c.rule,
-                    "rulePayload": redact_sensitive_text(&c.rule_payload),
-                    "chains": c.chains.iter().map(|ch| redact_sensitive_text(ch)).collect::<Vec<_>>(),
-                    "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
-                    "effectiveProtocol": c.effective_protocol,
-                    "exitType": c.exit_type,
-                    "error": c.error.as_deref().map(redact_sensitive_text),
-                    "startEpochMs": c.start_epoch_ms,
-                })
-            })
-            .collect();
-
-        let mut slow_candidates: Vec<_> = conns
-            .iter()
-            .filter(|c| c.connect_duration_ms.is_some())
-            .collect();
-        slow_candidates.sort_by_key(|c| std::cmp::Reverse(c.connect_duration_ms.unwrap_or(0)));
-        let slow_connections_json: Vec<serde_json::Value> = slow_candidates
-            .into_iter()
-            .take(40)
-            .map(|c| {
-                serde_json::json!({
-                    "host": redact_sensitive_text(&c.metadata.host),
-                    "destinationPort": c.metadata.destination_port,
-                    "network": c.metadata.network,
-                    "rule": c.rule,
-                    "rulePayload": redact_sensitive_text(&c.rule_payload),
-                    "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
-                    "effectiveProtocol": c.effective_protocol,
-                    "connectDurationMs": c.connect_duration_ms,
-                    "upload": c.upload,
-                    "download": c.download,
-                    "status": c.status,
-                    "startEpochMs": c.start_epoch_ms,
-                })
-            })
-            .collect();
-
-        let recent_connections_json: Vec<serde_json::Value> = conns
-            .iter()
-            .take(80)
-            .map(|c| {
-                serde_json::json!({
-                    "host": redact_sensitive_text(&c.metadata.host),
-                    "destinationPort": c.metadata.destination_port,
-                    "network": c.metadata.network,
-                    "fakeIp": c.metadata.fake_ip,
-                    "rule": c.rule,
-                    "rulePayload": redact_sensitive_text(&c.rule_payload),
-                    "chains": c.chains.iter().map(|ch| redact_sensitive_text(ch)).collect::<Vec<_>>(),
-                    "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
-                    "effectiveProtocol": c.effective_protocol,
-                    "exitType": c.exit_type,
-                    "connectDurationMs": c.connect_duration_ms,
-                    "upload": c.upload,
-                    "download": c.download,
-                    "status": c.status,
-                    "error": c.error.as_deref().map(redact_sensitive_text),
-                    "startEpochMs": c.start_epoch_ms,
-                })
-            })
-            .collect();
-
         let engine_logs_json: Vec<serde_json::Value> = hub
-            .logs_since(since_epoch_ms, 250)
+            .logs_in_window(since_epoch_ms, until_epoch_ms, 400)
             .into_iter()
             .map(|e| {
                 serde_json::json!({
@@ -3199,6 +3387,7 @@ pub fn android_collect_debug_snapshot_core(
             "demoActive": engine.demo_info().enabled,
             "capturedAtMs": captured_at_ms,
             "sinceEpochMs": since_epoch_ms,
+            "untilEpochMs": until_json,
             "startedAtMs": hub.started_at_ms(),
             "uptimeSecs": hub.uptime_secs(),
             "telemetryParked": hub.is_telemetry_parked(),
@@ -3219,18 +3408,19 @@ pub fn android_collect_debug_snapshot_core(
                 "upTotal": up_total,
                 "downTotal": down_total,
                 "activeConnections": hub.active_connection_count(),
+                "carryOverActiveConnections": sections.carry_over_count,
                 "totalConnections": hub.total_connections(),
                 "establishedConnections": hub.established_connections_total(),
                 "failedConnections": hub.failed_connections_total(),
                 "zeroRxClosedConnections": hub.zero_rx_closed_total(),
             },
             "windowSummary": {
-                "connections": conns.len(),
-                "tcpConnections": window_tcp,
-                "udpConnections": window_udp,
-                "failedConnections": window_failed,
-                "zeroRxClosedConnections": window_zero_rx,
-                "fakeIpRestoredConnections": window_fake_ip_restored,
+                "connections": sections.window_connections,
+                "tcpConnections": sections.window_tcp,
+                "udpConnections": sections.window_udp,
+                "failedConnections": sections.window_failed,
+                "zeroRxClosedConnections": sections.window_zero_rx,
+                "fakeIpRestoredConnections": sections.window_fake_ip_restored,
             },
             "tun": {
                 "rxPackets": rx_pkts,
@@ -3243,12 +3433,12 @@ pub fn android_collect_debug_snapshot_core(
                 "protectFailures": prot_fail,
             },
             "dns": dns_snap,
-            "outboundStats": outbound_stats_json,
-            "topDomains": top_domains_json,
+            "outboundStats": sections.outbound_stats_json,
+            "topDomains": sections.top_domains_json,
             "topRules": top_rules_json,
-            "failedConnections": failed_connections_json,
-            "slowConnections": slow_connections_json,
-            "recentConnections": recent_connections_json,
+            "failedConnections": sections.failed_connections_json,
+            "slowConnections": sections.slow_connections_json,
+            "recentConnections": sections.recent_connections_json,
             "engineLogs": engine_logs_json,
         }));
     }
@@ -3276,6 +3466,7 @@ pub fn android_collect_debug_snapshot_core(
         "demoActive": false,
         "capturedAtMs": captured_at_ms,
         "sinceEpochMs": since_epoch_ms,
+        "untilEpochMs": until_json,
         "rssBytes": read_process_rss_bytes(),
         "mode": mode_str,
         "routingPreset": routing_preset,
@@ -3308,6 +3499,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     _class: JClass<'local>,
     state_dir_jstr: JString<'local>,
     since_epoch_ms: jlong,
+    until_epoch_ms: jlong,
 ) -> jstring {
     jni_json_guarded(env, |env| {
         ensure_tracing_initialized();
@@ -3317,7 +3509,12 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
         } else {
             since_epoch_ms as u64
         };
-        android_collect_debug_snapshot_core(Path::new(dir.trim()), since_u64)
+        let until_u64 = if until_epoch_ms <= 0 {
+            u64::MAX
+        } else {
+            until_epoch_ms as u64
+        };
+        android_collect_debug_snapshot_window_core(Path::new(dir.trim()), since_u64, until_u64)
     })
 }
 
@@ -3439,4 +3636,241 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
         let target = jstring_to_rust(env, &target_jstr)?;
         android_diagnose_site_core(Path::new(dir.trim()), &target)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proxy_core::{
+        profile::ProfileSettingsPatch,
+        tracker::{ConnectionMetadata, ConnectionSnapshot},
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_conn(
+        id: &str,
+        network: &str,
+        host: &str,
+        outbound: &str,
+        start_epoch_ms: u64,
+        end_epoch_ms: Option<u64>,
+        connect_duration_ms: Option<u64>,
+        upload: u64,
+        download: u64,
+        fake_ip: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+    ) -> ConnectionSnapshot {
+        ConnectionSnapshot {
+            id: id.to_string(),
+            metadata: ConnectionMetadata {
+                id: id.to_string(),
+                network: network.to_string(),
+                inbound_type: "TUN".to_string(),
+                source: "198.18.0.1:54321".to_string(),
+                destination_ip: None,
+                destination_port: 443,
+                host: host.to_string(),
+                fake_ip: fake_ip.map(ToOwned::to_owned),
+                process: None,
+            },
+            upload,
+            download,
+            start_epoch_ms,
+            chains: vec![outbound.to_string(), "PROXY".to_string()],
+            rule: "GEOSITE".to_string(),
+            rule_payload: "geolocation-!cn".to_string(),
+            effective_outbound: outbound.to_string(),
+            effective_protocol: "AnyTLS".to_string(),
+            exit_type: "PROXY".to_string(),
+            remote_endpoint: "***REDACTED***:443".to_string(),
+            status: status.to_string(),
+            error: error.map(ToOwned::to_owned),
+            end_epoch_ms,
+            connect_duration_ms,
+        }
+    }
+
+    #[test]
+    fn window_diagnostic_sections_filters_carry_over_and_isolates_tcp_handshakes() {
+        let conns = vec![
+            sample_conn(
+                "carry-active",
+                "tcp",
+                "keepalive.example.com",
+                "Node-HK",
+                1_000,
+                None,
+                Some(950),
+                1_024,
+                2_048,
+                None,
+                "active",
+                None,
+            ),
+            sample_conn(
+                "carry-failed-in-window",
+                "tcp",
+                "api.example.com",
+                "Node-HK",
+                1_500,
+                Some(3_200),
+                None,
+                0,
+                0,
+                None,
+                "failed",
+                Some("Sub (203.0.113.124) reset"),
+            ),
+            sample_conn(
+                "win-udp",
+                "udp",
+                "quic.example.com",
+                "Node-HK",
+                2_500,
+                None,
+                Some(0),
+                120,
+                240,
+                None,
+                "active",
+                None,
+            ),
+            sample_conn(
+                "win-tcp",
+                "tcp",
+                "video.example.com",
+                "Node-HK",
+                3_000,
+                Some(4_100),
+                Some(185),
+                500,
+                0,
+                Some("198.18.0.42"),
+                "closed",
+                None,
+            ),
+            sample_conn(
+                "after-window",
+                "tcp",
+                "late.example.com",
+                "Node-HK",
+                6_000,
+                Some(6_100),
+                Some(40),
+                10,
+                10,
+                None,
+                "failed",
+                Some("post-window error"),
+            ),
+        ];
+
+        let mut delays = HashMap::new();
+        delays.insert("Node-HK".to_string(), 88);
+
+        let sec = build_window_diagnostic_sections(&conns, 2_000, 5_000, &delays);
+        assert_eq!(sec.carry_over_count, 2);
+        assert_eq!(sec.window_connections, 2);
+        assert_eq!(sec.window_tcp, 1);
+        assert_eq!(sec.window_udp, 1);
+        assert_eq!(sec.window_zero_rx, 1);
+        assert_eq!(sec.window_fake_ip_restored, 1);
+        assert_eq!(sec.window_failed, 1);
+
+        assert_eq!(sec.outbound_stats_json.len(), 1);
+        let ob = &sec.outbound_stats_json[0];
+        assert_eq!(ob["outbound"], "Node-HK");
+        assert_eq!(ob["connections"], 2);
+        assert_eq!(ob["handshakeSamples"], 1);
+        assert_eq!(ob["handshakeP50Ms"], 185);
+        assert_eq!(ob["handshakeP95Ms"], 185);
+        assert_eq!(ob["handshakeMaxMs"], 185);
+        assert_eq!(ob["latestProbeDelayMs"], 88);
+
+        assert_eq!(sec.slow_connections_json.len(), 1);
+        assert_eq!(sec.slow_connections_json[0]["host"], "video.example.com");
+
+        assert_eq!(sec.failed_connections_json.len(), 1);
+        assert_eq!(sec.failed_connections_json[0]["host"], "api.example.com");
+        let err_str = sec.failed_connections_json[0]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(!err_str.contains("203.0.113.124"));
+        assert!(err_str.contains("***REDACTED***"));
+    }
+
+    static UNIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn redacted_active_profile_summary_masks_subscription_host_and_sub_title() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-redaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+
+        let mgr = ProfileManager::open_or_init(&tmp_dir).expect("open ProfileManager");
+        let starter_id = mgr.active_profile_id();
+        let (_, starter_summary) = build_redacted_active_profile_summary(&mgr);
+        let starter_json = starter_summary.expect("active starter summary");
+        assert!(starter_json["subscriptionHost"].is_null());
+
+        mgr.update_profile_settings(
+            &starter_id,
+            ProfileSettingsPatch {
+                name: Some("Sub (203.0.113.124)".to_string()),
+                auto_update_interval_secs: None,
+            },
+        )
+        .expect("rename starter profile");
+
+        let snap = android_collect_debug_snapshot_window_core(&tmp_dir, 1_000, 4_000)
+            .expect("collect offline window snapshot");
+        assert_eq!(snap["sinceEpochMs"], 1_000);
+        assert_eq!(snap["untilEpochMs"], 4_000);
+        assert_eq!(snap["activeProfile"]["name"], "Sub (***REDACTED***)");
+        assert!(!snap.to_string().contains("203.0.113.124"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn start_android_vpn_with_options_syncs_ipv6_and_flush_dns_clears_cache() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-ipv6-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            false,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        let (_, engine) = live_handle_and_engine().expect("live engine running");
+        let cfg = engine.config_snapshot();
+        assert!(!cfg.tun.ipv6);
+        assert!(!cfg.dns.ipv6);
+        assert!(!engine.router().dns().ipv6_enabled());
+
+        let cache_file = tmp_dir.join("fake_ip_cache.json");
+        std::fs::write(&cache_file, b"{}").expect("seed dummy fake_ip_cache.json");
+        let epoch_before = engine.router().epoch();
+        assert!(android_flush_dns_core());
+        assert!(engine.router().epoch() > epoch_before);
+        assert!(!cache_file.exists());
+
+        drop(engine);
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

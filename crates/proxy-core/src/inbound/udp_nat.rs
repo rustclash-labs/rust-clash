@@ -36,6 +36,24 @@ struct ReverseTargetMap {
 }
 
 impl ReverseTargetMap {
+    fn has_outbound(&self, target: &TargetAddr, raw_dst: &TargetAddr, was_fake_ip: bool) -> bool {
+        if self.target_to_raw.get(target) != Some(raw_dst) {
+            return false;
+        }
+        if self.last_raw_dst.as_ref() != Some(raw_dst) {
+            return false;
+        }
+        if was_fake_ip || matches!(target.host, HostName::Domain(_)) {
+            match self.port_to_fake_raw.get(&target.port) {
+                Some(PortFakeMapping::Unique(existing)) => existing == raw_dst,
+                Some(PortFakeMapping::Ambiguous) => true,
+                None => false,
+            }
+        } else {
+            true
+        }
+    }
+
     fn record_outbound(&mut self, target: &TargetAddr, raw_dst: &TargetAddr, was_fake_ip: bool) {
         if self.target_to_raw.contains_key(target)
             || self.target_to_raw.len() < MAX_UDP_DESTS_PER_SESSION
@@ -81,6 +99,14 @@ struct NatSessionKey {
     outbound_name: String,
 }
 
+#[derive(Clone, Debug)]
+struct CachedUdpRoute {
+    outbound_name: String,
+    resolved_target: TargetAddr,
+    was_fake_ip: bool,
+    router_epoch: u64,
+}
+
 struct NatSessionEntry {
     tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
     reverse_map: Arc<RwLock<ReverseTargetMap>>,
@@ -101,6 +127,7 @@ pub struct UdpNatManager {
     idle_timeout: Duration,
     boot: Instant,
     sessions: Arc<DashMap<NatSessionKey, NatSessionEntry>>,
+    fast_routes: Arc<DashMap<(SocketAddr, SocketAddr), CachedUdpRoute>>,
     hub: Arc<TelemetryHub>,
     reply_sink: UdpReplySink,
 }
@@ -124,6 +151,7 @@ impl UdpNatManager {
             idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
             boot: Instant::now(),
             sessions: Arc::new(DashMap::new()),
+            fast_routes: Arc::new(DashMap::new()),
             hub: Arc::clone(&hub),
             reply_sink,
         });
@@ -143,6 +171,7 @@ impl UdpNatManager {
 
     /// Synchronously evict and close every cached UDP NAT session (e.g. on Wi-Fi <-> Cellular handoff).
     pub fn reset_all_sessions(&self) -> usize {
+        self.fast_routes.clear();
         let keys: Vec<NatSessionKey> = self.sessions.iter().map(|e| e.key().clone()).collect();
         let mut count = 0;
         for key in keys {
@@ -154,6 +183,107 @@ impl UdpNatManager {
             }
         }
         count
+    }
+
+    fn cache_fast_route(
+        &self,
+        client_src: SocketAddr,
+        raw_dst: &TargetAddr,
+        outbound_name: &str,
+        resolved_target: &TargetAddr,
+        was_fake_ip: bool,
+        router_epoch: u64,
+    ) {
+        if router_epoch == 0 {
+            return;
+        }
+        let HostName::Ip(dst_ip) = raw_dst.host else {
+            return;
+        };
+        let route_key = (client_src, SocketAddr::new(dst_ip, raw_dst.port));
+        let cap = self.max_sessions.saturating_mul(4);
+        if self.fast_routes.len() >= cap && !self.fast_routes.contains_key(&route_key) {
+            self.fast_routes
+                .retain(|_, v| v.router_epoch == router_epoch);
+            if self.fast_routes.len() >= cap
+                && let Some(victim) = self.fast_routes.iter().next().map(|e| *e.key())
+            {
+                self.fast_routes.remove(&victim);
+            }
+        }
+        self.fast_routes.insert(
+            route_key,
+            CachedUdpRoute {
+                outbound_name: outbound_name.to_string(),
+                resolved_target: resolved_target.clone(),
+                was_fake_ip,
+                router_epoch,
+            },
+        );
+    }
+
+    /// O(1) synchronous zero-spawn fast path for established UDP flows when `router_epoch` is unchanged.
+    /// Returns `Ok(())` on fast-path hit, or `Err(payload)` (returning the original buffer with zero
+    /// extra allocation) on fast-path miss so the caller can perform full async routing.
+    pub fn try_send_fast(
+        &self,
+        client_src: SocketAddr,
+        raw_dst: SocketAddr,
+        router_epoch: u64,
+        payload: Vec<u8>,
+    ) -> Result<(), Vec<u8>> {
+        if router_epoch == 0 {
+            return Err(payload);
+        }
+        let cached = match self.fast_routes.get(&(client_src, raw_dst)) {
+            Some(entry) => entry.clone(),
+            None => return Err(payload),
+        };
+        if router_epoch != cached.router_epoch {
+            self.fast_routes.remove_if(&(client_src, raw_dst), |_, v| {
+                v.router_epoch != router_epoch
+            });
+            return Err(payload);
+        }
+
+        let key = NatSessionKey {
+            client_src,
+            outbound_name: cached.outbound_name,
+        };
+        let Some(entry) = self.sessions.get(&key) else {
+            return Err(payload);
+        };
+        if entry.tx.is_closed() || entry.conn_entry.is_closed() {
+            return Err(payload);
+        }
+
+        let raw_target = TargetAddr::from(raw_dst);
+        let needs_map_update = !entry.reverse_map.read().has_outbound(
+            &cached.resolved_target,
+            &raw_target,
+            cached.was_fake_ip,
+        );
+        if needs_map_update {
+            entry.reverse_map.write().record_outbound(
+                &cached.resolved_target,
+                &raw_target,
+                cached.was_fake_ip,
+            );
+        }
+
+        let payload_len = payload.len();
+        match entry.tx.try_send((cached.resolved_target, payload)) {
+            Ok(()) => {
+                entry.last_active_ms.store(self.now_ms(), Ordering::Relaxed);
+                self.hub.record_upload(&entry.conn_entry, payload_len);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                entry.last_active_ms.store(self.now_ms(), Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed((_, returned_payload))) => Err(returned_payload),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,6 +298,35 @@ impl UdpNatManager {
         chains: Vec<String>,
         outbound: DynOutbound,
         payload: Vec<u8>,
+    ) {
+        self.send_datagram_with_epoch(
+            client_src,
+            raw_dst,
+            restored_from_fake_ip,
+            target,
+            rule_type,
+            rule_payload,
+            chains,
+            outbound,
+            payload,
+            0,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_datagram_with_epoch(
+        &self,
+        client_src: SocketAddr,
+        raw_dst: TargetAddr,
+        restored_from_fake_ip: Option<std::net::Ipv4Addr>,
+        target: TargetAddr,
+        rule_type: &str,
+        rule_payload: &str,
+        chains: Vec<String>,
+        outbound: DynOutbound,
+        payload: Vec<u8>,
+        router_epoch: u64,
     ) {
         if !outbound.udp_supported() {
             let reason = match outbound.exit_category() {
@@ -203,30 +362,62 @@ impl UdpNatManager {
             && !existing.conn_entry.is_closed()
         {
             existing.last_active_ms.store(now_ms, Ordering::Relaxed);
-            existing
-                .reverse_map
-                .write()
-                .record_outbound(&target, &raw_dst, was_fake_ip);
+            let needs_map_update =
+                !existing
+                    .reverse_map
+                    .read()
+                    .has_outbound(&target, &raw_dst, was_fake_ip);
+            if needs_map_update {
+                existing
+                    .reverse_map
+                    .write()
+                    .record_outbound(&target, &raw_dst, was_fake_ip);
+            }
             self.hub.record_upload(&existing.conn_entry, payload.len());
-            let _ = existing.tx.try_send((target, payload));
+            let _ = existing.tx.try_send((target.clone(), payload));
+            drop(existing);
+            self.cache_fast_route(
+                client_src,
+                &raw_dst,
+                outbound.name(),
+                &target,
+                was_fake_ip,
+                router_epoch,
+            );
             return;
         }
 
         if self.sessions.len() >= self.max_sessions {
             let idle_ms = self.idle_timeout.as_millis() as u64;
-            self.sessions.retain(|_, v| {
-                !v.tx.is_closed()
+            let mut evicted_keys = Vec::new();
+            self.sessions.retain(|k, v| {
+                let keep = !v.tx.is_closed()
                     && !v.conn_entry.is_closed()
-                    && now_ms.saturating_sub(v.last_active_ms.load(Ordering::Relaxed)) < idle_ms
+                    && now_ms.saturating_sub(v.last_active_ms.load(Ordering::Relaxed)) < idle_ms;
+                if !keep {
+                    v.conn_entry.request_close();
+                    evicted_keys.push(k.clone());
+                }
+                keep
             });
+            for ek in &evicted_keys {
+                self.fast_routes.retain(|rk, rv| {
+                    !(rk.0 == ek.client_src && rv.outbound_name == ek.outbound_name)
+                });
+            }
             if self.sessions.len() >= self.max_sessions {
                 let oldest_key = self
                     .sessions
                     .iter()
                     .min_by_key(|entry| entry.value().last_active_ms.load(Ordering::Relaxed))
                     .map(|entry| entry.key().clone());
-                if let Some(k) = oldest_key {
-                    self.sessions.remove(&k);
+                if let Some(k) = oldest_key
+                    && let Some((_, evicted)) = self.sessions.remove(&k)
+                {
+                    evicted.conn_entry.request_close();
+                    self.fast_routes.retain(|rk, rv| {
+                        !(rk.0 == k.client_src && rv.outbound_name == k.outbound_name)
+                    });
                 }
             }
         }
@@ -242,7 +433,16 @@ impl UdpNatManager {
                         .write()
                         .record_outbound(&target, &raw_dst, was_fake_ip);
                     self.hub.record_upload(&occ.get().conn_entry, payload.len());
-                    let _ = occ.get().tx.try_send((target, payload));
+                    let _ = occ.get().tx.try_send((target.clone(), payload));
+                    drop(occ);
+                    self.cache_fast_route(
+                        client_src,
+                        &raw_dst,
+                        outbound.name(),
+                        &target,
+                        was_fake_ip,
+                        router_epoch,
+                    );
                     return;
                 }
                 let conn_entry = self.hub.register_connection_with_outbound(
@@ -264,12 +464,13 @@ impl UdpNatManager {
                 let last_active_ms = Arc::new(AtomicU64::new(now_ms));
                 let (tx, rx) = mpsc::channel::<(TargetAddr, Vec<u8>)>(UDP_SESSION_QUEUE_CAPACITY);
                 let _ = tx.try_send((target.clone(), payload));
-                occ.insert(NatSessionEntry {
+                let evicted = occ.insert(NatSessionEntry {
                     tx,
                     reverse_map: Arc::clone(&reverse_map),
                     conn_entry: Arc::clone(&conn_entry),
                     last_active_ms: Arc::clone(&last_active_ms),
                 });
+                evicted.conn_entry.request_close();
                 (rx, conn_entry, reverse_map, last_active_ms)
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
@@ -302,32 +503,130 @@ impl UdpNatManager {
             }
         };
 
+        self.cache_fast_route(
+            client_src,
+            &raw_dst,
+            outbound.name(),
+            &target,
+            was_fake_ip,
+            router_epoch,
+        );
+
         let inbound_label = self.inbound_label;
         let hub_clone = Arc::clone(&self.hub);
         let sessions_map = Arc::clone(&self.sessions);
+        let fast_routes_map = Arc::clone(&self.fast_routes);
         let sink = Arc::clone(&self.reply_sink);
         let boot = self.boot;
         let idle_timeout = self.idle_timeout;
 
         tokio::spawn(async move {
             let mut rx = rx;
-            let session = match outbound.open_udp_session().await {
-                Ok(s) => Arc::new(s),
-                Err(err) => {
+            let session = tokio::select! {
+                biased;
+                _ = conn_entry.closed() => {
+                    if sessions_map
+                        .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
+                        .is_some()
+                    {
+                        fast_routes_map.retain(|rk, rv| {
+                            !(rk.0 == key.client_src && rv.outbound_name == key.outbound_name)
+                        });
+                    }
+                    hub_clone.unregister_connection(&conn_entry.id);
+                    return;
+                }
+                res = outbound.open_udp_session() => {
+                    match res {
+                        Ok(s) => Arc::new(s),
+                        Err(err) => {
+                            tracing::debug!(
+                                "[{}] open_udp_session on '{}' failed for {} -> {}: {}",
+                                inbound_label,
+                                outbound.name(),
+                                client_src,
+                                target,
+                                err
+                            );
+                            if sessions_map
+                                .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
+                                .is_some()
+                            {
+                                fast_routes_map.retain(|rk, rv| {
+                                    !(rk.0 == key.client_src && rv.outbound_name == key.outbound_name)
+                                });
+                            }
+                            hub_clone.record_connection_failed(&conn_entry.id, &err.to_string());
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Wait for and transmit the first queued datagram BEFORE marking the connection
+            // established so lazy UDP outbounds (VLESS, Trojan, SS, AnyTLS) measure true dial RTT
+            // instead of `hs=0ms` and report first-packet dial failures as `failed` (not `zeroRxClosed`).
+            enum FirstPacketOutcome {
+                Sent,
+                Failed(std::io::Error),
+                ClosedOrIdle,
+            }
+
+            let first_outcome = tokio::select! {
+                biased;
+                _ = conn_entry.closed() => FirstPacketOutcome::ClosedOrIdle,
+                res = tokio::time::timeout(idle_timeout, async {
+                    let Some((first_dst, first_data)) = rx.recv().await else {
+                        return Ok(false);
+                    };
+                    last_active_ms.store(boot.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    session.send_to(&first_data, &first_dst).await.map(|()| true)
+                }) => {
+                    match res {
+                        Ok(Ok(true)) => FirstPacketOutcome::Sent,
+                        Ok(Ok(false)) | Err(_) => FirstPacketOutcome::ClosedOrIdle,
+                        Ok(Err(err)) => FirstPacketOutcome::Failed(err),
+                    }
+                }
+            };
+
+            match first_outcome {
+                FirstPacketOutcome::Sent => {
+                    conn_entry.mark_established();
+                }
+                FirstPacketOutcome::Failed(err) => {
                     tracing::debug!(
-                        "[{}] open_udp_session on '{}' failed for {} -> {}: {}",
+                        "[{}] first UDP send_to on '{}' failed for {} -> {}: {}",
                         inbound_label,
                         outbound.name(),
                         client_src,
                         target,
                         err
                     );
-                    sessions_map.remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry));
+                    if sessions_map
+                        .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
+                        .is_some()
+                    {
+                        fast_routes_map.retain(|rk, rv| {
+                            !(rk.0 == key.client_src && rv.outbound_name == key.outbound_name)
+                        });
+                    }
                     hub_clone.record_connection_failed(&conn_entry.id, &err.to_string());
                     return;
                 }
-            };
-            conn_entry.mark_established();
+                FirstPacketOutcome::ClosedOrIdle => {
+                    if sessions_map
+                        .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
+                        .is_some()
+                    {
+                        fast_routes_map.retain(|rk, rv| {
+                            !(rk.0 == key.client_src && rv.outbound_name == key.outbound_name)
+                        });
+                    }
+                    hub_clone.unregister_connection(&conn_entry.id);
+                    return;
+                }
+            }
 
             let session_rx = Arc::clone(&session);
             let writer_last = Arc::clone(&last_active_ms);
@@ -361,7 +660,14 @@ impl UdpNatManager {
                 _ = conn_entry.closed() => {}
             }
 
-            sessions_map.remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry));
+            if sessions_map
+                .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
+                .is_some()
+            {
+                fast_routes_map.retain(|rk, rv| {
+                    !(rk.0 == key.client_src && rv.outbound_name == key.outbound_name)
+                });
+            }
             hub_clone.unregister_connection(&conn_entry.id);
         });
     }
@@ -521,5 +827,162 @@ mod tests {
         }
         assert!(map.target_to_raw.len() <= MAX_UDP_DESTS_PER_SESSION);
         assert!(map.port_to_fake_raw.len() <= MAX_UDP_DESTS_PER_SESSION);
+    }
+
+    #[tokio::test]
+    async fn fast_path_populates_on_first_packet_and_invalidates_on_epoch_bump() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mgr = UdpNatManager::new("test-udp", 64, Arc::clone(&hub), Arc::new(|_, _, _| {}));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(AsyncMutex::new(Vec::new()));
+        let outbound: DynOutbound = Arc::new(SlowMockUdpOutbound {
+            open_calls: Arc::clone(&open_calls),
+            sent: Arc::clone(&sent),
+        });
+
+        let src: SocketAddr = "198.18.0.2:54321".parse().unwrap();
+        let raw_dst_sock: SocketAddr = "198.18.0.50:443".parse().unwrap();
+        let raw_dst = TargetAddr::from(raw_dst_sock);
+        let resolved_dst = TargetAddr::new_domain("quic.example.com", 443).unwrap();
+
+        // Fast path misses before first routed packet populates `fast_routes`.
+        assert_eq!(
+            mgr.try_send_fast(src, raw_dst_sock, 1, vec![0]),
+            Err(vec![0])
+        );
+
+        mgr.send_datagram_with_epoch(
+            src,
+            raw_dst,
+            Some("198.18.0.50".parse().unwrap()),
+            resolved_dst,
+            "MATCH",
+            "",
+            vec!["mock-quic-node".into()],
+            Arc::clone(&outbound),
+            vec![1],
+            1,
+        )
+        .await;
+
+        // Subsequent packets on the same epoch hit the O(1) zero-spawn fast path.
+        assert_eq!(mgr.try_send_fast(src, raw_dst_sock, 1, vec![2]), Ok(()));
+        assert_eq!(mgr.try_send_fast(src, raw_dst_sock, 1, vec![3]), Ok(()));
+
+        // Epoch 0 disables fast path without evicting epoch 1.
+        assert_eq!(
+            mgr.try_send_fast(src, raw_dst_sock, 0, vec![99]),
+            Err(vec![99])
+        );
+        assert_eq!(mgr.try_send_fast(src, raw_dst_sock, 1, vec![4]), Ok(()));
+
+        for _ in 0..150 {
+            if sent.lock().await.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            sent.lock().await.clone(),
+            vec![vec![1], vec![2], vec![3], vec![4]]
+        );
+
+        // Bumping router_epoch invalidates the cached route and returns original payload.
+        assert_eq!(
+            mgr.try_send_fast(src, raw_dst_sock, 2, vec![5]),
+            Err(vec![5])
+        );
+        assert_eq!(
+            mgr.try_send_fast(src, raw_dst_sock, 1, vec![6]),
+            Err(vec![6])
+        );
+        mgr.reset_all_sessions();
+    }
+
+    struct FailingFirstSendUdpSession;
+
+    #[async_trait::async_trait]
+    impl OutboundUdpSession for FailingFirstSendUdpSession {
+        async fn send_to(&self, _payload: &[u8], _target: &TargetAddr) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "upstream dial refused",
+            ))
+        }
+
+        async fn recv_from(&self) -> std::io::Result<(Vec<u8>, TargetAddr)> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed",
+            ))
+        }
+    }
+
+    struct LazyFailingUdpOutbound;
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for LazyFailingUdpOutbound {
+        fn name(&self) -> &str {
+            "lazy-vless-node"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(&self, _target: &TargetAddr) -> std::io::Result<BoxedStream> {
+            Err(std::io::Error::other("unused"))
+        }
+
+        async fn open_udp_session(&self) -> std::io::Result<Box<dyn OutboundUdpSession>> {
+            Ok(Box::new(FailingFirstSendUdpSession))
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_udp_session_first_send_to_error_records_failed_not_zero_rx() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mgr = UdpNatManager::new("test-udp", 64, Arc::clone(&hub), Arc::new(|_, _, _| {}));
+        let outbound: DynOutbound = Arc::new(LazyFailingUdpOutbound);
+
+        let src: SocketAddr = "198.18.0.2:54322".parse().unwrap();
+        let raw_dst_sock: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let raw_dst = TargetAddr::from(raw_dst_sock);
+
+        mgr.send_datagram_with_epoch(
+            src,
+            raw_dst.clone(),
+            None,
+            raw_dst,
+            "MATCH",
+            "",
+            vec!["lazy-vless-node".into()],
+            outbound,
+            vec![0xaa, 0xbb],
+            7,
+        )
+        .await;
+
+        for _ in 0..100 {
+            if hub.failed_connections_total() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(hub.failed_connections_total(), 1);
+        assert_eq!(hub.zero_rx_closed_total(), 0);
+        assert_eq!(hub.established_connections_total(), 0);
+        assert_eq!(hub.active_connection_count(), 0);
+        assert!(mgr.try_send_fast(src, raw_dst_sock, 7, vec![0xcc]).is_err());
+
+        let diags = hub.diagnostics_snapshot(10);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].status, "failed");
+        assert!(diags[0].connect_duration_ms.is_none());
     }
 }

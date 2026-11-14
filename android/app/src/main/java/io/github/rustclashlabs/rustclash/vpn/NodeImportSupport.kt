@@ -125,6 +125,27 @@ object NodeImportSupport {
         return pixels to w
     }
 
+    /**
+     * Formats `host` + `port` safely for UI and diagnostics, bracketing bare IPv6 literals
+     * (`2001:4860:4864:4:8000::` + `3478` -> `[2001:4860:4864:4:8000::]:3478`).
+     */
+    fun formatHostPort(host: String, port: Int): String {
+        val trimmed = host.trim()
+        if (trimmed.isEmpty()) {
+            return if (port > 0) "unknown:$port" else "unknown"
+        }
+        if (port <= 0) {
+            return trimmed
+        }
+        if (trimmed.startsWith("[")) {
+            return if (trimmed.contains("]:")) trimmed else "$trimmed:$port"
+        }
+        if (trimmed.count { it == ':' } >= 2) {
+            return "[$trimmed]:$port"
+        }
+        return if (trimmed.endsWith(":$port")) trimmed else "$trimmed:$port"
+    }
+
     private const val SENSITIVE_KEY_PATTERN =
         "(?:[a-z0-9_-]*[_-])?(?:password|passwd|uuid|client_secret|client-secret|secret|" +
             "api_key|apikey|api-key|access_token|access-token|refresh_token|token|" +
@@ -134,6 +155,28 @@ object NodeImportSupport {
 
     private val PROXY_SHARE_SCHEME_REGEX = Regex(
         """(?i)\b(ss|ssr|ssd|vless|vmess|anytls|trojan|socks5|socks5s|socks5h|socks|http-proxy|https-proxy|hysteria2|hy2|hysteria|tuic|wireguard|wg|snell)://[^\s"'`<>\]})]+""",
+    )
+
+    private val REDACT_PROXY_URI_REGEX = Regex(
+        """(?i)\b(ss|ssr|ssd|vless|vmess|anytls|trojan|socks5|socks5s|socks5h|socks|http-proxy|https-proxy|hysteria2|hy2|hysteria|tuic|wireguard|wg|snell|clash)://[^\s"'`<>\]})]*""",
+    )
+
+    private val HTTP_URL_REGEX = Regex(
+        """(?i)\b(https?)://([^\s/"'`<>@]+@)?(\[[0-9a-fA-F:.%]+\](?::\d+)?|[^\s/?#"'>`\[\])}]+)(/[^\s?#"'>`\])}]*)?(\?[^\s"'<>`\])}]*)?(#[^\s"'<>`\])}]*)?""",
+    )
+
+    private val SUB_LABEL_REGEX = Regex("""\bSub\s*\([^()\r\n]+\)""")
+
+    private val IPV4_LITERAL_REGEX = Regex("""^\d{1,3}(?:\.\d{1,3}){3}$""")
+
+    private val PQ_KEY_SPEC_REGEX = Regex("""mlkem768x25519plus\.[^\s"'`&#)\]}>]+""")
+
+    private val STANDALONE_UUID_REGEX = Regex(
+        """\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b""",
+    )
+
+    private val EXTRACT_SAFE_HOST_REGEX = Regex(
+        """(?i)^[a-z][a-z0-9+.-]*://(?:[^\s/"'`<>@]+@)?(\[[0-9a-fA-F:.%]+\](?::\d+)?|[^\s/?#"'>`\[\])}]+)""",
     )
 
     private val ESCAPED_DOUBLE_QUOTED_SECRET_REGEX = Regex(
@@ -364,17 +407,23 @@ object NodeImportSupport {
     fun redactSecretsForUi(raw: String): String {
         var out = raw
         // Redact proxy share URIs (including Trojan, SOCKS5, HTTP-Proxy, VMess, Hysteria2, TUIC, WireGuard)
-        out = Regex("""(?i)\b(ss|ssr|ssd|vless|vmess|anytls|trojan|socks5|socks5s|socks5h|socks|http-proxy|https-proxy|hysteria2|hy2|hysteria|tuic|wireguard|wg|snell|clash)://[^\s"'`<>\]})]*""")
-            .replace(out) { m -> "${m.groupValues[1].lowercase()}://***REDACTED***" }
-        // Redact HTTP(S) subscription URLs: scrub userinfo, query/fragment tokens, and secret path segments
-        out = Regex("""(?i)\b(https?)://([^\s/"'`<>@]+@)?([^\s/?#"'>`\])}]+)(/[^\s?#"'>`\])}]*)?(\?[^\s"'<>`\])}]*)?(#[^\s"'<>`\])}]*)?""")
-            .replace(out) { m ->
-                val scheme = m.groupValues[1].lowercase()
-                val hasUserInfo = m.groupValues[2].isNotEmpty()
-                val hostPort = m.groupValues[3]
-                val safePath = sanitizeHttpUrlPath(m.groupValues[4])
-                val hasQuery = m.groupValues[5].isNotEmpty()
-                val hasFragment = m.groupValues[6].isNotEmpty()
+        out = REDACT_PROXY_URI_REGEX.replace(out) { m -> "${m.groupValues[1].lowercase()}://***REDACTED***" }
+        // Redact auto-generated subscription profile labels such as `Sub (203.0.113.124)`
+        out = SUB_LABEL_REGEX.replace(out, "Sub (***REDACTED***)")
+        // Redact HTTP(S) subscription URLs: scrub userinfo, query/fragment tokens, secret path segments, and IP subscription hosts
+        out = HTTP_URL_REGEX.replace(out) { m ->
+            val scheme = m.groupValues[1].lowercase()
+            val hasUserInfo = m.groupValues[2].isNotEmpty()
+            val hostPort = m.groupValues[3]
+            val rawPath = m.groupValues[4]
+            val safePath = sanitizeHttpUrlPath(rawPath)
+            val hasQuery = m.groupValues[5].isNotEmpty()
+            val hasFragment = m.groupValues[6].isNotEmpty()
+            if (isNonLoopbackIpHostPort(hostPort) &&
+                (hasUserInfo || hasQuery || hasFragment || isSubscriptionLikeHttpPath(rawPath, safePath))
+            ) {
+                "$scheme://***REDACTED***"
+            } else {
                 val authPrefix = if (hasUserInfo) "***REDACTED***@" else ""
                 if (hasQuery || hasFragment) {
                     "$scheme://$authPrefix$hostPort$safePath?***REDACTED***"
@@ -382,9 +431,9 @@ object NodeImportSupport {
                     "$scheme://$authPrefix$hostPort$safePath"
                 }
             }
+        }
         // Redact Xray/VLESS post-quantum key specs
-        out = Regex("""mlkem768x25519plus\.[^\s"'`&#)\]}>]+""")
-            .replace(out, "mlkem768x25519plus.***REDACTED***")
+        out = PQ_KEY_SPEC_REGEX.replace(out, "mlkem768x25519plus.***REDACTED***")
         // Redact escaped double-quoted, double-quoted, single-quoted, and unquoted key=value / key: value secrets
         out = ESCAPED_DOUBLE_QUOTED_SECRET_REGEX.replace(out) { m ->
             "${m.groupValues[1]}${m.groupValues[2]}${m.groupValues[3]}${m.groupValues[4]}\\\"***REDACTED***\\\""
@@ -399,10 +448,9 @@ object NodeImportSupport {
             "${m.groupValues[1]}${m.groupValues[2]}${m.groupValues[3]}${m.groupValues[4]}***REDACTED***"
         }
         // Redact standalone non-nil UUIDs
-        out = Regex("""\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b""")
-            .replace(out) { m ->
-                if (m.value == "00000000-0000-0000-0000-000000000000") m.value else "***REDACTED***"
-            }
+        out = STANDALONE_UUID_REGEX.replace(out) { m ->
+            if (m.value == "00000000-0000-0000-0000-000000000000") m.value else "***REDACTED***"
+        }
         return out
     }
 
@@ -416,7 +464,7 @@ object NodeImportSupport {
                 return if (p > 0 && p != 80 && p != 443) "$h:$p" else h
             }
         }
-        val m = Regex("""(?i)^[a-z][a-z0-9+.-]*://(?:[^\s/"'`<>@]+@)?([^\s/?#"'>`\])}]+)""").find(candidate)
+        val m = EXTRACT_SAFE_HOST_REGEX.find(candidate)
         return m?.groupValues?.getOrNull(1)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
     }
 
@@ -446,6 +494,51 @@ object NodeImportSupport {
         }
 
     private val SECRET_PATH_PREFIX_SEGMENTS = setOf("s", "sub", "subs", "link", "token", "raw", "d")
+    private val SUBSCRIPTION_PATH_KEYWORDS = setOf(
+        "s",
+        "sub",
+        "subs",
+        "subscribe",
+        "subscription",
+        "link",
+        "token",
+        "raw",
+        "d",
+        "clash",
+    )
+
+    private fun isNonLoopbackIpHostPort(hostPort: String): Boolean {
+        if (hostPort.startsWith("[")) {
+            val ipLiteral = hostPort.substringAfter('[')
+                .substringBefore(']')
+                .substringBefore('%')
+                .trim()
+                .lowercase()
+            return ipLiteral.isNotEmpty() && ipLiteral != "::1" && ipLiteral != "0:0:0:0:0:0:0:1"
+        }
+        val hostOnly = hostPort.substringBefore(':').trim().lowercase()
+        if (hostOnly == "localhost" || hostOnly == "127.0.0.1") {
+            return false
+        }
+        if (!IPV4_LITERAL_REGEX.matches(hostOnly)) {
+            return false
+        }
+        return hostOnly.split('.').all { (it.toIntOrNull() ?: 999) in 0..255 }
+    }
+
+    private fun isSubscriptionLikeHttpPath(rawPath: String, safePath: String): Boolean {
+        if (safePath.contains("***REDACTED***")) {
+            return true
+        }
+        val lower = rawPath.lowercase()
+        if (lower.endsWith(".yaml") || lower.endsWith(".yml")) {
+            return true
+        }
+        return lower.split('/').any { seg ->
+            val clean = seg.substringBefore('.')
+            clean.isNotEmpty() && clean in SUBSCRIPTION_PATH_KEYWORDS
+        }
+    }
 
     private fun sanitizeHttpUrlPath(path: String): String {
         if (path.isEmpty() || path == "/") return path
@@ -459,7 +552,7 @@ object NodeImportSupport {
                 val base = seg.substringBefore('.')
                 val isBenignKnown = base.equals("generate_204", ignoreCase = true)
                 val looksLikeToken = !isBenignKnown && (
-                    (prevLower in SECRET_PATH_PREFIX_SEGMENTS && base.length >= 6) ||
+                    (prevLower in SECRET_PATH_PREFIX_SEGMENTS && base.length >= 4) ||
                         base.length >= 20 ||
                         (base.length >= 16 && base.any { it.isDigit() || it.isUpperCase() }) ||
                         seg.contains('=') ||

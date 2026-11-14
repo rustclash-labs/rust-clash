@@ -97,6 +97,7 @@ fun SettingsScreen(
     onSaveDebugReportToFile: () -> Unit = {},
     onClearDebugLogs: () -> Unit = {},
     onRefreshDebugSummary: () -> Unit = {},
+    onOpenBatteryOptimizationSettings: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var showAppearanceSheet by remember { mutableStateOf(false) }
@@ -194,9 +195,13 @@ fun SettingsScreen(
                 icon = Icons.Rounded.Tune,
                 title = "通用",
                 subtitle = "订阅自动更新 · 后台运行 · 通知",
-                trailingBadge = UiJsonParsers.formatAutoUpdateInterval(
-                    state.defaultSubAutoUpdateSecs.takeIf { it > 0L },
-                ),
+                trailingBadge = if (!state.isBatteryOptimizationIgnored) {
+                    "待优化"
+                } else {
+                    UiJsonParsers.formatAutoUpdateInterval(
+                        state.defaultSubAutoUpdateSecs.takeIf { it > 0L },
+                    )
+                },
                 onClick = { showGeneralSheet = true },
             )
             SettingsGroupDivider()
@@ -295,6 +300,7 @@ fun SettingsScreen(
         GeneralSettingsBottomSheet(
             state = state,
             onSetDefaultSubAutoUpdateSecs = onSetDefaultSubAutoUpdateSecs,
+            onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
             onDismiss = { showGeneralSheet = false },
         )
     }
@@ -308,6 +314,7 @@ fun SettingsScreen(
             onShareDebugReport = onShareDebugReport,
             onSaveDebugReportToFile = onSaveDebugReportToFile,
             onClearDebugLogs = onClearDebugLogs,
+            onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
             onDismiss = { showDebugSheet = false },
         )
     }
@@ -556,6 +563,7 @@ private fun PerformanceBottomSheet(
 private fun GeneralSettingsBottomSheet(
     state: AppUiState,
     onSetDefaultSubAutoUpdateSecs: (Long) -> Unit = {},
+    onOpenBatteryOptimizationSettings: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
@@ -582,6 +590,13 @@ private fun GeneralSettingsBottomSheet(
                 fontWeight = FontWeight.Bold,
             )
             Spacer(modifier = Modifier.height(12.dp))
+
+            BatteryOptimizationStatusCard(
+                isIgnored = state.isBatteryOptimizationIgnored,
+                onOpenSettings = onOpenBatteryOptimizationSettings,
+            )
+
+            HorizontalDivider(color = extColors.hairline, modifier = Modifier.padding(vertical = 12.dp))
 
             Text(
                 text = "订阅默认自动更新",
@@ -630,6 +645,77 @@ private fun GeneralSettingsBottomSheet(
     }
 }
 
+@Composable
+private fun BatteryOptimizationStatusCard(
+    isIgnored: Boolean,
+    onOpenSettings: () -> Unit,
+) {
+    val extColors = LocalRustClashColors.current
+    val containerColor = if (isIgnored) extColors.emeraldContainer else extColors.amberContainer
+    val contentColor = if (isIgnored) extColors.onEmeraldContainer else extColors.onAmberContainer
+    val accentColor = if (isIgnored) extColors.emerald else extColors.amber
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = containerColor,
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.4f)),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Bolt,
+                    contentDescription = null,
+                    tint = accentColor,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (isIgnored) {
+                        "后台省电白名单：已加入不受限制白名单"
+                    } else {
+                        "受系统省电限制（荣耀 iAware / 国产系统易在后台回收 VPN）"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = contentColor,
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = if (isIgnored) {
+                    "系统允许 VPN 服务在锁屏与后台长驻运行，降低异常断连概率。"
+                } else {
+                    "建议将 RustClash 设为「允许后台活动 / 不受限制」，避免锁屏后被系统省电策略强杀。"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = contentColor.copy(alpha = 0.9f),
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onOpenSettings,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, accentColor.copy(alpha = 0.55f)),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    text = "前往设置不受限制",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = contentColor,
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DebugDiagnosticsBottomSheet(
@@ -640,6 +726,7 @@ private fun DebugDiagnosticsBottomSheet(
     onShareDebugReport: () -> Unit,
     onSaveDebugReportToFile: () -> Unit,
     onClearDebugLogs: () -> Unit,
+    onOpenBatteryOptimizationSettings: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
@@ -670,6 +757,14 @@ private fun DebugDiagnosticsBottomSheet(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            if (!state.isBatteryOptimizationIgnored) {
+                Spacer(modifier = Modifier.height(12.dp))
+                BatteryOptimizationStatusCard(
+                    isIgnored = false,
+                    onOpenSettings = onOpenBatteryOptimizationSettings,
+                )
+            }
 
             Spacer(modifier = Modifier.height(14.dp))
 

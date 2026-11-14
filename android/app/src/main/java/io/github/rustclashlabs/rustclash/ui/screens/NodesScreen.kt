@@ -745,7 +745,7 @@ private fun NodeRowCard(
 
                 Spacer(modifier = Modifier.width(8.dp))
 
-                val endpointText = if (node.port > 0) "${node.server}:${node.port}" else node.server
+                val endpointText = NodeImportSupport.formatHostPort(node.server, node.port)
                 Text(
                     text = endpointText,
                     style = MaterialTheme.typography.bodySmall,
@@ -1629,7 +1629,7 @@ private fun NodeQrInfoDialog(
                     Spacer(modifier = Modifier.height(10.dp))
                 }
                 Text(
-                    text = "${node.protocolDisplay} · ${node.server}:${node.port}",
+                    text = "${node.protocolDisplay} · ${NodeImportSupport.formatHostPort(node.server, node.port)}",
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
