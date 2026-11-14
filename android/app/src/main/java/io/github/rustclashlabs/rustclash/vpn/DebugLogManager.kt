@@ -219,6 +219,7 @@ object DebugLogManager {
         downBandwidthKbps: Int,
         upBandwidthKbps: Int,
         triggeredHandoff: Boolean,
+        hasIpv6: Boolean? = null,
     ) {
         val now = System.currentTimeMillis()
         val transport = when {
@@ -227,9 +228,13 @@ object DebugLogManager {
             isEthernet -> "ETHERNET"
             else -> "OTHER"
         }
-        val stateFp = "$networkHandle|$transport|$isValidated|$isNotMetered"
+        val stateFp = "$networkHandle|$transport|$isValidated|$isNotMetered|${hasIpv6 ?: "-"}"
         synchronized(lock) {
-            if (eventType == "NET_CAPS" && !triggeredHandoff && lastNetworkLostMs == 0L && stateFp == lastNetStateFingerprint) {
+            if ((eventType == "NET_CAPS" || eventType == "NET_AVAILABLE") &&
+                !triggeredHandoff &&
+                lastNetworkLostMs == 0L &&
+                stateFp == lastNetStateFingerprint
+            ) {
                 return
             }
             lastNetStateFingerprint = stateFp
@@ -240,26 +245,67 @@ object DebugLogManager {
             } else {
                 ""
             }
+            val ipv6Note = if (hasIpv6 != null) " ipv6=$hasIpv6" else ""
             pushEventLocked(
                 now,
                 eventType,
                 "handle=$networkHandle transport=$transport validated=$isValidated unmetered=$isNotMetered " +
-                    "bw=${downBandwidthKbps}/${upBandwidthKbps}kbps handoff=$triggeredHandoff$gapNote",
+                    "bw=${downBandwidthKbps}/${upBandwidthKbps}kbps handoff=$triggeredHandoff$ipv6Note$gapNote",
             )
         }
     }
 
-    fun onNetworkLostObserved(networkHandle: Long, lostActiveUnderlying: Boolean) {
+    fun onNetworkLinkIpv6Changed(
+        networkHandle: Long,
+        transportLabel: String,
+        hasIpv6: Boolean,
+        handoffTriggered: Boolean,
+    ) {
         val now = System.currentTimeMillis()
         synchronized(lock) {
-            if (lostActiveUnderlying) {
+            lastNetStateFingerprint = ""
+            pushEventLocked(
+                now,
+                "NET_LINK_IPV6",
+                "handle=$networkHandle transport=$transportLabel ipv6=$hasIpv6 handoff=$handoffTriggered",
+            )
+        }
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    fun onNetworkLinkIpv6Changed(
+        context: Context,
+        networkHandle: Long,
+        transportLabel: String,
+        hasIpv6: Boolean,
+        handoffTriggered: Boolean,
+    ) {
+        onNetworkLinkIpv6Changed(
+            networkHandle = networkHandle,
+            transportLabel = transportLabel,
+            hasIpv6 = hasIpv6,
+            handoffTriggered = handoffTriggered,
+        )
+    }
+
+    fun onNetworkLostObserved(
+        networkHandle: Long,
+        lostActiveUnderlying: Boolean,
+        fallbackHandle: Long = 0L,
+    ) {
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            if (lostActiveUnderlying && fallbackHandle == 0L) {
                 lastNetworkLostMs = now
                 lastNetStateFingerprint = ""
+            } else if (fallbackHandle != 0L) {
+                lastNetStateFingerprint = ""
             }
+            val fallbackNote = if (fallbackHandle != 0L) " fallbackHandle=$fallbackHandle" else ""
             pushEventLocked(
                 now,
                 "NET_LOST",
-                "handle=$networkHandle activeUnderlyingLost=$lostActiveUnderlying",
+                "handle=$networkHandle activeUnderlyingLost=$lostActiveUnderlying$fallbackNote",
             )
         }
     }
@@ -807,13 +853,19 @@ object DebugLogManager {
             val uptime = nativeObj.optLong("uptimeSecs", 0L)
             val netTrans = nativeObj.optLong("networkTransitions", 0L)
             val isWifi = nativeObj.optBoolean("isWifi", true)
+            val hasIpv6 = if (nativeObj.has("hasIpv6") && !nativeObj.isNull("hasIpv6")) {
+                nativeObj.optBoolean("hasIpv6", true)
+            } else {
+                null
+            }
+            val ipv6RoutePart = if (hasIpv6 != null) " ipv6Route=`$hasIpv6`" else ""
 
             sb.appendLine()
             sb.appendLine("#### Rust Engine & Tunnel Summary")
             sb.appendLine(
                 "- State: vpnRunning=`$vpnRunning` uptime=`${uptime}s` mode=`$mode` preset=`${preset.ifEmpty { "-" }}` " +
                     "activeNode=`$effOut ($effProto, delay=${if (effDelay > 0) "${effDelay}ms" else "N/A"})` " +
-                    "net=`${if (isWifi) "WIFI" else "CELLULAR"}` transitions=`$netTrans`",
+                    "net=`${if (isWifi) "WIFI" else "CELLULAR"}` transitions=`$netTrans`$ipv6RoutePart",
             )
 
             nativeObj.optJSONObject("activeProfile")?.let { prof ->

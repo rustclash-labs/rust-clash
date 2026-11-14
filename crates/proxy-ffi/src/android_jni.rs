@@ -97,6 +97,7 @@ struct AndroidVpnRuntime {
     last_network_handle: AtomicI64,
     has_network_baseline: AtomicBool,
     is_wifi: AtomicBool,
+    has_ipv6: AtomicBool,
 }
 
 /// Fast, microsecond-only pointer swap lock for reading/installing the active `AndroidVpnRuntime`.
@@ -400,6 +401,7 @@ fn shutdown_runtime_outside_lock(#[allow(unused_mut)] mut prev: AndroidVpnRuntim
     }
     prev.engine.shutdown();
     clear_global_socket_protector();
+    proxy_core::platform::socket_protect::set_os_underlying_ipv6_available(None);
     prev.runtime.shutdown_timeout(Duration::from_millis(300));
 }
 
@@ -934,6 +936,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
         last_network_handle: AtomicI64::new(0),
         has_network_baseline: AtomicBool::new(false),
         is_wifi: AtomicBool::new(true),
+        has_ipv6: AtomicBool::new(true),
     };
 
     let cancelled = {
@@ -987,6 +990,23 @@ pub fn notify_android_network_changed_core(
     network_handle: i64,
     is_wifi: bool,
 ) -> Option<NetworkChangeReport> {
+    notify_android_network_changed_with_caps_core(network_handle, is_wifi, true)
+}
+
+/// Pure-Rust core implementation of `nativeNotifyNetworkChangedWithCaps`.
+pub fn notify_android_network_changed_with_caps_core(
+    network_handle: i64,
+    is_wifi: bool,
+    has_ipv6: bool,
+) -> Option<NetworkChangeReport> {
+    proxy_core::platform::socket_protect::set_os_underlying_ipv6_available(
+        if network_handle == 0 {
+            None
+        } else {
+            Some(has_ipv6)
+        },
+    );
+
     enum HandoffState {
         Offline,
         NoChange,
@@ -1001,10 +1021,13 @@ pub fn notify_android_network_changed_core(
                 .last_network_handle
                 .swap(network_handle, Ordering::AcqRel);
             let prev_wifi = rt.is_wifi.swap(is_wifi, Ordering::AcqRel);
+            let prev_ipv6 = rt.has_ipv6.swap(has_ipv6, Ordering::AcqRel);
             if !had_baseline && network_handle != 0 {
                 HandoffState::NoChange
             } else if prev_handle != network_handle || prev_wifi != is_wifi {
                 rt.network_transitions.fetch_add(1, Ordering::Relaxed);
+                HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
+            } else if prev_ipv6 && !has_ipv6 {
                 HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
             } else {
                 HandoffState::NoChange
@@ -1031,7 +1054,7 @@ pub fn notify_android_network_changed_core(
             engine.hub().push_log(
                 "info",
                 format!(
-                    "Android network handoff (handle {prev_handle} -> {network_handle}, wifi={is_wifi}): closed_tcp={}, reset_udp_nat={}, evicted_tls_pool={}",
+                    "Android network handoff (handle {prev_handle} -> {network_handle}, wifi={is_wifi}, ipv6={has_ipv6}): closed_tcp={}, reset_udp_nat={}, evicted_tls_pool={}",
                     report.closed_active_connections,
                     report.reset_udp_nat_sessions,
                     report.evicted_tls_sessions
@@ -1090,6 +1113,7 @@ pub fn android_status_json_core() -> serde_json::Value {
             "tunTxPackets": tx_pkts,
             "networkTransitions": rt.network_transitions.load(Ordering::Relaxed),
             "isWifi": rt.is_wifi.load(Ordering::Acquire),
+            "hasIpv6": rt.has_ipv6.load(Ordering::Acquire),
         })
     } else {
         serde_json::json!({
@@ -1622,6 +1646,24 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 ) -> jboolean {
     jni_bool_guarded(|| {
         notify_android_network_changed_core(network_handle, is_wifi == JNI_TRUE).is_some()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeNotifyNetworkChangedWithCaps(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    network_handle: jlong,
+    is_wifi: jboolean,
+    has_ipv6: jboolean,
+) -> jboolean {
+    jni_bool_guarded(|| {
+        notify_android_network_changed_with_caps_core(
+            network_handle,
+            is_wifi == JNI_TRUE,
+            has_ipv6 == JNI_TRUE,
+        )
+        .is_some()
     })
 }
 
@@ -3318,6 +3360,7 @@ pub fn android_collect_debug_snapshot_window_core(
                 rt.protector.fail_count(),
                 rt.network_transitions.load(Ordering::Relaxed),
                 rt.is_wifi.load(Ordering::Acquire),
+                rt.has_ipv6.load(Ordering::Acquire),
                 rt.last_network_handle.load(Ordering::Acquire),
             )
         })
@@ -3331,6 +3374,7 @@ pub fn android_collect_debug_snapshot_window_core(
         prot_fail,
         network_transitions,
         is_wifi,
+        has_ipv6,
         last_network_handle,
     )) = live_ctx
     {
@@ -3424,6 +3468,7 @@ pub fn android_collect_debug_snapshot_window_core(
             "effectiveDelayMs": active_delay,
             "networkTransitions": network_transitions,
             "isWifi": is_wifi,
+            "hasIpv6": has_ipv6,
             "lastNetworkHandle": last_network_handle,
             "activeProfile": active_profile,
             "geodata": geodata,
@@ -4000,6 +4045,74 @@ mod tests {
         std::fs::write(&yaml_path, &backup_bytes).expect("restore active yaml");
         drop(mgr);
         drop(engine);
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn network_handoff_with_caps_tracks_cellular_baseline_wifi_handoff_and_ipv6_loss() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-net-caps-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            true,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        // 1. Initial Cellular baseline (handle=101, is_wifi=false, has_ipv6=true):
+        //    records true transport & IPv6 state without counting a synthetic transition.
+        let base_rep = notify_android_network_changed_with_caps_core(101, false, true)
+            .expect("active runtime on initial cellular baseline");
+        assert!(!base_rep.dns_cache_flushed);
+        let status_cell = android_status_json_core();
+        assert_eq!(status_cell["networkTransitions"], 0);
+        assert_eq!(status_cell["isWifi"], false);
+        assert_eq!(status_cell["hasIpv6"], true);
+
+        // 2. Handoff to IPv4-only Wi-Fi (handle=202, is_wifi=true, has_ipv6=false):
+        //    increments networkTransitions to 1, flushes DNS/sockets, updates isWifi & hasIpv6.
+        let wifi_rep = notify_android_network_changed_with_caps_core(202, true, false)
+            .expect("active runtime on wifi handoff");
+        assert!(wifi_rep.dns_cache_flushed);
+        let status_wifi = android_status_json_core();
+        assert_eq!(status_wifi["networkTransitions"], 1);
+        assert_eq!(status_wifi["isWifi"], true);
+        assert_eq!(status_wifi["hasIpv6"], false);
+
+        let snap = android_collect_debug_snapshot_window_core(&tmp_dir, 0, u64::MAX)
+            .expect("collect live window snapshot");
+        assert_eq!(snap["networkTransitions"], 1);
+        assert_eq!(snap["isWifi"], true);
+        assert_eq!(snap["hasIpv6"], false);
+        assert_eq!(snap["lastNetworkHandle"], 202);
+
+        // 3. Gaining IPv6 on same Wi-Fi handle (202, true, true) updates hasIpv6 without tearing down IPv4 sessions
+        let gain_v6 = notify_android_network_changed_with_caps_core(202, true, true)
+            .expect("active runtime on ipv6 gain");
+        assert!(!gain_v6.dns_cache_flushed);
+        let status_v6 = android_status_json_core();
+        assert_eq!(status_v6["networkTransitions"], 1);
+        assert_eq!(status_v6["hasIpv6"], true);
+
+        // 4. Losing IPv6 on same Wi-Fi handle (202, true, false) flushes stale IPv6 state without bumping transitions
+        let lose_v6 = notify_android_network_changed_with_caps_core(202, true, false)
+            .expect("active runtime on ipv6 loss");
+        assert!(lose_v6.dns_cache_flushed);
+        let status_no_v6 = android_status_json_core();
+        assert_eq!(status_no_v6["networkTransitions"], 1);
+        assert_eq!(status_no_v6["hasIpv6"], false);
+
         assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
