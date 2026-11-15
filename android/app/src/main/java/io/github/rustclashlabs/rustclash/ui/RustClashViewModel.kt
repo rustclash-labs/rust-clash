@@ -2,9 +2,12 @@ package io.github.rustclashlabs.rustclash.ui
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.net.VpnService
 import android.os.PowerManager
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
@@ -55,6 +58,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     private var tickerJob: Job? = null
     private var refreshJob: Job? = null
     private var importJob: Job? = null
+    private var installedAppsJob: Job? = null
     private var importGeneration: Long = 0L
     private var previousVpnRunning: Boolean = false
     private var lastSyncedRouterEpoch: Long = -1L
@@ -427,17 +431,75 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun selectProxyInGroup(groupName: String, proxyName: String) {
         if (!NativeBridge.ensureLoaded()) return
-        viewModelScope.launch {
-            val raw = withContext(Dispatchers.IO) {
-                NativeBridge.nativeSelectProxyPersisted(stateDir, groupName, proxyName)
+        val curState = _uiState.value
+        val targetGroup = curState.groups.firstOrNull { it.name == groupName }
+        val selectionSteps = buildList {
+            if (targetGroup != null && proxyName !in targetGroup.members) {
+                val subSelectable = curState.groups.firstOrNull {
+                    it.name != "GLOBAL" &&
+                        it.isSelectable &&
+                        proxyName in it.members &&
+                        it.name in targetGroup.members
+                } ?: curState.groups.firstOrNull {
+                    it.name != "GLOBAL" &&
+                        it.isSelectable &&
+                        proxyName in it.members
+                }
+                if (subSelectable != null) {
+                    add(subSelectable.name to proxyName)
+                    if (targetGroup.isSelectable &&
+                        subSelectable.name in targetGroup.members &&
+                        targetGroup.now != subSelectable.name
+                    ) {
+                        add(targetGroup.name to subSelectable.name)
+                    }
+                } else {
+                    val autoSub = curState.groups.firstOrNull {
+                        it.name != "GLOBAL" &&
+                            proxyName in it.members &&
+                            it.name in targetGroup.members
+                    }
+                    if (autoSub != null && targetGroup.isSelectable) {
+                        add(targetGroup.name to autoSub.name)
+                    } else {
+                        add(groupName to proxyName)
+                    }
+                }
+            } else {
+                add(groupName to proxyName)
             }
-            val obj = runCatching { JSONObject(raw) }.getOrNull()
-            if (obj != null && obj.optBoolean("ok", false)) {
-                applyNodeManagerSnapshot(raw)
+        }
+        viewModelScope.launch {
+            var lastRaw = ""
+            var lastObj: JSONObject? = null
+            for ((grp, prx) in selectionSteps) {
+                val raw = withContext(Dispatchers.IO) {
+                    NativeBridge.nativeSelectProxyPersisted(stateDir, grp, prx)
+                }
+                val obj = runCatching { JSONObject(raw) }.getOrNull()
+                lastRaw = raw
+                lastObj = obj
+                if (obj == null || !obj.optBoolean("ok", false)) {
+                    break
+                }
+            }
+            if (lastObj != null && lastObj.optBoolean("ok", false)) {
+                applyNodeManagerSnapshot(lastRaw)
                 emitMessage("已切换节点：$proxyName")
             } else {
-                emitMessage(obj?.optString("error") ?: "切换节点失败")
+                emitMessage(lastObj?.optString("error") ?: "切换节点失败")
             }
+        }
+    }
+
+    private fun updatePersistedFavoriteNodes(transform: (MutableSet<String>) -> Unit) {
+        val prev = _uiState.value.favoriteNodes
+        val next = prev.toMutableSet()
+        transform(next)
+        if (next != prev) {
+            val snapshot = next.toSet()
+            prefs.edit().putStringSet(RustClashVpnService.KEY_FAVORITE_NODES, snapshot).apply()
+            _uiState.update { it.copy(favoriteNodes = snapshot) }
         }
     }
 
@@ -527,16 +589,15 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 val inputKind = resp.optString("inputKind", "")
                 val activeProfId = resp.optString("activeProfileId", "").trim()
                 val importedProfId = resp.optString("importedProfileId", "").trim().ifEmpty { activeProfId }
-                val isExternalDeepLink = fromExternalIntent || trimmed.startsWith("clash://", ignoreCase = true)
                 val isSubImport = inputKind.contains("subscription", ignoreCase = true) ||
                     inputKind.equals("clash-install-config-url", ignoreCase = true) ||
                     trimmed.startsWith("https://", ignoreCase = true) ||
                     trimmed.startsWith("clash://", ignoreCase = true)
                 if (isSubImport && importedProfId.isNotEmpty()) {
                     val rawTargetSecs = when {
-                        isExternalDeepLink && !externalConfirmed -> 0L
+                        fromExternalIntent && !externalConfirmed -> 0L
                         subscriptionAutoUpdateSecs != null -> subscriptionAutoUpdateSecs
-                        isExternalDeepLink -> 0L
+                        fromExternalIntent -> 0L
                         else -> _uiState.value.defaultSubAutoUpdateSecs
                     }
                     val targetSecs = if (rawTargetSecs <= 0L) 0L else rawTargetSecs.coerceAtLeast(60L)
@@ -606,10 +667,18 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 val resp = runCatching { JSONObject(raw) }.getOrNull()
                 if (resp != null && resp.optBoolean("ok", false)) {
+                    val name = nodeJson.optString("name").trim()
+                    val origClean = originalName?.trim().orEmpty()
+                    if (origClean.isNotEmpty() && name.isNotEmpty() && origClean != name) {
+                        updatePersistedFavoriteNodes { favs ->
+                            if (favs.remove(origClean)) {
+                                favs.add(name)
+                            }
+                        }
+                    }
                     clearModalError()
                     syncSnapshotQuietly()
                     refreshProfilesQuietly()
-                    val name = nodeJson.optString("name")
                     emitMessage(if (originalName != null) "已保存节点：$name" else "已添加节点：$name")
                     onSuccess?.invoke()
                 } else {
@@ -633,6 +702,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val resp = runCatching { JSONObject(raw) }.getOrNull()
             if (resp != null && resp.optBoolean("ok", false)) {
+                updatePersistedFavoriteNodes { favs ->
+                    favs.remove(nodeName.trim())
+                }
                 syncSnapshotQuietly()
                 refreshProfilesQuietly()
                 emitMessage("已删除节点：$nodeName")
@@ -650,7 +722,21 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val resp = runCatching { JSONObject(raw) }.getOrNull()
             if (resp != null && resp.optBoolean("ok", false)) {
-                val removed = resp.optJSONArray("removedNodes")?.length() ?: 0
+                val removedArr = resp.optJSONArray("removedNodes")
+                val removed = removedArr?.length() ?: 0
+                if (removedArr != null && removed > 0) {
+                    val removedNames = buildSet {
+                        for (i in 0 until removed) {
+                            val n = removedArr.optString(i).trim()
+                            if (n.isNotEmpty()) add(n)
+                        }
+                    }
+                    if (removedNames.isNotEmpty()) {
+                        updatePersistedFavoriteNodes { favs ->
+                            favs.removeAll(removedNames)
+                        }
+                    }
+                }
                 syncSnapshotQuietly()
                 refreshProfilesQuietly()
                 emitMessage(if (removed > 0) "已清理 $removed 个重复节点" else "未发现重复节点")
@@ -1021,7 +1107,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         if (!forceReload && _uiState.value.installedApps.isNotEmpty()) return
         val includeSystem = _uiState.value.showSystemApps
         val currentlySelected = _uiState.value.selectedPackages
-        viewModelScope.launch {
+        installedAppsJob?.cancel()
+        installedAppsJob = viewModelScope.launch {
             val apps = withContext(Dispatchers.IO) {
                 val pm = appContext.packageManager
                 pm.getInstalledApplications(PackageManager.GET_META_DATA)
@@ -1045,8 +1132,24 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                     .sortedBy { it.label.lowercase() }
             }
-            _uiState.update { it.copy(installedApps = apps) }
+            if (isActive) {
+                _uiState.update { it.copy(installedApps = apps) }
+            }
         }
+    }
+
+    private fun requestLiveVpnTunnelRestartIfPermitted(): Boolean {
+        if (_uiState.value.vpnState != VpnLifecycleState.RUNNING) return false
+        val prepared = runCatching { VpnService.prepare(appContext) == null }.getOrDefault(false)
+        if (!prepared) return false
+        return runCatching {
+            val restartIntent = Intent(appContext, RustClashVpnService::class.java).apply {
+                action = RustClashVpnService.ACTION_START_VPN
+                putExtra(RustClashVpnService.EXTRA_DEMO_MODE, _uiState.value.demoMode)
+            }
+            ContextCompat.startForegroundService(appContext, restartIntent)
+            true
+        }.getOrDefault(false)
     }
 
     fun savePerAppPolicy(mode: PerAppMode, selectedPackages: Set<String>) {
@@ -1068,20 +1171,22 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 lockdownWarning = plan.lockdownConflictWarning,
             )
         }
-        val runningNote = if (_uiState.value.vpnState == VpnLifecycleState.RUNNING) {
-            "（重新连接 VPN 后对系统隧道生效）"
-        } else {
-            ""
+        val restarted = requestLiveVpnTunnelRestartIfPermitted()
+        val runningNote = when {
+            restarted -> "，正在平滑重连隧道以立即生效"
+            _uiState.value.vpnState == VpnLifecycleState.RUNNING -> "（重新连接 VPN 后对系统隧道生效）"
+            else -> ""
         }
         emitMessage("已保存分应用代理策略$runningNote")
     }
 
     fun setEnableIpv6(enabled: Boolean) {
         prefs.edit().putBoolean(RustClashVpnService.KEY_ENABLE_IPV6, enabled).apply()
-        val runningNotice = if (_uiState.value.vpnState == VpnLifecycleState.RUNNING) {
-            "IPv6 设置已保存，重新连接 VPN 后对系统隧道生效"
-        } else {
-            null
+        val restarted = requestLiveVpnTunnelRestartIfPermitted()
+        val runningNotice = when {
+            restarted -> "IPv6 设置已保存，正在平滑重连 VPN 隧道以立即生效"
+            _uiState.value.vpnState == VpnLifecycleState.RUNNING -> "IPv6 设置已保存，重新连接 VPN 后对系统隧道生效"
+            else -> null
         }
         _uiState.update { it.copy(enableIpv6 = enabled, settingsSheetNotice = runningNotice) }
         if (runningNotice != null) {

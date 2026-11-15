@@ -1366,6 +1366,7 @@ impl ProxyEngine {
             dns_engine,
         )?;
         router.set_unified_delay(cfg.unified_delay);
+        router.set_tun_dns_hijack(cfg.tun.dns_hijack);
         Ok(Arc::new(router))
     }
 
@@ -1458,6 +1459,7 @@ impl ProxyEngine {
             Arc::clone(&dns_engine),
         )?);
         initial_router.set_unified_delay(cfg.unified_delay);
+        initial_router.set_tun_dns_hijack(cfg.tun.dns_hijack);
         if let Some(ref sel) = initial_selections {
             initial_router.apply_saved_selections(sel);
         }
@@ -1929,8 +1931,9 @@ impl ProxyEngine {
     }
 
     pub fn set_mode(&self, mode: RunMode) {
-        let router = {
+        let (router, prev_mode) = {
             let mut st = self.state.write();
+            let prev_mode = st.snapshot.config.mode;
             let mut next_snap = (*st.snapshot).clone();
             next_snap.config.mode = mode;
             if let Ok(y) = next_snap.config.to_disk_yaml_string() {
@@ -1940,9 +1943,15 @@ impl ProxyEngine {
             st.next_seq = st.next_seq.wrapping_add(1);
             st.mode_seq = st.next_seq;
             st.snapshot = Arc::new(next_snap);
-            router
+            (router, prev_mode)
         };
         router.set_mode(mode);
+        let migrated = if prev_mode != mode {
+            let _ = self.hub.reset_udp_nat_sessions();
+            self.hub.close_all_connections()
+        } else {
+            0
+        };
         self.trigger_preconnect();
         if self.demo_cluster.read().is_none()
             && let Some(mgr) = self.profile_manager()
@@ -1956,7 +1965,10 @@ impl ProxyEngine {
         }
         self.hub.push_log(
             "info",
-            format!("Switched routing mode to '{}'", mode.as_str()),
+            format!(
+                "Switched routing mode to '{}' (migrated {migrated} active connection(s))",
+                mode.as_str()
+            ),
         );
     }
 
@@ -2828,8 +2840,12 @@ impl ProxyEngine {
                 {
                     target_cfg.dns.listen = bound_dns.to_string();
                 }
-                if prev.tun.enable && !prev.tun.ipv6 {
-                    target_cfg.dns.ipv6 = false;
+                if prev.tun.enable {
+                    if !prev.tun.ipv6 {
+                        target_cfg.dns.ipv6 = false;
+                    } else if !prev.tun.auto_route {
+                        target_cfg.dns.ipv6 = true;
+                    }
                 }
                 target_cfg.tun = prev.tun.clone();
                 (target_cfg, None)
@@ -3268,23 +3284,34 @@ impl ProxyEngine {
             Arc::clone(&new_dns),
         )?);
         new_router.set_unified_delay(new_cfg.unified_delay);
+        new_router.set_tun_dns_hijack(new_cfg.tun.dns_hijack);
         new_router.set_low_power_mode(self.is_low_power_mode());
         new_router.import_delays_from(&prev_router);
 
-        let mut carried_selections = prev_router.manual_selections_snapshot();
-        for (k, v) in &base_saved_selections {
-            carried_selections
-                .entry(k.clone())
-                .or_insert_with(|| v.clone());
-        }
-        if !prev_had_concrete && !new_cfg.proxies.is_empty() {
-            carried_selections.retain(|_, v| v != "DIRECT");
-        }
-        if let Some(explicit) = explicit_selections {
-            for (k, v) in explicit {
-                carried_selections.insert(k.clone(), v.clone());
+        let carried_selections = if is_profile_transition {
+            match explicit_selections {
+                Some(explicit) => {
+                    crate::profile::default_selected_groups_for_config(&new_cfg, explicit)
+                }
+                None => {
+                    crate::profile::default_selected_groups_for_config(&new_cfg, &HashMap::new())
+                }
             }
-        }
+        } else {
+            let mut carried = prev_router.manual_selections_snapshot();
+            for (k, v) in &base_saved_selections {
+                carried.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            if !prev_had_concrete && !new_cfg.proxies.is_empty() {
+                carried.retain(|_, v| v != "DIRECT");
+            }
+            if let Some(explicit) = explicit_selections {
+                for (k, v) in explicit {
+                    carried.insert(k.clone(), v.clone());
+                }
+            }
+            carried
+        };
         new_router.apply_saved_selections(&carried_selections);
 
         let target_mixed_spec = mixed_listen_spec(&new_cfg);
@@ -3644,6 +3671,7 @@ impl ProxyEngine {
             None
         };
 
+        let prev_mixed_port = base_snapshot.mixed_addr.port();
         let final_mixed_addr = services.mixed.bound_addr;
         let final_dns_addr = services.dns.as_ref().map(|d| d.bound_addr);
         let final_tun_mode = services
@@ -3653,6 +3681,11 @@ impl ProxyEngine {
             .unwrap_or(TunRuntimeMode::Disabled);
 
         new_policy.blocked_local_ports = compute_blocked_local_ports(&new_cfg, final_dns_addr);
+        let valid_outbound_names: Vec<String> = new_cfg
+            .proxies
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect();
 
         let final_log_level = {
             let mut st = self.state.write();
@@ -3708,6 +3741,36 @@ impl ProxyEngine {
         self.hub.set_log_level(&final_log_level);
 
         drop(services);
+
+        let valid_ob_set: std::collections::HashSet<&str> =
+            valid_outbound_names.iter().map(String::as_str).collect();
+        let closed_missing = self.hub.close_connections_missing_outbounds(&valid_ob_set);
+        if closed_missing > 0 || is_profile_transition {
+            let _ = self.hub.reset_udp_nat_sessions();
+        }
+
+        if final_mixed_addr.port() != prev_mixed_port {
+            let state_dir = self.state_dir();
+            if !state_dir.as_os_str().is_empty() {
+                let sp = crate::platform::sysproxy::query_sysproxy_status(&state_dir);
+                if sp.enabled {
+                    let host = sp.host.as_deref().unwrap_or("127.0.0.1");
+                    if let Err(err) = crate::platform::sysproxy::enable_system_proxy(
+                        host,
+                        final_mixed_addr.port(),
+                        &sp.bypass,
+                        &state_dir,
+                    ) {
+                        tracing::warn!(
+                            port = final_mixed_addr.port(),
+                            error = %err,
+                            "Failed to synchronize OS System Proxy port after mixed-port rebind"
+                        );
+                    }
+                }
+            }
+        }
+
         self.trigger_preconnect();
 
         let pc_wake = Arc::clone(&self.preconnect_wake);

@@ -477,6 +477,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessEncryptedStream<S> {
                             || matches!(
                                 this.init_state,
                                 InboundInitState::Pending1RttPeerPadding { .. }
+                                    | InboundInitState::Pending0RttServerRandom { .. }
                                     | InboundInitState::Pending0RttFirstHeader { .. }
                             )
                             || matches!(this.record_state, ReadRecordState::NeedCiphertext { .. })

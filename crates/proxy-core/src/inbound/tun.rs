@@ -452,8 +452,6 @@ pub fn spawn_userspace_tun_with_ipv6(
                     && flow.to_remote_tx.is_some()
                 {
                     flow.to_remote_tx.take();
-                    flow.fin_started_at.get_or_insert(now);
-                    flow.fin_started_wall_ms.get_or_insert(now_wall);
                 }
 
                 // Flush any buffered bytes from remote outbound -> smoltcp TX buffer
@@ -641,7 +639,8 @@ fn handle_ingress_packet(
                         let src_port = udp.src_port();
                         let dst_port = udp.dst_port();
                         let dst_sock = SocketAddr::new(IpAddr::V4(dst_v4), dst_port);
-                        let is_unmapped_fake = dst_port != 53
+                        let hijack_dns = dst_port == 53 && router.read().tun_dns_hijack();
+                        let is_unmapped_fake = !hijack_dns
                             && router
                                 .read()
                                 .dns()
@@ -660,7 +659,7 @@ fn handle_ingress_packet(
                             );
                             return;
                         }
-                        // Unmapped Fake-IP UDP (non-53): fall through to `device.rx_queue` so
+                        // Unmapped Fake-IP UDP (non-hijacked): fall through to `device.rx_queue` so
                         // `smoltcp` `iface.poll()` immediately emits `ICMPv4 Destination Unreachable (PortUnreachable)`!
                     } else {
                         return;
@@ -710,13 +709,14 @@ fn handle_ingress_packet(
                     let dst_port = udp.dst_port();
                     let src_addr = SocketAddr::new(IpAddr::V6(src_v6), src_port);
                     let dst_sock = SocketAddr::new(IpAddr::V6(dst_v6), dst_port);
-                    let is_unmapped_fake = dst_port != 53
+                    let hijack_dns = dst_port == 53 && router.read().tun_dns_hijack();
+                    let is_unmapped_fake = !hijack_dns
                         && router
                             .read()
                             .dns()
                             .is_unmapped_fake_ip(&TargetAddr::from(dst_sock));
                     if !is_unmapped_fake
-                        && (dst_port == 53
+                        && (hijack_dns
                             || !should_fast_reject_unreachable_direct_ipv6(
                                 src_addr,
                                 dst_v6,
@@ -794,14 +794,15 @@ fn should_fast_reject_unreachable_direct_ipv6(
     transport: SocketTransport,
     router_slot: &RwLock<Arc<Router>>,
 ) -> bool {
-    if dst_port == 53
-        || !crate::platform::socket_protect::is_global_unicast_ipv6(dst_v6)
+    if !crate::platform::socket_protect::is_global_unicast_ipv6(dst_v6)
         || crate::platform::socket_protect::is_direct_ipv6_reachable()
     {
         return false;
     }
     let current_router = Arc::clone(&router_slot.read());
-    if current_router.dns().is_fake_ip(IpAddr::V6(dst_v6)) {
+    if (dst_port == 53 && current_router.tun_dns_hijack())
+        || current_router.dns().is_fake_ip(IpAddr::V6(dst_v6))
+    {
         return false;
     }
     current_router.will_route_ip_direct(
@@ -825,8 +826,10 @@ fn spawn_tun_udp_handler(
     if shutting_down.load(Ordering::Acquire) {
         return;
     }
-    let payload = if dst.port() != 53 {
-        let epoch = router.read().epoch();
+    let current_router = Arc::clone(&router.read());
+    let hijack_dns = dst.port() == 53 && current_router.tun_dns_hijack();
+    let payload = if !hijack_dns {
+        let epoch = current_router.epoch();
         match udp_nat.try_send_fast(src, dst, epoch, payload) {
             Ok(()) => return,
             Err(payload) => payload,
@@ -838,19 +841,28 @@ fn spawn_tun_udp_handler(
     let Ok(permit) = Arc::clone(udp_sem).try_acquire_owned() else {
         return;
     };
-    let current_router = Arc::clone(&router.read());
     let egress = egress_tx.clone();
     let nat = Arc::clone(udp_nat);
     let shutting_down_task = Arc::clone(shutting_down);
 
     tokio::spawn(async move {
         let _permit = permit;
-        // 1. Port 53 (`any:53`) Fake-IP DNS Hijack across both IPv4 and IPv6!
-        if dst.port() == 53 {
-            if let Ok(dns_resp) = current_router.dns().handle_dns_packet(&payload).await
-                && let Some(ip_pkt) = build_ip_udp_packet(dst, src, &dns_resp)
-            {
-                let _ = egress.send(ip_pkt).await;
+        // 1. Port 53 (`any:53`) Fake-IP DNS Hijack across both IPv4 and IPv6 when `tun.dns_hijack` is active!
+        if hijack_dns {
+            const MAX_TUN_UDP_DNS_PAYLOAD: usize = 1232;
+            if let Ok(dns_resp) = current_router.dns().handle_dns_packet(&payload).await {
+                let wire_out = if dns_resp.len() > MAX_TUN_UDP_DNS_PAYLOAD {
+                    if let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(&payload) {
+                        crate::dns::wire::build_truncated_dns_header(&payload, &qp)
+                    } else {
+                        dns_resp
+                    }
+                } else {
+                    dns_resp
+                };
+                if let Some(ip_pkt) = build_ip_udp_packet(dst, src, &wire_out) {
+                    let _ = egress.send(ip_pkt).await;
+                }
             }
             return;
         }
@@ -950,7 +962,7 @@ fn register_syn_flow(
         // Port 53 (`any:53`) Fake-IP DNS-over-TCP Hijack (RFC 1035 / RFC 7766 2-byte length prefix).
         // Prevents Android/OS virtual VPN DNS (`198.18.0.2:53`) TCP fallback queries from hitting
         // `UNMAPPED-FAKE-IP` when UDP DNS responses are truncated (`TC=1`) or retried over TCP.
-        if tuple.dst.port() == 53 {
+        if tuple.dst.port() == 53 && current_router.tun_dns_hijack() {
             serve_tun_tcp_dns_flow(
                 Arc::clone(current_router.dns()),
                 to_remote_rx,
@@ -1218,9 +1230,9 @@ async fn recover_unmapped_fake_ip_tcp(
         let Some(chunk) = chunk_res else {
             return UnmappedFakeIpRecovery::Failed;
         };
-        let remain = MAX_SNIFF_BYTES.saturating_sub(buf.len());
-        buf.extend_from_slice(&chunk[..chunk.len().min(remain)]);
-        match sniff_client_hello_or_http_host(&buf) {
+        buf.extend_from_slice(&chunk);
+        let sniff_window = &buf[..buf.len().min(MAX_SNIFF_BYTES)];
+        match sniff_client_hello_or_http_host(sniff_window) {
             SniffOutcome::Domain(domain) => {
                 let fake_v4 = match dst.ip() {
                     IpAddr::V4(v4) => Some(v4),
@@ -2273,5 +2285,40 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+    }
+
+    #[tokio::test]
+    async fn recover_unmapped_fake_ip_preserves_coalesced_payload_beyond_max_sniff_bytes() {
+        let dns = Arc::new(crate::dns::fake_ip::FakeIpDnsEngine::new(&Default::default()).unwrap());
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Router::new(
+            crate::config::RunMode::Rule,
+            HashMap::new(),
+            &[],
+            &rules,
+            Arc::clone(&dns),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let (closed_tx, _closed_rx) = watch::channel(());
+
+        // Coalesce an HTTP request whose body extends well past `MAX_SNIFF_BYTES` (16 KiB -> 24 KiB)
+        let mut big_req =
+            b"POST /upload HTTP/1.1\r\nHost: coalesced.example.com\r\nContent-Length: 24576\r\n\r\n"
+                .to_vec();
+        big_req.extend(vec![b'X'; 24576]);
+        let expected_len = big_req.len();
+        tx.send(big_req.clone()).await.unwrap();
+
+        let dst: SocketAddr = "198.18.9.77:80".parse().unwrap();
+        match recover_unmapped_fake_ip_tcp(dst, &router, &mut rx, &closed_tx).await {
+            UnmappedFakeIpRecovery::Recovered { domain, payload } => {
+                assert_eq!(domain, "coalesced.example.com");
+                assert_eq!(payload.len(), expected_len);
+                assert_eq!(payload, big_req);
+            }
+            _ => panic!("expected Recovered outcome without truncating coalesced payload"),
+        }
     }
 }

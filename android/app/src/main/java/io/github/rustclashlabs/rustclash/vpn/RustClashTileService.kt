@@ -113,13 +113,16 @@ class RustClashTileService : TileService() {
             }
 
             val latestDemoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
-            val shouldOpenAppForEmptyNodes = !latestDemoMode &&
-                snapInfo != null &&
-                snapInfo.ok &&
-                snapInfo.nodes.isEmpty() &&
-                snapInfo.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
+            val shouldOpenAppForInvalidOrEmptyState = !latestDemoMode && (
+                snapInfo == null ||
+                    !snapInfo.ok ||
+                    (
+                        snapInfo.nodes.isEmpty() &&
+                            snapInfo.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
+                        )
+                )
 
-            if (shouldOpenAppForEmptyNodes) {
+            if (shouldOpenAppForInvalidOrEmptyState) {
                 val openIntent = Intent(this@RustClashTileService, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 }

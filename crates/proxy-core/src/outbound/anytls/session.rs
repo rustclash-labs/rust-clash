@@ -72,12 +72,25 @@ pub struct AnyTlsClientSession {
     healthy: AtomicBool,
     negotiated_v2: AtomicBool,
     v2_notify: Notify,
+    pending_ping_at_ms: AtomicU64,
     tx: mpsc::Sender<OutboundCmd>,
     streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>>,
+    aborted_streams: DashMap<u32, ()>,
     synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>>,
     preconnect_pong: Mutex<Option<oneshot::Sender<io::Result<()>>>>,
     pool_return: Arc<Mutex<Vec<IdleSessionEntry>>>,
     io_aborts: Mutex<(Option<AbortHandle>, Option<AbortHandle>)>,
+}
+
+fn encode_psh_frames(stream_id: u32, psh_bytes: Bytes, dst: &mut BytesMut) -> io::Result<()> {
+    if psh_bytes.is_empty() {
+        Frame::empty(Command::Psh, stream_id).encode_into(dst)?;
+    } else {
+        for chunk in psh_bytes.chunks(MAX_DATA_CHUNK) {
+            Frame::new(Command::Psh, stream_id, psh_bytes.slice_ref(chunk)).encode_into(dst)?;
+        }
+    }
+    Ok(())
 }
 
 pub struct IdleSessionEntry {
@@ -201,110 +214,117 @@ impl AnyTlsClientSession {
         let rd_join = tokio::spawn(async move {
             loop {
                 match Frame::read_from(&mut rd).await {
-                    Ok(frame) => match frame.cmd {
-                        Command::Waste => {}
-                        Command::HeartResponse => {
-                            if let Some(waiter) = session_rd.preconnect_pong.lock().take() {
-                                let _ = waiter.send(Ok(()));
-                            }
-                        }
-                        Command::HeartRequest => {
-                            let pong = OutboundCmd::Frame(Frame::empty(
-                                Command::HeartResponse,
-                                frame.stream_id,
-                            ));
-                            if let Err(mpsc::error::TrySendError::Full(deferred)) =
-                                tx_pong.try_send(pong)
-                            {
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    tx_pong.send(deferred),
-                                )
-                                .await;
-                            }
-                        }
-                        Command::ServerSettings => {
-                            let text = String::from_utf8_lossy(&frame.data);
-                            if text.lines().any(|l| l.trim() == "v=2") {
-                                session_rd.negotiated_v2.store(true, Ordering::Release);
-                                session_rd.v2_notify.notify_waiters();
-                            }
-                        }
-                        Command::UpdatePaddingScheme => {
-                            let text = String::from_utf8_lossy(&frame.data);
-                            if let Ok(new_scheme) = PaddingScheme::parse(&text) {
-                                *scheme_rd.write() = new_scheme;
-                            }
-                        }
-                        Command::Alert => {
-                            let msg = String::from_utf8_lossy(&frame.data).into_owned();
-                            tracing::warn!("AnyTLS server alert on session #{seq}: {msg}");
-                            session_rd.mark_unhealthy(&format!("AnyTLS server alert: {msg}"));
-                            break;
-                        }
-                        Command::SynAck => {
-                            if let Some((_, waiter)) =
-                                session_rd.synack_waiters.remove(&frame.stream_id)
-                            {
-                                if frame.data.is_empty() {
+                    Ok(frame) => {
+                        session_rd.pending_ping_at_ms.store(0, Ordering::Relaxed);
+                        match frame.cmd {
+                            Command::Waste => {}
+                            Command::HeartResponse => {
+                                if let Some(waiter) = session_rd.preconnect_pong.lock().take() {
                                     let _ = waiter.send(Ok(()));
-                                } else {
-                                    let err_msg = String::from_utf8_lossy(&frame.data).into_owned();
-                                    session_rd.streams.remove(&frame.stream_id);
-                                    let _ = waiter.send(Err(io::Error::new(
-                                        io::ErrorKind::ConnectionRefused,
-                                        format!("AnyTLS SYNACK error: {err_msg}"),
-                                    )));
                                 }
                             }
-                        }
-                        Command::Psh => {
-                            // If a v1 server sends data directly without SYNACK, implicitly resolve waiter
-                            if let Some((_, waiter)) =
-                                session_rd.synack_waiters.remove(&frame.stream_id)
-                            {
-                                let _ = waiter.send(Ok(()));
+                            Command::HeartRequest => {
+                                let pong = OutboundCmd::Frame(Frame::empty(
+                                    Command::HeartResponse,
+                                    frame.stream_id,
+                                ));
+                                if let Err(mpsc::error::TrySendError::Full(deferred)) =
+                                    tx_pong.try_send(pong)
+                                {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        tx_pong.send(deferred),
+                                    )
+                                    .await;
+                                }
                             }
-                            if !frame.data.is_empty() {
-                                let maybe_stx = session_rd
-                                    .streams
-                                    .get(&frame.stream_id)
-                                    .map(|entry| entry.value().clone());
-                                if let Some(stx) = maybe_stx {
-                                    match stx.try_send(Ok(frame.data)) {
-                                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                                        Err(mpsc::error::TrySendError::Full(item)) => {
-                                            if tokio::time::timeout(
-                                                STREAM_INBOUND_SEND_TIMEOUT,
-                                                stx.send(item),
-                                            )
-                                            .await
-                                            .is_err()
-                                                && session_rd
-                                                    .streams
-                                                    .remove(&frame.stream_id)
-                                                    .is_some()
-                                            {
-                                                let _ = tx_pong.try_send(OutboundCmd::Frame(
-                                                    Frame::empty(Command::Fin, frame.stream_id),
-                                                ));
+                            Command::ServerSettings => {
+                                let text = String::from_utf8_lossy(&frame.data);
+                                if text.lines().any(|l| l.trim() == "v=2") {
+                                    session_rd.negotiated_v2.store(true, Ordering::Release);
+                                    session_rd.v2_notify.notify_waiters();
+                                }
+                            }
+                            Command::UpdatePaddingScheme => {
+                                let text = String::from_utf8_lossy(&frame.data);
+                                if let Ok(new_scheme) = PaddingScheme::parse(&text) {
+                                    *scheme_rd.write() = new_scheme;
+                                }
+                            }
+                            Command::Alert => {
+                                let msg = String::from_utf8_lossy(&frame.data).into_owned();
+                                tracing::warn!("AnyTLS server alert on session #{seq}: {msg}");
+                                session_rd.mark_unhealthy(&format!("AnyTLS server alert: {msg}"));
+                                break;
+                            }
+                            Command::SynAck => {
+                                if let Some((_, waiter)) =
+                                    session_rd.synack_waiters.remove(&frame.stream_id)
+                                {
+                                    if frame.data.is_empty() {
+                                        let _ = waiter.send(Ok(()));
+                                    } else {
+                                        let err_msg =
+                                            String::from_utf8_lossy(&frame.data).into_owned();
+                                        session_rd.streams.remove(&frame.stream_id);
+                                        let _ = waiter.send(Err(io::Error::new(
+                                            io::ErrorKind::ConnectionRefused,
+                                            format!("AnyTLS SYNACK error: {err_msg}"),
+                                        )));
+                                    }
+                                }
+                            }
+                            Command::Psh => {
+                                // If a v1 server sends data directly without SYNACK, implicitly resolve waiter
+                                if let Some((_, waiter)) =
+                                    session_rd.synack_waiters.remove(&frame.stream_id)
+                                {
+                                    let _ = waiter.send(Ok(()));
+                                }
+                                if !frame.data.is_empty() {
+                                    let maybe_stx = session_rd
+                                        .streams
+                                        .get(&frame.stream_id)
+                                        .map(|entry| entry.value().clone());
+                                    if let Some(stx) = maybe_stx {
+                                        match stx.try_send(Ok(frame.data)) {
+                                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                            Err(mpsc::error::TrySendError::Full(item)) => {
+                                                if tokio::time::timeout(
+                                                    STREAM_INBOUND_SEND_TIMEOUT,
+                                                    stx.send(item),
+                                                )
+                                                .await
+                                                .is_err()
+                                                    && session_rd
+                                                        .streams
+                                                        .remove(&frame.stream_id)
+                                                        .is_some()
+                                                {
+                                                    session_rd
+                                                        .aborted_streams
+                                                        .insert(frame.stream_id, ());
+                                                    let _ = tx_pong.try_send(OutboundCmd::Frame(
+                                                        Frame::empty(Command::Fin, frame.stream_id),
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Command::Fin => {
-                            if let Some((_, waiter)) =
-                                session_rd.synack_waiters.remove(&frame.stream_id)
-                            {
-                                let _ = waiter.send(Ok(()));
+                            Command::Fin => {
+                                if let Some((_, waiter)) =
+                                    session_rd.synack_waiters.remove(&frame.stream_id)
+                                {
+                                    let _ = waiter.send(Ok(()));
+                                }
+                                // Per AnyTLS spec: on receiving remote cmdFIN, close local stream WITHOUT echoing cmdFIN
+                                session_rd.streams.remove(&frame.stream_id);
                             }
-                            // Per AnyTLS spec: on receiving remote cmdFIN, close local stream WITHOUT echoing cmdFIN
-                            session_rd.streams.remove(&frame.stream_id);
+                            Command::Syn | Command::Settings => {}
                         }
-                        Command::Syn | Command::Settings => {}
-                    },
+                    }
                     Err(err) => {
                         session_rd.mark_unhealthy(&format!("session read closed: {err}"));
                         break;
@@ -390,7 +410,7 @@ impl AnyTlsClientSession {
         let mut pkt1 = BytesMut::with_capacity(128 + psh_body.len());
         Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
         Frame::empty(Command::Syn, 1).encode_into(&mut pkt1)?;
-        Frame::new(Command::Psh, 1, psh_body.freeze()).encode_into(&mut pkt1)?;
+        encode_psh_frames(1, psh_body.freeze(), &mut pkt1)?;
 
         let (tx, rx) = mpsc::channel::<OutboundCmd>(SESSION_OUTBOUND_QUEUE_CAP);
         let streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>> = Arc::new(DashMap::new());
@@ -407,8 +427,10 @@ impl AnyTlsClientSession {
             healthy: AtomicBool::new(true),
             negotiated_v2: AtomicBool::new(false),
             v2_notify: Notify::new(),
+            pending_ping_at_ms: AtomicU64::new(0),
             tx: tx.clone(),
             streams: Arc::clone(&streams),
+            aborted_streams: DashMap::new(),
             synack_waiters: Arc::clone(&synack_waiters),
             preconnect_pong: Mutex::new(None),
             pool_return: Arc::clone(&pool_ctx.idle),
@@ -475,6 +497,7 @@ impl AnyTlsClientSession {
             Ok(res) => Self::finish_cold_synack(Arc::clone(&session), stream_handle, res),
             Err(_) => {
                 session.synack_waiters.remove(&1);
+                session.abort_session("AnyTLS v2 cmdSYNACK timed out");
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "AnyTLS v2 cmdSYNACK timed out",
@@ -550,8 +573,10 @@ impl AnyTlsClientSession {
             healthy: AtomicBool::new(true),
             negotiated_v2: AtomicBool::new(false),
             v2_notify: Notify::new(),
+            pending_ping_at_ms: AtomicU64::new(0),
             tx: tx.clone(),
             streams: Arc::clone(&streams),
+            aborted_streams: DashMap::new(),
             synack_waiters: Arc::clone(&synack_waiters),
             preconnect_pong: Mutex::new(Some(pong_tx)),
             pool_return: Arc::clone(&pool_ctx.idle),
@@ -587,10 +612,12 @@ impl AnyTlsClientSession {
                     if session.is_healthy()
                         && session.session_epoch == pool_ctx.pool_epoch.load(Ordering::SeqCst)
                     {
-                        idle.push(IdleSessionEntry {
-                            session: Arc::clone(&session),
-                            idle_since: Instant::now(),
-                        });
+                        if !idle.iter().any(|e| Arc::ptr_eq(&e.session, &session)) {
+                            idle.push(IdleSessionEntry {
+                                session: Arc::clone(&session),
+                                idle_since: Instant::now(),
+                            });
+                        }
                         return Ok(session);
                     }
                 }
@@ -647,7 +674,7 @@ impl AnyTlsClientSession {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let mut batch = BytesMut::with_capacity(64 + psh_body.len());
         Frame::empty(Command::Syn, stream_id).encode_into(&mut batch)?;
-        Frame::new(Command::Psh, stream_id, psh_body.freeze()).encode_into(&mut batch)?;
+        encode_psh_frames(stream_id, psh_body.freeze(), &mut batch)?;
 
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 
@@ -690,6 +717,7 @@ impl AnyTlsClientSession {
                 )),
                 Err(_) => {
                     self.synack_waiters.remove(&stream_id);
+                    self.abort_session("AnyTLS v2 cmdSYNACK timed out on reused session");
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "AnyTLS v2 cmdSYNACK timed out on reused session",
@@ -714,9 +742,23 @@ impl AnyTlsClientSession {
     }
 
     pub fn send_ping(&self) -> bool {
-        self.tx
+        let now_ms = crate::tracker::TelemetryHub::now_ms().max(1);
+        let prev = self.pending_ping_at_ms.load(Ordering::Relaxed);
+        if prev != 0 && now_ms.saturating_sub(prev) > 10_000 {
+            return false;
+        }
+        if self
+            .tx
             .try_send(OutboundCmd::Frame(Frame::empty(Command::HeartRequest, 0)))
             .is_ok()
+        {
+            if prev == 0 {
+                self.pending_ping_at_ms.store(now_ms, Ordering::Relaxed);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     fn mark_unhealthy_inner(&self, reason: &str) -> bool {
@@ -785,6 +827,7 @@ impl AnyTlsClientSession {
 
     fn on_stream_dropped(self: &Arc<Self>, stream_id: u32) {
         self.synack_waiters.remove(&stream_id);
+        self.aborted_streams.remove(&stream_id);
         let was_present = self.streams.remove(&stream_id).is_some();
         if was_present && self.is_healthy() {
             let fin_cmd = OutboundCmd::Frame(Frame::empty(Command::Fin, stream_id));
@@ -804,10 +847,12 @@ impl AnyTlsClientSession {
                 let mut idle = self.pool_return.lock();
                 if self.session_epoch == self.pool_epoch.load(Ordering::SeqCst) && self.is_healthy()
                 {
-                    idle.push(IdleSessionEntry {
-                        session: Arc::clone(self),
-                        idle_since: Instant::now(),
-                    });
+                    if !idle.iter().any(|e| Arc::ptr_eq(&e.session, self)) {
+                        idle.push(IdleSessionEntry {
+                            session: Arc::clone(self),
+                            idle_since: Instant::now(),
+                        });
+                    }
                     return;
                 }
             }
@@ -863,8 +908,22 @@ impl AsyncRead for AnyTlsStream {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Err(err))) => Poll::Ready(Err(err)),
-            // Remote FIN removed sender from DashMap -> EOF!
-            Poll::Ready(None) => Poll::Ready(Ok(())),
+            // Remote FIN removed sender from DashMap -> EOF, unless reader aborted due to stall!
+            Poll::Ready(None) => {
+                if self
+                    .session
+                    .aborted_streams
+                    .remove(&self.stream_id)
+                    .is_some()
+                {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "AnyTLS stream inbound receive queue timed out",
+                    )))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1172,10 +1231,12 @@ impl AnyTlsSessionPool {
                 && sess.session_epoch == self.epoch.load(Ordering::SeqCst)
                 && sess.active_stream_count() == 0
             {
-                guard.push(IdleSessionEntry {
-                    session: sess,
-                    idle_since: Instant::now(),
-                });
+                if !guard.iter().any(|e| Arc::ptr_eq(&e.session, &sess)) {
+                    guard.push(IdleSessionEntry {
+                        session: sess,
+                        idle_since: Instant::now(),
+                    });
+                }
                 return;
             }
         }
@@ -1290,6 +1351,7 @@ impl Drop for AnyTlsSessionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     struct TaskDropSignal(Option<oneshot::Sender<()>>);
 
@@ -1321,8 +1383,10 @@ mod tests {
             healthy: AtomicBool::new(healthy),
             negotiated_v2: AtomicBool::new(true),
             v2_notify: Notify::new(),
+            pending_ping_at_ms: AtomicU64::new(0),
             tx,
             streams: Arc::new(DashMap::new()),
+            aborted_streams: DashMap::new(),
             synack_waiters: Arc::new(DashMap::new()),
             preconnect_pong: Mutex::new(None),
             pool_return: pool_ctx.idle,
@@ -1471,5 +1535,64 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(weak_idle.strong_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn psh_chunking_blackhole_ping_aborted_stream_and_idle_dedup_invariants() {
+        // 1. >64 KiB initial PSH payload chunks cleanly into <=32 KiB frames without u16 overflow.
+        let mut encoded = BytesMut::new();
+        let big = Bytes::from(vec![0xABu8; 70_000]);
+        encode_psh_frames(7, big.clone(), &mut encoded).expect("chunked PSH encode must succeed");
+        let mut cursor = tokio::io::BufReader::new(encoded.as_ref());
+        let mut reassembled = Vec::new();
+        while let Ok(frame) = Frame::read_from(&mut cursor).await {
+            assert_eq!(frame.cmd, Command::Psh);
+            assert_eq!(frame.stream_id, 7);
+            assert!(frame.data.len() <= MAX_DATA_CHUNK);
+            reassembled.extend_from_slice(&frame.data);
+        }
+        assert_eq!(reassembled, big.as_ref());
+
+        // 2. Unanswered HeartRequest older than 10s fails `send_ping()`, evicting blackholed idle sessions.
+        let pool = AnyTlsSessionPool::new(Duration::from_secs(60), Duration::from_secs(300), 2);
+        pool.set_low_power_mode(true);
+        let ctx = pool.pool_context();
+        let (sess, _wr, _rd) = spawn_synthetic_session(21, ctx.session_epoch, true, ctx);
+        assert!(sess.send_ping());
+        let now_ms = crate::tracker::TelemetryHub::now_ms().max(20_000);
+        sess.pending_ping_at_ms
+            .store(now_ms.saturating_sub(15_000), Ordering::Relaxed);
+        assert!(
+            !sess.send_ping(),
+            "blackholed AnyTLS session with unanswered HeartRequest >10s must fail send_ping"
+        );
+        sess.pending_ping_at_ms.store(0, Ordering::Relaxed);
+
+        // 3. Duplicate `return_or_abort_unused_idle` never pushes duplicate Arc entries into `idle`.
+        pool.return_or_abort_unused_idle(Arc::clone(&sess));
+        pool.return_or_abort_unused_idle(Arc::clone(&sess));
+        assert_eq!(pool.idle_count(), 1);
+        let popped = pool.pop_latest_idle().expect("pop idle");
+
+        // 4. Aborted stream surfaces `TimedOut` instead of silent 0-byte EOF on `poll_read`.
+        popped.active_streams.store(1, Ordering::SeqCst);
+        let (stx, srx) = mpsc::channel(1);
+        drop(stx);
+        popped.aborted_streams.insert(42, ());
+        let mut stream = AnyTlsStream {
+            session: Arc::clone(&popped),
+            stream_id: 42,
+            rx: srx,
+            read_buf: Bytes::new(),
+            reserve_fut: Mutex::new(None),
+        };
+        let mut out = [0u8; 16];
+        let read_err = stream
+            .read(&mut out)
+            .await
+            .expect_err("aborted stream must return TimedOut instead of clean EOF");
+        assert_eq!(read_err.kind(), io::ErrorKind::TimedOut);
+        drop(stream);
+        popped.abort_session("test cleanup");
     }
 }

@@ -4754,4 +4754,78 @@ mod tests {
         assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn live_profile_mutations_preserve_android_ipv6_dns_setting() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-live-ipv6-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect-v6", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            true,
+            protector,
+        )
+        .expect("start_android_vpn_with_options with enable_ipv6=true");
+        assert_eq!(res["ok"], true);
+
+        let (_, engine) = live_handle_and_engine().expect("live engine");
+        assert!(engine.config_snapshot().tun.ipv6);
+        assert!(engine.config_snapshot().dns.ipv6);
+
+        // 1. Live share-URI import (whose default profile YAML has dns.ipv6=false) must keep dns.ipv6=true.
+        let import_res =
+            android_import_unified_core(&tmp_dir, "socks5://127.0.0.1:1080#LocalSocks", true, true)
+                .expect("live unified import");
+        assert_eq!(import_res["ok"], true);
+        assert!(engine.config_snapshot().tun.ipv6);
+        assert!(
+            engine.config_snapshot().dns.ipv6,
+            "live URI import must preserve Android VPN dns.ipv6=true"
+        );
+
+        // 2. Switching routing presets live must also preserve dns.ipv6=true.
+        let preset_res =
+            android_set_routing_preset_core(&tmp_dir, "global").expect("live set routing preset");
+        assert_eq!(preset_res["ok"], true);
+        assert!(
+            engine.config_snapshot().dns.ipv6,
+            "live routing preset switch must preserve Android VPN dns.ipv6=true"
+        );
+
+        // 3. Saving custom rules live must preserve dns.ipv6=true.
+        let rules_res = android_save_custom_rules_core(
+            &tmp_dir,
+            "DOMAIN-SUFFIX,example.com,PROXY\nMATCH,DIRECT",
+        )
+        .expect("live save custom rules");
+        assert_eq!(rules_res["ok"], true);
+        assert!(
+            engine.config_snapshot().dns.ipv6,
+            "live custom rules save must preserve Android VPN dns.ipv6=true"
+        );
+
+        // 4. Saving redacted active YAML live must preserve dns.ipv6=true.
+        let active_yaml = android_get_active_yaml_core(&tmp_dir).expect("get active yaml");
+        let yaml_str = active_yaml["yaml"].as_str().expect("yaml text");
+        let save_yaml_res =
+            android_save_active_yaml_core(&tmp_dir, yaml_str).expect("save active yaml");
+        assert_eq!(save_yaml_res["ok"], true);
+        assert!(
+            engine.config_snapshot().dns.ipv6,
+            "live active YAML save must preserve Android VPN dns.ipv6=true"
+        );
+
+        drop(engine);
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

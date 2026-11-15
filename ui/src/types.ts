@@ -446,6 +446,15 @@ export interface FakeIpPoolResponse {
   entries: FakeIpEntry[];
 }
 
+export type DnsRecordQueryType =
+  | "A"
+  | "AAAA"
+  | "HTTPS"
+  | "CNAME"
+  | "TXT"
+  | "MX"
+  | "NS";
+
 export interface DnsQueryAnswer {
   type: string;
   data: string;

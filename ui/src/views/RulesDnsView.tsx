@@ -4,6 +4,7 @@ import { RefreshIcon, SearchIcon } from "../components/Icons";
 import { useI18n } from "../i18n";
 import type {
   DnsQueryResponse,
+  DnsRecordQueryType,
   FakeIpPoolResponse,
   GeoDataStatus,
   RuleExplainResponse,
@@ -30,7 +31,7 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
 
   // DNS resolver & Fake-IP cache
   const [dnsDomain, setDnsDomain] = useState("github.com");
-  const [dnsType, setDnsType] = useState<"A" | "AAAA">("A");
+  const [dnsType, setDnsType] = useState<DnsRecordQueryType>("A");
   const [dnsResult, setDnsResult] = useState<DnsQueryResponse | null>(null);
   const [fakePool, setFakePool] = useState<FakeIpPoolResponse | null>(null);
   const [dnsBusy, setDnsBusy] = useState(false);
@@ -340,10 +341,15 @@ export const RulesDnsView: React.FC<RulesDnsViewProps> = ({
             <select
               className="select"
               value={dnsType}
-              onChange={(e) => setDnsType(e.target.value as "A" | "AAAA")}
+              onChange={(e) => setDnsType(e.target.value as DnsRecordQueryType)}
             >
               <option value="A">A (IPv4)</option>
               <option value="AAAA">AAAA (IPv6)</option>
+              <option value="HTTPS">HTTPS (SVCB)</option>
+              <option value="CNAME">CNAME</option>
+              <option value="TXT">TXT</option>
+              <option value="MX">MX</option>
+              <option value="NS">NS</option>
             </select>
             <button
               type="submit"

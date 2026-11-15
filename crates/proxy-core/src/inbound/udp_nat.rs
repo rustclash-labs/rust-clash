@@ -526,14 +526,11 @@ impl UdpNatManager {
             return;
         }
 
-        // Scope Fake-IP UDP sessions per Fake-IP on proxy outbounds so concurrent QUIC `:443`
-        // flows to distinct Fake-IP domains never collide on origin IPv4/IPv6 return addresses,
-        // while keeping `DIRECT` sessions unscoped (`None`) to preserve full-cone NAT on one socket.
-        let fake_ip_scope = if outbound.exit_category() == "DIRECT" {
-            None
-        } else {
-            restored_from_fake_ip
-        };
+        // Scope Fake-IP UDP sessions per Fake-IP across both proxy and `DIRECT` outbounds so
+        // concurrent QUIC `:443` flows to distinct Fake-IP domains sharing a CDN Anycast IP never
+        // collide on `peer_to_domain` or return addresses, while keeping non-Fake-IP `DIRECT`
+        // sessions (`restored_from_fake_ip == None`) unscoped to preserve full-cone NAT on one socket.
+        let fake_ip_scope = restored_from_fake_ip;
         let key = NatSessionKey {
             client_src,
             outbound_name: outbound.name().to_string(),
@@ -778,10 +775,10 @@ impl UdpNatManager {
                     hub_clone.unregister_connection(&conn_entry.id);
                     return;
                 }
-                res = outbound.open_udp_session() => {
+                res = tokio::time::timeout(Duration::from_secs(10), outbound.open_udp_session()) => {
                     match res {
-                        Ok(s) => Arc::new(s),
-                        Err(err) => {
+                        Ok(Ok(s)) => Arc::new(s),
+                        Ok(Err(err)) => {
                             tracing::debug!(
                                 "[{}] open_udp_session on '{}' failed for {} -> {}: {}",
                                 inbound_label,
@@ -792,6 +789,20 @@ impl UdpNatManager {
                             );
                             cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
                             hub_clone.record_connection_failed(&conn_entry.id, &err.to_string());
+                            return;
+                        }
+                        Err(_) => {
+                            let msg = "open_udp_session timed out after 10s";
+                            tracing::debug!(
+                                "[{}] {} on '{}' for {} -> {}",
+                                inbound_label,
+                                msg,
+                                outbound.name(),
+                                client_src,
+                                target
+                            );
+                            cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
+                            hub_clone.record_connection_failed(&conn_entry.id, msg);
                             return;
                         }
                     }
@@ -1718,8 +1729,8 @@ mod tests {
 
         mgr.send_datagram(
             src,
-            "198.18.0.20:443".parse().unwrap(),
-            Some("198.18.0.20".parse().unwrap()),
+            ok_target.clone(),
+            None,
             ok_target.clone(),
             "MATCH",
             "",
@@ -1734,11 +1745,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Now send to a NODATA target on the same shared `(src, DIRECT)` session followed by another good packet!
+        // Now send to a NODATA target on the same shared `(src, DIRECT)` non-Fake-IP session followed by another good packet!
         mgr.send_datagram(
             src,
-            "198.18.0.21:443".parse().unwrap(),
-            Some("198.18.0.21".parse().unwrap()),
+            bad_target.clone(),
+            None,
             bad_target,
             "MATCH",
             "",
@@ -1749,8 +1760,8 @@ mod tests {
         .await;
         mgr.send_datagram(
             src,
-            "198.18.0.20:443".parse().unwrap(),
-            Some("198.18.0.20".parse().unwrap()),
+            ok_target.clone(),
+            None,
             ok_target.clone(),
             "MATCH",
             "",
@@ -1772,6 +1783,132 @@ mod tests {
             vec![(ok_target.clone(), vec![1]), (ok_target, vec![3])]
         );
         assert_eq!(mgr.active_session_count(), 1);
+        mgr.reset_all_sessions();
+    }
+
+    struct AnycastDirectMockSession {
+        rx: AsyncMutex<mpsc::Receiver<(Vec<u8>, TargetAddr)>>,
+        tx: mpsc::Sender<(Vec<u8>, TargetAddr)>,
+        last_domain: parking_lot::Mutex<Option<TargetAddr>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundUdpSession for AnycastDirectMockSession {
+        async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> std::io::Result<()> {
+            // Mirror `DirectUdpSession::peer_to_domain`: a single socket overwrites `last_domain`
+            // when two domains resolve to the same Anycast IP `104.16.1.1:443`!
+            *self.last_domain.lock() = Some(target.clone());
+            let mapped = self
+                .last_domain
+                .lock()
+                .clone()
+                .unwrap_or_else(|| "104.16.1.1:443".parse().unwrap());
+            let _ = self.tx.send((payload.to_vec(), mapped)).await;
+            Ok(())
+        }
+
+        async fn recv_from(&self) -> std::io::Result<(Vec<u8>, TargetAddr)> {
+            self.rx.lock().await.recv().await.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "mock closed")
+            })
+        }
+    }
+
+    struct AnycastDirectMockOutbound;
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for AnycastDirectMockOutbound {
+        fn name(&self) -> &str {
+            "DIRECT"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "direct"
+        }
+
+        fn exit_category(&self) -> &'static str {
+            "DIRECT"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(&self, _target: &TargetAddr) -> std::io::Result<BoxedStream> {
+            Err(std::io::Error::other("unused"))
+        }
+
+        async fn open_udp_session(&self) -> std::io::Result<Box<dyn OutboundUdpSession>> {
+            let (tx, rx) = mpsc::channel(16);
+            Ok(Box::new(AnycastDirectMockSession {
+                rx: AsyncMutex::new(rx),
+                tx,
+                last_domain: parking_lot::Mutex::new(None),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_direct_fake_ip_quic_flows_on_same_anycast_ip_never_crosstalk() {
+        let hub = Arc::new(TelemetryHub::new());
+        let replies: Arc<parking_lot::Mutex<CapturedReplies>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let replies_sink = Arc::clone(&replies);
+        let mgr = UdpNatManager::new(
+            "test-direct-fakeip",
+            64,
+            Arc::clone(&hub),
+            Arc::new(move |c, eff, data| {
+                replies_sink.lock().push((c, eff, data));
+            }),
+        );
+        let outbound: DynOutbound = Arc::new(AnycastDirectMockOutbound);
+
+        let client_src: SocketAddr = "198.18.0.2:61001".parse().unwrap();
+        let fake_a: Ipv4Addr = "198.18.0.30".parse().unwrap();
+        let fake_b: Ipv4Addr = "198.18.0.31".parse().unwrap();
+        let raw_a: TargetAddr = "198.18.0.30:443".parse().unwrap();
+        let raw_b: TargetAddr = "198.18.0.31:443".parse().unwrap();
+        let dom_a = TargetAddr::new_domain("cdn-a.cn", 443).unwrap();
+        let dom_b = TargetAddr::new_domain("cdn-b.cn", 443).unwrap();
+
+        mgr.send_datagram_with_epoch(
+            client_src,
+            raw_a.clone(),
+            Some(fake_a),
+            dom_a,
+            "GEOSITE",
+            "cn",
+            vec!["DIRECT".into()],
+            Arc::clone(&outbound),
+            vec![0x11],
+            1,
+        )
+        .await;
+        mgr.send_datagram_with_epoch(
+            client_src,
+            raw_b.clone(),
+            Some(fake_b),
+            dom_b,
+            "GEOSITE",
+            "cn",
+            vec!["DIRECT".into()],
+            outbound,
+            vec![0x22],
+            1,
+        )
+        .await;
+
+        for _ in 0..100 {
+            if replies.lock().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mgr.active_session_count(), 2);
+        let got = replies.lock().clone();
+        assert!(got.contains(&(client_src, raw_a, vec![0x11])));
+        assert!(got.contains(&(client_src, raw_b, vec![0x22])));
         mgr.reset_all_sessions();
     }
 

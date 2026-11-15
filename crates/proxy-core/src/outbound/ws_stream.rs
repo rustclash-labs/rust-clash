@@ -54,6 +54,43 @@ impl Default for WsTransportConfig {
     }
 }
 
+fn sanitize_ws_uri_path(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        let is_valid_uri_char = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'&'
+                    | b'='
+                    | b'+'
+                    | b'!'
+                    | b'$'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b','
+                    | b';'
+                    | b'@'
+                    | b'['
+                    | b']'
+                    | b'%'
+            );
+        if is_valid_uri_char {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 impl WsTransportConfig {
     /// Normalize `?ed=<N>` inline query parameter (common in Xray/v2rayN share URIs and Clash configs)
     /// into `(request_path, effective_max_early_data, early_data_header_name)`.
@@ -65,7 +102,7 @@ impl WsTransportConfig {
         };
 
         let mut extracted_ed: Option<usize> = None;
-        let clean_path = if let Some((base, query)) = raw_path.split_once('?') {
+        let raw_clean_path = if let Some((base, query)) = raw_path.split_once('?') {
             let mut kept_pairs = Vec::new();
             for pair in query.split('&') {
                 if pair.is_empty() {
@@ -95,6 +132,7 @@ impl WsTransportConfig {
         } else {
             format!("/{raw_path}")
         };
+        let clean_path = sanitize_ws_uri_path(&raw_clean_path);
 
         let max_ed = self.max_early_data.or(extracted_ed).unwrap_or(0).min(8192);
         let hdr_name = self
@@ -983,4 +1021,29 @@ pub async fn accept_ws_stream(
     .map_err(ws_err_to_io)?;
 
     Ok(Box::new(WsByteStream::with_initial_read(ws, early_data)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_upgrade_request_encodes_spaces_and_utf8_while_preserving_plus_and_percent() {
+        let cfg = WsTransportConfig {
+            path: "/ws path/节点%20ok?token=a+b&ed=2048".to_string(),
+            headers: HashMap::new(),
+            max_early_data: None,
+            early_data_header_name: None,
+        };
+        let (clean_path, max_ed, _) = cfg.normalized_parts();
+        assert_eq!(max_ed, 2048);
+        assert_eq!(clean_path, "/ws%20path/%E8%8A%82%E7%82%B9%20ok?token=a+b");
+
+        let req = build_ws_upgrade_request("edge.example.com", 443, true, &cfg, Some(b"hi"))
+            .expect("upgrade request with spaces/UTF-8 path must build cleanly");
+        assert_eq!(
+            req.uri().path_and_query().unwrap().as_str(),
+            "/ws%20path/%E8%8A%82%E7%82%B9%20ok?token=a+b"
+        );
+    }
 }

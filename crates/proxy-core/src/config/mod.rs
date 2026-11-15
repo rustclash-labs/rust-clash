@@ -836,9 +836,25 @@ rules:
                 *entry = orig.clone();
             }
         }
+        let current_names: HashSet<String> =
+            self.proxies.iter().map(|p| p.name().to_string()).collect();
         for node in &mut self.proxies {
             if let Some(prev_node) = prev.proxies.iter().find(|p| p.name() == node.name()) {
                 node.restore_credentials_from(prev_node);
+            } else if node.has_redacted_credentials() {
+                let (srv, port) = node.server_port();
+                let srv_trimmed = srv.trim();
+                let mut candidates = prev.proxies.iter().filter(|p| {
+                    !current_names.contains(p.name())
+                        && std::mem::discriminant(*p) == std::mem::discriminant(&*node)
+                        && p.server_port().1 == port
+                        && p.server_port().0.trim().eq_ignore_ascii_case(srv_trimmed)
+                });
+                if let Some(unique_prev) = candidates.next()
+                    && candidates.next().is_none()
+                {
+                    node.restore_credentials_from(unique_prev);
+                }
             }
         }
         for (k, prov) in &mut self.rule_providers {
@@ -2484,13 +2500,38 @@ fn yaml_str_field<'a>(map: &'a YamlMap, key: &str) -> Option<&'a str> {
     map.get(key).and_then(YamlValue::as_str)
 }
 
+fn yaml_mapping_explicitly_disabled(map: &YamlMap) -> bool {
+    for key in ["enable", "enabled"] {
+        if let Some(v) = map.get(key) {
+            match v {
+                YamlValue::Bool(false) => return true,
+                YamlValue::Number(n) if n.as_i64() == Some(0) => return true,
+                YamlValue::String(s)
+                    if matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "false" | "0" | "no" | "off"
+                    ) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 fn yaml_value_is_effectively_empty(val: &YamlValue) -> bool {
     match val {
         YamlValue::Null => true,
         YamlValue::Bool(b) => !*b,
         YamlValue::String(s) => s.trim().is_empty(),
         YamlValue::Array(seq) => seq.is_empty() || seq.iter().all(yaml_value_is_effectively_empty),
-        YamlValue::Object(m) => m.is_empty() || m.values().all(yaml_value_is_effectively_empty),
+        YamlValue::Object(m) => {
+            m.is_empty()
+                || yaml_mapping_explicitly_disabled(m)
+                || m.values().all(yaml_value_is_effectively_empty)
+        }
         _ => false,
     }
 }
@@ -3634,6 +3675,24 @@ impl ProxyNodeConfig {
         copy
     }
 
+    pub fn has_redacted_credentials(&self) -> bool {
+        match self {
+            Self::Ss { password, .. }
+            | Self::Anytls { password, .. }
+            | Self::Trojan { password, .. } => password == REDACTED_SECRET,
+            Self::Vless {
+                uuid, encryption, ..
+            } => *uuid == uuid::Uuid::nil() || encryption == REDACTED_SECRET,
+            Self::Socks5 { password, .. } => password.as_deref() == Some(REDACTED_SECRET),
+            Self::Http {
+                password, headers, ..
+            } => {
+                password.as_deref() == Some(REDACTED_SECRET)
+                    || headers.values().any(|v| v == REDACTED_SECRET)
+            }
+        }
+    }
+
     /// Restore redacted credentials from an existing concrete node (even if renamed).
     pub fn restore_credentials_from(&mut self, prev: &ProxyNodeConfig) {
         match (self, prev) {
@@ -4354,5 +4413,55 @@ rules:
         roundtrip.restore_redacted_from(&cfg);
         assert_eq!(roundtrip.secret.as_deref(), Some(generated.as_str()));
         assert!(roundtrip.is_ephemeral_secret);
+    }
+
+    #[test]
+    fn disabled_smux_mappings_accepted_and_renamed_redacted_node_restores_secret() {
+        let mihomo_yaml = "\
+proxies:
+  - name: HK-Trojan
+    type: trojan
+    server: hk.example.com
+    port: 443
+    password: real-secret-password
+    sni: hk.example.com
+    smux:
+      enabled: false
+      protocol: smux
+      max-connections: 4
+    ech-opts:
+      enable: false
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [HK-Trojan, DIRECT]
+rules:
+  - MATCH,PROXY
+";
+        let (orig, skipped) =
+            ClashConfig::from_yaml_str_sanitized(mihomo_yaml).expect("parse disabled smux yaml");
+        assert!(
+            skipped.is_empty(),
+            "disabled smux/ech-opts must not be skipped"
+        );
+        assert_eq!(orig.proxies.len(), 1);
+
+        let edited_redacted_yaml = orig
+            .redacted()
+            .to_yaml_string()
+            .unwrap()
+            .replace("HK-Trojan", "HK-Trojan-Renamed");
+        let mut edited = ClashConfig::from_yaml_str_unchecked(&edited_redacted_yaml).unwrap();
+        edited.restore_redacted_from(&orig);
+        edited
+            .validate()
+            .expect("renamed node with restored credentials must validate");
+        match &edited.proxies[0] {
+            ProxyNodeConfig::Trojan { name, password, .. } => {
+                assert_eq!(name, "HK-Trojan-Renamed");
+                assert_eq!(password, "real-secret-password");
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
     }
 }

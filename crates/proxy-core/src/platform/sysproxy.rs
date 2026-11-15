@@ -950,6 +950,93 @@ fn parse_networksetup_proxy_output(out: &str) -> (bool, String, u16) {
     (enabled, server, port)
 }
 
+/// Formats `ProxyServer` and `ProxyOverride` strings for Windows WinINET / WinHTTP settings,
+/// bracketing IPv6 hosts (`[::1]:7890`) and translating CIDR bypass entries (such as
+/// `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) into WinINET `*` wildcards.
+pub fn format_windows_proxy_server_and_override(
+    host: &str,
+    port: u16,
+    bypass: &[String],
+) -> (String, String) {
+    let trimmed_host = host.trim();
+    let proxy_server = if trimmed_host.contains(':') && !trimmed_host.starts_with('[') {
+        format!("[{trimmed_host}]:{port}")
+    } else {
+        format!("{trimmed_host}:{port}")
+    };
+
+    let mut override_items: Vec<String> = Vec::with_capacity(bypass.len() + 20);
+    let mut push_unique = |item: String| {
+        if !item.is_empty() && !override_items.iter().any(|x| x.eq_ignore_ascii_case(&item)) {
+            override_items.push(item);
+        }
+    };
+
+    for raw in bypass {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry == "::1" || entry.eq_ignore_ascii_case("::1/128") {
+            push_unique("[::1]".to_string());
+            continue;
+        }
+        if let Some((ip_part, prefix_part)) = entry.split_once('/') {
+            if let (Ok(v4), Ok(prefix)) = (
+                ip_part.trim().parse::<std::net::Ipv4Addr>(),
+                prefix_part.trim().parse::<u8>(),
+            ) && prefix <= 32
+            {
+                let oct = v4.octets();
+                match prefix {
+                    32 => push_unique(v4.to_string()),
+                    24 => push_unique(format!("{}.{}.{}.*", oct[0], oct[1], oct[2])),
+                    16 => push_unique(format!("{}.{}.*", oct[0], oct[1])),
+                    8 => push_unique(format!("{}.*", oct[0])),
+                    9..=15 => {
+                        let span = 1u16 << (16 - prefix);
+                        let base = (oct[1] as u16) & !(span - 1);
+                        for second in base..(base + span).min(256) {
+                            push_unique(format!("{}.{}.*", oct[0], second));
+                        }
+                    }
+                    17..=23 => {
+                        let span = 1u16 << (24 - prefix);
+                        let base = (oct[2] as u16) & !(span - 1);
+                        for third in base..(base + span).min(256) {
+                            push_unique(format!("{}.{}.{}.*", oct[0], oct[1], third));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if let Ok(v6) = ip_part.trim().parse::<std::net::Ipv6Addr>() {
+                if prefix_part.trim() == "128" {
+                    push_unique(format!("[{v6}]"));
+                } else {
+                    let seg0 = v6.segments()[0];
+                    if seg0 != 0 {
+                        push_unique(format!("[{seg0:x}:*]"));
+                    }
+                }
+                continue;
+            }
+        }
+        if entry.contains(':')
+            && !entry.starts_with('[')
+            && entry.parse::<std::net::Ipv6Addr>().is_ok()
+        {
+            push_unique(format!("[{entry}]"));
+        } else {
+            push_unique(entry.to_string());
+        }
+    }
+
+    push_unique("<local>".to_string());
+    (proxy_server, override_items.join(";"))
+}
+
 #[cfg(windows)]
 fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -1011,12 +1098,8 @@ fn enable_windows_sysproxy(
         }
     }
 
-    let proxy_server = format!("{host}:{port}");
-    let mut override_items: Vec<String> = bypass.to_vec();
-    if !override_items.iter().any(|x| x == "<local>") {
-        override_items.push("<local>".to_string());
-    }
-    let proxy_override = override_items.join(";");
+    let (proxy_server, proxy_override) =
+        format_windows_proxy_server_and_override(host, port, bypass);
 
     let enable_val: u32 = 1;
     let enable_name = wide_nul("ProxyEnable");
@@ -1596,5 +1679,26 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_proxy_formatter_brackets_ipv6_and_expands_cidr_bypass() {
+        let mut bypass = default_proxy_bypass_list();
+        bypass.push("127.0.0.0/8".to_string());
+        let (srv_v6, ovr) = format_windows_proxy_server_and_override("::1", 7890, &bypass);
+        assert_eq!(srv_v6, "[::1]:7890");
+        let items: Vec<&str> = ovr.split(';').collect();
+        assert!(items.contains(&"127.0.0.1"));
+        assert!(items.contains(&"127.*"));
+        assert!(items.contains(&"10.*"));
+        assert!(items.contains(&"172.16.*"));
+        assert!(items.contains(&"172.31.*"));
+        assert!(items.contains(&"192.168.*"));
+        assert!(items.contains(&"[::1]"));
+        assert!(items.contains(&"<local>"));
+        assert!(
+            items.iter().all(|s| !s.contains('/')),
+            "WinINET ProxyOverride must not contain raw CIDR slashes: {ovr}"
+        );
     }
 }

@@ -4,7 +4,7 @@ pub mod stream;
 use std::{
     collections::HashMap,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -37,7 +37,8 @@ use crate::{
         },
     },
     platform::socket_protect::{
-        protected_tcp_connect_host_with_dns, protected_udp_bind, resolve_protected_host_addrs,
+        connect_protected_udp_addrs, protected_tcp_connect_host_with_dns,
+        resolve_protected_host_addrs,
     },
 };
 
@@ -78,12 +79,16 @@ impl ShadowsocksOutbound {
         self
     }
 
-    async fn resolve_server_addr(&self) -> io::Result<SocketAddr> {
-        resolve_protected_host_addrs(&self.server, self.port, self.dns.as_deref())
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SS server DNS empty"))
+    async fn resolve_server_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        let addrs =
+            resolve_protected_host_addrs(&self.server, self.port, self.dns.as_deref()).await?;
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "SS server DNS empty",
+            ));
+        }
+        Ok(addrs)
     }
 }
 
@@ -255,14 +260,8 @@ impl OutboundHandler for ShadowsocksOutbound {
                 "UDP disabled on this Shadowsocks outbound",
             ));
         }
-        let remote = self.resolve_server_addr().await?;
-        let bind_addr = if remote.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        };
-        let sock = protected_udp_bind(bind_addr, Some(remote))?;
-        sock.connect(remote).await?;
+        let remotes = self.resolve_server_addrs().await?;
+        let (sock, _remote) = connect_protected_udp_addrs(&remotes).await?;
 
         Ok(Box::new(ShadowsocksUdpSession {
             sock,

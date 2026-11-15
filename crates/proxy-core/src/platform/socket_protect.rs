@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, LazyLock, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
@@ -1030,6 +1030,96 @@ pub fn protected_udp_bind(
     sock.bind(&bind_addr.into())?;
     let std_udp: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_udp)
+}
+
+/// Bind and `connect()` a protected UDP socket across candidate `SocketAddr`s ordered via
+/// Happy Eyeballs health/reachability rules, falling back across IPv6/IPv4 on bind/connect failure.
+pub async fn connect_protected_udp_addrs(
+    addrs: &[SocketAddr],
+) -> io::Result<(UdpSocket, SocketAddr)> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "no resolved UDP server addresses",
+        ));
+    }
+    let ordered = prioritize_healthy_happy_eyeballs_addrs(addrs);
+    let mut last_err: Option<io::Error> = None;
+    for remote in ordered {
+        let bind_addr = if remote.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        };
+        match protected_udp_bind(bind_addr, Some(remote)) {
+            Ok(sock) => match sock.connect(remote).await {
+                Ok(()) => {
+                    note_direct_addr_connect_result(remote, Ok(()));
+                    return Ok((sock, remote));
+                }
+                Err(err) => {
+                    note_direct_addr_connect_result(remote, Err(&err));
+                    note_tcp_connect_outcome_at(remote, Err(&err), Instant::now());
+                    last_err = Some(err);
+                }
+            },
+            Err(err) => {
+                note_direct_addr_connect_result(remote, Err(&err));
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "unable to bind/connect UDP socket",
+        )
+    }))
+}
+
+/// Bind an unconnected protected UDP socket matching the first routable candidate relay `SocketAddr`
+/// ordered via Happy Eyeballs health/reachability rules (e.g. for SOCKS5 `UDP ASSOCIATE`).
+pub fn bind_protected_udp_addrs(addrs: &[SocketAddr]) -> io::Result<(UdpSocket, SocketAddr)> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "no resolved UDP relay addresses",
+        ));
+    }
+    let has_ipv4_fallback = addrs.iter().any(SocketAddr::is_ipv4);
+    let ordered = prioritize_healthy_happy_eyeballs_addrs(addrs);
+    let mut last_err: Option<io::Error> = None;
+    for relay_addr in ordered {
+        if has_ipv4_fallback
+            && let SocketAddr::V6(s6) = relay_addr
+            && is_global_unicast_ipv6(*s6.ip())
+            && let Err(err) =
+                std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+                    .and_then(|probe| probe.connect(relay_addr))
+        {
+            note_direct_addr_connect_result(relay_addr, Err(&err));
+            last_err = Some(err);
+            continue;
+        }
+        let local_bind = if relay_addr.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        };
+        match protected_udp_bind(local_bind, Some(relay_addr)) {
+            Ok(sock) => return Ok((sock, relay_addr)),
+            Err(err) => {
+                note_direct_addr_connect_result(relay_addr, Err(&err));
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "unable to bind UDP relay socket",
+        )
+    }))
 }
 
 #[cfg(test)]

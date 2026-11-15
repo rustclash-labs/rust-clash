@@ -139,6 +139,7 @@ pub struct Router {
     mode: RwLock<RunMode>,
     epoch: AtomicU64,
     unified_delay: AtomicBool,
+    tun_dns_hijack: AtomicBool,
     outbounds: HashMap<String, DynOutbound>,
     groups: HashMap<String, Arc<ProxyGroup>>,
     group_order: Vec<String>,
@@ -271,6 +272,7 @@ impl Router {
             mode: RwLock::new(initial_mode),
             epoch: AtomicU64::new(ROUTER_EPOCH_SEQ.fetch_add(1, Ordering::Relaxed)),
             unified_delay: AtomicBool::new(true),
+            tun_dns_hijack: AtomicBool::new(true),
             outbounds,
             groups,
             group_order,
@@ -322,6 +324,14 @@ impl Router {
 
     pub fn set_unified_delay(&self, enabled: bool) {
         self.unified_delay.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn tun_dns_hijack(&self) -> bool {
+        self.tun_dns_hijack.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tun_dns_hijack(&self, enabled: bool) {
+        self.tun_dns_hijack.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_low_power_mode(&self, enabled: bool) {
@@ -1294,6 +1304,73 @@ impl Router {
         group_results
     }
 
+    fn collect_topo_auto_groups(&self) -> Vec<Arc<ProxyGroup>> {
+        fn visit(
+            grp: &Arc<ProxyGroup>,
+            groups: &HashMap<String, Arc<ProxyGroup>>,
+            depth: usize,
+            visiting: &mut HashSet<String>,
+            visited: &mut HashSet<String>,
+            out: &mut Vec<Arc<ProxyGroup>>,
+        ) {
+            if depth >= 16 || visited.contains(&grp.name) || !visiting.insert(grp.name.clone()) {
+                return;
+            }
+            for member in &grp.members {
+                if let Some(sub) = groups.get(member) {
+                    visit(sub, groups, depth + 1, visiting, visited, out);
+                }
+            }
+            visiting.remove(&grp.name);
+            visited.insert(grp.name.clone());
+            if matches!(
+                grp.group_type,
+                ProxyGroupType::UrlTest | ProxyGroupType::Fallback | ProxyGroupType::LoadBalance
+            ) {
+                out.push(Arc::clone(grp));
+            }
+        }
+
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut out = Vec::new();
+        for name in &self.group_order {
+            if let Some(grp) = self.groups.get(name) {
+                visit(grp, &self.groups, 0, &mut visiting, &mut visited, &mut out);
+            }
+        }
+        out
+    }
+
+    fn reconcile_auto_groups_from_delays(&self) -> bool {
+        let mut changed = false;
+        for grp in self.collect_topo_auto_groups() {
+            let mut map = HashMap::with_capacity(grp.members.len());
+            for member in &grp.members {
+                map.insert(member.clone(), self.effective_member_delay(member));
+            }
+            let prev = grp.current();
+            let eff = grp.update_selection_from_probes(&map);
+            if grp.current() != prev {
+                changed = true;
+            }
+            if let Some(ms) = eff {
+                if self.delays.is_known_failed(&grp.name) {
+                    changed = true;
+                }
+                self.delays.record(&grp.name, ms);
+            } else if !grp.members.is_empty()
+                && grp.members.iter().all(|m| self.is_member_known_failed(m))
+            {
+                self.delays.record_failure(&grp.name);
+            } else if self.delays.latest_delay(&grp.name).is_some() {
+                self.delays.clear(&grp.name);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub async fn test_delay(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
         let unified = self.unified_delay();
         if let Some(outbound) = self.outbounds.get(name) {
@@ -1301,16 +1378,18 @@ impl Router {
             match outbound.latency_test_with_mode(url, timeout, unified).await {
                 Ok(ms) => {
                     self.delays.record(name, ms);
+                    let group_changed = self.reconcile_auto_groups_from_delays();
                     self.sync_selector_delays();
-                    if !was_alive {
+                    if !was_alive || group_changed {
                         self.bump_epoch();
                     }
                     return Ok(ms);
                 }
                 Err(e) => {
                     self.delays.record_failure(name);
+                    let group_changed = self.reconcile_auto_groups_from_delays();
                     self.sync_selector_delays();
-                    if was_alive {
+                    if was_alive || group_changed {
                         self.bump_epoch();
                     }
                     return Err(ProxyError::Io(e));
@@ -1444,6 +1523,7 @@ impl Router {
             if let Some(grp) = self.groups.get(name) {
                 let mut snap = grp.snapshot(&self.delays);
                 let (leaf_ob, chains) = self.resolve_chain_preview(name);
+                snap.udp = leaf_ob.udp_supported();
                 snap.effective_outbound = Some(leaf_ob.name().to_string());
                 snap.effective_protocol = Some(leaf_ob.protocol().to_string());
                 snap.chains = Some(chains);
@@ -1905,6 +1985,25 @@ mod tests {
                 .effective_outbound_for_group("Region-Fallback")
                 .as_deref(),
             Some("DIRECT")
+        );
+        assert!(router.proxies_snapshot()["Region-Fallback"].udp);
+
+        // 4. Revive `hk-2` (45ms) and run a single-node `test_delay("hk-2")`:
+        //    `HK-Auto` (`UrlTest`), `Region-Fallback` (`Fallback`), and `GLOBAL` (`Select` -> `HK-Auto`)
+        //    must all reconcile immediately without needing a full group probe!
+        hk2_ms.store(45, Ordering::SeqCst);
+        let single_ms = router
+            .test_delay("hk-2", &probe_url, Duration::from_secs(2))
+            .await
+            .expect("single-node test_delay on hk-2 should succeed");
+        assert_eq!(single_ms, 45);
+        assert_eq!(router.delays().latest_delay("HK-Auto"), Some(45));
+        assert_eq!(router.delays().latest_delay("GLOBAL"), Some(45));
+        assert_eq!(
+            router
+                .effective_outbound_for_group("Region-Fallback")
+                .as_deref(),
+            Some("hk-2")
         );
 
         let _ = stop_tx.send(true);

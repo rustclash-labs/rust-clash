@@ -252,16 +252,26 @@ pub fn matches_geoip_dynamic(
     rule_mmdb: Option<&Arc<MmdbReader>>,
     ip: IpAddr,
 ) -> bool {
+    let is_lan_or_private =
+        code_upper.eq_ignore_ascii_case("LAN") || code_upper.eq_ignore_ascii_case("PRIVATE");
+    let iso_matches = |iso: &str| -> bool {
+        iso.eq_ignore_ascii_case(code_upper)
+            || (is_lan_or_private
+                && (iso.eq_ignore_ascii_case("LAN") || iso.eq_ignore_ascii_case("PRIVATE")))
+    };
+    if is_lan_or_private && builtin.is_some_and(|b| b.contains(ip)) {
+        return true;
+    }
     if let Some(reader) = rule_mmdb
         && let Some(iso) = reader.lookup_country_code(ip)
     {
-        return iso.eq_ignore_ascii_case(code_upper);
+        return iso_matches(&iso);
     }
     let live = LIVE_GEODATA.read();
     if let Some(ref reader) = live.mmdb
         && let Some(iso) = reader.lookup_country_code(ip)
     {
-        return iso.eq_ignore_ascii_case(code_upper);
+        return iso_matches(&iso);
     }
     if code_upper == "CN" {
         return live.geoip_cn.contains(ip);
