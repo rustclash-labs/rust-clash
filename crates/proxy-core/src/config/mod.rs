@@ -3058,7 +3058,10 @@ fn default_fake_ip_range() -> String {
 
 pub fn default_fake_ip_filter() -> Vec<String> {
     vec![
+        "*".to_string(),
         "localhost".to_string(),
+        "*.localhost".to_string(),
+        "*.invalid".to_string(),
         "*.lan".to_string(),
         "*.local".to_string(),
         "*.home.arpa".to_string(),
@@ -4275,16 +4278,25 @@ rules:
         assert!(decode_http_chunked_body(incomplete, 1024).is_err());
 
         let filters = default_fake_ip_filter();
+        assert!(filters.iter().any(|p| p == "*"));
+        assert!(filters.iter().any(|p| p == "*.localhost"));
+        assert!(filters.iter().any(|p| p == "*.invalid"));
         assert!(filters.iter().any(|p| p == "+.pool.ntp.org"));
         assert!(filters.iter().any(|p| p == "stun*.l.google.com"));
         assert!(filters.iter().any(|p| p == "captive.apple.com"));
         assert!(filters.iter().any(|p| p == "connectivitycheck.gstatic.com"));
 
         let dns_engine = crate::dns::fake_ip::FakeIpDnsEngine::new(&DnsConfig::default()).unwrap();
+        assert!(dns_engine.should_bypass_fake_ip("null"));
+        assert!(dns_engine.should_bypass_fake_ip("wpad"));
+        assert!(dns_engine.should_bypass_fake_ip("tauri.localhost"));
+        assert!(dns_engine.should_bypass_fake_ip("sub-blocked.invalid"));
         assert!(dns_engine.should_bypass_fake_ip("stun.l.google.com"));
         assert!(dns_engine.should_bypass_fake_ip("stun1.l.google.com"));
         assert!(dns_engine.should_bypass_fake_ip("0.cn.pool.ntp.org"));
         assert!(dns_engine.should_bypass_fake_ip("captive.apple.com"));
+        assert!(!dns_engine.should_bypass_fake_ip("api.openai.com"));
+        assert!(!dns_engine.should_bypass_fake_ip("raii-handoff.android.test"));
     }
 
     #[test]

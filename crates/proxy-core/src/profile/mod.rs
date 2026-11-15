@@ -963,6 +963,25 @@ impl ProfileManager {
                                     "*.local",
                                     "+.msftconnecttest.com",
                                     "+.msftncsi.com",
+                                ]
+                            || cfg.dns.fake_ip_filter
+                                == [
+                                    "localhost",
+                                    "*.lan",
+                                    "*.local",
+                                    "*.home.arpa",
+                                    "+.msftconnecttest.com",
+                                    "+.msftncsi.com",
+                                    "connectivitycheck.gstatic.com",
+                                    "captive.apple.com",
+                                    "+.stun.*.*",
+                                    "+.stun.*.*.*",
+                                    "+.stun.*.*.*.*",
+                                    "+.stun6.*.*",
+                                    "+.stun6.*.*.*",
+                                    "stun*.l.google.com",
+                                    "+.pool.ntp.org",
+                                    "time.*.com",
                                 ]);
                     if is_legacy_fake_ip_filter {
                         cfg.dns.fake_ip_filter = crate::config::default_fake_ip_filter();
@@ -4448,6 +4467,81 @@ rules:
         let (reopened_cfg, _) = reopened.load_active_config().unwrap();
         assert_eq!(reopened_cfg.proxies.len(), 1);
         assert_eq!(reopened_cfg.proxies[0].name(), "Initial-Node");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v047_legacy_fake_ip_filter_migrates_on_open_and_smart_cn_routes_google_analytics_via_proxy()
+    {
+        let dir = std::env::temp_dir().join(format!("rc-v047-filter-mig-{}", Uuid::new_v4()));
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+        let active_id = mgr.active_profile_id();
+        let yaml_path = mgr.profile_yaml_path(&active_id);
+
+        // Simulate a persisted v0.4.7 Starter profile with the 16-entry fake_ip_filter
+        let (mut cfg, _) = mgr.load_active_config().unwrap();
+        cfg.dns.fake_ip_filter = vec![
+            "localhost",
+            "*.lan",
+            "*.local",
+            "*.home.arpa",
+            "+.msftconnecttest.com",
+            "+.msftncsi.com",
+            "connectivitycheck.gstatic.com",
+            "captive.apple.com",
+            "+.stun.*.*",
+            "+.stun.*.*.*",
+            "+.stun.*.*.*.*",
+            "+.stun6.*.*",
+            "+.stun6.*.*.*",
+            "stun*.l.google.com",
+            "+.pool.ntp.org",
+            "time.*.com",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        fs::write(&yaml_path, cfg.to_yaml_string().unwrap()).unwrap();
+        drop(mgr);
+
+        // Re-opening upgrades the legacy v0.4.7 filter list in-place to include "*", "*.localhost", "*.invalid"
+        let reopened = ProfileManager::open_or_init(&dir).unwrap();
+        let (upgraded_cfg, _) = reopened.load_active_config().unwrap();
+        assert_eq!(
+            upgraded_cfg.dns.fake_ip_filter,
+            crate::config::default_fake_ip_filter()
+        );
+
+        // Also verify `smart-cn` routes `www.google-analytics.com` via PROXY (`GEOSITE,google,PROXY`) instead of `GEOSITE,cn,DIRECT`
+        let u1 = Uuid::new_v4();
+        reopened
+            .import_nodes_to_active(
+                &format!("vless://{u1}@127.0.0.1:18443?security=none#HK-Node"),
+                true,
+                true,
+            )
+            .unwrap();
+        let (smart_cfg, _) = reopened.load_active_config().unwrap();
+        let dns = Arc::new(FakeIpDnsEngine::new(&smart_cfg.dns_with_merged_hosts()).unwrap());
+        let outbounds = build_outbounds(&smart_cfg.proxies, &[]).unwrap();
+        let router = Router::new(
+            smart_cfg.mode,
+            outbounds,
+            &smart_cfg.proxy_groups,
+            &smart_cfg.rules,
+            dns,
+        )
+        .unwrap();
+        let target = crate::addr::TargetAddr::new_domain("www.google-analytics.com", 443).unwrap();
+        let preview = router.preview_route_no_dns(&target);
+        assert!(
+            preview.matched_rule.contains("GeoSite,google,"),
+            "unexpected matched_rule: {}",
+            preview.matched_rule
+        );
+        assert_eq!(preview.effective_outbound, "HK-Node");
+        assert_eq!(preview.exit_type, "PROXY");
 
         let _ = fs::remove_dir_all(&dir);
     }

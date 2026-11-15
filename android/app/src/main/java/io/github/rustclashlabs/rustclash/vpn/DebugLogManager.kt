@@ -921,8 +921,13 @@ object DebugLogManager {
             }
 
             nativeObj.optJSONObject("traffic")?.let { tr ->
-                val carryOver = tr.optLong("carryOverActiveConnections", 0L)
-                val carryOverPart = if (carryOver > 0L) " carryOverActive=`$carryOver`" else ""
+                val carryOverActive = tr.optLong("carryOverActiveConnections", 0L)
+                val carryOverTotal = tr.optLong("carryOverStreams", 0L)
+                val carryOverPart = when {
+                    carryOverTotal > 0L -> " carryOver=`$carryOverTotal` carryOverActive=`$carryOverActive`"
+                    carryOverActive > 0L -> " carryOverActive=`$carryOverActive`"
+                    else -> ""
+                }
                 sb.appendLine(
                     "- Session Traffic & Conns: upTotal=`${formatBytesCompact(tr.optLong("upTotal"))}` " +
                         "downTotal=`${formatBytesCompact(tr.optLong("downTotal"))}` " +
@@ -1000,7 +1005,8 @@ object DebugLogManager {
             val o = arr.optJSONObject(i) ?: continue
             val name = o.optString("outbound")
             val proto = o.optString("protocol")
-            val probe = if (o.isNull("latestProbeDelayMs")) "N/A" else "${o.optLong("latestProbeDelayMs")}ms"
+            val probeMs = o.optLong("latestProbeDelayMs", -1L)
+            val probe = if (o.isNull("latestProbeDelayMs") || probeMs <= 0L) "N/A" else "${probeMs}ms"
             val p50 = if (o.isNull("handshakeP50Ms")) "-" else "${o.optLong("handshakeP50Ms")}ms"
             val p95 = if (o.isNull("handshakeP95Ms")) "-" else "${o.optLong("handshakeP95Ms")}ms"
             val maxHs = if (o.isNull("handshakeMaxMs")) "-" else "${o.optLong("handshakeMaxMs")}ms"
