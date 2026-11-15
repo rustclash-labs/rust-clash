@@ -556,25 +556,41 @@ async fn forward_udp_dns_raw(ns: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
     sock.send(query).await?;
 
     let mut buf = vec![0u8; 8192];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(2);
+    let mut retry_at = Some(started + Duration::from_millis(650));
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             return Err(ProxyError::Timeout);
         }
-        let n = tokio::time::timeout(remaining, sock.recv(&mut buf))
-            .await
-            .map_err(|_| ProxyError::Timeout)??;
-        if n < 12 {
-            continue;
+        let wait_dur = match retry_at {
+            Some(rt) => rt.saturating_duration_since(now).min(remaining),
+            None => remaining,
+        };
+        match tokio::time::timeout(wait_dur, sock.recv(&mut buf)).await {
+            Err(_) => {
+                if retry_at.take().is_some() && tokio::time::Instant::now() < deadline {
+                    let _ = sock.send(query).await;
+                    continue;
+                }
+                return Err(ProxyError::Timeout);
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(n)) => {
+                if n < 12 {
+                    continue;
+                }
+                if (buf[2] & 0x80) == 0 || [buf[0], buf[1]] != expected_id {
+                    continue;
+                }
+                if !dns_questions_match(expected_query.as_ref(), &buf[..n]) {
+                    continue;
+                }
+                return Ok(buf[..n].to_vec());
+            }
         }
-        if (buf[2] & 0x80) == 0 || [buf[0], buf[1]] != expected_id {
-            continue;
-        }
-        if !dns_questions_match(expected_query.as_ref(), &buf[..n]) {
-            continue;
-        }
-        return Ok(buf[..n].to_vec());
     }
 }
 
@@ -2620,6 +2636,64 @@ mod tests {
             meta.answers,
             vec![crate::dns::wire::DnsAnswerData::A(std::net::Ipv4Addr::new(
                 198, 51, 100, 2
+            ))]
+        );
+
+        srv_jh.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_dns_retransmits_at_650ms_when_initial_packet_is_dropped() {
+        let server_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ns = server_sock.local_addr().unwrap();
+        let received_packets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received_clone = std::sync::Arc::clone(&received_packets);
+
+        let srv_jh = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            // 1st packet: simulate cellular RRC wake-up packet loss (drop silently)
+            let (_n1, _peer1) = server_sock.recv_from(&mut buf).await.unwrap();
+            received_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            // 2nd packet (650ms retransmit): answer cleanly
+            let (n2, peer2) = server_sock.recv_from(&mut buf).await.unwrap();
+            received_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let parsed = crate::dns::wire::DnsQueryPacket::parse(&buf[..n2]).unwrap();
+            let reply = parsed.build_response(
+                &buf[..n2],
+                0,
+                60,
+                &[crate::dns::wire::DnsAnswerData::A(std::net::Ipv4Addr::new(
+                    203, 0, 113, 77,
+                ))],
+            );
+            server_sock.send_to(&reply, peer2).await.unwrap();
+        });
+
+        let query = crate::dns::wire::build_dns_query(
+            0x7788,
+            "rrc-wakeup.example.com",
+            crate::dns::wire::QTYPE_A,
+        );
+        let t0 = tokio::time::Instant::now();
+        let resp = forward_udp_dns_with_tcp_fallback(ns, &query)
+            .await
+            .expect("650ms UDP retransmit should recover dropped initial packet");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            received_packets.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(
+            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_millis(1600),
+            "expected recovery around 650ms, got {elapsed:?}"
+        );
+        let meta = crate::dns::wire::extract_dns_response_meta(&resp).unwrap();
+        assert_eq!(
+            meta.answers,
+            vec![crate::dns::wire::DnsAnswerData::A(std::net::Ipv4Addr::new(
+                203, 0, 113, 77
             ))]
         );
 

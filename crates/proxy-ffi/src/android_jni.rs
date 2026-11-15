@@ -126,7 +126,9 @@ fn sync_delays_from_router(router: &Router) {
     let snap = router.proxies_snapshot();
     let mut cache = OFFLINE_DELAY_CACHE.lock();
     for (name, info) in snap {
-        if let Some(last) = info.history.last() {
+        if let Some(last) = info.history.last()
+            && last.delay > 0
+        {
             cache.insert(name, last.delay);
         }
     }
@@ -1066,23 +1068,34 @@ pub fn notify_android_network_changed_with_caps_core(
     let state = {
         let guard = ANDROID_RUNTIME.lock();
         if let Some(rt) = guard.as_ref() {
-            let had_baseline = rt.has_network_baseline.swap(true, Ordering::AcqRel);
-            let prev_handle = rt
-                .last_network_handle
-                .swap(network_handle, Ordering::AcqRel);
-            let prev_wifi = rt.is_wifi.swap(is_wifi, Ordering::AcqRel);
-            let prev_ipv6 = rt.has_ipv6.swap(has_ipv6, Ordering::AcqRel);
-            if !had_baseline && network_handle != 0 {
-                HandoffState::NoChange
-            } else if prev_handle != network_handle || prev_wifi != is_wifi {
-                rt.network_transitions.fetch_add(1, Ordering::Relaxed);
-                HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
-            } else if prev_ipv6 && !has_ipv6 {
-                HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
-            } else if !prev_ipv6 && has_ipv6 {
-                HandoffState::Ipv6Gained(Arc::clone(&rt.engine))
+            if network_handle == 0 {
+                let prev_handle = rt.last_network_handle.swap(0, Ordering::AcqRel);
+                rt.is_wifi.store(false, Ordering::Release);
+                rt.has_ipv6.store(false, Ordering::Release);
+                if prev_handle != 0 {
+                    HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
+                } else {
+                    HandoffState::NoChange
+                }
             } else {
-                HandoffState::NoChange
+                let had_baseline = rt.has_network_baseline.swap(true, Ordering::AcqRel);
+                let prev_handle = rt
+                    .last_network_handle
+                    .swap(network_handle, Ordering::AcqRel);
+                let prev_wifi = rt.is_wifi.swap(is_wifi, Ordering::AcqRel);
+                let prev_ipv6 = rt.has_ipv6.swap(has_ipv6, Ordering::AcqRel);
+                if !had_baseline {
+                    HandoffState::NoChange
+                } else if prev_handle != network_handle || prev_wifi != is_wifi {
+                    rt.network_transitions.fetch_add(1, Ordering::Relaxed);
+                    HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
+                } else if prev_ipv6 && !has_ipv6 {
+                    HandoffState::Changed(Arc::clone(&rt.engine), prev_handle)
+                } else if !prev_ipv6 && has_ipv6 {
+                    HandoffState::Ipv6Gained(Arc::clone(&rt.engine))
+                } else {
+                    HandoffState::NoChange
+                }
             }
         } else {
             HandoffState::Offline
@@ -3154,6 +3167,7 @@ fn build_redacted_active_profile_summary(
 
 struct WindowDiagnosticSections {
     carry_over_count: usize,
+    carry_over_active_count: usize,
     window_connections: usize,
     window_tcp: usize,
     window_udp: usize,
@@ -3175,12 +3189,16 @@ fn build_window_diagnostic_sections(
     delays_map: &HashMap<String, u64>,
 ) -> WindowDiagnosticSections {
     let mut carry_over_count = 0usize;
+    let mut carry_over_active_count = 0usize;
     let mut carry_over_conns = Vec::new();
     let mut window_conns = Vec::with_capacity(conns.len());
     for c in conns {
         if c.start_epoch_ms < since_epoch_ms {
             if c.status == "active" || c.end_epoch_ms.is_none_or(|end| end >= since_epoch_ms) {
                 carry_over_count += 1;
+                if c.status == "active" {
+                    carry_over_active_count += 1;
+                }
                 carry_over_conns.push(c);
             }
         } else if c.start_epoch_ms <= until_epoch_ms {
@@ -3330,7 +3348,7 @@ fn build_window_diagnostic_sections(
             let p50 = percentile_u64(&agg.handshakes, 50);
             let p95 = percentile_u64(&agg.handshakes, 95);
             let max_hs = agg.handshakes.last().copied();
-            let probe_delay = delays_map.get(&outbound_name).copied();
+            let probe_delay = delays_map.get(&outbound_name).copied().filter(|&d| d > 0);
             let safe_name = redact_sensitive_text(&outbound_name);
             (
                 agg.connections,
@@ -3498,6 +3516,7 @@ fn build_window_diagnostic_sections(
 
     WindowDiagnosticSections {
         carry_over_count,
+        carry_over_active_count,
         window_connections: window_connections_total,
         window_tcp,
         window_udp,
@@ -3684,7 +3703,8 @@ pub fn android_collect_debug_snapshot_window_core(
                 "upTotal": up_total,
                 "downTotal": down_total,
                 "activeConnections": hub.active_connection_count(),
-                "carryOverActiveConnections": sections.carry_over_count,
+                "carryOverStreams": sections.carry_over_count,
+                "carryOverActiveConnections": sections.carry_over_active_count,
                 "totalConnections": hub.total_connections(),
                 "establishedConnections": hub.established_connections_total(),
                 "failedConnections": hub.failed_connections_total(),
@@ -4576,6 +4596,7 @@ mod tests {
 
         // 2. Verify carryOverConnections reports the 2 overlapping carry-over streams sorted by total bytes desc, with redaction
         assert_eq!(sec.carry_over_count, 2);
+        assert_eq!(sec.carry_over_active_count, 1);
         assert_eq!(sec.carry_over_connections_json.len(), 2);
 
         let first_carry = &sec.carry_over_connections_json[0];
@@ -4634,6 +4655,103 @@ mod tests {
         assert!(!cache_file.exists());
         assert!(!android_flush_dns_core());
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn two_step_break_before_make_handoff_and_zero_probe_delay_handling() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        OFFLINE_DELAY_CACHE.lock().clear();
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustclash-jni-two-step-handoff-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            true,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        // 0. Offline boot notification before any active network arrives must not establish baseline
+        let boot_offline =
+            notify_android_network_changed_with_caps_core(0, false, false).expect("offline call");
+        assert!(!boot_offline.dns_cache_flushed);
+        assert_eq!(android_status_json_core()["networkTransitions"], 0);
+
+        // 1. Initial Wi-Fi baseline (202, wifi=true, ipv6=true) -> 0 transitions
+        let base_wifi = notify_android_network_changed_with_caps_core(202, true, true)
+            .expect("initial wifi baseline");
+        assert!(!base_wifi.dns_cache_flushed);
+        assert_eq!(android_status_json_core()["networkTransitions"], 0);
+
+        // 2. Break-before-make step 1: Wi-Fi lost (0, false, false) tears down dead sockets immediately
+        //    WITHOUT bumping networkTransitions yet.
+        let lost_rep =
+            notify_android_network_changed_with_caps_core(0, false, false).expect("net_lost call");
+        assert!(lost_rep.dns_cache_flushed);
+        assert_eq!(android_status_json_core()["networkTransitions"], 0);
+
+        // 3. Break-before-make step 2: Cellular arrives 370ms later (101, wifi=false, ipv6=true)
+        //    -> bumps networkTransitions to 1 (single physical handoff, not 2!).
+        let cell_rep = notify_android_network_changed_with_caps_core(101, false, true)
+            .expect("cellular replacement");
+        assert!(cell_rep.dns_cache_flushed);
+        let st = android_status_json_core();
+        assert_eq!(st["networkTransitions"], 1);
+        assert_eq!(st["isWifi"], false);
+        assert_eq!(st["hasIpv6"], true);
+
+        // 4. Verify `sync_delays_from_router` preserves positive cached delay when a probe times out (`0`)
+        let (_, engine) = live_handle_and_engine().expect("live engine");
+        engine.router().delays().record("DIRECT", 42);
+        sync_delays_from_router(&engine.router());
+        assert_eq!(OFFLINE_DELAY_CACHE.lock().get("DIRECT").copied(), Some(42));
+
+        engine.router().delays().record_failure("DIRECT");
+        sync_delays_from_router(&engine.router());
+        assert_eq!(
+            OFFLINE_DELAY_CACHE.lock().get("DIRECT").copied(),
+            Some(42),
+            "transient 0ms probe failure must not clobber positive cached latency"
+        );
+        drop(engine);
+
+        // 5. Verify `build_window_diagnostic_sections` maps `0` probe delay to JSON `null` (`N/A`)
+        let conn = sample_conn(
+            "probe-zero",
+            "tcp",
+            "www.google-analytics.com",
+            "Node-HK",
+            2_500,
+            Some(2_800),
+            Some(140),
+            512,
+            2_048,
+            Some("198.18.0.77"),
+            "closed",
+            None,
+        );
+        let mut delays = HashMap::new();
+        delays.insert("Node-HK".to_string(), 0);
+        let sec = build_window_diagnostic_sections(&[conn], 2_000, 5_000, &delays);
+        assert_eq!(sec.outbound_stats_json.len(), 1);
+        assert!(
+            sec.outbound_stats_json[0]["latestProbeDelayMs"].is_null(),
+            "failed probe delay (0) must serialize as null rather than 0ms"
+        );
+
+        assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

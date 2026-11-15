@@ -706,6 +706,17 @@ static GEOSITE_NON_CN: LazyLock<GeoSiteMatcher> = LazyLock::new(|| {
             "ggpht.com",
             "gvt1.com",
             "gvt2.com",
+            "gvt3.com",
+            "google-analytics.com",
+            "googleoptimize.com",
+            "googletagmanager.com",
+            "googletagservices.com",
+            "googleadservices.com",
+            "googlesyndication.com",
+            "doubleclick.net",
+            "urchin.com",
+            "withgoogle.com",
+            "firebaseio.com",
             "1e100.net",
             "gmail.com",
             "android.com",
@@ -878,9 +889,12 @@ static GEOSITE_GOOGLE: LazyLock<GeoSiteMatcher> = LazyLock::new(|| {
             "gvt3.com",
             "doubleclick.net",
             "googlesyndication.com",
+            "google-analytics.com",
+            "googleoptimize.com",
             "googletagmanager.com",
             "googletagservices.com",
             "googleadservices.com",
+            "urchin.com",
             "withgoogle.com",
             "firebaseio.com",
             "1e100.net",
@@ -1242,6 +1256,7 @@ mod tests {
     #[test]
     fn builtin_geosite_google_includes_gvt_doubleclick_ads_and_firebase_domains() {
         let google = lookup_builtin_geosite("google").unwrap();
+        let non_cn = lookup_builtin_geosite("geolocation-!cn").unwrap();
         for domain in [
             "beacons.gcp.gvt2.com",
             "redirector.gvt3.com",
@@ -1249,15 +1264,23 @@ mod tests {
             "clientservices.googleapis.com",
             "googleads.g.doubleclick.net",
             "pagead2.googlesyndication.com",
+            "www.google-analytics.com",
+            "ssl.google-analytics.com",
+            "www.googleoptimize.com",
             "www.googletagmanager.com",
             "www.googletagservices.com",
             "www.googleadservices.com",
+            "ssl.urchin.com",
             "experiments.withgoogle.com",
             "demo.firebaseio.com",
         ] {
             assert!(
                 google.matches_domain(domain),
                 "expected GEOSITE_GOOGLE to match {domain}"
+            );
+            assert!(
+                non_cn.matches_domain(domain),
+                "expected GEOSITE_NON_CN to match {domain}"
             );
         }
         assert!(!google.matches_domain("www.baidu.com"));

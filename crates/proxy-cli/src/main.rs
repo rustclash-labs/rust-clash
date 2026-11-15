@@ -1023,7 +1023,10 @@ dns:
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.0/15
   fake-ip-filter:
+    - "*"
     - localhost
+    - "*.localhost"
+    - "*.invalid"
     - "*.lan"
     - "*.local"
     - "*.home.arpa"

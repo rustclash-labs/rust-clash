@@ -711,13 +711,31 @@ class DebugLogManagerTest {
               "traffic": {
                 "upTotal": 5242880,
                 "downTotal": 62914560,
-                "activeConnections": 8,
-                "carryOverActiveConnections": 2,
+                "activeConnections": 1,
+                "carryOverStreams": 48,
+                "carryOverActiveConnections": 1,
                 "totalConnections": 90,
                 "establishedConnections": 88,
                 "failedConnections": 2,
                 "zeroRxClosedConnections": 0
               },
+              "outboundStats": [
+                {
+                  "outbound": "HK-IPLC-01",
+                  "protocol": "VLESS",
+                  "exitType": "PROXY",
+                  "latestProbeDelayMs": 0,
+                  "connections": 12,
+                  "failures": 0,
+                  "zeroRxCount": 0,
+                  "handshakeSamples": 12,
+                  "handshakeP50Ms": 140,
+                  "handshakeP95Ms": 220,
+                  "handshakeMaxMs": 260,
+                  "uploadBytes": 4096,
+                  "downloadBytes": 65536
+                }
+              ],
               "topDomains": [
                 {
                   "host": "upos-sz-upcdn.bilivideo.com",
@@ -745,7 +763,7 @@ class DebugLogManagerTest {
                   "host": "240e:97c:2f::1",
                   "port": 443,
                   "network": "udp",
-                  "status": "active",
+                  "status": "closed",
                   "rule": "GeoSite,geolocation-!cn",
                   "effectiveOutbound": "Sub (203.0.113.124)",
                   "uploadBytes": 524288,
@@ -763,6 +781,9 @@ class DebugLogManagerTest {
             nativeSnapshotRawJson = withCarryOverJson,
             crashBreadcrumb = null,
         )
+        assertTrue(reportWithCarry.contains("carryOver=`48` carryOverActive=`1`"))
+        assertTrue(reportWithCarry.contains("probe=`N/A`"))
+        assertFalse(reportWithCarry.contains("probe=`0ms`"))
         assertTrue(reportWithCarry.contains("#### Carry-Over Streams (2)"))
         assertTrue(
             reportWithCarry.contains(
@@ -772,7 +793,7 @@ class DebugLogManagerTest {
         )
         assertTrue(
             reportWithCarry.contains(
-                "- `[240e:97c:2f::1]:443` (udp, active) -> `Sub (***REDACTED***)` [GeoSite,geolocation-!cn] " +
+                "- `[240e:97c:2f::1]:443` (udp, closed) -> `Sub (***REDACTED***)` [GeoSite,geolocation-!cn] " +
                     "totalUp=`512.0 KB` totalDown=`12.00 MB` age=`750ms`",
             ),
         )

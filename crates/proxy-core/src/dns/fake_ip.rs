@@ -447,7 +447,7 @@ pub fn domain_matches_clash_pattern(domain: &str, raw_pat: &str) -> Option<u32> 
     if p.is_empty() {
         return None;
     }
-    if p == "*" || p == "+" || p == "+.*" {
+    if p == "+" || p == "+.*" {
         return Some(100);
     }
     if let Some(rest) = p.strip_prefix("geosite:") {
@@ -2385,8 +2385,8 @@ impl FakeIpDnsEngine {
         let domain = query.question.name.as_str();
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
 
-        // Built-in localhost resolution
-        if normalized == "localhost" {
+        // Built-in RFC 6761 localhost resolution (`localhost` and `*.localhost`)
+        if normalized == "localhost" || normalized.ends_with(".localhost") {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return match query.question.qtype {
                 QTYPE_A => Ok(query.build_response(
@@ -2403,6 +2403,19 @@ impl FakeIpDnsEngine {
                 )),
                 _ => Ok(query.build_response(raw_query, 0, 60, &[])),
             };
+        }
+
+        // Built-in RFC 6761 `.invalid` and malformed literal SDK hostnames (`"null"`, `"undefined"`):
+        // return instant local NXDOMAIN (RCODE=3) without allocating Fake-IP or leaking upstream.
+        if normalized.is_empty()
+            || normalized == "invalid"
+            || normalized.ends_with(".invalid")
+            || normalized == "null"
+            || normalized == "undefined"
+        {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.nxdomain_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(query.build_response(raw_query, 3, 60, &[]));
         }
 
         // Enforce `dns.ipv6: false` across ALL modes so IPv6 queries never leak or stall Happy-Eyeballs
@@ -3769,5 +3782,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn handle_dns_packet_resolves_subdomain_localhost_and_short_circuits_invalid_or_null() {
+        // Point nameserver to an unroutable port that never answers so any upstream leak fails/stalls
+        let dead_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_udp.local_addr().unwrap();
+        let cfg = DnsConfig {
+            ipv6: true,
+            nameserver: vec![dead_addr.to_string()],
+            fallback: Vec::new(),
+            ..Default::default()
+        };
+
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        // 1. `tauri.localhost` resolves locally to 127.0.0.1 / ::1 without upstream traffic
+        let q_local_a = build_dns_query(0x4101, "tauri.localhost", QTYPE_A);
+        let resp_local_a = engine.handle_dns_packet(&q_local_a).await.unwrap();
+        let meta_local_a = crate::dns::wire::extract_dns_response_meta(&resp_local_a).unwrap();
+        assert_eq!(meta_local_a.rcode, 0);
+        assert_eq!(
+            meta_local_a.answers,
+            vec![DnsAnswerData::A(Ipv4Addr::LOCALHOST)]
+        );
+
+        let q_local_aaaa = build_dns_query(0x4102, "api.localhost", QTYPE_AAAA);
+        let resp_local_aaaa = engine.handle_dns_packet(&q_local_aaaa).await.unwrap();
+        let meta_local_aaaa =
+            crate::dns::wire::extract_dns_response_meta(&resp_local_aaaa).unwrap();
+        assert_eq!(meta_local_aaaa.rcode, 0);
+        assert_eq!(
+            meta_local_aaaa.answers,
+            vec![DnsAnswerData::Aaaa(Ipv6Addr::LOCALHOST)]
+        );
+
+        // 2. `"null"`, `"undefined"`, and `"*.invalid"` immediately return local NXDOMAIN (rcode=3)
+        //    with zero Fake-IP allocations and zero upstream queries.
+        for (idx, bad_host) in ["null", "undefined", "invalid", "sub-blocked.invalid"]
+            .into_iter()
+            .enumerate()
+        {
+            let q = build_dns_query(0x4200 + idx as u16, bad_host, QTYPE_A);
+            let resp = engine.handle_dns_packet(&q).await.unwrap();
+            let meta = crate::dns::wire::extract_dns_response_meta(&resp).unwrap();
+            assert_eq!(meta.rcode, 3, "expected NXDOMAIN for {bad_host}");
+            assert!(meta.answers.is_empty());
+        }
+
+        let snap = engine.telemetry_snapshot();
+        assert_eq!(snap.active_fake_ip_entries, 0);
+        assert_eq!(snap.upstream_queries, 0);
+        assert_eq!(snap.nxdomain_hits, 4);
     }
 }
