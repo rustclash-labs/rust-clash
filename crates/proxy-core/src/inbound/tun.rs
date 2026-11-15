@@ -1315,6 +1315,15 @@ impl OsTunGuard {
             s.stop();
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_session(
+        session: Box<dyn crate::platform::tun::SystemTunSession>,
+    ) -> Self {
+        Self {
+            session: parking_lot::Mutex::new(Some(session)),
+        }
+    }
 }
 
 impl Drop for OsTunGuard {

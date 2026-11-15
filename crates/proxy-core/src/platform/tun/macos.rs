@@ -710,7 +710,7 @@ mod darwin_impl {
                             revents: 0,
                         };
                         // SAFETY: `pfd` references `utun_fd` which lives for the entire thread.
-                        if unsafe { libc::poll(&raw mut pfd, 1, 200) } <= 0 {
+                        if unsafe { libc::poll(&raw mut pfd, 1, 50) } <= 0 {
                             continue;
                         }
                         loop {
@@ -824,11 +824,11 @@ mod darwin_impl {
                 .name("tun-macos-netwatch".into())
                 .spawn(move || {
                     while !stop_watch.load(Ordering::Acquire) {
-                        for _ in 0..15 {
+                        for _ in 0..60 {
                             if stop_watch.load(Ordering::Acquire) {
                                 return;
                             }
-                            std::thread::sleep(Duration::from_millis(200));
+                            std::thread::sleep(Duration::from_millis(50));
                         }
                         if stop_watch.load(Ordering::Acquire) {
                             return;

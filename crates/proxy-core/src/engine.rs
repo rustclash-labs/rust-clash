@@ -3974,13 +3974,28 @@ impl ProxyEngine {
 
     pub fn shutdown(&self) {
         let (already_shutting_down, detached_os_tun) = self.begin_shutdown_signals();
-        if already_shutting_down
-            && detached_os_tun.is_none()
-            && self
-                .services
-                .try_lock()
-                .is_ok_and(|g| g.tun.is_none() && g.dns.is_none() && g.mixed.task.is_none())
-        {
+        if let Some(os_guard) = detached_os_tun {
+            os_guard.stop_now();
+        }
+        if let Ok(mut guard) = self.services.try_lock() {
+            let _ = guard.mixed.shutdown_tx.send(true);
+            let _ = guard.mixed.task.take();
+            if let Some(mut t) = guard.tun.take() {
+                let _ = t.shutdown_tx.send(true);
+                if let Some(os_g) = t.os_guard.take() {
+                    os_g.stop_now();
+                }
+            }
+            if let Some(d) = guard.dns.take() {
+                let _ = d.shutdown_tx.send(true);
+            }
+            drop(guard);
+            if let Some(late_guard) = self.active_os_tun.write().take() {
+                late_guard.stop_now();
+            }
+            return;
+        }
+        if already_shutting_down {
             return;
         }
 
@@ -3988,9 +4003,6 @@ impl ProxyEngine {
             let services_arc = Arc::clone(&self.services);
             let active_os_tun_arc = Arc::clone(&self.active_os_tun);
             rt_handle.spawn(async move {
-                if let Some(os_guard) = detached_os_tun {
-                    let _ = tokio::task::spawn_blocking(move || os_guard.stop_now()).await;
-                }
                 if let Ok(mut guard) =
                     tokio::time::timeout(Duration::from_secs(5), services_arc.lock()).await
                 {
@@ -4008,13 +4020,11 @@ impl ProxyEngine {
                 }
             });
         } else {
-            if let Some(os_guard) = detached_os_tun {
-                os_guard.stop_now();
-            }
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 if let Ok(mut guard) = self.services.try_lock() {
                     let _ = guard.mixed.shutdown_tx.send(true);
+                    let _ = guard.mixed.task.take();
                     if let Some(mut t) = guard.tun.take() {
                         let _ = t.shutdown_tx.send(true);
                         if let Some(os_g) = t.os_guard.take() {
@@ -4428,6 +4438,57 @@ mod tests {
 
         engine.shutdown_async().await;
         assert!(vtun.ingress_tx.is_closed());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_tears_down_os_tun_synchronously_even_inside_tokio_runtime() {
+        struct SlowStopMockTunSession {
+            stopped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl crate::platform::tun::SystemTunSession for SlowStopMockTunSession {
+            fn health(&self) -> crate::platform::tun::TunHealthSnapshot {
+                crate::platform::tun::TunHealthSnapshot::default()
+            }
+            fn stop(&mut self) {
+                std::thread::sleep(Duration::from_millis(60));
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("rustclash-sync-stop-{}", Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).expect("starter yaml");
+        cfg.mixed_port = 0;
+        cfg.dns.enable = false;
+        cfg.tun.enable = false;
+
+        let engine = ProxyEngine::start_with_options(
+            cfg,
+            temp_dir.clone(),
+            PreconnectPolicy::Disabled,
+            None,
+            None,
+        )
+        .await
+        .expect("start engine");
+
+        let stopped_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mock_guard = Arc::new(OsTunGuard::from_test_session(Box::new(
+            SlowStopMockTunSession {
+                stopped: Arc::clone(&stopped_flag),
+            },
+        )));
+        *engine.active_os_tun.write() = Some(mock_guard);
+
+        engine.shutdown();
+        assert!(
+            stopped_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "ProxyEngine::shutdown() must synchronously finish OsTunGuard::stop_now() before returning"
+        );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

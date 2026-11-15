@@ -778,7 +778,7 @@ impl LinuxSystemTunSession {
                         revents: 0,
                     };
                     // SAFETY: `pfd` references `f`'s valid fd for the duration of `poll`.
-                    let prc = unsafe { libc::poll(&raw mut pfd, 1, 200) };
+                    let prc = unsafe { libc::poll(&raw mut pfd, 1, 50) };
                     if prc <= 0 {
                         continue;
                     }
@@ -880,11 +880,11 @@ impl LinuxSystemTunSession {
             .name("tun-linux-netwatch".into())
             .spawn(move || {
                 while !stop_watch.load(Ordering::Acquire) {
-                    for _ in 0..15 {
+                    for _ in 0..60 {
                         if stop_watch.load(Ordering::Acquire) {
                             return;
                         }
-                        std::thread::sleep(Duration::from_millis(200));
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     let latest = detect_linux_default_egress();
                     let mut guard = egress_watch.lock();
