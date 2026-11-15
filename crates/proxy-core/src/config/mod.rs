@@ -726,12 +726,16 @@ dns:
     - 223.5.5.5:53
     - 119.29.29.29:53
     - 1.1.1.1:53
+    - https://223.5.5.5/dns-query
   direct-nameserver:
     - 223.5.5.5:53
     - 119.29.29.29:53
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
   nameserver:
     - 223.5.5.5:53
     - 119.29.29.29:53
+    - https://223.5.5.5/dns-query
     - 1.1.1.1:53
 tun:
   enable: false
@@ -1891,6 +1895,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut YamlMap, lenient_subscription: bo
                 *seq = vec![
                     YamlValue::String("223.5.5.5:53".to_string()),
                     YamlValue::String("119.29.29.29:53".to_string()),
+                    YamlValue::String("https://223.5.5.5/dns-query".to_string()),
                     YamlValue::String("1.1.1.1:53".to_string()),
                 ];
             }
@@ -1926,6 +1931,7 @@ fn normalize_clash_yaml_root_mapping(map: &mut YamlMap, lenient_subscription: bo
                         YamlValue::String("223.5.5.5:53".to_string()),
                         YamlValue::String("119.29.29.29:53".to_string()),
                         YamlValue::String("1.1.1.1:53".to_string()),
+                        YamlValue::String("https://223.5.5.5/dns-query".to_string()),
                     ]),
                 );
             }
@@ -3077,6 +3083,15 @@ pub fn default_fake_ip_filter() -> Vec<String> {
         "stun*.l.google.com".to_string(),
         "+.pool.ntp.org".to_string(),
         "time.*.com".to_string(),
+    ]
+}
+
+pub fn default_smart_cn_direct_nameservers() -> Vec<String> {
+    vec![
+        "223.5.5.5:53".to_string(),
+        "119.29.29.29:53".to_string(),
+        "https://223.5.5.5/dns-query".to_string(),
+        "https://1.12.12.12/dns-query".to_string(),
     ]
 }
 

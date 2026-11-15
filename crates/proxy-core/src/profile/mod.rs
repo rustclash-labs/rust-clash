@@ -986,13 +986,41 @@ impl ProfileManager {
                     if is_legacy_fake_ip_filter {
                         cfg.dns.fake_ip_filter = crate::config::default_fake_ip_filter();
                     }
+                    let mut dns_upgraded = false;
+                    if can_upgrade_legacy
+                        && cfg.dns.direct_nameserver == ["223.5.5.5:53", "119.29.29.29:53"]
+                    {
+                        cfg.dns.direct_nameserver =
+                            crate::config::default_smart_cn_direct_nameservers();
+                        dns_upgraded = true;
+                    }
+                    if can_upgrade_legacy
+                        && cfg.dns.nameserver == ["223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"]
+                    {
+                        cfg.dns.nameserver = vec![
+                            "223.5.5.5:53".to_string(),
+                            "119.29.29.29:53".to_string(),
+                            "https://223.5.5.5/dns-query".to_string(),
+                            "1.1.1.1:53".to_string(),
+                        ];
+                        dns_upgraded = true;
+                    }
+                    if can_upgrade_legacy
+                        && cfg.dns.default_nameserver
+                            == ["223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"]
+                    {
+                        cfg.dns
+                            .default_nameserver
+                            .push("https://223.5.5.5/dns-query".to_string());
+                        dns_upgraded = true;
+                    }
                     if can_upgrade_legacy
                         && let Some(target_grp) = detect_untouched_legacy_starter_group(&cfg)
                     {
                         cfg.rules = ClashConfig::smart_cn_rules_for_group(&target_grp);
                         if cfg.dns.direct_nameserver.is_empty() {
                             cfg.dns.direct_nameserver =
-                                vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()];
+                                crate::config::default_smart_cn_direct_nameservers();
                         }
                         if cfg.dns.nameserver
                             == vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()]
@@ -1000,6 +1028,7 @@ impl ProfileManager {
                             cfg.dns.nameserver = vec![
                                 "223.5.5.5:53".to_string(),
                                 "119.29.29.29:53".to_string(),
+                                "https://223.5.5.5/dns-query".to_string(),
                                 "https://dns.alidns.com/dns-query".to_string(),
                                 "1.1.1.1:53".to_string(),
                             ];
@@ -1016,7 +1045,7 @@ impl ProfileManager {
                             dirty = true;
                             continue;
                         }
-                    } else if is_legacy_fake_ip_filter
+                    } else if (is_legacy_fake_ip_filter || dns_upgraded)
                         && validate_profile_config(&cfg, &extra_ca_der).is_ok()
                         && let Ok(new_yaml) = cfg.to_yaml_string()
                     {
@@ -1410,7 +1439,7 @@ impl ProfileManager {
                 cfg.rules = ClashConfig::smart_cn_rules_for_group(&primary);
                 if cfg.dns.direct_nameserver.is_empty() {
                     cfg.dns.direct_nameserver =
-                        vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()];
+                        crate::config::default_smart_cn_direct_nameservers();
                 }
                 RulePreset::SmartCn
             }
@@ -2552,7 +2581,7 @@ impl ProfileManager {
                     cfg.rules = ClashConfig::smart_cn_rules_for_group(&primary);
                     if cfg.dns.direct_nameserver.is_empty() {
                         cfg.dns.direct_nameserver =
-                            vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()];
+                            crate::config::default_smart_cn_direct_nameservers();
                     }
                     cfg_mutated = true;
                 }
@@ -4542,6 +4571,77 @@ rules:
         );
         assert_eq!(preview.effective_outbound, "HK-Node");
         assert_eq!(preview.exit_type, "PROXY");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_v048_smart_cn_share_uris_profile_upgrades_direct_nameserver_doh_fallbacks_without_touching_custom()
+     {
+        let dir = std::env::temp_dir().join(format!("rc-v048-direct-doh-{}", Uuid::new_v4()));
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+        let u1 = Uuid::new_v4();
+        mgr.import_nodes_to_active(
+            &format!("vless://{u1}@127.0.0.1:18443?security=none#SG-Node"),
+            true,
+            true,
+        )
+        .unwrap();
+        let active_id = mgr.active_profile_id();
+        let yaml_path = mgr.profile_yaml_path(&active_id);
+
+        // Simulate a v0.4.8 ShareUris + SmartCn profile on disk with plain UDP-only direct-nameserver
+        let (mut cfg, _) = mgr.load_active_config().unwrap();
+        cfg.dns.direct_nameserver = vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()];
+        cfg.dns.nameserver = vec![
+            "223.5.5.5:53".to_string(),
+            "119.29.29.29:53".to_string(),
+            "1.1.1.1:53".to_string(),
+        ];
+        fs::write(&yaml_path, cfg.to_yaml_string().unwrap()).unwrap();
+        drop(mgr);
+
+        let reopened = ProfileManager::open_or_init(&dir).unwrap();
+        let (upgraded, _) = reopened.load_active_config().unwrap();
+        assert_eq!(
+            upgraded.dns.direct_nameserver,
+            crate::config::default_smart_cn_direct_nameservers()
+        );
+        assert!(
+            upgraded
+                .dns
+                .direct_nameserver
+                .contains(&"https://223.5.5.5/dns-query".to_string())
+        );
+        assert!(
+            upgraded
+                .dns
+                .direct_nameserver
+                .contains(&"https://1.12.12.12/dns-query".to_string())
+        );
+        assert!(
+            upgraded
+                .dns
+                .nameserver
+                .contains(&"https://223.5.5.5/dns-query".to_string())
+        );
+
+        // Switch to Custom preset with UDP-only direct_nameserver and verify reopen NEVER overwrites Custom
+        reopened
+            .apply_routing_preset(RoutingPresetChoice::Custom)
+            .unwrap();
+        let (mut custom_cfg, _) = reopened.load_active_config().unwrap();
+        custom_cfg.dns.direct_nameserver =
+            vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()];
+        fs::write(&yaml_path, custom_cfg.to_yaml_string().unwrap()).unwrap();
+        drop(reopened);
+
+        let reopened_custom = ProfileManager::open_or_init(&dir).unwrap();
+        let (preserved_custom, _) = reopened_custom.load_active_config().unwrap();
+        assert_eq!(
+            preserved_custom.dns.direct_nameserver,
+            vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

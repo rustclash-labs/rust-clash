@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io,
     net::SocketAddr,
     ops::Deref,
@@ -24,6 +24,7 @@ use crate::{addr::TargetAddr, config::uri::redact_sensitive_text, outbound::Outb
 
 const MAX_RECENT_DIAGNOSTICS: usize = 200;
 const MAX_DEBUG_DIAGNOSTICS: usize = 1_500;
+const MAX_FAILED_DIAGNOSTICS: usize = 300;
 const MAX_RECENT_LOGS: usize = 300;
 const MAX_DEBUG_LOGS: usize = 1_500;
 const MAX_IMPORTANT_LOGS: usize = 500;
@@ -303,6 +304,7 @@ pub struct TelemetryHub {
     connections: DashMap<String, Arc<ActiveConnection>>,
     activity_notify: Notify,
     recent_diagnostics: Mutex<VecDeque<ConnectionSnapshot>>,
+    failed_diagnostics: Mutex<VecDeque<ConnectionSnapshot>>,
     session_resetters: Mutex<Vec<Weak<dyn SessionResetter>>>,
     history: Mutex<VecDeque<TrafficPoint>>,
     recent_logs: Mutex<VecDeque<LogEntry>>,
@@ -342,6 +344,7 @@ impl TelemetryHub {
             connections: DashMap::new(),
             activity_notify: Notify::new(),
             recent_diagnostics: Mutex::new(VecDeque::with_capacity(MAX_RECENT_DIAGNOSTICS)),
+            failed_diagnostics: Mutex::new(VecDeque::with_capacity(MAX_FAILED_DIAGNOSTICS)),
             session_resetters: Mutex::new(Vec::new()),
             history: Mutex::new(VecDeque::with_capacity(120)),
             recent_logs: Mutex::new(VecDeque::with_capacity(MAX_RECENT_LOGS)),
@@ -610,23 +613,11 @@ impl TelemetryHub {
         conn
     }
 
-    fn archive_diagnostic(&self, snap: ConnectionSnapshot) {
-        if snap.status == "failed" {
-            self.failed_connections_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else if snap.connect_duration_ms.is_some() {
-            self.established_connections_total
-                .fetch_add(1, Ordering::Relaxed);
-            if snap.download == 0 && snap.upload > 0 {
-                self.zero_rx_closed_total.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let max_cap = if self.is_debug_mode() {
-            MAX_DEBUG_DIAGNOSTICS
-        } else {
-            MAX_RECENT_DIAGNOSTICS
-        };
-        let mut ring = self.recent_diagnostics.lock();
+    fn push_or_coalesce_diagnostic(
+        ring: &mut VecDeque<ConnectionSnapshot>,
+        snap: ConnectionSnapshot,
+        max_cap: usize,
+    ) {
         if snap.status == "failed"
             && let Some(existing) = ring.iter_mut().rev().take(16).find(|cand| {
                 cand.status == "failed"
@@ -648,6 +639,35 @@ impl TelemetryHub {
             ring.pop_front();
         }
         ring.push_back(snap);
+    }
+
+    fn archive_diagnostic(&self, snap: ConnectionSnapshot) {
+        let is_failed = snap.status == "failed";
+        if is_failed {
+            self.failed_connections_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else if snap.connect_duration_ms.is_some() {
+            self.established_connections_total
+                .fetch_add(1, Ordering::Relaxed);
+            if snap.download == 0 && snap.upload > 0 {
+                self.zero_rx_closed_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let max_cap = if self.is_debug_mode() {
+            MAX_DEBUG_DIAGNOSTICS
+        } else {
+            MAX_RECENT_DIAGNOSTICS
+        };
+        if is_failed {
+            let mut failed_ring = self.failed_diagnostics.lock();
+            Self::push_or_coalesce_diagnostic(
+                &mut failed_ring,
+                snap.clone(),
+                MAX_FAILED_DIAGNOSTICS,
+            );
+        }
+        let mut ring = self.recent_diagnostics.lock();
+        Self::push_or_coalesce_diagnostic(&mut ring, snap, max_cap);
     }
 
     pub fn record_connection_failed(&self, id: &str, raw_reason: &str) {
@@ -897,7 +917,8 @@ impl TelemetryHub {
     }
 
     /// Return active + archived connection snapshots overlapping `[since_epoch_ms, until_epoch_ms]`,
-    /// sorted newest-first and capped at `MAX_DEBUG_DIAGNOSTICS`.
+    /// sorted newest-first and capped at `MAX_DEBUG_DIAGNOSTICS`, while prioritizing `failed_diagnostics`
+    /// so high-volume routine `closed` churn never evicts failure root causes within a diagnostic window.
     pub fn diagnostics_in_window(
         &self,
         since_epoch_ms: u64,
@@ -913,25 +934,50 @@ impl TelemetryHub {
                 && (s.start_epoch_ms >= since_epoch_ms
                     || s.end_epoch_ms.is_none_or(|end| end >= since_epoch_ms))
         };
-        let mut combined: Vec<DiagnosticEntry> = self
-            .connections
-            .iter()
-            .map(|entry| entry.value().snapshot())
-            .filter(matches_window)
-            .collect();
-        {
-            let ring = self.recent_diagnostics.lock();
-            combined.extend(ring.iter().filter(|s| matches_window(s)).cloned());
+
+        let mut seen_ids = HashSet::new();
+        let mut selected: Vec<DiagnosticEntry> = {
+            let failed_ring = self.failed_diagnostics.lock();
+            failed_ring
+                .iter()
+                .rev()
+                .filter(|s| matches_window(s))
+                .take(cap)
+                .filter(|s| seen_ids.insert(s.id.clone()))
+                .cloned()
+                .collect()
+        };
+
+        let remaining = cap.saturating_sub(selected.len());
+        if remaining > 0 {
+            let mut others: Vec<DiagnosticEntry> = self
+                .connections
+                .iter()
+                .map(|entry| entry.value().snapshot())
+                .filter(|s| matches_window(s) && seen_ids.insert(s.id.clone()))
+                .collect();
+            {
+                let ring = self.recent_diagnostics.lock();
+                others.extend(
+                    ring.iter()
+                        .filter(|s| matches_window(s) && seen_ids.insert(s.id.clone()))
+                        .cloned(),
+                );
+            }
+            others.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
+            if others.len() > remaining {
+                others.truncate(remaining);
+            }
+            selected.extend(others);
         }
-        combined.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
-        if combined.len() > cap {
-            combined.truncate(cap);
-        }
-        combined
+
+        selected.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
+        selected
     }
 
     pub fn clear_diagnostics(&self) {
         self.recent_diagnostics.lock().clear();
+        self.failed_diagnostics.lock().clear();
     }
 
     pub fn totals(&self) -> (u64, u64) {
@@ -1567,5 +1613,88 @@ mod tests {
         assert!(!logs[1].payload.ends_with(" (x2)"));
         assert!(!logs[2].payload.ends_with(" (x2)"));
         assert!(!logs[3].payload.ends_with(" (x2)"));
+    }
+
+    #[test]
+    fn diagnostics_in_window_retains_failed_connections_across_high_volume_closed_churn() {
+        let hub = TelemetryHub::new();
+        hub.set_debug_mode(true);
+
+        let make_snap =
+            |id: &str, status: &str, start_ms: u64, err: Option<&str>| ConnectionSnapshot {
+                id: id.to_string(),
+                metadata: ConnectionMetadata {
+                    id: id.to_string(),
+                    network: "tcp".to_string(),
+                    inbound_type: "TUN(smoltcp)".to_string(),
+                    source: "198.18.0.1:50101".to_string(),
+                    destination_ip: None,
+                    destination_port: 443,
+                    host: format!("{id}.example.com"),
+                    fake_ip: Some("198.18.0.42".to_string()),
+                    process: None,
+                },
+                upload: 128,
+                download: if status == "failed" { 0 } else { 512 },
+                start_epoch_ms: start_ms,
+                chains: vec!["DIRECT".to_string()],
+                rule: "GEOSITE".to_string(),
+                rule_payload: "cn".to_string(),
+                effective_outbound: "DIRECT".to_string(),
+                effective_protocol: "direct".to_string(),
+                exit_type: "DIRECT".to_string(),
+                remote_endpoint: "223.5.5.5:443".to_string(),
+                status: status.to_string(),
+                error: err.map(String::from),
+                end_epoch_ms: Some(start_ms + 50),
+                connect_duration_ms: (status != "failed").then_some(20),
+                coalesced_count: 1,
+            };
+
+        // Record 2 failed connections early in the 30-minute slice, followed by 1,800 routine closed connections
+        hub.archive_diagnostic(make_snap(
+            "early-fail-1",
+            "failed",
+            1_000,
+            Some("direct-nameserver DNS resolution failed"),
+        ));
+        hub.archive_diagnostic(make_snap(
+            "early-fail-2",
+            "failed",
+            2_500,
+            Some("direct-nameserver DNS resolution failed"),
+        ));
+        for i in 0..1_800u64 {
+            hub.archive_diagnostic(make_snap(
+                &format!("closed-{i}"),
+                "closed",
+                10_000 + i * 10,
+                None,
+            ));
+        }
+
+        let window = hub.diagnostics_in_window(500, 50_000, MAX_DEBUG_DIAGNOSTICS);
+        assert_eq!(window.len(), MAX_DEBUG_DIAGNOSTICS);
+        let failed_in_window: Vec<&ConnectionSnapshot> =
+            window.iter().filter(|s| s.status == "failed").collect();
+        assert_eq!(
+            failed_in_window.len(),
+            2,
+            "failed connections in window must never be evicted by routine closed churn"
+        );
+        assert_eq!(failed_in_window[0].id, "early-fail-2");
+        assert_eq!(failed_in_window[1].id, "early-fail-1");
+
+        // Verify newest-first ordering and zero duplicate IDs
+        let mut seen = HashSet::new();
+        for pair in window.windows(2) {
+            assert!(pair[0].start_epoch_ms >= pair[1].start_epoch_ms);
+        }
+        for s in &window {
+            assert!(seen.insert(&s.id), "duplicate snapshot id {}", s.id);
+        }
+
+        hub.clear_diagnostics();
+        assert!(hub.diagnostics_in_window(0, u64::MAX, 100).is_empty());
     }
 }
