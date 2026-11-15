@@ -7,16 +7,27 @@ package io.github.rustclashlabs.rustclash.vpn
  * models on any host without requiring Android ART native libraries.
  */
 object NativeBridge {
-    val isNativeLoaded: Boolean by lazy {
-        try {
+    @Volatile
+    private var loadedState: Boolean? = null
+
+    val isLoadedFast: Boolean
+        get() = loadedState == true
+
+    val isNativeLoaded: Boolean
+        get() = ensureLoaded()
+
+    @Synchronized
+    fun ensureLoaded(): Boolean {
+        loadedState?.let { return it }
+        val loaded = try {
             System.loadLibrary("proxy_ffi")
             true
         } catch (_: UnsatisfiedLinkError) {
             false
         }
+        loadedState = loaded
+        return loaded
     }
-
-    fun ensureLoaded(): Boolean = isNativeLoaded
 
     external fun nativeStartVpn(
         vpnService: Any,

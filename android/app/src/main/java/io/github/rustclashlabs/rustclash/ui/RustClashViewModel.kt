@@ -15,6 +15,7 @@ import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.ThemePreference
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
+import io.github.rustclashlabs.rustclash.vpn.DebugLogSummaryUi
 import io.github.rustclashlabs.rustclash.vpn.NativeBridge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.PerAppMode
@@ -52,6 +53,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     val messages: SharedFlow<String> = _messages.asSharedFlow()
 
     private var tickerJob: Job? = null
+    private var refreshJob: Job? = null
     private var importJob: Job? = null
     private var importGeneration: Long = 0L
     private var previousVpnRunning: Boolean = false
@@ -61,7 +63,6 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         DebugLogManager.installCrashBreadcrumbHook(appContext)
-        DebugLogManager.syncNativeDebugFlag(appContext)
         refreshAll()
     }
 
@@ -94,7 +95,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         val demo = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
         val defaultSubSecs = prefs.getLong(RustClashVpnService.KEY_DEFAULT_SUB_AUTO_UPDATE_SECS, 86400L)
         return AppUiState(
-            nativeLoaded = NativeBridge.ensureLoaded(),
+            nativeLoaded = NativeBridge.isLoadedFast,
             vpnState = RustClashVpnService.stateTracker.state,
             lastError = RustClashVpnService.stateTracker.lastError,
             lockdownWarning = RustClashVpnService.lockdownWarning,
@@ -106,8 +107,11 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             defaultSubAutoUpdateSecs = defaultSubSecs,
             enableIpv6 = ipv6,
             demoMode = demo,
-            isBatteryOptimizationIgnored = queryIsBatteryOptimizationIgnored(),
-            debugLog = DebugLogManager.getStorageSummary(appContext),
+            isBatteryOptimizationIgnored = true,
+            debugLog = DebugLogSummaryUi(
+                enabled = DebugLogManager.isEnabled(appContext),
+                sliceIntervalSecs = DebugLogManager.getSliceIntervalSecs(appContext),
+            ),
         )
     }
 
@@ -241,22 +245,27 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun refreshAll() {
-        val batteryOptIgnored = queryIsBatteryOptimizationIgnored()
-        if (!NativeBridge.ensureLoaded()) {
+        if (refreshJob?.isActive == true) return
+        refreshJob = viewModelScope.launch {
+            val (nativeOk, batteryOptIgnored, debugSummary) = withContext(Dispatchers.IO) {
+                val loaded = NativeBridge.ensureLoaded()
+                if (loaded) {
+                    DebugLogManager.syncNativeDebugFlag(appContext)
+                }
+                val batteryOk = queryIsBatteryOptimizationIgnored()
+                val summary = DebugLogManager.getStorageSummary(appContext)
+                Triple(loaded, batteryOk, summary)
+            }
             _uiState.update {
                 it.copy(
-                    nativeLoaded = false,
+                    nativeLoaded = nativeOk,
                     isBatteryOptimizationIgnored = batteryOptIgnored,
-                    debugLog = DebugLogManager.getStorageSummary(appContext),
+                    debugLog = debugSummary,
                 )
             }
-            return
-        }
-        _uiState.update { it.copy(isBatteryOptimizationIgnored = batteryOptIgnored) }
-        viewModelScope.launch {
+            if (!nativeOk) return@launch
             syncSnapshotQuietly()
             refreshProfilesQuietly()
-            refreshDebugLogSummaryQuietly()
             pollLiveStatusAndDiagnostics(includeDiagnostics = true)
         }
     }
@@ -266,19 +275,10 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         val err = RustClashVpnService.stateTracker.lastError
         val warn = RustClashVpnService.lockdownWarning
 
-        if (!NativeBridge.ensureLoaded()) {
-            _uiState.update {
-                it.copy(
-                    nativeLoaded = false,
-                    vpnState = state,
-                    lastError = err,
-                    lockdownWarning = warn,
-                )
+        val result = withContext(Dispatchers.IO) {
+            if (!NativeBridge.ensureLoaded()) {
+                return@withContext null
             }
-            return
-        }
-
-        val (telemetry, diagnostics) = withContext(Dispatchers.IO) {
             val statusJson = if (state == VpnLifecycleState.RUNNING) {
                 NativeBridge.nativeGetStatusJson()
             } else {
@@ -294,6 +294,18 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             }
             parsedStatus to parsedDiag
         }
+        if (result == null) {
+            _uiState.update {
+                it.copy(
+                    nativeLoaded = false,
+                    vpnState = state,
+                    lastError = err,
+                    lockdownWarning = warn,
+                )
+            }
+            return
+        }
+        val (telemetry, diagnostics) = result
 
         val transitioned = previousVpnRunning != telemetry.running
         previousVpnRunning = telemetry.running
@@ -330,10 +342,10 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private suspend fun syncSnapshotQuietly() {
-        if (!NativeBridge.ensureLoaded()) return
         val raw = withContext(Dispatchers.IO) {
+            if (!NativeBridge.ensureLoaded()) return@withContext null
             NativeBridge.nativeGetNodeManagerSnapshot(stateDir)
-        }
+        } ?: return
         applyNodeManagerSnapshot(raw)
     }
 
@@ -380,10 +392,10 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private suspend fun refreshProfilesQuietly() {
-        if (!NativeBridge.ensureLoaded()) return
         val raw = withContext(Dispatchers.IO) {
+            if (!NativeBridge.ensureLoaded()) return@withContext null
             NativeBridge.nativeGetProfilesSnapshotJson(stateDir)
-        }
+        } ?: return
         val parsed = UiJsonParsers.parseProfilesSnapshot(raw) ?: return
         _uiState.update { prev ->
             prev.copy(

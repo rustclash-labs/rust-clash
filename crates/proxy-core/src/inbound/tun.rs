@@ -30,7 +30,10 @@ use tokio::{
 
 use crate::{
     addr::{HostName, TargetAddr},
-    inbound::udp_nat::UdpNatManager,
+    inbound::{
+        sniff::{MAX_SNIFF_BYTES, SniffOutcome, sniff_client_hello_or_http_host},
+        udp_nat::UdpNatManager,
+    },
     platform::process::SocketTransport,
     router::Router,
     tracker::{SessionResetter, TelemetryHub},
@@ -637,19 +640,31 @@ fn handle_ingress_packet(
                     {
                         let src_port = udp.src_port();
                         let dst_port = udp.dst_port();
-                        let payload = udp.payload().to_vec();
-                        spawn_tun_udp_handler(
-                            SocketAddr::new(IpAddr::V4(src_v4), src_port),
-                            SocketAddr::new(IpAddr::V4(dst_v4), dst_port),
-                            payload,
-                            shutting_down,
-                            egress_tx,
-                            udp_sem,
-                            udp_nat,
-                            router,
-                        );
+                        let dst_sock = SocketAddr::new(IpAddr::V4(dst_v4), dst_port);
+                        let is_unmapped_fake = dst_port != 53
+                            && router
+                                .read()
+                                .dns()
+                                .is_unmapped_fake_ip(&TargetAddr::from(dst_sock));
+                        if !is_unmapped_fake {
+                            let payload = udp.payload().to_vec();
+                            spawn_tun_udp_handler(
+                                SocketAddr::new(IpAddr::V4(src_v4), src_port),
+                                dst_sock,
+                                payload,
+                                shutting_down,
+                                egress_tx,
+                                udp_sem,
+                                udp_nat,
+                                router,
+                            );
+                            return;
+                        }
+                        // Unmapped Fake-IP UDP (non-53): fall through to `device.rx_queue` so
+                        // `smoltcp` `iface.poll()` immediately emits `ICMPv4 Destination Unreachable (PortUnreachable)`!
+                    } else {
+                        return;
                     }
-                    return;
                 }
                 IpProtocol::Tcp => {
                     if let Ok(tcp_pkt) = TcpPacket::new_checked(ip4.payload())
@@ -694,19 +709,26 @@ fn handle_ingress_packet(
                     let src_port = udp.src_port();
                     let dst_port = udp.dst_port();
                     let src_addr = SocketAddr::new(IpAddr::V6(src_v6), src_port);
-                    if dst_port == 53
-                        || !should_fast_reject_unreachable_direct_ipv6(
-                            src_addr,
-                            dst_v6,
-                            dst_port,
-                            SocketTransport::Udp,
-                            router,
-                        )
+                    let dst_sock = SocketAddr::new(IpAddr::V6(dst_v6), dst_port);
+                    let is_unmapped_fake = dst_port != 53
+                        && router
+                            .read()
+                            .dns()
+                            .is_unmapped_fake_ip(&TargetAddr::from(dst_sock));
+                    if !is_unmapped_fake
+                        && (dst_port == 53
+                            || !should_fast_reject_unreachable_direct_ipv6(
+                                src_addr,
+                                dst_v6,
+                                dst_port,
+                                SocketTransport::Udp,
+                                router,
+                            ))
                     {
                         let payload = udp.payload().to_vec();
                         spawn_tun_udp_handler(
                             src_addr,
-                            SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
+                            dst_sock,
                             payload,
                             shutting_down,
                             egress_tx,
@@ -716,8 +738,8 @@ fn handle_ingress_packet(
                         );
                         return;
                     }
-                    // Unreachable global-unicast DIRECT IPv6 UDP (non-53): fall through to
-                    // `device.rx_queue` so `smoltcp` `iface.poll()` immediately emits
+                    // Unreachable global-unicast DIRECT IPv6 UDP or unmapped Fake-IP UDP (non-53):
+                    // fall through to `device.rx_queue` so `smoltcp` `iface.poll()` immediately emits
                     // `ICMPv6 Destination Unreachable (PortUnreachable)` back to `egress_tx`!
                 }
                 IpProtocol::Tcp => {
@@ -941,12 +963,38 @@ fn register_syn_flow(
         }
 
         let raw_target = TargetAddr::from(tuple.dst);
+        let mut prefetched_first_payload: Option<Vec<u8>> = None;
+        let route_target = if current_router.dns().is_unmapped_fake_ip(&raw_target) {
+            match recover_unmapped_fake_ip_tcp(
+                tuple.dst,
+                &current_router,
+                &mut to_remote_rx,
+                &bridge_closed_tx,
+            )
+            .await
+            {
+                UnmappedFakeIpRecovery::BridgeClosed => return,
+                UnmappedFakeIpRecovery::Recovered { domain, payload } => {
+                    prefetched_first_payload = Some(payload);
+                    if !current_router.dns().is_unmapped_fake_ip(&raw_target) {
+                        raw_target.clone()
+                    } else {
+                        TargetAddr::new_domain(domain, tuple.dst.port())
+                            .unwrap_or_else(|_| raw_target.clone())
+                    }
+                }
+                UnmappedFakeIpRecovery::Failed => raw_target.clone(),
+            }
+        } else {
+            raw_target.clone()
+        };
+
         let decision = current_router
             .route_async_with_context(
                 Some(tuple.src.ip()),
                 Some(tuple.src),
                 crate::platform::process::SocketTransport::Tcp,
-                &raw_target,
+                &route_target,
             )
             .await;
         let conn_guard = hub_clone.register_connection_with_outbound_guard(
@@ -1036,51 +1084,47 @@ fn register_syn_flow(
 
         let writer_fut = async move {
             let drain_and_shutdown = async {
-                // Coalesce client-speaks-first payload (TLS ClientHello / HTTP GET) for up to 15ms
-                // for 0-RTT proxy framing, then flush pending proxy target headers if no payload
-                // arrived so server-speaks-first protocols (SSH, SMTP, FTP, MySQL) never deadlock.
+                // If an initial payload was prefetched while recovering an unmapped Fake-IP,
+                // flush it immediately; otherwise coalesce client-speaks-first payload for up
+                // to 15ms for 0-RTT proxy framing before flushing pending proxy headers.
                 let mut client_eof = false;
-                match tokio::time::timeout(Duration::from_millis(15), to_remote_rx.recv()).await {
-                    Ok(Some(first_chunk)) => {
-                        if wr.write_all(&first_chunk).await.is_err() {
-                            return;
-                        }
-                        let mut write_failed = false;
-                        while let Ok(more) = to_remote_rx.try_recv() {
-                            if wr.write_all(&more).await.is_err() {
-                                write_failed = true;
-                                break;
+                if let Some(first_chunk) = prefetched_first_payload {
+                    if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else {
+                    match tokio::time::timeout(Duration::from_millis(15), to_remote_rx.recv()).await
+                    {
+                        Ok(Some(first_chunk)) => {
+                            if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx)
+                                .await
+                                .is_err()
+                            {
+                                return;
                             }
                         }
-                        if write_failed || wr.flush().await.is_err() {
-                            return;
+                        Ok(None) => {
+                            client_eof = true;
+                            if wr.flush().await.is_err() {
+                                return;
+                            }
                         }
-                    }
-                    Ok(None) => {
-                        client_eof = true;
-                        if wr.flush().await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        if wr.flush().await.is_err() {
-                            return;
+                        Err(_) => {
+                            if wr.flush().await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
                 if !client_eof {
                     while let Some(first_chunk) = to_remote_rx.recv().await {
-                        if wr.write_all(&first_chunk).await.is_err() {
-                            return;
-                        }
-                        let mut write_failed = false;
-                        while let Ok(more) = to_remote_rx.try_recv() {
-                            if wr.write_all(&more).await.is_err() {
-                                write_failed = true;
-                                break;
-                            }
-                        }
-                        if write_failed || wr.flush().await.is_err() {
+                        if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx)
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -1146,6 +1190,70 @@ fn register_syn_flow(
             task_abort: flow_task.abort_handle(),
         },
     );
+}
+
+enum UnmappedFakeIpRecovery {
+    Recovered { domain: String, payload: Vec<u8> },
+    Failed,
+    BridgeClosed,
+}
+
+async fn recover_unmapped_fake_ip_tcp(
+    dst: SocketAddr,
+    router: &Router,
+    to_remote_rx: &mut mpsc::Receiver<Vec<u8>>,
+    bridge_closed_tx: &watch::Sender<()>,
+) -> UnmappedFakeIpRecovery {
+    const UNMAPPED_SNIFF_TIMEOUT: Duration = Duration::from_millis(250);
+    let mut buf = Vec::new();
+    let deadline = tokio::time::Instant::now() + UNMAPPED_SNIFF_TIMEOUT;
+
+    loop {
+        let chunk_res = tokio::select! {
+            biased;
+            _ = bridge_closed_tx.closed() => return UnmappedFakeIpRecovery::BridgeClosed,
+            _ = tokio::time::sleep_until(deadline) => return UnmappedFakeIpRecovery::Failed,
+            recv = to_remote_rx.recv() => recv,
+        };
+        let Some(chunk) = chunk_res else {
+            return UnmappedFakeIpRecovery::Failed;
+        };
+        let remain = MAX_SNIFF_BYTES.saturating_sub(buf.len());
+        buf.extend_from_slice(&chunk[..chunk.len().min(remain)]);
+        match sniff_client_hello_or_http_host(&buf) {
+            SniffOutcome::Domain(domain) => {
+                let fake_v4 = match dst.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                };
+                if let Some(v4) = fake_v4 {
+                    let _ = router.dns().recover_unmapped_fake_ip(v4, &domain);
+                }
+                return UnmappedFakeIpRecovery::Recovered {
+                    domain,
+                    payload: buf,
+                };
+            }
+            SniffOutcome::NoHostname => return UnmappedFakeIpRecovery::Failed,
+            SniffOutcome::NeedMoreBytes => {
+                if buf.len() >= MAX_SNIFF_BYTES {
+                    return UnmappedFakeIpRecovery::Failed;
+                }
+            }
+        }
+    }
+}
+
+async fn write_payload_batch<W: AsyncWriteExt + Unpin>(
+    wr: &mut W,
+    first_chunk: &[u8],
+    to_remote_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> io::Result<()> {
+    wr.write_all(first_chunk).await?;
+    while let Ok(more) = to_remote_rx.try_recv() {
+        wr.write_all(&more).await?;
+    }
+    wr.flush().await
 }
 
 async fn serve_tun_tcp_dns_flow(
@@ -2011,5 +2119,159 @@ mod tests {
         .expect(
             "TUN shutdown must reset all UdpNatManager sessions so active_connection_count == 0",
         );
+    }
+
+    #[tokio::test]
+    async fn tun_recovers_unmapped_fake_ip_via_tls_sni_and_fast_rejects_unmapped_udp() {
+        struct CaptureDomainOutbound {
+            tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for CaptureDomainOutbound {
+            fn name(&self) -> &str {
+                "CaptureProxy"
+            }
+
+            fn protocol(&self) -> &'static str {
+                "MockProxy"
+            }
+
+            fn exit_category(&self) -> &'static str {
+                "PROXY"
+            }
+
+            fn udp_supported(&self) -> bool {
+                true
+            }
+
+            async fn connect_tcp(
+                &self,
+                target: &TargetAddr,
+            ) -> io::Result<crate::outbound::BoxedStream> {
+                let (client_half, mut server_half) = tokio::io::duplex(2048);
+                let target_str = target.to_string();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = server_half.read(&mut buf).await.unwrap_or(0);
+                    let _ = tx.send((target_str, buf[..n].to_vec()));
+                    let _ = server_half.shutdown().await;
+                });
+                Ok(Box::new(client_half))
+            }
+        }
+
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert(
+            "CaptureProxy".to_string(),
+            Arc::new(CaptureDomainOutbound { tx: captured_tx }),
+        );
+        let rules = vec!["MATCH,CaptureProxy".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &rules,
+                Arc::clone(&dns),
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, tun_task) =
+            spawn_userspace_tun(1500, router_slot, Arc::clone(&hub), shutdown_rx);
+
+        let client_ip = Ipv4Addr::new(198, 18, 0, 10);
+
+        // 1. Unmapped Fake-IP UDP (non-53) triggers immediate ICMPv4 PortUnreachable with zero failed conns
+        let unmapped_udp_ip = Ipv4Addr::new(198, 18, 9, 98);
+        let udp_pkt = build_ipv4_udp_packet(client_ip, 54001, unmapped_udp_ip, 443, b"quic-stale")
+            .expect("valid IPv4 UDP packet");
+        vtun.ingress_tx.send(udp_pkt).await.unwrap();
+
+        let icmp_pkt = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected immediate ICMPv4 Destination Unreachable")
+            .expect("egress packet");
+        let ip4_icmp = Ipv4Packet::new_checked(&icmp_pkt).unwrap();
+        assert_eq!(ip4_icmp.dst_addr(), client_ip);
+        assert_eq!(ip4_icmp.next_header(), IpProtocol::Icmp);
+        let icmp4 = smoltcp::wire::Icmpv4Packet::new_checked(ip4_icmp.payload()).unwrap();
+        assert_eq!(
+            icmp4.msg_type(),
+            smoltcp::wire::Icmpv4Message::DstUnreachable
+        );
+        assert_eq!(
+            smoltcp::wire::Icmpv4DstUnreachable::from(icmp4.msg_code()),
+            smoltcp::wire::Icmpv4DstUnreachable::PortUnreachable
+        );
+        assert_eq!(hub.failed_connections_total(), 0);
+
+        // 2. Unmapped Fake-IP TCP carrying TLS ClientHello recovers SNI & forwards full ClientHello
+        let stale_tcp_ip = Ipv4Addr::new(198, 18, 9, 99);
+        assert!(dns.lookup_domain(IpAddr::V4(stale_tcp_ip)).is_none());
+
+        let syn = build_ipv4_tcp_packet(
+            (client_ip, 54002),
+            (stale_tcp_ip, 443),
+            smoltcp::wire::TcpControl::Syn,
+            1000,
+            None,
+            &[],
+        );
+        vtun.ingress_tx.send(syn).await.unwrap();
+
+        let syn_ack_raw = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected SYN-ACK")
+            .expect("egress SYN-ACK");
+        let ip4_sa = Ipv4Packet::new_checked(&syn_ack_raw).unwrap();
+        let tcp_sa = TcpPacket::new_checked(ip4_sa.payload()).unwrap();
+        assert!(tcp_sa.syn() && tcp_sa.ack());
+        let srv_ack = tcp_sa.seq_number().0.wrapping_add(1);
+
+        let ack = build_ipv4_tcp_packet(
+            (client_ip, 54002),
+            (stale_tcp_ip, 443),
+            smoltcp::wire::TcpControl::None,
+            1001,
+            Some(srv_ack),
+            &[],
+        );
+        vtun.ingress_tx.send(ack).await.unwrap();
+
+        let chlo =
+            crate::inbound::sniff::test_helpers::build_tls_client_hello("recovered.example.com");
+        let data_pkt = build_ipv4_tcp_packet(
+            (client_ip, 54002),
+            (stale_tcp_ip, 443),
+            smoltcp::wire::TcpControl::Psh,
+            1001,
+            Some(srv_ack),
+            &chlo,
+        );
+        vtun.ingress_tx.send(data_pkt).await.unwrap();
+
+        let (routed_target, forwarded_bytes) =
+            tokio::time::timeout(Duration::from_secs(2), captured_rx.recv())
+                .await
+                .expect("expected recovered SNI flow to reach outbound")
+                .expect("captured payload");
+        assert_eq!(routed_target, "recovered.example.com:443");
+        assert_eq!(forwarded_bytes, chlo);
+        assert_eq!(
+            dns.lookup_domain(IpAddr::V4(stale_tcp_ip)).as_deref(),
+            Some("recovered.example.com")
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
     }
 }

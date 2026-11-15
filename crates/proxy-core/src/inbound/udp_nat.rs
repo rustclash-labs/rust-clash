@@ -505,6 +505,9 @@ impl UdpNatManager {
         if !outbound.udp_supported() {
             let reason = match outbound.exit_category() {
                 "REJECT" => "blocked by REJECT rule",
+                "ERROR" if outbound.name() == "UNMAPPED-FAKE-IP" => {
+                    "target is an unmapped or expired Fake-IP; please re-resolve DNS"
+                }
                 "ERROR" => "routing chain resolution error",
                 _ => "selected outbound does not support UDP relay",
             };

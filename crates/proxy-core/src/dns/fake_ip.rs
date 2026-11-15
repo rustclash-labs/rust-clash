@@ -266,7 +266,9 @@ impl PoolInner {
             Some(ip) => ip,
             None => {
                 if let Some((evicted_ip, evicted_domain)) = self.ip_to_domain.pop_lru() {
-                    self.domain_to_ip.remove(&evicted_domain);
+                    if self.domain_to_ip.get(&evicted_domain) == Some(&evicted_ip) {
+                        self.domain_to_ip.remove(&evicted_domain);
+                    }
                     evicted_ip
                 } else {
                     let fallback = Ipv4Addr::from(self.cursor);
@@ -280,8 +282,9 @@ impl PoolInner {
             }
         };
 
-        if let Some((_evicted_ip, evicted_domain)) = self.ip_to_domain.push(ip, normalized.clone())
+        if let Some((evicted_ip, evicted_domain)) = self.ip_to_domain.push(ip, normalized.clone())
             && evicted_domain != normalized
+            && self.domain_to_ip.get(&evicted_domain) == Some(&evicted_ip)
         {
             self.domain_to_ip.remove(&evicted_domain);
         }
@@ -303,8 +306,9 @@ impl PoolInner {
         {
             self.ip_to_domain.pop(&prev_ip);
         }
-        if let Some((_evicted_ip, evicted_domain)) = self.ip_to_domain.push(ip, normalized.clone())
+        if let Some((evicted_ip, evicted_domain)) = self.ip_to_domain.push(ip, normalized.clone())
             && evicted_domain != normalized
+            && self.domain_to_ip.get(&evicted_domain) == Some(&evicted_ip)
         {
             self.domain_to_ip.remove(&evicted_domain);
         }
@@ -316,6 +320,26 @@ impl PoolInner {
                 ip_u32 + 1
             };
         }
+        true
+    }
+
+    fn recover_unmapped(&mut self, ip: Ipv4Addr, domain: &str, net: Ipv4Net) -> bool {
+        let ip_u32 = u32::from(ip);
+        if !net.contains(&ip) || ip_u32 < self.start_host || ip_u32 > self.end_host {
+            return false;
+        }
+        if self.ip_to_domain.contains(&ip) {
+            return false;
+        }
+        let Some(normalized) = crate::inbound::sniff::normalize_valid_hostname(domain) else {
+            return false;
+        };
+        if let Some((evicted_ip, evicted_domain)) = self.ip_to_domain.push(ip, normalized.clone())
+            && self.domain_to_ip.get(&evicted_domain) == Some(&evicted_ip)
+        {
+            self.domain_to_ip.remove(&evicted_domain);
+        }
+        self.domain_to_ip.entry(normalized).or_insert(ip);
         true
     }
 
@@ -1254,6 +1278,24 @@ impl FakeIpDnsEngine {
             self.assignment_notify.notify_one();
         }
         ip
+    }
+
+    /// Re-associate an unmapped Fake-IP inside `fake-ip-range` with a recovered hostname
+    /// (for example from TLS ClientHello SNI or HTTP Host) without overwriting existing entries
+    /// or corrupting an already-assigned primary Fake-IP for that domain.
+    pub fn recover_unmapped_fake_ip(&self, ip: Ipv4Addr, domain: &str) -> bool {
+        let recovered = {
+            let mut guard = self.pool.lock();
+            let ok = guard.recover_unmapped(ip, domain, self.net);
+            if ok {
+                self.dirty_revision.fetch_add(1, Ordering::AcqRel);
+            }
+            ok
+        };
+        if recovered {
+            self.assignment_notify.notify_one();
+        }
+        recovered
     }
 
     pub fn has_unpersisted_entries(&self) -> bool {
@@ -4257,5 +4299,34 @@ mod tests {
         );
 
         srv_task.abort();
+    }
+
+    #[test]
+    fn recover_unmapped_fake_ip_preserves_existing_and_validates_inputs() {
+        let engine = FakeIpDnsEngine::new(&DnsConfig::default()).unwrap();
+        let active_ip = engine.assign_fake_ip("primary.example.com");
+
+        // Never overwrite an already-mapped Fake-IP
+        assert!(!engine.recover_unmapped_fake_ip(active_ip, "hijack.example.com"));
+        assert_eq!(
+            engine.lookup_domain(IpAddr::V4(active_ip)).as_deref(),
+            Some("primary.example.com")
+        );
+
+        // Reject reserved TUN addresses (.0, .1), outside-range IPs, and invalid hostnames
+        assert!(!engine.recover_unmapped_fake_ip(Ipv4Addr::new(198, 18, 0, 1), "bad.example.com"));
+        assert!(!engine.recover_unmapped_fake_ip(Ipv4Addr::new(8, 8, 8, 8), "bad.example.com"));
+        let stale_ip = Ipv4Addr::new(198, 18, 9, 55);
+        assert!(!engine.recover_unmapped_fake_ip(stale_ip, "198.18.1.2"));
+        assert!(!engine.recover_unmapped_fake_ip(stale_ip, "localhost"));
+
+        // Recovering a stale Fake-IP aliases the domain in ip_to_domain while keeping primary IP
+        assert!(engine.recover_unmapped_fake_ip(stale_ip, "Primary.Example.COM."));
+        assert_eq!(
+            engine.lookup_domain(IpAddr::V4(stale_ip)).as_deref(),
+            Some("primary.example.com")
+        );
+        assert_eq!(engine.lookup_ip("primary.example.com"), Some(active_ip));
+        assert!(engine.has_unpersisted_entries());
     }
 }
