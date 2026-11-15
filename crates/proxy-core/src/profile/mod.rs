@@ -437,8 +437,14 @@ fn extract_clash_deeplink_target(line: &str) -> Option<String> {
     None
 }
 
+const MAX_DEEPLINK_UNWRAPS: usize = 2;
+
 /// Unified input classifier distinguishing Share URIs, Base64 URI lists, Clash YAML, and HTTPS Subscription URLs.
 pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
+    classify_import_input_bounded(raw, 0)
+}
+
+fn classify_import_input_bounded(raw: &str, depth: usize) -> Result<(ImportInputKind, String)> {
     let trimmed = trim_bom_and_controls_str(raw);
     if trimmed.is_empty() {
         return Err(ProxyError::Config("import input cannot be empty".into()));
@@ -457,7 +463,12 @@ pub fn classify_import_input(raw: &str) -> Result<(ImportInputKind, String)> {
     if active_lines.len() == 1 {
         let single = active_lines[0];
         if let Some(extracted_url) = extract_clash_deeplink_target(single) {
-            return classify_import_input(&extracted_url);
+            if depth >= MAX_DEEPLINK_UNWRAPS {
+                return Err(ProxyError::Config(
+                    "nested clash:// deep link exceeded maximum unwrap depth".into(),
+                ));
+            }
+            return classify_import_input_bounded(&extracted_url, depth + 1);
         }
         let lower = single.to_ascii_lowercase();
         if lower.starts_with("https://") || lower.starts_with("http://") {
@@ -935,6 +946,20 @@ impl ProfileManager {
                     let can_upgrade_legacy =
                         matches!(p.kind, ProfileKind::Starter | ProfileKind::ShareUris)
                             || p.rule_preset == Some(RulePreset::SmartCn);
+                    let is_legacy_fake_ip_filter = can_upgrade_legacy
+                        && (cfg.dns.fake_ip_filter
+                            == ["localhost", "*.lan", "+.msftconnecttest.com"]
+                            || cfg.dns.fake_ip_filter
+                                == [
+                                    "localhost",
+                                    "*.lan",
+                                    "*.local",
+                                    "+.msftconnecttest.com",
+                                    "+.msftncsi.com",
+                                ]);
+                    if is_legacy_fake_ip_filter {
+                        cfg.dns.fake_ip_filter = crate::config::default_fake_ip_filter();
+                    }
                     if can_upgrade_legacy
                         && let Some(target_grp) = detect_untouched_legacy_starter_group(&cfg)
                     {
@@ -965,6 +990,11 @@ impl ProfileManager {
                             dirty = true;
                             continue;
                         }
+                    } else if is_legacy_fake_ip_filter
+                        && validate_profile_config(&cfg, &extra_ca_der).is_ok()
+                        && let Ok(new_yaml) = cfg.to_yaml_string()
+                    {
+                        let _ = write_atomic_with_backup(&yaml_path, &new_yaml);
                     }
                     if p.rule_preset.is_some() {
                         continue;
@@ -1385,17 +1415,38 @@ impl ProfileManager {
         raw_yaml_override: Option<&str>,
         selections_hint: Option<&HashMap<String, String>>,
     ) -> Result<HashMap<String, String>> {
+        let active_id = self.active_profile_id();
+        self.persist_profile_yaml(&active_id, cfg, raw_yaml_override, selections_hint)
+    }
+
+    pub fn persist_profile_yaml(
+        &self,
+        profile_id: &str,
+        cfg: &ClashConfig,
+        raw_yaml_override: Option<&str>,
+        selections_hint: Option<&HashMap<String, String>>,
+    ) -> Result<HashMap<String, String>> {
+        let profile_exists = self
+            .index
+            .lock()
+            .profiles
+            .iter()
+            .any(|p| p.id == profile_id);
+        if !profile_exists {
+            return Err(ProxyError::Config(format!(
+                "profile '{profile_id}' not found"
+            )));
+        }
         let (proxy_count, rule_count) = validate_profile_config(cfg, &self.extra_ca_der)?;
         let yaml = match raw_yaml_override {
             Some(s) => s.to_string(),
             None => cfg.to_yaml_string()?,
         };
-        let active_id = self.active_profile_id();
-        let path = self.profile_yaml_path(&active_id);
+        let path = self.profile_yaml_path(profile_id);
         write_atomic_with_backup(&path, &yaml)?;
         let detected_preset = classify_rule_preset(cfg);
 
-        let mut overlay = self.load_manual_overlay(&active_id);
+        let mut overlay = self.load_manual_overlay(profile_id);
         if !overlay.proxies.is_empty() {
             let mut synced_proxies = Vec::with_capacity(overlay.proxies.len());
             let mut synced_attachments = HashMap::new();
@@ -1416,13 +1467,13 @@ impl ProfileManager {
             }
             overlay.proxies = synced_proxies;
             overlay.group_attachments = synced_attachments;
-            self.save_manual_overlay(&active_id, &overlay)?;
+            self.save_manual_overlay(profile_id, &overlay)?;
         }
         let manual_proxy_count = overlay.proxies.len();
 
         let mut idx = self.index.lock();
         let mut final_selections = HashMap::new();
-        if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == active_id) {
+        if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == profile_id) {
             let mut merged = p.selected_groups.clone();
             if let Some(hint) = selections_hint {
                 for (k, v) in hint {
@@ -2344,6 +2395,9 @@ impl ProfileManager {
 
         match outcome {
             Ok((mut cfg, mut yaml, uinfo, skipped)) => {
+                let prev_cfg = ClashConfig::from_file(self.profile_yaml_path(id)).ok();
+                let mut cfg_mutated = false;
+
                 let overlay = self.load_manual_overlay(id);
                 if !overlay.proxies.is_empty() {
                     let mut manual_names = Vec::with_capacity(overlay.proxies.len());
@@ -2376,13 +2430,46 @@ impl ProfileManager {
                             }
                         }
                     }
-                    yaml = serde_saphyr::to_string(&cfg).map_err(|e| {
-                        ProxyError::Config(format!(
-                            "failed to serialize merged subscription YAML: {e}"
-                        ))
-                    })?;
+                    cfg_mutated = true;
                 }
                 let manual_proxy_count = overlay.proxies.len();
+
+                let mut fresh_custom_backup: Option<Vec<String>> = None;
+                if exists.rule_preset == Some(RulePreset::SmartCn) && !is_smart_cn_rule_list(&cfg) {
+                    fresh_custom_backup = Some(cfg.rules.clone());
+                    if cfg.proxy_groups.is_empty() {
+                        let mut proxies: Vec<String> =
+                            cfg.proxies.iter().map(|n| n.name().to_string()).collect();
+                        proxies.push("DIRECT".to_string());
+                        cfg.proxy_groups.push(ProxyGroupConfig {
+                            name: "PROXY".to_string(),
+                            group_type: ProxyGroupType::Select,
+                            proxies,
+                            url: "http://www.gstatic.com/generate_204".to_string(),
+                            interval: 300,
+                            tolerance: 50,
+                            strategy: None,
+                        });
+                    }
+                    let primary = primary_proxy_group_for_config(&cfg);
+                    cfg.rules = ClashConfig::smart_cn_rules_for_group(&primary);
+                    if cfg.dns.direct_nameserver.is_empty() {
+                        cfg.dns.direct_nameserver =
+                            vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()];
+                    }
+                    cfg_mutated = true;
+                }
+
+                if let Some(ref prev) = prev_cfg
+                    && cfg.mode != prev.mode
+                {
+                    cfg.mode = prev.mode;
+                    cfg_mutated = true;
+                }
+
+                if cfg_mutated {
+                    yaml = cfg.to_yaml_string()?;
+                }
 
                 let (proxy_count, rule_count) = validate_profile_config(&cfg, &self.extra_ca_der)?;
                 write_atomic_with_backup(&self.profile_yaml_path(id), &yaml)?;
@@ -2416,7 +2503,9 @@ impl ProfileManager {
                         p.rule_count = rule_count;
                         p.last_skipped_count = skipped.len();
                         p.rule_preset = Some(detected_preset);
-                        if detected_preset == RulePreset::Custom {
+                        if let Some(backup) = fresh_custom_backup {
+                            p.custom_rules_backup = backup;
+                        } else if detected_preset == RulePreset::Custom {
                             p.custom_rules_backup = cfg.rules.clone();
                         }
                         p.selected_groups =
@@ -3274,35 +3363,11 @@ fn parse_http11_response(raw: &[u8]) -> Result<(u16, HttpHeaderList, Vec<u8>)> {
 
     let body_raw = &raw[hdr_end + 4..];
     let body = if is_chunked {
-        decode_chunked_body(body_raw)?
+        crate::config::decode_http_chunked_body(body_raw, MAX_SUBSCRIPTION_BYTES)?
     } else {
         body_raw.to_vec()
     };
     Ok((status, headers, body))
-}
-
-fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    while let Some(crlf) = input.windows(2).position(|w| w == b"\r\n") {
-        let len_str = std::str::from_utf8(&input[..crlf])
-            .unwrap_or("")
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
-        let chunk_len = usize::from_str_radix(len_str, 16)
-            .map_err(|_| ProxyError::Config("invalid chunked transfer length".into()))?;
-        input = &input[crlf + 2..];
-        if chunk_len == 0 {
-            break;
-        }
-        if input.len() < chunk_len + 2 {
-            return Err(ProxyError::Config("truncated chunked HTTP response".into()));
-        }
-        out.extend_from_slice(&input[..chunk_len]);
-        input = &input[chunk_len + 2..];
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -63,7 +63,7 @@ fn is_important_log(level: &str, payload: &str) -> bool {
     sev >= 2 || !is_routine_connection_log(payload)
 }
 
-fn split_tun_coalesce_suffix(s: &str) -> (&str, u64) {
+fn split_coalesce_suffix(s: &str) -> (&str, u64) {
     if let Some(without_close) = s.strip_suffix(')')
         && let Some((base, count_str)) = without_close.rsplit_once(" (x")
         && !count_str.is_empty()
@@ -81,7 +81,7 @@ fn tun_log_coalesce_key<'a>(level: &str, payload: &'a str) -> Option<(&'a str, &
         return None;
     }
     let after_tun = payload.strip_prefix("[TUN] ")?;
-    let (clean, _) = split_tun_coalesce_suffix(after_tun);
+    let (clean, _) = split_coalesce_suffix(after_tun);
     let (src_part, rest) = clean.split_once(" -> ")?;
     let (proto_prefix, client_addr) = if let Some(addr) = src_part.strip_prefix("TCP ") {
         ("TCP", addr)
@@ -99,6 +99,21 @@ fn tun_log_coalesce_key<'a>(level: &str, payload: &'a str) -> Option<(&'a str, &
         return None;
     }
     Some((proto_prefix, rest))
+}
+
+fn diag_log_coalesce_key<'a>(level: &str, payload: &'a str) -> Option<&'a str> {
+    if !matches!(
+        level.trim().to_ascii_lowercase().as_str(),
+        "warn" | "warning"
+    ) {
+        return None;
+    }
+    let after_diag = payload.strip_prefix("[DIAG] ")?;
+    let (clean, _) = split_coalesce_suffix(after_diag);
+    if clean.is_empty() {
+        return None;
+    }
+    Some(clean)
 }
 
 fn default_coalesced_count() -> u64 {
@@ -406,7 +421,8 @@ impl TelemetryHub {
         } else {
             crate::platform::process::SocketTransport::Tcp
         };
-        crate::platform::process::find_local_process(transport, sa).map(|info| info.name)
+        crate::platform::process::find_local_process_nonblocking(transport, sa)
+            .map(|info| info.name)
     }
 
     fn infer_exit_type_from_leaf(leaf: &str) -> &'static str {
@@ -612,17 +628,18 @@ impl TelemetryHub {
         };
         let mut ring = self.recent_diagnostics.lock();
         if snap.status == "failed"
-            && let Some(back) = ring.back_mut()
-            && back.status == "failed"
-            && back.metadata.network == snap.metadata.network
-            && back.metadata.host == snap.metadata.host
-            && back.metadata.destination_port == snap.metadata.destination_port
-            && back.effective_outbound == snap.effective_outbound
-            && back.error == snap.error
-            && snap.start_epoch_ms.saturating_sub(back.start_epoch_ms) < 1_000
+            && let Some(existing) = ring.iter_mut().rev().take(16).find(|cand| {
+                cand.status == "failed"
+                    && cand.metadata.network == snap.metadata.network
+                    && cand.metadata.host == snap.metadata.host
+                    && cand.metadata.destination_port == snap.metadata.destination_port
+                    && cand.effective_outbound == snap.effective_outbound
+                    && cand.error == snap.error
+                    && snap.start_epoch_ms.saturating_sub(cand.start_epoch_ms) < 1_000
+            })
         {
-            back.end_epoch_ms = snap.end_epoch_ms;
-            back.coalesced_count = back
+            existing.end_epoch_ms = snap.end_epoch_ms;
+            existing.coalesced_count = existing
                 .coalesced_count
                 .saturating_add(snap.coalesced_count.max(1));
             return;
@@ -989,32 +1006,63 @@ impl TelemetryHub {
             payload: payload.into(),
         };
         let important = is_important_log(&entry.level, &entry.payload);
+        let tun_key = tun_log_coalesce_key(&entry.level, &entry.payload);
+        let diag_key = diag_log_coalesce_key(&entry.level, &entry.payload);
+        let mut coalesced = false;
         {
             let mut logs = self.recent_logs.lock();
-            if let Some(key) = tun_log_coalesce_key(&entry.level, &entry.payload)
-                && let Some(back) = logs.back_mut()
-                && tun_log_coalesce_key(&back.level, &back.payload) == Some(key)
-                && timestamp_ms.saturating_sub(back.timestamp_ms) < 1_000
+            if let Some(key) = tun_key
+                && let Some(existing) = logs.iter_mut().rev().take(16).find(|cand| {
+                    tun_log_coalesce_key(&cand.level, &cand.payload) == Some(key)
+                        && timestamp_ms.saturating_sub(cand.timestamp_ms) < 1_000
+                })
             {
-                let (base_payload, prev_count) = split_tun_coalesce_suffix(&back.payload);
+                let (base_payload, prev_count) = split_coalesce_suffix(&existing.payload);
                 let new_count = prev_count.saturating_add(1);
-                back.timestamp_ms = timestamp_ms;
-                back.payload = format!("{base_payload} (x{new_count})");
+                existing.timestamp_ms = timestamp_ms;
+                existing.payload = format!("{base_payload} (x{new_count})");
                 return;
             }
-            while logs.len() >= max_logs {
-                logs.pop_front();
+            if let Some(dkey) = diag_key
+                && let Some(existing) = logs.iter_mut().rev().take(16).find(|cand| {
+                    diag_log_coalesce_key(&cand.level, &cand.payload) == Some(dkey)
+                        && timestamp_ms.saturating_sub(cand.timestamp_ms) < 1_000
+                })
+            {
+                let (base_payload, prev_count) = split_coalesce_suffix(&existing.payload);
+                let new_count = prev_count.saturating_add(1);
+                existing.timestamp_ms = timestamp_ms;
+                existing.payload = format!("{base_payload} (x{new_count})");
+                coalesced = true;
+            } else {
+                while logs.len() >= max_logs {
+                    logs.pop_front();
+                }
+                logs.push_back(entry.clone());
             }
-            logs.push_back(entry.clone());
         }
         if important {
             let mut imp = self.important_logs.lock();
+            if let Some(dkey) = diag_key
+                && let Some(existing) = imp.iter_mut().rev().take(16).find(|cand| {
+                    diag_log_coalesce_key(&cand.level, &cand.payload) == Some(dkey)
+                        && timestamp_ms.saturating_sub(cand.timestamp_ms) < 1_000
+                })
+            {
+                let (base_payload, prev_count) = split_coalesce_suffix(&existing.payload);
+                let new_count = prev_count.saturating_add(1);
+                existing.timestamp_ms = timestamp_ms;
+                existing.payload = format!("{base_payload} (x{new_count})");
+                return;
+            }
             while imp.len() >= MAX_IMPORTANT_LOGS {
                 imp.pop_front();
             }
             imp.push_back(entry.clone());
         }
-        let _ = self.log_tx.send(entry);
+        if !coalesced {
+            let _ = self.log_tx.send(entry);
+        }
     }
 
     pub fn recent_logs(&self) -> Vec<LogEntry> {

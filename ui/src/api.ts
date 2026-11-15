@@ -132,18 +132,51 @@ function captureSecretFromUrlOnBoot(): void {
   migrateAndScrubLegacyLocalStorage();
   try {
     const params = new URLSearchParams(window.location.search);
-    const hasUrlToken = params.has("secret") || params.has("token");
-    const urlSecret = (params.get("secret") ?? params.get("token"))?.trim();
-    if (hasUrlToken) {
+    const hasQueryToken = params.has("secret") || params.has("token");
+    let urlSecret = (params.get("secret") ?? params.get("token"))?.trim();
+    if (hasQueryToken) {
       params.delete("secret");
       params.delete("token");
+    }
+
+    let cleanHash = window.location.hash;
+    let hasHashToken = false;
+    if (cleanHash.length > 1) {
+      const rawHash = cleanHash.slice(1);
+      const qIdx = rawHash.indexOf("?");
+      const hashParamStr = qIdx >= 0 ? rawHash.slice(qIdx + 1) : rawHash;
+      if (hashParamStr.includes("secret=") || hashParamStr.includes("token=")) {
+        const hashParams = new URLSearchParams(hashParamStr);
+        if (hashParams.has("secret") || hashParams.has("token")) {
+          hasHashToken = true;
+          const hashSecret = (
+            hashParams.get("secret") ?? hashParams.get("token")
+          )?.trim();
+          if (!urlSecret && hashSecret) {
+            urlSecret = hashSecret;
+          }
+          hashParams.delete("secret");
+          hashParams.delete("token");
+          const restHash = hashParams.toString();
+          if (qIdx >= 0) {
+            const prefix = rawHash.slice(0, qIdx);
+            cleanHash = restHash ? `#${prefix}?${restHash}` : prefix ? `#${prefix}` : "";
+          } else {
+            cleanHash = restHash ? `#${restHash}` : "";
+          }
+        }
+      }
+    }
+
+    if (hasQueryToken || hasHashToken) {
       const restQuery = params.toString();
       const cleanUrl =
         window.location.pathname +
         (restQuery ? `?${restQuery}` : "") +
-        window.location.hash;
+        cleanHash;
       window.history.replaceState(window.history.state, document.title, cleanUrl);
     }
+
     if (urlSecret) {
       writeSessionSecret(urlSecret);
     } else {
@@ -706,6 +739,26 @@ export const clashApi = {
     apiFetch<ProfilesSnapshot>(
       `/profiles/${encodeURIComponent(id)}/activate`,
       { method: "PUT" },
+    ),
+  getProfileRawYaml: (id: string, includeSensitive = false) =>
+    apiFetch<{
+      id: string;
+      active: boolean;
+      yaml: string;
+      uris: string[];
+      redacted?: boolean;
+    }>(
+      includeSensitive
+        ? `/profiles/${encodeURIComponent(id)}/raw?include_sensitive=true`
+        : `/profiles/${encodeURIComponent(id)}/raw`,
+    ),
+  saveProfileRawYaml: (id: string, payload: string) =>
+    apiFetch<ProfilesSnapshot>(
+      `/profiles/${encodeURIComponent(id)}/raw`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ payload }),
+      },
     ),
   refreshProfile: (id: string) =>
     apiFetch<{

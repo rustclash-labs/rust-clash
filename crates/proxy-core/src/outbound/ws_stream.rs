@@ -5,17 +5,21 @@ use std::{
     task::{Context, Poll},
 };
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use aws_lc_rs::digest::{Context as DigestContext, SHA1_FOR_LEGACY_USE_ONLY};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD},
+};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Sink, Stream};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
         client::IntoClientRequest,
         handshake::server::{Request as WsServerRequest, Response as WsServerResponse},
-        protocol::Message,
+        protocol::{Message, Role},
     },
 };
 
@@ -241,6 +245,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsByteStream<S> {
     }
 }
 
+fn format_ws_host_authority(effective_host: &str, port: u16, is_tls: bool) -> String {
+    let host_for_uri = if effective_host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{effective_host}]")
+    } else {
+        effective_host.to_string()
+    };
+    let is_default_port = (is_tls && port == 443) || (!is_tls && port == 80);
+    let has_explicit_port = if host_for_uri.starts_with('[') {
+        host_for_uri.contains("]:")
+    } else {
+        host_for_uri.contains(':')
+    };
+    if has_explicit_port || is_default_port {
+        host_for_uri
+    } else {
+        format!("{host_for_uri}:{port}")
+    }
+}
+
 fn build_ws_upgrade_request(
     default_host: &str,
     port: u16,
@@ -250,12 +273,7 @@ fn build_ws_upgrade_request(
 ) -> io::Result<http::Request<()>> {
     let (clean_path, _, ed_header_name) = cfg.normalized_parts();
     let effective_host = cfg.host_header().unwrap_or(default_host);
-    let host_authority =
-        if effective_host.contains(':') || (is_tls && port == 443) || (!is_tls && port == 80) {
-            effective_host.to_string()
-        } else {
-            format!("{effective_host}:{port}")
-        };
+    let host_authority = format_ws_host_authority(effective_host, port, is_tls);
     let scheme = if is_tls { "wss" } else { "ws" };
     let uri = format!("{scheme}://{host_authority}{clean_path}");
 
@@ -324,6 +342,158 @@ fn build_ws_upgrade_request(
     Ok(req)
 }
 
+const MAX_WS_UPGRADE_RESPONSE_BYTES: usize = 16 * 1024;
+const WS_ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+fn compute_sec_websocket_accept(sec_ws_key: &str) -> String {
+    let mut ctx = DigestContext::new(&SHA1_FOR_LEGACY_USE_ONLY);
+    ctx.update(sec_ws_key.as_bytes());
+    ctx.update(WS_ACCEPT_GUID);
+    BASE64_STD.encode(ctx.finish().as_ref())
+}
+
+/// Perform an RFC 6455 HTTP/1.1 client WebSocket upgrade on `inner` that validates
+/// `101 Switching Protocols`, `Upgrade: websocket`, `Connection: Upgrade`, and
+/// `Sec-WebSocket-Accept`, while tolerating servers (Xray-core, v2ray-core, sing-box)
+/// that consume `Sec-WebSocket-Protocol` as 0-RTT early data without echoing it back.
+async fn client_ws_handshake_rfc6455(
+    mut inner: BoxedStream,
+    req: http::Request<()>,
+) -> io::Result<(WebSocketStream<BoxedStream>, BytesMut)> {
+    let sec_ws_key = req
+        .headers()
+        .get("Sec-WebSocket-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing Sec-WebSocket-Key in WebSocket upgrade request",
+            )
+        })?
+        .to_string();
+    let expected_accept = compute_sec_websocket_accept(&sec_ws_key);
+
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    if path_and_query.contains(['\r', '\n', ' ']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid characters in WebSocket request target",
+        ));
+    }
+
+    let mut raw_req = Vec::with_capacity(512);
+    raw_req.extend_from_slice(b"GET ");
+    raw_req.extend_from_slice(path_and_query.as_bytes());
+    raw_req.extend_from_slice(b" HTTP/1.1\r\n");
+    for (name, value) in req.headers() {
+        raw_req.extend_from_slice(name.as_str().as_bytes());
+        raw_req.extend_from_slice(b": ");
+        raw_req.extend_from_slice(value.as_bytes());
+        raw_req.extend_from_slice(b"\r\n");
+    }
+    raw_req.extend_from_slice(b"\r\n");
+
+    inner.write_all(&raw_req).await?;
+    inner.flush().await?;
+
+    let mut resp_buf = BytesMut::with_capacity(1024);
+    let mut tmp = [0u8; 2048];
+    let hdr_end = loop {
+        if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if resp_buf.len() >= MAX_WS_UPGRADE_RESPONSE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket upgrade response headers exceeded 16 KiB",
+            ));
+        }
+        let max_read = (MAX_WS_UPGRADE_RESPONSE_BYTES + 4)
+            .saturating_sub(resp_buf.len())
+            .min(tmp.len());
+        let n = inner.read(&mut tmp[..max_read]).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF before WebSocket upgrade response completed",
+            ));
+        }
+        resp_buf.extend_from_slice(&tmp[..n]);
+    };
+
+    let leftover = resp_buf.split_off(hdr_end + 4);
+    let head_bytes = &resp_buf[..hdr_end];
+    let head_str = std::str::from_utf8(head_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-UTF8 WebSocket upgrade response headers",
+        )
+    })?;
+
+    let mut lines = head_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let mut status_parts = status_line.split_whitespace();
+    let http_ver = status_parts.next().unwrap_or("");
+    let status_code = status_parts.next().unwrap_or("");
+    if !http_ver.starts_with("HTTP/1.") || status_code != "101" {
+        return Err(io::Error::other(format!(
+            "WebSocket upgrade rejected with status: {status_line}"
+        )));
+    }
+
+    let mut has_upgrade_ws = false;
+    let mut has_conn_upgrade = false;
+    let mut accept_matched = false;
+
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, val)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let val = val.trim();
+        if name.eq_ignore_ascii_case("upgrade") {
+            if val
+                .split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("websocket"))
+            {
+                has_upgrade_ws = true;
+            }
+        } else if name.eq_ignore_ascii_case("connection") {
+            if val
+                .split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+            {
+                has_conn_upgrade = true;
+            }
+        } else if name.eq_ignore_ascii_case("sec-websocket-accept") && val == expected_accept {
+            accept_matched = true;
+        }
+    }
+
+    if !has_upgrade_ws || !has_conn_upgrade || !accept_matched {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebSocket 101 response missing valid Upgrade, Connection, or Sec-WebSocket-Accept header",
+        ));
+    }
+
+    let ws = if leftover.is_empty() {
+        WebSocketStream::from_raw_socket(inner, Role::Client, None).await
+    } else {
+        WebSocketStream::from_partially_read(inner, leftover.to_vec(), Role::Client, None).await
+    };
+    Ok((ws, BytesMut::new()))
+}
+
 type HandshakeBoxFuture = Pin<
     Box<
         dyn std::future::Future<Output = io::Result<(WebSocketStream<BoxedStream>, BytesMut)>>
@@ -342,10 +512,14 @@ enum LazyEarlyDataState {
     },
     Handshaking {
         fut: HandshakeBoxFuture,
+        pending_ed_len: usize,
         read_waker: Option<std::task::Waker>,
         write_waker: Option<std::task::Waker>,
     },
-    Connected(WsByteStream<BoxedStream>),
+    Connected {
+        ws_stream: WsByteStream<BoxedStream>,
+        pending_ed_ack: usize,
+    },
     Failed,
 }
 
@@ -404,9 +578,9 @@ fn spawn_ws_handshake_future(
 ) -> HandshakeBoxFuture {
     Box::pin(async move {
         let req = build_ws_upgrade_request(&default_host, port, is_tls, &cfg, ed_bytes.as_deref())?;
-        let (ws, _resp) = tokio::time::timeout(
+        tokio::time::timeout(
             crate::outbound::OUTBOUND_HANDSHAKE_TIMEOUT,
-            tokio_tungstenite::client_async(req, inner),
+            client_ws_handshake_rfc6455(inner, req),
         )
         .await
         .map_err(|_| {
@@ -415,8 +589,6 @@ fn spawn_ws_handshake_future(
                 "WebSocket 0-RTT upgrade handshake timed out",
             )
         })?
-        .map_err(ws_err_to_io)?;
-        Ok((ws, BytesMut::new()))
     })
 }
 
@@ -454,12 +626,14 @@ impl AsyncRead for LazyWsEarlyDataStream {
                     );
                     *guard = LazyEarlyDataState::Handshaking {
                         fut,
+                        pending_ed_len: 0,
                         read_waker: None,
                         write_waker: None,
                     };
                 }
                 LazyEarlyDataState::Handshaking {
                     fut,
+                    pending_ed_len,
                     read_waker,
                     write_waker,
                 } => match fut.as_mut().poll(cx) {
@@ -476,16 +650,18 @@ impl AsyncRead for LazyWsEarlyDataStream {
                         return Poll::Ready(Err(e));
                     }
                     Poll::Ready(Ok((ws, init_rd))) => {
+                        let ed_ack = *pending_ed_len;
                         let w_wr = write_waker.take();
-                        *guard = LazyEarlyDataState::Connected(WsByteStream::with_initial_read(
-                            ws, init_rd,
-                        ));
+                        *guard = LazyEarlyDataState::Connected {
+                            ws_stream: WsByteStream::with_initial_read(ws, init_rd),
+                            pending_ed_ack: ed_ack,
+                        };
                         if let Some(w) = w_wr {
                             w.wake();
                         }
                     }
                 },
-                LazyEarlyDataState::Connected(ws_stream) => {
+                LazyEarlyDataState::Connected { ws_stream, .. } => {
                     return Pin::new(ws_stream).poll_read(cx, buf);
                 }
                 LazyEarlyDataState::Failed => {
@@ -538,33 +714,14 @@ impl AsyncWrite for LazyWsEarlyDataStream {
                     );
                     *guard = LazyEarlyDataState::Handshaking {
                         fut,
+                        pending_ed_len: ed_take,
                         read_waker: None,
                         write_waker: None,
                     };
-                    if let LazyEarlyDataState::Handshaking {
-                        fut, write_waker, ..
-                    } = &mut *guard
-                    {
-                        match fut.as_mut().poll(cx) {
-                            Poll::Pending => {
-                                save_waker_slot(write_waker, cx.waker());
-                                return Poll::Ready(Ok(ed_take));
-                            }
-                            Poll::Ready(Err(e)) => {
-                                *guard = LazyEarlyDataState::Failed;
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Ready(Ok((ws, init_rd))) => {
-                                *guard = LazyEarlyDataState::Connected(
-                                    WsByteStream::with_initial_read(ws, init_rd),
-                                );
-                                return Poll::Ready(Ok(ed_take));
-                            }
-                        }
-                    }
                 }
                 LazyEarlyDataState::Handshaking {
                     fut,
+                    pending_ed_len,
                     read_waker,
                     write_waker,
                 } => match fut.as_mut().poll(cx) {
@@ -581,16 +738,29 @@ impl AsyncWrite for LazyWsEarlyDataStream {
                         return Poll::Ready(Err(e));
                     }
                     Poll::Ready(Ok((ws, init_rd))) => {
+                        let ed_ack = *pending_ed_len;
                         let w_rd = read_waker.take();
-                        *guard = LazyEarlyDataState::Connected(WsByteStream::with_initial_read(
-                            ws, init_rd,
-                        ));
+                        *guard = LazyEarlyDataState::Connected {
+                            ws_stream: WsByteStream::with_initial_read(ws, init_rd),
+                            pending_ed_ack: 0,
+                        };
                         if let Some(w) = w_rd {
                             w.wake();
                         }
+                        if ed_ack > 0 {
+                            return Poll::Ready(Ok(ed_ack));
+                        }
                     }
                 },
-                LazyEarlyDataState::Connected(ws_stream) => {
+                LazyEarlyDataState::Connected {
+                    ws_stream,
+                    pending_ed_ack,
+                } => {
+                    if *pending_ed_ack > 0 {
+                        let ack = *pending_ed_ack;
+                        *pending_ed_ack = 0;
+                        return Poll::Ready(Ok(ack));
+                    }
                     return Pin::new(ws_stream).poll_write(cx, buf);
                 }
                 LazyEarlyDataState::Failed => {
@@ -607,9 +777,39 @@ impl AsyncWrite for LazyWsEarlyDataStream {
         let mut guard = self.state.lock();
         loop {
             match &mut *guard {
-                LazyEarlyDataState::Init { .. } => return Poll::Ready(Ok(())),
+                LazyEarlyDataState::Init {
+                    inner,
+                    default_host,
+                    port,
+                    is_tls,
+                    cfg,
+                    ..
+                } => {
+                    let Some(stream) = inner.take() else {
+                        *guard = LazyEarlyDataState::Failed;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "WS stream already consumed",
+                        )));
+                    };
+                    let fut = spawn_ws_handshake_future(
+                        stream,
+                        default_host.clone(),
+                        *port,
+                        *is_tls,
+                        cfg.clone(),
+                        None,
+                    );
+                    *guard = LazyEarlyDataState::Handshaking {
+                        fut,
+                        pending_ed_len: 0,
+                        read_waker: None,
+                        write_waker: None,
+                    };
+                }
                 LazyEarlyDataState::Handshaking {
                     fut,
+                    pending_ed_len,
                     read_waker,
                     write_waker,
                 } => match fut.as_mut().poll(cx) {
@@ -626,16 +826,18 @@ impl AsyncWrite for LazyWsEarlyDataStream {
                         return Poll::Ready(Err(e));
                     }
                     Poll::Ready(Ok((ws, init_rd))) => {
+                        let ed_ack = *pending_ed_len;
                         let w_rd = read_waker.take();
-                        *guard = LazyEarlyDataState::Connected(WsByteStream::with_initial_read(
-                            ws, init_rd,
-                        ));
+                        *guard = LazyEarlyDataState::Connected {
+                            ws_stream: WsByteStream::with_initial_read(ws, init_rd),
+                            pending_ed_ack: ed_ack,
+                        };
                         if let Some(w) = w_rd {
                             w.wake();
                         }
                     }
                 },
-                LazyEarlyDataState::Connected(ws_stream) => {
+                LazyEarlyDataState::Connected { ws_stream, .. } => {
                     return Pin::new(ws_stream).poll_flush(cx);
                 }
                 LazyEarlyDataState::Failed => {
@@ -658,6 +860,7 @@ impl AsyncWrite for LazyWsEarlyDataStream {
                 }
                 LazyEarlyDataState::Handshaking {
                     fut,
+                    pending_ed_len,
                     read_waker,
                     write_waker,
                 } => match fut.as_mut().poll(cx) {
@@ -674,16 +877,18 @@ impl AsyncWrite for LazyWsEarlyDataStream {
                         return Poll::Ready(Err(e));
                     }
                     Poll::Ready(Ok((ws, init_rd))) => {
+                        let ed_ack = *pending_ed_len;
                         let w_rd = read_waker.take();
-                        *guard = LazyEarlyDataState::Connected(WsByteStream::with_initial_read(
-                            ws, init_rd,
-                        ));
+                        *guard = LazyEarlyDataState::Connected {
+                            ws_stream: WsByteStream::with_initial_read(ws, init_rd),
+                            pending_ed_ack: ed_ack,
+                        };
                         if let Some(w) = w_rd {
                             w.wake();
                         }
                     }
                 },
-                LazyEarlyDataState::Connected(ws_stream) => {
+                LazyEarlyDataState::Connected { ws_stream, .. } => {
                     return Pin::new(ws_stream).poll_shutdown(cx);
                 }
                 LazyEarlyDataState::Failed => {
@@ -716,9 +921,9 @@ pub async fn connect_ws_stream(
     }
 
     let req = build_ws_upgrade_request(default_host, port, is_tls, cfg, None)?;
-    let (ws, _resp) = tokio::time::timeout(
+    let (ws, init_rd) = tokio::time::timeout(
         crate::outbound::OUTBOUND_HANDSHAKE_TIMEOUT,
-        tokio_tungstenite::client_async(req, inner),
+        client_ws_handshake_rfc6455(inner, req),
     )
     .await
     .map_err(|_| {
@@ -726,13 +931,14 @@ pub async fn connect_ws_stream(
             io::ErrorKind::TimedOut,
             "WebSocket upgrade handshake timed out",
         )
-    })?
-    .map_err(ws_err_to_io)?;
-    Ok(Box::new(WsByteStream::new(ws)))
+    })??;
+    Ok(Box::new(WsByteStream::with_initial_read(ws, init_rd)))
 }
 
 /// Accept an inbound WebSocket stream (supporting optional `Sec-WebSocket-Protocol` early data)
 /// for loopback E2E protocol servers (`VLESS+WS` and `Trojan+WS`).
+/// Note: Matches Xray-core / v2ray-core / sing-box server behavior by consuming
+/// `Sec-WebSocket-Protocol` early data WITHOUT echoing it in the `101 Switching Protocols` response.
 #[allow(clippy::result_large_err)]
 pub async fn accept_ws_stream(
     inner: BoxedStream,
@@ -752,7 +958,7 @@ pub async fn accept_ws_stream(
 
     let ws = tokio_tungstenite::accept_hdr_async(
         inner,
-        |req: &WsServerRequest, mut resp: WsServerResponse| {
+        |req: &WsServerRequest, resp: WsServerResponse| {
             if let Some(exp) = &expected
                 && req.uri().path() != exp
             {
@@ -768,8 +974,6 @@ pub async fn accept_ws_stream(
                 let trimmed = proto_str.trim();
                 if let Ok(decoded) = URL_SAFE_NO_PAD.decode(trimmed.trim_end_matches('=')) {
                     early_data.extend_from_slice(&decoded);
-                    resp.headers_mut()
-                        .insert("Sec-WebSocket-Protocol", proto_val.clone());
                 }
             }
             Ok(resp)

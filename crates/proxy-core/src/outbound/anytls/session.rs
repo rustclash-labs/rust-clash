@@ -376,6 +376,22 @@ impl AnyTlsClientSession {
             })
             .await?;
 
+        // Build Packet 1 before spawning background IO tasks so early address/frame errors
+        // cannot leak background session tasks or corrupt active_streams.
+        let settings_payload = format!(
+            "v=2\nclient=rust-clash/{}\npadding-md5={}",
+            env!("CARGO_PKG_VERSION"),
+            shared_scheme.read().md5_hex()
+        );
+        let mut psh_body = BytesMut::with_capacity(32 + initial_payload.len());
+        psh_body.extend_from_slice(&initial_target.to_socks5_bytes()?);
+        psh_body.extend_from_slice(initial_payload);
+
+        let mut pkt1 = BytesMut::with_capacity(128 + psh_body.len());
+        Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
+        Frame::empty(Command::Syn, 1).encode_into(&mut pkt1)?;
+        Frame::new(Command::Psh, 1, psh_body.freeze()).encode_into(&mut pkt1)?;
+
         let (tx, rx) = mpsc::channel::<OutboundCmd>(SESSION_OUTBOUND_QUEUE_CAP);
         let streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>> = Arc::new(DashMap::new());
         let synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>> =
@@ -417,25 +433,8 @@ impl AnyTlsClientSession {
 
         session.spawn_io_tasks(tls_stream, rx, scheme_snapshot, Arc::clone(&shared_scheme));
 
-        // Build Packet 1: `cmdSettings` + `cmdSYN(1)` + `cmdPSH(1, SocksAddr || initial_payload)`
-        let settings_payload = format!(
-            "v=2\nclient=rust-clash/{}\npadding-md5={}",
-            env!("CARGO_PKG_VERSION"),
-            shared_scheme.read().md5_hex()
-        );
-        let mut psh_body = BytesMut::with_capacity(32 + initial_payload.len());
-        psh_body.extend_from_slice(&initial_target.to_socks5_bytes()?);
-        psh_body.extend_from_slice(initial_payload);
-
-        let mut pkt1 = BytesMut::with_capacity(128 + psh_body.len());
-        Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
-        Frame::empty(Command::Syn, 1).encode_into(&mut pkt1)?;
-        Frame::new(Command::Psh, 1, psh_body.freeze()).encode_into(&mut pkt1)?;
-
-        tx.send(OutboundCmd::RawBatch(pkt1))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "AnyTLS session closed"))?;
-
+        // Construct `stream_handle` BEFORE awaiting `tx.send(...)` so async cancellation
+        // or send failure runs `AnyTlsStream::drop` and cleans up `active_streams` & IO tasks.
         let stream_handle = AnyTlsStream {
             session: Arc::clone(&session),
             stream_id: 1,
@@ -443,6 +442,14 @@ impl AnyTlsClientSession {
             read_buf: Bytes::new(),
             reserve_fut: Mutex::new(None),
         };
+
+        if tx.send(OutboundCmd::RawBatch(pkt1)).await.is_err() {
+            session.abort_session("AnyTLS session closed during initial packet send");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AnyTLS session closed",
+            ));
+        }
 
         // AnyTLS v2 servers reply to `cmdSettings` immediately with `cmdServerSettings("v=2")` in 1 proxy RTT,
         // and then send `cmdSYNACK` once target dial finishes. AnyTLS v1 servers send neither `cmdServerSettings`
@@ -519,6 +526,15 @@ impl AnyTlsClientSession {
         )
         .await?;
 
+        let settings_payload = format!(
+            "v=2\nclient=rust-clash/{}\npadding-md5={}",
+            env!("CARGO_PKG_VERSION"),
+            shared_scheme.read().md5_hex()
+        );
+        let mut pkt1 = BytesMut::with_capacity(128);
+        Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
+        Frame::empty(Command::HeartRequest, 0).encode_into(&mut pkt1)?;
+
         let (tx, rx) = mpsc::channel::<OutboundCmd>(SESSION_OUTBOUND_QUEUE_CAP);
         let streams: Arc<DashMap<u32, mpsc::Sender<io::Result<Bytes>>>> = Arc::new(DashMap::new());
         let synack_waiters: Arc<DashMap<u32, oneshot::Sender<io::Result<()>>>> =
@@ -554,15 +570,6 @@ impl AnyTlsClientSession {
         // Server processes `cmdSettings` (pushing `ServerSettings` + optional `UpdatePaddingScheme`)
         // strictly before replying with `cmdHeartResponse`, so awaiting `pong_rx` guarantees
         // authentication, v2 negotiation, and padding scheme synchronization are settled.
-        let settings_payload = format!(
-            "v=2\nclient=rust-clash/{}\npadding-md5={}",
-            env!("CARGO_PKG_VERSION"),
-            shared_scheme.read().md5_hex()
-        );
-        let mut pkt1 = BytesMut::with_capacity(128);
-        Frame::new(Command::Settings, 0, Bytes::from(settings_payload)).encode_into(&mut pkt1)?;
-        Frame::empty(Command::HeartRequest, 0).encode_into(&mut pkt1)?;
-
         if tx.send(OutboundCmd::RawBatch(pkt1)).await.is_err() {
             session.abort_for_network_change();
             return Err(io::Error::new(
@@ -626,12 +633,22 @@ impl AnyTlsClientSession {
         initial_payload: &[u8],
     ) -> io::Result<AnyTlsStream> {
         if !self.is_healthy() {
+            self.abort_session("AnyTLS session is no longer healthy");
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "AnyTLS session is no longer healthy",
             ));
         }
+
+        let mut psh_body = BytesMut::with_capacity(32 + initial_payload.len());
+        psh_body.extend_from_slice(&target.to_socks5_bytes()?);
+        psh_body.extend_from_slice(initial_payload);
+
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        let mut batch = BytesMut::with_capacity(64 + psh_body.len());
+        Frame::empty(Command::Syn, stream_id).encode_into(&mut batch)?;
+        Frame::new(Command::Psh, stream_id, psh_body.freeze()).encode_into(&mut batch)?;
+
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 
         let (stx, srx) = mpsc::channel(STREAM_INBOUND_QUEUE_CAP);
@@ -645,24 +662,8 @@ impl AnyTlsClientSession {
             None
         };
 
-        let mut psh_body = BytesMut::with_capacity(32 + initial_payload.len());
-        psh_body.extend_from_slice(&target.to_socks5_bytes()?);
-        psh_body.extend_from_slice(initial_payload);
-
-        let mut batch = BytesMut::with_capacity(64 + psh_body.len());
-        Frame::empty(Command::Syn, stream_id).encode_into(&mut batch)?;
-        Frame::new(Command::Psh, stream_id, psh_body.freeze()).encode_into(&mut batch)?;
-
-        if self.tx.send(OutboundCmd::RawBatch(batch)).await.is_err() {
-            self.streams.remove(&stream_id);
-            self.synack_waiters.remove(&stream_id);
-            self.active_streams.fetch_sub(1, Ordering::SeqCst);
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "AnyTLS session writer closed",
-            ));
-        }
-
+        // Construct `stream_handle` BEFORE awaiting `self.tx.send(...)` so async cancellation
+        // or send failure runs `AnyTlsStream::drop`, decrementing `active_streams` cleanly.
         let stream_handle = AnyTlsStream {
             session: Arc::clone(self),
             stream_id,
@@ -670,6 +671,14 @@ impl AnyTlsClientSession {
             read_buf: Bytes::new(),
             reserve_fut: Mutex::new(None),
         };
+
+        if self.tx.send(OutboundCmd::RawBatch(batch)).await.is_err() {
+            self.abort_session("AnyTLS session writer closed");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AnyTLS session writer closed",
+            ));
+        }
 
         if let Some(synack_rx) = maybe_synack_rx {
             match tokio::time::timeout(V2_SYNACK_TIMEOUT, synack_rx).await {
@@ -694,6 +703,10 @@ impl AnyTlsClientSession {
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
+    }
+
+    pub fn active_stream_count(&self) -> u32 {
+        self.active_streams.load(Ordering::SeqCst)
     }
 
     pub fn is_v2_negotiated(&self) -> bool {
@@ -742,10 +755,10 @@ impl AnyTlsClientSession {
         let _ = self.mark_unhealthy_inner(reason);
     }
 
-    /// Immediately fail all multiplexed streams and abort the underlying TLS reader/writer tasks
-    /// so the stale OS socket closes without waiting for kernel TCP retransmission timeouts.
-    pub fn abort_for_network_change(&self) -> bool {
-        let was_healthy = self.mark_unhealthy_inner("network interface changed");
+    /// Fail all multiplexed streams and abort the underlying TLS reader/writer tasks immediately
+    /// so background tasks and OS sockets are released without waiting for TCP read timeouts.
+    pub fn abort_session(&self, reason: &str) -> bool {
+        let was_healthy = self.mark_unhealthy_inner(reason);
         let (wr_abort, rd_abort) = {
             let mut guard = self.io_aborts.lock();
             (guard.0.take(), guard.1.take())
@@ -757,6 +770,12 @@ impl AnyTlsClientSession {
             a.abort();
         }
         was_healthy
+    }
+
+    /// Immediately fail all multiplexed streams and abort the underlying TLS reader/writer tasks
+    /// so the stale OS socket closes without waiting for kernel TCP retransmission timeouts.
+    pub fn abort_for_network_change(&self) -> bool {
+        self.abort_session("network interface changed")
     }
 
     fn on_stream_dropped(self: &Arc<Self>, stream_id: u32) {
@@ -788,7 +807,7 @@ impl AnyTlsClientSession {
                 }
             }
             // Session invalidated or pool dropped after last stream closed: release background tasks.
-            self.abort_for_network_change();
+            self.abort_session("AnyTLS session retired");
         }
     }
 }
@@ -1049,44 +1068,101 @@ impl AnyTlsSessionPool {
                 let cur_epoch = epoch.load(Ordering::SeqCst);
                 let effective_min_idle =
                     min_idle_session.max(dynamic_min_idle.load(Ordering::Relaxed));
-                let mut guard = idle_arc.lock();
-                guard.retain(|e| e.session.is_healthy() && e.session.session_epoch == cur_epoch);
-                // Sort descending by `seq` so index 0..effective_min_idle are the newest sessions
-                guard.sort_by_key(|a| std::cmp::Reverse(a.session.seq));
-                let now = Instant::now();
-                let mut idx = 0usize;
-                guard.retain(|entry| {
-                    let keep = idx < effective_min_idle
-                        || now.duration_since(entry.idle_since) < idle_timeout;
-                    idx += 1;
-                    if keep {
-                        let _ = entry.session.send_ping();
-                    } else {
-                        entry.session.mark_unhealthy("idle timeout expired");
-                    }
-                    keep
-                });
+                let mut to_abort = Vec::new();
+                {
+                    let mut guard = idle_arc.lock();
+                    guard.retain(|e| {
+                        let valid = e.session.is_healthy() && e.session.session_epoch == cur_epoch;
+                        if !valid {
+                            to_abort.push((Arc::clone(&e.session), "stale idle session"));
+                        }
+                        valid
+                    });
+                    // Sort descending by `seq` so index 0..effective_min_idle are the newest sessions
+                    guard.sort_by_key(|a| std::cmp::Reverse(a.session.seq));
+                    let now = Instant::now();
+                    let mut idx = 0usize;
+                    guard.retain(|entry| {
+                        let keep = idx < effective_min_idle
+                            || now.duration_since(entry.idle_since) < idle_timeout;
+                        idx += 1;
+                        if keep {
+                            if !entry.session.send_ping() {
+                                to_abort
+                                    .push((Arc::clone(&entry.session), "idle ping queue closed"));
+                                return false;
+                            }
+                            true
+                        } else {
+                            to_abort.push((Arc::clone(&entry.session), "idle timeout expired"));
+                            false
+                        }
+                    });
+                }
+                for (sess, reason) in to_abort {
+                    sess.abort_session(reason);
+                }
             }
         });
     }
 
     /// Pop the highest-`seq` healthy idle session matching the current network epoch, if any.
     pub fn pop_latest_idle(&self) -> Option<Arc<AnyTlsClientSession>> {
-        let mut guard = self.idle.lock();
-        let cur_epoch = self.epoch.load(Ordering::SeqCst);
-        guard.retain(|e| e.session.is_healthy() && e.session.session_epoch == cur_epoch);
-        if guard.is_empty() {
-            return None;
+        let mut stale = Vec::new();
+        let chosen = {
+            let mut guard = self.idle.lock();
+            let cur_epoch = self.epoch.load(Ordering::SeqCst);
+            guard.retain(|e| {
+                let valid = e.session.is_healthy() && e.session.session_epoch == cur_epoch;
+                if !valid {
+                    stale.push(Arc::clone(&e.session));
+                }
+                valid
+            });
+            if guard.is_empty() {
+                None
+            } else {
+                let best_idx = guard
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, e)| e.session.seq)
+                    .map(|(i, _)| i)?;
+                let entry = guard.swap_remove(best_idx);
+                self.total_reuses.fetch_add(1, Ordering::Relaxed);
+                Some(entry.session)
+            }
+        };
+        for sess in stale {
+            sess.abort_session("stale idle session");
         }
-        // Pick the entry with the highest `seq`
-        let best_idx = guard
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, e)| e.session.seq)
-            .map(|(i, _)| i)?;
-        let chosen = guard.swap_remove(best_idx);
-        self.total_reuses.fetch_add(1, Ordering::Relaxed);
-        Some(chosen.session)
+        chosen
+    }
+
+    /// Return a popped idle session to the pool if it still has `active_streams == 0` and is healthy,
+    /// or abort its IO tasks if unhealthy/stale (used when stream setup fails or cancels before activation).
+    pub fn return_or_abort_unused_idle(&self, sess: Arc<AnyTlsClientSession>) {
+        if sess.active_stream_count() != 0 {
+            return;
+        }
+        let cur_epoch = self.epoch.load(Ordering::SeqCst);
+        if !self.shutdown.load(Ordering::Acquire)
+            && sess.is_healthy()
+            && sess.session_epoch == cur_epoch
+        {
+            let mut guard = self.idle.lock();
+            if !self.shutdown.load(Ordering::Acquire)
+                && sess.is_healthy()
+                && sess.session_epoch == self.epoch.load(Ordering::SeqCst)
+                && sess.active_stream_count() == 0
+            {
+                guard.push(IdleSessionEntry {
+                    session: sess,
+                    idle_since: Instant::now(),
+                });
+                return;
+            }
+        }
+        sess.abort_session("unused idle session retired");
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -1132,10 +1208,23 @@ impl AnyTlsSessionPool {
     }
 
     pub fn idle_count(&self) -> usize {
-        let mut guard = self.idle.lock();
-        let cur_epoch = self.epoch.load(Ordering::SeqCst);
-        guard.retain(|e| e.session.is_healthy() && e.session.session_epoch == cur_epoch);
-        guard.len()
+        let mut stale = Vec::new();
+        let len = {
+            let mut guard = self.idle.lock();
+            let cur_epoch = self.epoch.load(Ordering::SeqCst);
+            guard.retain(|e| {
+                let valid = e.session.is_healthy() && e.session.session_epoch == cur_epoch;
+                if !valid {
+                    stale.push(Arc::clone(&e.session));
+                }
+                valid
+            });
+            guard.len()
+        };
+        for sess in stale {
+            sess.abort_session("stale idle session");
+        }
+        len
     }
 
     pub fn healthy_session_count(&self) -> usize {
@@ -1167,7 +1256,14 @@ impl Drop for AnyTlsSessionPool {
         self.low_power_wake.notify_waiters();
         let drained_idle: Vec<IdleSessionEntry> = std::mem::take(&mut *self.idle.lock());
         for entry in drained_idle {
-            entry.session.abort_for_network_change();
+            entry.session.abort_session("AnyTLS session pool dropped");
+        }
+        let drained_live: Vec<Arc<AnyTlsClientSession>> = std::mem::take(&mut *self.live.lock())
+            .into_iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        for sess in drained_live {
+            sess.abort_session("AnyTLS session pool dropped");
         }
     }
 }

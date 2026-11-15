@@ -467,6 +467,76 @@ async fn negotiate_socks5_and_read_target(
     Ok((cmd, raw_target))
 }
 
+async fn enforce_post_route_target_policy(
+    peer_addr: SocketAddr,
+    local_mixed_port: u16,
+    policy: &MixedInboundPolicy,
+    router: &Router,
+    decision: &crate::router::RouteDecision,
+) -> io::Result<()> {
+    reject_forbidden_proxy_target(peer_addr, local_mixed_port, policy, &decision.target)?;
+    if decision.outbound.exit_category() == "DIRECT"
+        && let HostName::Domain(domain) = &decision.target.host
+    {
+        let resolved_ips = match router.dns().resolve_direct_ips(domain).await {
+            Ok(ips) => ips,
+            Err(_) => {
+                crate::router::geodata::resolve_host_bypassing_fake_ip(domain, decision.target.port)
+                    .await
+                    .map(|sas| sas.into_iter().map(|sa| sa.ip()).collect())
+                    .unwrap_or_default()
+            }
+        };
+        for ip in resolved_ips {
+            let ip_target = TargetAddr::from(SocketAddr::new(ip, decision.target.port));
+            reject_forbidden_proxy_target(peer_addr, local_mixed_port, policy, &ip_target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Relay `tcp <-> tracked` while preserving 0-RTT payload coalescing for client-speaks-first
+/// protocols (HTTP, TLS) and flushing pending proxy target headers after `15ms` when the client
+/// waits for a server banner first (SSH, SMTP, FTP, MySQL).
+async fn relay_bidirectional_coalesced(
+    tcp: &mut TcpStream,
+    tracked: &mut crate::tracker::TrackedStream<BoxedStream>,
+    conn_entry: &ActiveConnection,
+    already_flushed_initial: bool,
+) -> io::Result<()> {
+    if !already_flushed_initial {
+        tokio::select! {
+            biased;
+            _ = conn_entry.closed() => return Ok(()),
+            res = tcp.readable() => {
+                res?;
+            }
+            () = tokio::time::sleep(Duration::from_millis(15)) => {
+                tracked.flush().await?;
+            }
+        }
+    }
+    tokio::select! {
+        res = tokio::io::copy_bidirectional_with_sizes(tcp, tracked, 64 * 1024, 64 * 1024) => {
+            let _ = res?;
+        }
+        _ = conn_entry.closed() => {}
+    }
+    Ok(())
+}
+
+struct UdpAssocCleanupGuard {
+    udp_task: JoinHandle<()>,
+    udp_nat: Arc<crate::inbound::udp_nat::UdpNatManager>,
+}
+
+impl Drop for UdpAssocCleanupGuard {
+    fn drop(&mut self) {
+        self.udp_task.abort();
+        let _ = self.udp_nat.reset_all_sessions();
+    }
+}
+
 async fn handle_socks5(
     tcp: &mut TcpStream,
     peer: SocketAddr,
@@ -507,7 +577,8 @@ async fn handle_socks5(
                 )
                 .await;
             if let Err(err) =
-                reject_forbidden_proxy_target(peer, local_mixed_port, policy, &decision.target)
+                enforce_post_route_target_policy(peer, local_mixed_port, policy, &router, &decision)
+                    .await
             {
                 hub.push_log(
                     "warn",
@@ -572,13 +643,7 @@ async fn handle_socks5(
                 .await?;
             let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
 
-            tokio::select! {
-                res = tokio::io::copy_bidirectional_with_sizes(tcp, &mut tracked, 64 * 1024, 64 * 1024) => {
-                    let _ = res?;
-                }
-                _ = conn_entry.closed() => {}
-            }
-            Ok(())
+            relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, false).await
         }
         0x03 => {
             // UDP ASSOCIATE: bind ephemeral relay socket on the local interface facing `peer`
@@ -612,6 +677,7 @@ async fn handle_socks5(
             tcp.write_all(&reply).await?;
 
             let udp_reply_for_sink = Arc::clone(&udp_sock);
+            let reply_sem = Arc::new(Semaphore::new(64));
             let udp_nat = crate::inbound::udp_nat::UdpNatManager::new(
                 "Mixed(SOCKS5-UDP)",
                 64,
@@ -621,10 +687,20 @@ async fn handle_socks5(
                     pkt.put_slice(&[0x00, 0x00, 0x00]);
                     if return_src_target.encode_socks5(&mut pkt).is_ok() {
                         pkt.put_slice(&resp);
-                        let sock = Arc::clone(&udp_reply_for_sink);
-                        tokio::spawn(async move {
-                            let _ = sock.send_to(&pkt, client_udp_addr).await;
-                        });
+                        match udp_reply_for_sink.try_send_to(&pkt, client_udp_addr) {
+                            Ok(_) => {}
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                if let Ok(permit) = Arc::clone(&reply_sem).try_acquire_owned() {
+                                    let sock = Arc::clone(&udp_reply_for_sink);
+                                    let pkt_bytes = pkt.freeze();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let _ = sock.send_to(&pkt_bytes, client_udp_addr).await;
+                                    });
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }),
             );
@@ -704,12 +780,14 @@ async fn handle_socks5(
                                     &raw_dst,
                                 )
                                 .await;
-                            if reject_forbidden_proxy_target(
+                            if enforce_post_route_target_policy(
                                 peer,
                                 local_mixed_port,
                                 &policy_for_pkt,
-                                &decision.target,
+                                &router_for_pkt,
+                                &decision,
                             )
+                            .await
                             .is_err()
                             {
                                 return;
@@ -732,6 +810,7 @@ async fn handle_socks5(
                     }
                 })
             };
+            let _cleanup_guard = UdpAssocCleanupGuard { udp_task, udp_nat };
 
             // Keep UDP association alive until the TCP control stream closes
             let mut drain = [0u8; 64];
@@ -741,7 +820,6 @@ async fn handle_socks5(
                     Ok(_) => continue,
                 }
             }
-            udp_task.abort();
             Ok(())
         }
         other => {
@@ -877,7 +955,8 @@ async fn handle_http_proxy(
             )
             .await;
         if let Err(err) =
-            reject_forbidden_proxy_target(peer, local_mixed_port, policy, &decision.target)
+            enforce_post_route_target_policy(peer, local_mixed_port, policy, &router, &decision)
+                .await
         {
             hub.push_log(
                 "warn",
@@ -934,21 +1013,29 @@ async fn handle_http_proxy(
         tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
-        if !trailing_body.is_empty() {
+        let had_trailing = !trailing_body.is_empty();
+        if had_trailing {
             tracked.write_all(trailing_body).await?;
+            tracked.flush().await?;
         }
 
-        tokio::select! {
-            res = tokio::io::copy_bidirectional_with_sizes(tcp, &mut tracked, 64 * 1024, 64 * 1024) => {
-                let _ = res?;
-            }
-            _ = conn_entry.closed() => {}
-        }
-        Ok(())
+        relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, had_trailing).await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://example.com/foo HTTP/1.1`)
+        if uri_part.len() >= 8 && uri_part[..8].eq_ignore_ascii_case("https://") {
+            let _ = tcp
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nX-Proxy-Error: https-uri-requires-connect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plain HTTP proxy request cannot use https:// scheme without CONNECT",
+            ));
+        }
+
         let (raw_target, origin_path) =
-            if uri_part.starts_with("http://") || uri_part.starts_with("https://") {
+            if uri_part.len() >= 7 && uri_part[..7].eq_ignore_ascii_case("http://") {
                 let url = Url::parse(uri_part).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -998,6 +1085,71 @@ async fn handle_http_proxy(
                 (target, uri_part.to_string())
             };
 
+        // Validate HTTP/1.1 framing headers before dialing so CL/TE smuggling or invalid
+        // Content-Length headers are rejected cleanly with 400 Bad Request.
+        let mut has_upgrade = false;
+        let mut has_transfer_encoding = false;
+        let mut content_length: Option<u64> = None;
+        let mut nominated_hop_headers: Vec<String> = Vec::new();
+        for line in lines.clone() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let k_trim = k.trim();
+            let v_trim = v.trim();
+            if k_trim.eq_ignore_ascii_case("upgrade") && !v_trim.is_empty() {
+                has_upgrade = true;
+            } else if k_trim.eq_ignore_ascii_case("transfer-encoding") {
+                has_transfer_encoding = true;
+            } else if k_trim.eq_ignore_ascii_case("content-length") {
+                let Ok(parsed_len) = v_trim.parse::<u64>() else {
+                    let _ = tcp
+                        .write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nX-Proxy-Error: invalid-content-length\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Content-Length in plain HTTP proxy request",
+                    ));
+                };
+                if let Some(prev) = content_length
+                    && prev != parsed_len
+                {
+                    let _ = tcp
+                        .write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nX-Proxy-Error: conflicting-content-length\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conflicting Content-Length headers in plain HTTP proxy request",
+                    ));
+                }
+                content_length = Some(parsed_len);
+            } else if k_trim.eq_ignore_ascii_case("connection")
+                || k_trim.eq_ignore_ascii_case("proxy-connection")
+            {
+                for token in v_trim.split(',') {
+                    let tok = token.trim().to_ascii_lowercase();
+                    if !tok.is_empty() && tok != "upgrade" {
+                        nominated_hop_headers.push(tok);
+                    }
+                }
+            }
+        }
+        if has_transfer_encoding && content_length.is_some() {
+            let _ = tcp
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nX-Proxy-Error: conflicting-framing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rejecting request with both Transfer-Encoding and Content-Length",
+            ));
+        }
+
         if let Err(err) = reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
         {
             hub.push_log(
@@ -1017,7 +1169,8 @@ async fn handle_http_proxy(
             )
             .await;
         if let Err(err) =
-            reject_forbidden_proxy_target(peer, local_mixed_port, policy, &decision.target)
+            enforce_post_route_target_policy(peer, local_mixed_port, policy, &router, &decision)
+                .await
         {
             hub.push_log(
                 "warn",
@@ -1071,13 +1224,25 @@ async fn handle_http_proxy(
         conn_guard.mark_established();
         record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
-        let mut rewritten = String::with_capacity(header_text.len());
+        let mut rewritten = String::with_capacity(header_text.len() + 32);
         rewritten.push_str(&format!("{method} {origin_path} {version}\r\n"));
         for line in lines {
             if let Some((k, _)) = line.split_once(':') {
                 let k_trim = k.trim();
                 if k_trim.eq_ignore_ascii_case("proxy-connection")
                     || k_trim.eq_ignore_ascii_case("proxy-authorization")
+                    || k_trim.eq_ignore_ascii_case("proxy-authenticate")
+                {
+                    continue;
+                }
+                if !has_upgrade
+                    && (k_trim.eq_ignore_ascii_case("connection")
+                        || k_trim.eq_ignore_ascii_case("keep-alive")
+                        || k_trim.eq_ignore_ascii_case("te")
+                        || k_trim.eq_ignore_ascii_case("trailer")
+                        || nominated_hop_headers
+                            .iter()
+                            .any(|h| k_trim.eq_ignore_ascii_case(h)))
                 {
                     continue;
                 }
@@ -1085,19 +1250,57 @@ async fn handle_http_proxy(
             rewritten.push_str(line);
             rewritten.push_str("\r\n");
         }
+        if !has_upgrade {
+            rewritten.push_str("Connection: close\r\n");
+        }
         rewritten.push_str("\r\n");
 
         let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
         tracked.write_all(rewritten.as_bytes()).await?;
-        if !trailing_body.is_empty() {
-            tracked.write_all(trailing_body).await?;
-        }
 
-        tokio::select! {
-            res = tokio::io::copy_bidirectional_with_sizes(tcp, &mut tracked, 64 * 1024, 64 * 1024) => {
-                let _ = res?;
+        if has_upgrade || has_transfer_encoding {
+            if !trailing_body.is_empty() {
+                tracked.write_all(trailing_body).await?;
             }
-            _ = conn_entry.closed() => {}
+            tracked.flush().await?;
+            tokio::select! {
+                res = tokio::io::copy_bidirectional_with_sizes(tcp, &mut tracked, 64 * 1024, 64 * 1024) => {
+                    let _ = res?;
+                }
+                _ = conn_entry.closed() => {}
+            }
+        } else {
+            // Forward strictly `Content-Length` body bytes (default 0) so pipelined subsequent
+            // HTTP requests on the same client TCP socket never leak `Proxy-Authorization` upstream!
+            let expected_body = content_length.unwrap_or(0);
+            let initial_take = (trailing_body.len() as u64).min(expected_body) as usize;
+            if initial_take > 0 {
+                tracked.write_all(&trailing_body[..initial_take]).await?;
+            }
+            let remaining_body = expected_body - initial_take as u64;
+            if remaining_body > 0 {
+                let mut body_reader = (&mut *tcp).take(remaining_body);
+                tokio::select! {
+                    res = tokio::io::copy(&mut body_reader, &mut tracked) => {
+                        let copied = res?;
+                        if copied < remaining_body {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "client closed before sending full Content-Length body",
+                            ));
+                        }
+                    }
+                    _ = conn_entry.closed() => return Ok(()),
+                }
+            }
+            tracked.flush().await?;
+            tokio::select! {
+                res = tokio::io::copy(&mut tracked, tcp) => {
+                    let _ = res?;
+                }
+                _ = conn_entry.closed() => {}
+            }
+            let _ = tcp.shutdown().await;
         }
         Ok(())
     }

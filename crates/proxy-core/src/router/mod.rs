@@ -371,6 +371,14 @@ impl Router {
         self.outbounds.values().map(|o| o.on_network_change()).sum()
     }
 
+    /// Tear down router-scoped DNS caches and outbound socket pools on engine shutdown
+    /// without mutating process-wide socket reachability or shared DoT/DoH upstream pools.
+    pub fn shutdown_cleanup(&self) -> usize {
+        self.dns.clear_local_caches();
+        self.bump_epoch();
+        self.outbounds.values().map(|o| o.on_network_change()).sum()
+    }
+
     /// Synchronously evaluate whether raw IP target `dst` routes to an outbound whose
     /// `exit_category() == "DIRECT"` without mutating rule hit counters or performing async I/O.
     pub fn will_route_ip_direct(
@@ -973,6 +981,89 @@ impl Router {
         }
     }
 
+    fn collect_reachable_concrete_probes(
+        &self,
+        entry_group: &ProxyGroup,
+        probe_url: &str,
+        unique_probes: &mut HashSet<(String, String)>,
+        descendant_auto_groups: &mut Vec<Arc<ProxyGroup>>,
+        seen_auto: &mut HashSet<String>,
+    ) {
+        let mut stack: Vec<(String, usize)> = entry_group
+            .members
+            .iter()
+            .map(|m| (m.clone(), 0usize))
+            .collect();
+        let mut visited = HashSet::new();
+        visited.insert(entry_group.name.clone());
+
+        while let Some((cur, depth)) = stack.pop() {
+            if depth >= 16 {
+                continue;
+            }
+            if self.outbounds.contains_key(&cur) {
+                unique_probes.insert((cur, probe_url.to_string()));
+                continue;
+            }
+            if !visited.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(sub_grp) = self.groups.get(&cur) {
+                if matches!(
+                    sub_grp.group_type,
+                    ProxyGroupType::UrlTest
+                        | ProxyGroupType::Fallback
+                        | ProxyGroupType::LoadBalance
+                ) && seen_auto.insert(sub_grp.name.clone())
+                {
+                    descendant_auto_groups.push(Arc::clone(sub_grp));
+                }
+                for m in &sub_grp.members {
+                    stack.push((m.clone(), depth + 1));
+                }
+            }
+        }
+    }
+
+    fn resolve_probed_member_delay(
+        &self,
+        member_name: &str,
+        probe_url: &str,
+        concrete_results: &HashMap<(String, String), Option<u64>>,
+        depth: usize,
+    ) -> Option<u64> {
+        if depth >= 16 {
+            return None;
+        }
+        if self.outbounds.contains_key(member_name) {
+            return concrete_results
+                .get(&(member_name.to_string(), probe_url.to_string()))
+                .copied()
+                .flatten();
+        }
+        let sub_grp = self.groups.get(member_name)?;
+        match sub_grp.group_type {
+            ProxyGroupType::Select | ProxyGroupType::UrlTest | ProxyGroupType::Fallback => {
+                let chosen = sub_grp.current();
+                if chosen == member_name {
+                    return None;
+                }
+                self.resolve_probed_member_delay(&chosen, probe_url, concrete_results, depth + 1)
+            }
+            ProxyGroupType::LoadBalance => sub_grp
+                .members
+                .iter()
+                .filter_map(|m| {
+                    if m == member_name {
+                        None
+                    } else {
+                        self.resolve_probed_member_delay(m, probe_url, concrete_results, depth + 1)
+                    }
+                })
+                .min(),
+        }
+    }
+
     pub async fn test_delay(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
         let unified = self.unified_delay();
         if let Some(outbound) = self.outbounds.get(name) {
@@ -995,25 +1086,101 @@ impl Router {
             }
         }
         if let Some(group) = self.groups.get(name) {
-            let map = group
-                .evaluate_health_with_mode(
-                    &self.outbounds,
-                    &self.delays,
-                    Some(url),
-                    timeout,
-                    unified,
-                )
-                .await;
+            let mut unique_probes: HashSet<(String, String)> = HashSet::new();
+            let mut descendant_auto: Vec<Arc<ProxyGroup>> = Vec::new();
+            let mut seen_auto: HashSet<String> = HashSet::new();
+            if matches!(
+                group.group_type,
+                ProxyGroupType::UrlTest | ProxyGroupType::Fallback | ProxyGroupType::LoadBalance
+            ) {
+                seen_auto.insert(group.name.clone());
+                descendant_auto.push(Arc::clone(group));
+            }
+            self.collect_reachable_concrete_probes(
+                group,
+                url,
+                &mut unique_probes,
+                &mut descendant_auto,
+                &mut seen_auto,
+            );
+
+            let sem = Arc::new(Semaphore::new(16));
+            let delays = &self.delays;
+            let futs = unique_probes.into_iter().map(|(member, probe_url)| {
+                let outbound_opt = self.outbounds.get(&member).cloned();
+                let sem_clone = Arc::clone(&sem);
+                async move {
+                    let Some(outbound) = outbound_opt else {
+                        return ((member, probe_url), None);
+                    };
+                    let _permit = sem_clone.acquire().await.ok();
+                    match outbound
+                        .latency_test_with_mode(&probe_url, timeout, unified)
+                        .await
+                    {
+                        Ok(ms) => {
+                            delays.record(&member, ms);
+                            ((member, probe_url), Some(ms))
+                        }
+                        Err(_) => {
+                            delays.record_failure(&member);
+                            ((member, probe_url), None)
+                        }
+                    }
+                }
+            });
+
+            let concrete_results: HashMap<(String, String), Option<u64>> =
+                join_all(futs).await.into_iter().collect();
+            let evaluated_at = Instant::now();
+
+            let passes = descendant_auto.len().clamp(1, 8);
+            for _ in 0..passes {
+                for sub_grp in descendant_auto.iter().rev() {
+                    let mut sub_map = HashMap::with_capacity(sub_grp.members.len());
+                    for m in &sub_grp.members {
+                        sub_map.insert(
+                            m.clone(),
+                            self.resolve_probed_member_delay(m, url, &concrete_results, 0),
+                        );
+                    }
+                    let _ = sub_grp.update_selection_from_probes(&sub_map);
+                }
+            }
+            for sub_grp in &descendant_auto {
+                let mut sub_map = HashMap::with_capacity(sub_grp.members.len());
+                for m in &sub_grp.members {
+                    sub_map.insert(
+                        m.clone(),
+                        self.resolve_probed_member_delay(m, url, &concrete_results, 0),
+                    );
+                }
+                sub_grp.mark_evaluated(evaluated_at);
+                sub_grp.apply_probe_results(&sub_map, &self.delays);
+            }
+
+            let mut top_map = HashMap::with_capacity(group.members.len());
+            for m in &group.members {
+                top_map.insert(
+                    m.clone(),
+                    self.resolve_probed_member_delay(m, url, &concrete_results, 0),
+                );
+            }
+            if group.group_type == ProxyGroupType::Select {
+                group.mark_evaluated(evaluated_at);
+            }
             self.bump_epoch();
+
             let chosen = group.current();
-            if let Some(Some(ms)) = map.get(&chosen) {
+            if let Some(Some(ms)) = top_map.get(&chosen) {
                 self.delays.record(name, *ms);
                 return Ok(*ms);
             }
-            if let Some(ms) = map.values().flatten().copied().min() {
+            if let Some(ms) = top_map.values().flatten().copied().min() {
                 self.delays.record(name, ms);
                 return Ok(ms);
             }
+            self.delays.record_failure(name);
             return Err(ProxyError::Timeout);
         }
         Err(ProxyError::Routing(format!(
@@ -1025,8 +1192,9 @@ impl Router {
         self.refresh_due_auto_groups(timeout, true).await;
     }
 
-    /// Probe due automatic proxy groups (`URLTest`, `Fallback`, and `LoadBalance`), deduplicating
-    /// identical `(member_name, test_url)` probes across groups and bounding concurrency to 16.
+    /// Probe due automatic proxy groups (`URLTest`, `Fallback`, and `LoadBalance`), expanding
+    /// nested sub-group chains, deduplicating identical `(concrete_outbound, test_url)` probes,
+    /// and bounding concurrency to 16.
     pub async fn refresh_due_auto_groups(&self, timeout: Duration, force_all: bool) {
         let now = Instant::now();
         let mut due_groups: Vec<Arc<ProxyGroup>> = Vec::new();
@@ -1042,11 +1210,15 @@ impl Router {
                 )
                 && (force_all || grp.is_due_for_periodic_probe(now))
             {
-                for member in &grp.members {
-                    if self.outbounds.contains_key(member) {
-                        unique_probes.insert((member.clone(), grp.test_url.clone()));
-                    }
-                }
+                let mut dummy_desc = Vec::new();
+                let mut dummy_seen = HashSet::new();
+                self.collect_reachable_concrete_probes(
+                    grp,
+                    &grp.test_url,
+                    &mut unique_probes,
+                    &mut dummy_desc,
+                    &mut dummy_seen,
+                );
                 due_groups.push(Arc::clone(grp));
             }
         }
@@ -1086,13 +1258,24 @@ impl Router {
             join_all(futs).await.into_iter().collect();
         let evaluated_at = Instant::now();
 
+        let passes = due_groups.len().clamp(1, 8);
+        for _ in 0..passes {
+            for grp in &due_groups {
+                let mut group_map = HashMap::with_capacity(grp.members.len());
+                for member in &grp.members {
+                    let val =
+                        self.resolve_probed_member_delay(member, &grp.test_url, &probe_results, 0);
+                    group_map.insert(member.clone(), val);
+                }
+                let _ = grp.update_selection_from_probes(&group_map);
+            }
+        }
+
         for grp in due_groups {
             let mut group_map = HashMap::with_capacity(grp.members.len());
             for member in &grp.members {
-                let val = probe_results
-                    .get(&(member.clone(), grp.test_url.clone()))
-                    .copied()
-                    .flatten();
+                let val =
+                    self.resolve_probed_member_delay(member, &grp.test_url, &probe_results, 0);
                 group_map.insert(member.clone(), val);
             }
             grp.mark_evaluated(evaluated_at);

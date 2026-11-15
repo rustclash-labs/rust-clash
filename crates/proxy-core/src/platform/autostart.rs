@@ -199,9 +199,50 @@ impl AutostartManager {
     }
 }
 
+fn quote_xdg_exec_arg(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '%' => out.push_str("%%"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn escape_plist_xml_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub fn render_xdg_desktop_entry(exe_path: &Path, args: &[&str]) -> String {
-    let mut exec_parts = vec![format!("\"{}\"", exe_path.display())];
-    exec_parts.extend(args.iter().map(|a| a.to_string()));
+    let exe_str = exe_path.to_string_lossy();
+    let mut exec_parts = vec![quote_xdg_exec_arg(&exe_str)];
+    for a in args {
+        if a.chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '$' | '`' | '%'))
+        {
+            exec_parts.push(quote_xdg_exec_arg(a));
+        } else {
+            exec_parts.push((*a).to_string());
+        }
+    }
     format!(
         "[Desktop Entry]\nType=Application\nName=RustClash\nComment=Pure-Rust Multi-Protocol Proxy Client\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         exec_parts.join(" ")
@@ -209,9 +250,13 @@ pub fn render_xdg_desktop_entry(exe_path: &Path, args: &[&str]) -> String {
 }
 
 pub fn render_macos_launch_agent(exe_path: &Path, args: &[&str]) -> String {
-    let mut items = format!("        <string>{}</string>\n", exe_path.display());
+    let exe_escaped = escape_plist_xml_text(&exe_path.to_string_lossy());
+    let mut items = format!("        <string>{exe_escaped}</string>\n");
     for a in args {
-        items.push_str(&format!("        <string>{a}</string>\n"));
+        items.push_str(&format!(
+            "        <string>{}</string>\n",
+            escape_plist_xml_text(a)
+        ));
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>io.github.rustclashlabs.rust-clash</string>\n    <key>ProgramArguments</key>\n    <array>\n{items}    </array>\n    <key>RunAtLoad</key>\n    <true/>\n</dict>\n</plist>\n"
@@ -282,7 +327,13 @@ fn set_windows_autostart(enabled: bool, exe_path: &Path, args: &[&str]) -> io::R
             let mut cmd = format!("\"{}\"", exe_path.display());
             for a in args {
                 cmd.push(' ');
-                cmd.push_str(a);
+                if a.chars().any(|c| c.is_whitespace() || c == '"') {
+                    cmd.push('"');
+                    cmd.push_str(&a.replace('"', "\\\""));
+                    cmd.push('"');
+                } else {
+                    cmd.push_str(a);
+                }
             }
             let cmd_w: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
             let r = RegSetValueExW(
@@ -322,6 +373,15 @@ mod tests {
         let plist = render_macos_launch_agent(exe, &["--minimized"]);
         assert!(plist.contains("io.github.rustclashlabs.rust-clash"));
         assert!(plist.contains("--minimized"));
+
+        let special_exe = Path::new("/Applications/Rust & Clash <Beta>/rust-clash \"app\"");
+        let escaped_plist = render_macos_launch_agent(special_exe, &["--tag=<a&b>"]);
+        assert!(escaped_plist.contains("Rust &amp; Clash &lt;Beta&gt;"));
+        assert!(escaped_plist.contains("--tag=&lt;a&amp;b&gt;"));
+
+        let xdg = render_xdg_desktop_entry(special_exe, &["--profile", "My Profile $1"]);
+        assert!(xdg.contains("\\\"app\\\""));
+        assert!(xdg.contains("\"My Profile \\$1\""));
 
         mgr.set_enabled(false, exe, &[]).unwrap();
         assert!(!mgr.status().enabled);

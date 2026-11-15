@@ -87,43 +87,74 @@ impl ShadowsocksOutbound {
     }
 }
 
-/// 64-packet sliding anti-replay window per SIP022 server session ID.
-#[derive(Default)]
-struct SlidingReplayWindow {
-    server_session_id: Option<u64>,
+const MAX_TRACKED_SERVER_SESSIONS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ServerReplaySlot {
+    server_session_id: u64,
     max_pkt_id: u64,
     bitmap: u64,
+    last_touch: u64,
+}
+
+/// 64-packet sliding anti-replay window across up to 8 concurrent SIP022 server session IDs.
+#[derive(Default)]
+struct SlidingReplayWindow {
+    slots: [Option<ServerReplaySlot>; MAX_TRACKED_SERVER_SESSIONS],
+    clock: u64,
 }
 
 impl SlidingReplayWindow {
     fn accept(&mut self, server_sid: u64, pkt_id: u64) -> bool {
-        if self.server_session_id != Some(server_sid) {
-            self.server_session_id = Some(server_sid);
-            self.max_pkt_id = pkt_id;
-            self.bitmap = 1;
-            return true;
-        }
-        if pkt_id > self.max_pkt_id {
-            let shift = pkt_id - self.max_pkt_id;
-            if shift >= 64 {
-                self.bitmap = 1;
-            } else {
-                self.bitmap = (self.bitmap << shift) | 1;
+        self.clock = self.clock.wrapping_add(1);
+        let touch = self.clock;
+
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|s| s.server_session_id == server_sid)
+        {
+            if pkt_id > slot.max_pkt_id {
+                let shift = pkt_id - slot.max_pkt_id;
+                if shift >= 64 {
+                    slot.bitmap = 1;
+                } else {
+                    slot.bitmap = (slot.bitmap << shift) | 1;
+                }
+                slot.max_pkt_id = pkt_id;
+                slot.last_touch = touch;
+                return true;
             }
-            self.max_pkt_id = pkt_id;
-            true
-        } else {
-            let diff = self.max_pkt_id - pkt_id;
+            let diff = slot.max_pkt_id - pkt_id;
             if diff >= 64 {
                 return false;
             }
             let mask = 1u64 << diff;
-            if (self.bitmap & mask) != 0 {
+            if (slot.bitmap & mask) != 0 {
                 return false;
             }
-            self.bitmap |= mask;
-            true
+            slot.bitmap |= mask;
+            slot.last_touch = touch;
+            return true;
         }
+
+        let new_slot = ServerReplaySlot {
+            server_session_id: server_sid,
+            max_pkt_id: pkt_id,
+            bitmap: 1,
+            last_touch: touch,
+        };
+        if let Some(empty) = self.slots.iter_mut().find(|s| s.is_none()) {
+            *empty = Some(new_slot);
+        } else if let Some(lru) = self
+            .slots
+            .iter_mut()
+            .min_by_key(|s| s.map_or(0, |v| v.last_touch))
+        {
+            *lru = Some(new_slot);
+        }
+        true
     }
 }
 
@@ -422,9 +453,32 @@ pub async fn spawn_ss_server(
     let kind = SsCipherKind::parse(cipher_str)?;
     let master_key = kind.master_key(password)?;
 
-    let tcp_listener = TcpListener::bind(listen_addr).await?;
-    let bound_addr = tcp_listener.local_addr()?;
-    let udp_socket = Arc::new(UdpSocket::bind(bound_addr).await?);
+    let is_ephemeral = listen_addr
+        .parse::<SocketAddr>()
+        .is_ok_and(|addr| addr.port() == 0);
+    let max_attempts = if is_ephemeral { 16 } else { 1 };
+    let mut held_tcp = Vec::new();
+    let mut bound_pair = None;
+    let mut last_udp_err = None;
+    for _ in 0..max_attempts {
+        let candidate_tcp = TcpListener::bind(listen_addr).await?;
+        let candidate_addr = candidate_tcp.local_addr()?;
+        match UdpSocket::bind(candidate_addr).await {
+            Ok(udp) => {
+                bound_pair = Some((candidate_tcp, candidate_addr, Arc::new(udp)));
+                break;
+            }
+            Err(e) => {
+                last_udp_err = Some(e);
+                held_tcp.push(candidate_tcp);
+            }
+        }
+    }
+    drop(held_tcp);
+    let (tcp_listener, bound_addr, udp_socket) = match bound_pair {
+        Some(pair) => pair,
+        None => return Err(last_udp_err.expect("at least one SS UDP bind attempt ran")),
+    };
 
     let replay_cache: Arc<Mutex<HashMap<Vec<u8>, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 

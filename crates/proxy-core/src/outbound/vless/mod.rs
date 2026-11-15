@@ -186,13 +186,14 @@ impl VlessOutbound {
 }
 
 type UdpRecvItem = io::Result<(Vec<u8>, TargetAddr)>;
+type VlessUdpStreamEntry = (mpsc::Sender<Vec<u8>>, tokio::task::AbortHandle);
 
 /// Persistent multi-packet VLESS UDP session caching open `VLESS_CMD_UDP` streams per target.
 /// Avoids repeating TLS / ML-KEM-768 handshakes on every UDP datagram and supports asynchronous
 /// multi-datagram server bursts (such as QUIC/HTTP3 handshakes and media streams).
 struct VlessUdpSession {
     inner: Arc<VlessInner>,
-    streams: Arc<AsyncMutex<HashMap<TargetAddr, mpsc::Sender<Vec<u8>>>>>,
+    streams: Arc<AsyncMutex<HashMap<TargetAddr, VlessUdpStreamEntry>>>,
     rx_tx: mpsc::Sender<UdpRecvItem>,
     rx: AsyncMutex<mpsc::Receiver<UdpRecvItem>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -225,8 +226,8 @@ impl OutboundUdpSession for VlessUdpSession {
 
         let maybe_existing = {
             let mut map = self.streams.lock().await;
-            map.retain(|_, tx| !tx.is_closed());
-            map.get(target).cloned()
+            map.retain(|_, (tx, _)| !tx.is_closed());
+            map.get(target).map(|(tx, _)| tx.clone())
         };
         if let Some(tx) = maybe_existing
             && tx.send(payload.to_vec()).await.is_ok()
@@ -240,18 +241,21 @@ impl OutboundUdpSession for VlessUdpSession {
             .build_vless_request_header(VLESS_CMD_UDP, target)?;
 
         let mut map = self.streams.lock().await;
-        map.retain(|_, tx| !tx.is_closed());
-        if let Some(tx) = map.get(target) {
+        map.retain(|_, (tx, _)| !tx.is_closed());
+        if let Some((tx, _)) = map.get(target) {
             if tx.send(payload.to_vec()).await.is_ok() {
                 return Ok(());
             }
-            map.remove(target);
+            if let Some((_, reader_abort)) = map.remove(target) {
+                reader_abort.abort();
+            }
         }
 
         if map.len() >= 16
             && let Some(evict_key) = map.keys().next().cloned()
+            && let Some((_, reader_abort)) = map.remove(&evict_key)
         {
-            map.remove(&evict_key);
+            reader_abort.abort();
         }
 
         let stream = VlessClientStream::new(transport, req_hdr);
@@ -260,11 +264,14 @@ impl OutboundUdpSession for VlessUdpSession {
         self.closed
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut rx_guard) = self.rx.try_lock() {
+            let mut valid = Vec::new();
             while let Ok(item) = rx_guard.try_recv() {
                 if let Ok(ok_item) = item {
-                    let _ = self.rx_tx.try_send(Ok(ok_item));
-                    break;
+                    valid.push(ok_item);
                 }
+            }
+            for ok_item in valid {
+                let _ = self.rx_tx.try_send(Ok(ok_item));
             }
         }
 
@@ -300,18 +307,26 @@ impl OutboundUdpSession for VlessUdpSession {
         let streams_ref = Arc::clone(&self.streams);
         let closed_ref = Arc::clone(&self.closed);
         let weak_pkt_tx = pkt_tx.downgrade();
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             let mut end_err: Option<io::Error> = None;
             loop {
-                match tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, rd.read_u16()).await {
+                let len_res = tokio::select! {
+                    biased;
+                    _ = rx_tx.closed() => break,
+                    res = tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, rd.read_u16()) => res,
+                };
+                match len_res {
                     Ok(Ok(resp_len)) => {
                         let mut resp = vec![0u8; resp_len as usize];
-                        match tokio::time::timeout(
-                            UDP_SESSION_IDLE_TIMEOUT,
-                            rd.read_exact(&mut resp),
-                        )
-                        .await
-                        {
+                        let body_res = tokio::select! {
+                            biased;
+                            _ = rx_tx.closed() => break,
+                            res = tokio::time::timeout(
+                                UDP_SESSION_IDLE_TIMEOUT,
+                                rd.read_exact(&mut resp),
+                            ) => res,
+                        };
+                        match body_res {
                             Ok(Ok(_)) => {
                                 last_active_ms.store(
                                     started.elapsed().as_millis() as u64,
@@ -358,7 +373,7 @@ impl OutboundUdpSession for VlessUdpSession {
             let no_live_streams = {
                 let mut m = streams_ref.lock().await;
                 let ended_tx = weak_pkt_tx.upgrade();
-                m.retain(|k, tx| {
+                m.retain(|k, (tx, _)| {
                     if k == &target_clone
                         && ended_tx.as_ref().is_some_and(|mine| tx.same_channel(mine))
                     {
@@ -377,7 +392,7 @@ impl OutboundUdpSession for VlessUdpSession {
             }
         });
 
-        map.insert(target.clone(), pkt_tx);
+        map.insert(target.clone(), (pkt_tx, reader_handle.abort_handle()));
         Ok(())
     }
 
@@ -614,6 +629,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessClientStream<S> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
+        }
+        if this.pending_user_written > 0 {
             let done = this.pending_user_written;
             this.pending_user_written = 0;
             return Poll::Ready(Ok(done));

@@ -107,16 +107,37 @@ impl AnyTlsOutbound {
         initial_payload: &[u8],
     ) -> io::Result<AnyTlsStream> {
         // 1. Try reusing highest-Seq idle session first (up to 2 retries if stale)
+        struct IdlePopGuard<'a> {
+            pool: &'a AnyTlsSessionPool,
+            sess: Option<Arc<AnyTlsClientSession>>,
+        }
+        impl Drop for IdlePopGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(sess) = self.sess.take() {
+                    self.pool.return_or_abort_unused_idle(sess);
+                }
+            }
+        }
         for _ in 0..2 {
             let Some(idle_sess) = self.pool.pop_latest_idle() else {
                 break;
+            };
+            let guard = IdlePopGuard {
+                pool: &self.pool,
+                sess: Some(Arc::clone(&idle_sess)),
             };
             match idle_sess
                 .open_stream_with_payload(target, initial_payload)
                 .await
             {
-                Ok(stream) => return Ok(stream),
-                Err(_) => continue,
+                Ok(stream) => {
+                    drop(guard);
+                    return Ok(stream);
+                }
+                Err(_) => {
+                    drop(guard);
+                    continue;
+                }
             }
         }
 

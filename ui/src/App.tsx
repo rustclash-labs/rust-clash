@@ -779,7 +779,11 @@ export const App: React.FC = () => {
                     className="tabular"
                     style={{ fontSize: 11.5, color: "var(--text-muted)" }}
                   >
-                    {version?.version ? `v${version.version}` : "RustClash"}
+                    {version?.version
+                      ? /^(v|rust-clash)/i.test(version.version)
+                        ? version.version
+                        : `v${version.version}`
+                      : "RustClash"}
                   </span>
                 </div>
 

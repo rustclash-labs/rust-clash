@@ -250,9 +250,10 @@ impl ProxyGroup {
         Ok(())
     }
 
-    /// Apply member latency probe results (preserving `self.members` config order) to update
-    /// `selected` for `URLTest` (with `tolerance_ms` hysteresis), `Fallback`, and `LoadBalance`.
-    pub fn apply_probe_results(&self, map: &HashMap<String, Option<u64>>, delays: &DelayStore) {
+    /// Idempotently update `selected` for `URLTest` (with `tolerance_ms` hysteresis), `Fallback`,
+    /// and `LoadBalance` from `map` without mutating `DelayStore`, returning the group's resulting
+    /// effective probe latency (`Some(ms)`) or `None` if all members failed / group is `Select`.
+    pub fn update_selection_from_probes(&self, map: &HashMap<String, Option<u64>>) -> Option<u64> {
         match self.group_type {
             ProxyGroupType::UrlTest => {
                 if let Some((best_name, best_ms)) = self
@@ -270,7 +271,9 @@ impl ProxyGroup {
                     if should_switch {
                         *self.selected.write() = best_name.clone();
                     }
-                    delays.record(&self.name, best_ms);
+                    Some(best_ms)
+                } else {
+                    None
                 }
             }
             ProxyGroupType::Fallback => {
@@ -280,20 +283,34 @@ impl ProxyGroup {
                     .find_map(|m| map.get(m).and_then(|v| *v).map(|ms| (m, ms)))
                 {
                     *self.selected.write() = first_alive.clone();
-                    delays.record(&self.name, ms);
+                    Some(ms)
+                } else {
+                    None
                 }
             }
-            ProxyGroupType::LoadBalance => {
-                if let Some(best_ms) = self
-                    .members
-                    .iter()
-                    .filter_map(|m| map.get(m).and_then(|v| *v))
-                    .min()
-                {
-                    delays.record(&self.name, best_ms);
-                }
+            ProxyGroupType::LoadBalance => self
+                .members
+                .iter()
+                .filter_map(|m| map.get(m).and_then(|v| *v))
+                .min(),
+            ProxyGroupType::Select => {
+                let current = self.selected.read().clone();
+                map.get(&current).and_then(|v| *v)
             }
-            ProxyGroupType::Select => {}
+        }
+    }
+
+    /// Apply member latency probe results (preserving `self.members` config order) to update
+    /// `selected` for `URLTest` (with `tolerance_ms` hysteresis), `Fallback`, and `LoadBalance`,
+    /// and record the group's resulting latency (or failure when all members fail) in `delays`.
+    pub fn apply_probe_results(&self, map: &HashMap<String, Option<u64>>, delays: &DelayStore) {
+        if self.group_type == ProxyGroupType::Select {
+            return;
+        }
+        match self.update_selection_from_probes(map) {
+            Some(ms) => delays.record(&self.name, ms),
+            None if !self.members.is_empty() => delays.record_failure(&self.name),
+            None => {}
         }
     }
 

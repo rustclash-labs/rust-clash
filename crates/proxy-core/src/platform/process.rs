@@ -97,6 +97,32 @@ pub fn find_local_process(
     resolved
 }
 
+/// Non-spawning variant of [`find_local_process`] safe to call from hot synchronous telemetry
+/// hooks on Tokio worker threads: on Linux and Windows it queries in-memory kernel tables
+/// (`/proc` / `GetExtended*Table`), while on macOS (where uncached lookup spawns `/usr/sbin/lsof`)
+/// it returns cached entries without blocking or violating App Sandbox / NetworkExtension rules.
+pub fn find_local_process_nonblocking(
+    transport: SocketTransport,
+    local_addr: SocketAddr,
+) -> Option<LocalProcessInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        if local_addr.port() == 0 || !is_potentially_local_ip(local_addr.ip()) {
+            return None;
+        }
+        if let Some((ts, cached)) = PROCESS_CACHE.lock().get(&(transport, local_addr)).cloned()
+            && ts.elapsed() < PROCESS_CACHE_TTL
+        {
+            return cached;
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        find_local_process(transport, local_addr)
+    }
+}
+
 fn is_potentially_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {

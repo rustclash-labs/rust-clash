@@ -625,7 +625,7 @@ impl LinuxSystemTunSession {
 
         let stop_rx = Arc::clone(&stop_flag);
         let rx_cnt = Arc::clone(&rx_packets);
-        let rx_thread = std::thread::Builder::new()
+        let rx_thread = match std::thread::Builder::new()
             .name("tun-linux-rx".into())
             .spawn(move || {
                 let mut f = file;
@@ -655,11 +655,21 @@ impl LinuxSystemTunSession {
                         }
                     }
                 }
-            })?;
+            }) {
+            Ok(h) => h,
+            Err(err) => {
+                stop_flag.store(true, Ordering::Release);
+                let _ = stop_watch_tx.send(true);
+                rollback_linux_record(&rec);
+                clear_global_socket_protector();
+                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                return Err(err);
+            }
+        };
 
         let stop_tx = Arc::clone(&stop_flag);
         let tx_cnt = Arc::clone(&tx_packets);
-        let tx_thread = std::thread::Builder::new()
+        let tx_thread = match std::thread::Builder::new()
             .name("tun-linux-tx".into())
             .spawn(move || {
                 let f = writer_file;
@@ -688,14 +698,25 @@ impl LinuxSystemTunSession {
                         }
                     }
                 });
-            })?;
+            }) {
+            Ok(h) => h,
+            Err(err) => {
+                stop_flag.store(true, Ordering::Release);
+                let _ = stop_watch_tx.send(true);
+                let _ = rx_thread.join();
+                rollback_linux_record(&rec);
+                clear_global_socket_protector();
+                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                return Err(err);
+            }
+        };
 
         let stop_watch = Arc::clone(&stop_flag);
         let egress_watch = Arc::clone(&egress_snapshot);
         let transitions_watch = Arc::clone(&network_transitions);
         let dns_watch = spec.dns_engine.clone();
         let net_hook_watch = spec.network_change_hook.clone();
-        let watch_thread = std::thread::Builder::new()
+        let watch_thread = match std::thread::Builder::new()
             .name("tun-linux-netwatch".into())
             .spawn(move || {
                 while !stop_watch.load(Ordering::Acquire) {
@@ -718,7 +739,19 @@ impl LinuxSystemTunSession {
                         }
                     }
                 }
-            })?;
+            }) {
+            Ok(h) => h,
+            Err(err) => {
+                stop_flag.store(true, Ordering::Release);
+                let _ = stop_watch_tx.send(true);
+                let _ = rx_thread.join();
+                let _ = tx_thread.join();
+                rollback_linux_record(&rec);
+                clear_global_socket_protector();
+                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             spec,

@@ -197,7 +197,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TrojanClientStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.pending_req_hdr.is_empty() {
+        if !this.pending_req_hdr.is_empty() && this.pending_user_written == 0 {
             while !this.pending_req_hdr.is_empty() {
                 match Pin::new(&mut this.inner).poll_write(cx, &this.pending_req_hdr) {
                     Poll::Ready(Ok(0)) => {
@@ -211,8 +211,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TrojanClientStream<S> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
-            if let Poll::Ready(Err(e)) = Pin::new(&mut this.inner).poll_flush(cx) {
-                return Poll::Ready(Err(e));
+            match Pin::new(&mut this.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -248,6 +250,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrojanClientStream<S> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
+        }
+        if this.pending_user_written > 0 {
             let done = this.pending_user_written;
             this.pending_user_written = 0;
             return Poll::Ready(Ok(done));
@@ -403,11 +407,14 @@ impl OutboundUdpSession for TrojanUdpSession {
         self.closed
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut rx_guard) = self.rx.try_lock() {
+            let mut valid = Vec::new();
             while let Ok(item) = rx_guard.try_recv() {
                 if let Ok(ok_item) = item {
-                    let _ = self.rx_tx.try_send(Ok(ok_item));
-                    break;
+                    valid.push(ok_item);
                 }
+            }
+            for ok_item in valid {
+                let _ = self.rx_tx.try_send(Ok(ok_item));
             }
         }
 
@@ -445,12 +452,18 @@ impl OutboundUdpSession for TrojanUdpSession {
         let closed_ref = Arc::clone(&self.closed);
         tokio::spawn(async move {
             loop {
-                match tokio::time::timeout(
-                    UDP_SESSION_IDLE_TIMEOUT,
-                    read_trojan_udp_packet(&mut rd),
-                )
-                .await
-                {
+                let pkt_res = tokio::select! {
+                    biased;
+                    _ = rx_tx.closed() => {
+                        writer_abort.abort();
+                        break;
+                    }
+                    res = tokio::time::timeout(
+                        UDP_SESSION_IDLE_TIMEOUT,
+                        read_trojan_udp_packet(&mut rd),
+                    ) => res,
+                };
+                match pkt_res {
                     Ok(Ok(item)) => {
                         last_active_ms.store(
                             started.elapsed().as_millis() as u64,

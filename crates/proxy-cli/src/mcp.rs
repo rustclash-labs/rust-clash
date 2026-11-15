@@ -1026,8 +1026,58 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
 }
 
 pub async fn handle_mcp_request(req: &Value, opts: &McpServerOptions) -> Option<Value> {
-    let id = req.get("id").cloned();
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if let Some(batch) = req.as_array() {
+        if batch.is_empty() {
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request: empty JSON-RPC batch"
+                }
+            }));
+        }
+        let mut responses = Vec::with_capacity(batch.len());
+        for item in batch {
+            if let Some(resp) = handle_single_mcp_request(item, opts).await {
+                responses.push(resp);
+            }
+        }
+        return if responses.is_empty() {
+            None
+        } else {
+            Some(Value::Array(responses))
+        };
+    }
+
+    handle_single_mcp_request(req, opts).await
+}
+
+async fn handle_single_mcp_request(req: &Value, opts: &McpServerOptions) -> Option<Value> {
+    let Some(obj) = req.as_object() else {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request: expected JSON-RPC request object"
+            }
+        }));
+    };
+
+    let id = obj.get("id").cloned();
+    if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request: jsonrpc version must be '2.0'"
+            }
+        }));
+    }
+
+    let method = obj.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     // Notifications do not carry an `id` and must not receive a JSON-RPC response.
     let req_id = id?;
@@ -1043,7 +1093,7 @@ pub async fn handle_mcp_request(req: &Value, opts: &McpServerOptions) -> Option<
         }));
     }
 
-    let params = req.get("params").unwrap_or(&Value::Null);
+    let params = obj.get("params").unwrap_or(&Value::Null);
 
     match method {
         "initialize" => {
@@ -1139,13 +1189,34 @@ enum FrameMode {
     ContentLength,
 }
 
+const MAX_MCP_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MCP_LINE_BYTES: usize = MAX_MCP_FRAME_BYTES + 1024;
+const MAX_MCP_HEADER_LINE_BYTES: usize = 16 * 1024;
+const MAX_MCP_HEADER_LINES: usize = 64;
+
+async fn read_bounded_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    buf: &mut String,
+    max_bytes: usize,
+) -> Result<usize> {
+    buf.clear();
+    let mut limited = (&mut *reader).take((max_bytes + 1) as u64);
+    let n = limited.read_line(buf).await?;
+    if n > max_bytes && !buf.ends_with('\n') {
+        return Err(anyhow!(
+            "MCP input line exceeds maximum allowed size ({max_bytes} bytes)"
+        ));
+    }
+    Ok(n)
+}
+
 async fn read_next_mcp_frame<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
+    last_mode: &mut FrameMode,
 ) -> Result<Option<(Value, FrameMode)>> {
     let mut line = String::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = read_bounded_line(reader, &mut line, MAX_MCP_LINE_BYTES).await?;
         if n == 0 {
             return Ok(None);
         }
@@ -1154,23 +1225,30 @@ async fn read_next_mcp_frame<R: AsyncRead + Unpin>(
             continue;
         }
 
-        if let Some(rest) = trimmed
-            .strip_prefix("Content-Length:")
-            .or_else(|| trimmed.strip_prefix("content-length:"))
+        if let Some((hdr_name, hdr_val)) = trimmed.split_once(':')
+            && hdr_name.trim().eq_ignore_ascii_case("content-length")
         {
-            let content_len: usize = rest
+            *last_mode = FrameMode::ContentLength;
+            let content_len: usize = hdr_val
                 .trim()
                 .parse()
                 .context("invalid Content-Length header in MCP stream")?;
-            if content_len > 8 * 1024 * 1024 {
+            if content_len > MAX_MCP_FRAME_BYTES {
                 return Err(anyhow!("MCP frame exceeds 8 MiB safety cap"));
             }
-            // Consume remaining headers up to blank line.
+            // Consume remaining headers up to blank line with bounded header count and length.
+            let mut header_count = 1usize;
             loop {
                 let mut hdr = String::new();
-                let hn = reader.read_line(&mut hdr).await?;
+                let hn = read_bounded_line(reader, &mut hdr, MAX_MCP_HEADER_LINE_BYTES).await?;
                 if hn == 0 || hdr.trim().is_empty() {
                     break;
+                }
+                header_count += 1;
+                if header_count > MAX_MCP_HEADER_LINES {
+                    return Err(anyhow!(
+                        "MCP frame exceeded maximum header count ({MAX_MCP_HEADER_LINES})"
+                    ));
                 }
             }
             let mut body = vec![0u8; content_len];
@@ -1180,6 +1258,7 @@ async fn read_next_mcp_frame<R: AsyncRead + Unpin>(
             return Ok(Some((val, FrameMode::ContentLength)));
         }
 
+        *last_mode = FrameMode::NewlineJson;
         let val: Value = serde_json::from_str(trimmed).context("invalid JSON-RPC line on stdin")?;
         return Ok(Some((val, FrameMode::NewlineJson)));
     }
@@ -1212,8 +1291,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(input);
+    let mut last_mode = FrameMode::NewlineJson;
     loop {
-        match read_next_mcp_frame(&mut reader).await {
+        match read_next_mcp_frame(&mut reader, &mut last_mode).await {
             Ok(Some((req, mode))) => {
                 if let Some(resp) = handle_mcp_request(&req, &opts).await {
                     write_mcp_frame(&mut output, &resp, mode).await?;
@@ -1229,7 +1309,7 @@ where
                         "message": format!("Parse error: {}", redact_sensitive_text(&err.to_string()))
                     }
                 });
-                write_mcp_frame(&mut output, &err_resp, FrameMode::NewlineJson).await?;
+                write_mcp_frame(&mut output, &err_resp, last_mode).await?;
                 break;
             }
         }
@@ -1600,5 +1680,60 @@ rules:
             !serialized.contains(secret_marker),
             "parse failure must never echo arbitrary file contents back to MCP caller: {serialized}"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_validates_jsonrpc_version_supports_batches_and_preserves_content_length_error_framing()
+     {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. Missing or wrong `jsonrpc` version returns -32600 Invalid Request
+        let bad_ver = handle_mcp_request(&json!({"id": 7, "method": "ping"}), &ro_opts)
+            .await
+            .unwrap();
+        assert_eq!(bad_ver["error"]["code"], -32600);
+        assert_eq!(bad_ver["id"], 7);
+
+        // 2. JSON-RPC 2.0 batch request omits notifications and returns array of responses
+        let batch_resp = handle_mcp_request(
+            &json!([
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 10, "method": "ping"},
+                {"jsonrpc": "2.0", "id": 11, "method": "prompts/list"}
+            ]),
+            &ro_opts,
+        )
+        .await
+        .unwrap();
+        let arr = batch_resp.as_array().expect("batch array response");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], 10);
+        assert_eq!(arr[1]["id"], 11);
+
+        // 3. Mixed-case `CONTENT-LENGTH:` header with malformed JSON replies using `Content-Length:` framing!
+        let malformed_body = b"{invalid-json";
+        let raw_in = format!(
+            "CONTENT-LENGTH: {}\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n",
+            malformed_body.len()
+        );
+        let mut input_bytes = raw_in.into_bytes();
+        input_bytes.extend_from_slice(malformed_body);
+
+        let mut out_bytes = Vec::new();
+        serve_mcp_io(std::io::Cursor::new(input_bytes), &mut out_bytes, ro_opts)
+            .await
+            .unwrap();
+        let out_str = String::from_utf8(out_bytes).unwrap();
+        assert!(
+            out_str.starts_with("Content-Length: "),
+            "parse error on Content-Length stream must preserve Content-Length framing, got: {out_str}"
+        );
+        assert!(out_str.contains("-32700"));
     }
 }

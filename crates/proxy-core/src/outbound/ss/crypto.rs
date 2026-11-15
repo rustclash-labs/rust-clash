@@ -187,7 +187,10 @@ impl SsAeadCipher {
         })
     }
 
-    fn take_and_increment_le_nonce(&mut self) -> [u8; 12] {
+    fn take_and_increment_le_nonce(&mut self) -> io::Result<[u8; 12]> {
+        if self.nonce == [0xFF; 12] {
+            return Err(io::Error::other("Shadowsocks AEAD 96-bit nonce exhausted"));
+        }
         let current = self.nonce;
         for b in &mut self.nonce {
             *b = b.wrapping_add(1);
@@ -195,11 +198,11 @@ impl SsAeadCipher {
                 break;
             }
         }
-        current
+        Ok(current)
     }
 
     pub fn seal(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
-        let n = self.take_and_increment_le_nonce();
+        let n = self.take_and_increment_le_nonce()?;
         let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
         out.extend_from_slice(plaintext);
         self.key
@@ -215,7 +218,7 @@ impl SsAeadCipher {
                 "Shadowsocks AEAD chunk shorter than tag",
             ));
         }
-        let n = self.take_and_increment_le_nonce();
+        let n = self.take_and_increment_le_nonce()?;
         let mut buf = ciphertext_and_tag.to_vec();
         let plain = self
             .key

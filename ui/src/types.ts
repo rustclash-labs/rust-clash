@@ -265,6 +265,7 @@ export type ProxyNodeConfigPayload =
       tls?: boolean;
       sni?: string | null;
       "skip-cert-verify"?: boolean;
+      headers?: Record<string, string>;
     };
 
 export interface SkippedProxyEntry {

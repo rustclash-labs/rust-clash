@@ -479,11 +479,7 @@ impl DemoCluster {
                 ipv6: false,
                 enhanced_mode: "fake-ip".to_string(),
                 fake_ip_range: "198.18.0.0/15".to_string(),
-                fake_ip_filter: vec![
-                    "localhost".to_string(),
-                    "*.lan".to_string(),
-                    "+.msftconnecttest.com".to_string(),
-                ],
+                fake_ip_filter: crate::config::default_fake_ip_filter(),
                 default_nameserver: vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()],
                 direct_nameserver: vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()],
                 nameserver: vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()],
@@ -751,6 +747,20 @@ struct RuntimeServices {
     mixed: MixedService,
     dns: Option<DnsService>,
     tun: Option<TunService>,
+}
+
+impl RuntimeServices {
+    fn snapshot_shutdown_senders(&self) -> Vec<watch::Sender<bool>> {
+        let mut senders = Vec::with_capacity(3);
+        senders.push(self.mixed.shutdown_tx.clone());
+        if let Some(d) = &self.dns {
+            senders.push(d.shutdown_tx.clone());
+        }
+        if let Some(t) = &self.tun {
+            senders.push(t.shutdown_tx.clone());
+        }
+        senders
+    }
 }
 
 fn mixed_listen_spec(cfg: &ClashConfig) -> String {
@@ -1222,6 +1232,7 @@ pub struct ProxyEngine {
     router_slot: Arc<RwLock<Arc<Router>>>,
     mixed_policy: Arc<RwLock<MixedInboundPolicy>>,
     services: AsyncMutex<RuntimeServices>,
+    service_shutdown_txs: Mutex<Vec<watch::Sender<bool>>>,
     hub: Arc<TelemetryHub>,
     active_os_tun: RwLock<Option<Arc<OsTunGuard>>>,
     last_tun_error: RwLock<Option<String>>,
@@ -1698,6 +1709,12 @@ impl ProxyEngine {
             dns_addr: dns_bound_opt,
             tun_mode: initial_tun_mode,
         });
+        let runtime_services = RuntimeServices {
+            mixed: mixed_service,
+            dns: dns_service,
+            tun: tun_service,
+        };
+        let initial_shutdown_txs = runtime_services.snapshot_shutdown_senders();
         let engine = Arc::new(Self {
             state: RwLock::new(EngineState {
                 snapshot: initial_snapshot,
@@ -1711,11 +1728,8 @@ impl ProxyEngine {
             config_path: canonical_cfg_path,
             router_slot,
             mixed_policy,
-            services: AsyncMutex::new(RuntimeServices {
-                mixed: mixed_service,
-                dns: dns_service,
-                tun: tun_service,
-            }),
+            services: AsyncMutex::new(runtime_services),
+            service_shutdown_txs: Mutex::new(initial_shutdown_txs),
             hub,
             active_os_tun: RwLock::new(initial_os_tun),
             last_tun_error: RwLock::new(None),
@@ -2715,6 +2729,13 @@ impl ProxyEngine {
 
         if let Some(d) = old_demo {
             d.shutdown();
+            if !self.state_dir().as_os_str().is_empty() {
+                self.persist_fake_ip
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if self.router().dns().has_unpersisted_entries() {
+                    self.router().dns().assignment_notify().notify_waiters();
+                }
+            }
             self.hub.push_log(
                 "info",
                 "Exited Demo Sandbox and activated real user profile",
@@ -2773,12 +2794,21 @@ impl ProxyEngine {
             if self.demo_cluster.read().is_none() {
                 return Ok(());
             }
-            let target_cfg = if let Some(mgr) = self.profile_manager() {
-                mgr.load_active_config()?.0
+            let (target_cfg, saved_sel) = if let Some(mgr) = self.profile_manager() {
+                let (cfg, _) = mgr.load_active_config()?;
+                let sel = crate::profile::default_selected_groups_for_config(
+                    &cfg,
+                    &mgr.active_selected_groups(),
+                );
+                (cfg, Some(sel))
             } else {
-                ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml())?
+                (
+                    ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml())?,
+                    None,
+                )
             };
-            self.activate_profile_config(target_cfg).await
+            self.activate_profile_config_with_selections(target_cfg, saved_sel.as_ref())
+                .await
         }
     }
 
@@ -3008,6 +3038,7 @@ impl ProxyEngine {
             rollback.stopped_old_tun_cfg,
         )
         .await;
+        *self.service_shutdown_txs.lock() = services.snapshot_shutdown_senders();
     }
 
     async fn apply_serialized_config_transition<F>(
@@ -3122,47 +3153,85 @@ impl ProxyEngine {
             stopped_old_tun_cfg: None,
         };
 
-        // 2. Apply TUN transition with full rollback record (`stopped_old_tun_cfg`)
-        if need_tun_change {
-            if let Some(old_tun) = services.tun.take() {
-                rollback.stopped_old_tun_cfg = Some(old_tun.config.clone());
-                old_tun.stop().await;
-                *self.active_os_tun.write() = None;
-                *self.virtual_tun.lock() = None;
-                let mut st = self.state.write();
-                let mut next_snap = (*st.snapshot).clone();
-                next_snap.tun_mode = TunRuntimeMode::Disabled;
-                st.snapshot = Arc::new(next_snap);
-            }
-            if new_cfg.tun.enable {
-                let local_dns = services.dns.as_ref().map(|d| d.bound_addr);
-                match start_tun_service(
-                    &new_cfg,
-                    &new_dns,
-                    local_dns,
-                    Arc::clone(&self.router_slot),
-                    Arc::clone(&self.hub),
-                    Arc::clone(&self.preconnect_wake),
-                    self.state_dir(),
-                ) {
-                    Ok(started) => {
-                        *self.last_tun_error.write() = None;
-                        rollback.pending_new_tun = Some(started);
-                    }
-                    Err(err) => {
-                        let msg = format!(
-                            "failed to enable TUN '{}' (auto-route={}): {err}",
-                            new_cfg.tun.device, new_cfg.tun.auto_route
-                        );
-                        *self.last_tun_error.write() = Some(msg.clone());
-                        self.rollback_failed_transition(&mut services, rollback)
-                            .await;
-                        self.hub.push_log("error", &msg);
-                        return Err(ProxyError::Io(std::io::Error::new(err.kind(), msg)));
-                    }
+        // 2. Rebind or toggle UDP+TCP DNS Server FIRST if `dns.enable` or `dns.listen` changed
+        // so any subsequent OS TUN launch (`start_tun_service`) receives the newly bound `local_dns`!
+        if need_dns_change {
+            if !new_cfg.dns.enable {
+                if let Some(old_dns) = services.dns.take() {
+                    old_dns.stop().await;
+                    rollback.dns_needs_restore = true;
+                    self.hub.push_log("info", "Stopped DNS server");
                 }
             } else {
-                *self.last_tun_error.write() = None;
+                let target_dns_port = parse_any_listen_port(&new_cfg.dns.listen).unwrap_or(0);
+                let same_dns_port = target_dns_port != 0
+                    && services
+                        .dns
+                        .as_ref()
+                        .is_some_and(|d| d.bound_addr.port() == target_dns_port);
+
+                if !same_dns_port {
+                    let (d_tx, d_rx) = watch::channel(false);
+                    match spawn_dynamic_dns_server(
+                        &new_cfg.dns.listen,
+                        Arc::clone(&self.router_slot),
+                        d_rx,
+                    )
+                    .await
+                    {
+                        Ok((bound, t_udp, t_tcp)) => {
+                            new_cfg.dns.listen = bound.to_string();
+                            if let Some(old_dns) = services.dns.take() {
+                                old_dns.stop().await;
+                            }
+                            services.dns = Some(DnsService {
+                                listen_spec: new_cfg.dns.listen.clone(),
+                                bound_addr: bound,
+                                shutdown_tx: d_tx,
+                                udp_task: t_udp,
+                                tcp_task: t_tcp,
+                            });
+                            rollback.dns_needs_restore = true;
+                            self.hub
+                                .push_log("info", format!("Rebound UDP+TCP DNS to {bound}"));
+                        }
+                        Err(err) => {
+                            self.rollback_failed_transition(&mut services, rollback)
+                                .await;
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    if let Some(old_dns) = services.dns.take() {
+                        old_dns.stop().await;
+                        rollback.dns_needs_restore = true;
+                    }
+                    let (d_tx, d_rx) = watch::channel(false);
+                    match spawn_dynamic_dns_server(
+                        &new_cfg.dns.listen,
+                        Arc::clone(&self.router_slot),
+                        d_rx,
+                    )
+                    .await
+                    {
+                        Ok((bound, t_udp, t_tcp)) => {
+                            new_cfg.dns.listen = bound.to_string();
+                            services.dns = Some(DnsService {
+                                listen_spec: new_cfg.dns.listen.clone(),
+                                bound_addr: bound,
+                                shutdown_tx: d_tx,
+                                udp_task: t_udp,
+                                tcp_task: t_tcp,
+                            });
+                            rollback.dns_needs_restore = true;
+                        }
+                        Err(err) => {
+                            self.rollback_failed_transition(&mut services, rollback)
+                                .await;
+                            return Err(err);
+                        }
+                    }
+                }
             }
         }
 
@@ -3249,84 +3318,47 @@ impl ProxyEngine {
             );
         }
 
-        // 4. Rebind or toggle UDP+TCP DNS Server if `dns.enable` or `dns.listen` changed
-        if need_dns_change {
-            if !new_cfg.dns.enable {
-                if let Some(old_dns) = services.dns.take() {
-                    old_dns.stop().await;
-                    rollback.dns_needs_restore = true;
-                    self.hub.push_log("info", "Stopped DNS server");
+        // 4. Apply TUN transition with full rollback record (`stopped_old_tun_cfg`) using the updated `local_dns`
+        if need_tun_change {
+            if let Some(old_tun) = services.tun.take() {
+                rollback.stopped_old_tun_cfg = Some(old_tun.config.clone());
+                old_tun.stop().await;
+                *self.active_os_tun.write() = None;
+                *self.virtual_tun.lock() = None;
+                let mut st = self.state.write();
+                let mut next_snap = (*st.snapshot).clone();
+                next_snap.tun_mode = TunRuntimeMode::Disabled;
+                st.snapshot = Arc::new(next_snap);
+            }
+            if new_cfg.tun.enable {
+                let local_dns = services.dns.as_ref().map(|d| d.bound_addr);
+                match start_tun_service(
+                    &new_cfg,
+                    &new_dns,
+                    local_dns,
+                    Arc::clone(&self.router_slot),
+                    Arc::clone(&self.hub),
+                    Arc::clone(&self.preconnect_wake),
+                    self.state_dir(),
+                ) {
+                    Ok(started) => {
+                        *self.last_tun_error.write() = None;
+                        rollback.pending_new_tun = Some(started);
+                    }
+                    Err(err) => {
+                        let msg = format!(
+                            "failed to enable TUN '{}' (auto-route={}): {err}",
+                            new_cfg.tun.device, new_cfg.tun.auto_route
+                        );
+                        *self.last_tun_error.write() = Some(msg.clone());
+                        self.rollback_failed_transition(&mut services, rollback)
+                            .await;
+                        self.hub.push_log("error", &msg);
+                        return Err(ProxyError::Io(std::io::Error::new(err.kind(), msg)));
+                    }
                 }
             } else {
-                let target_dns_port = parse_any_listen_port(&new_cfg.dns.listen).unwrap_or(0);
-                let same_dns_port = target_dns_port != 0
-                    && services
-                        .dns
-                        .as_ref()
-                        .is_some_and(|d| d.bound_addr.port() == target_dns_port);
-
-                if !same_dns_port {
-                    let (d_tx, d_rx) = watch::channel(false);
-                    match spawn_dynamic_dns_server(
-                        &new_cfg.dns.listen,
-                        Arc::clone(&self.router_slot),
-                        d_rx,
-                    )
-                    .await
-                    {
-                        Ok((bound, t_udp, t_tcp)) => {
-                            new_cfg.dns.listen = bound.to_string();
-                            if let Some(old_dns) = services.dns.take() {
-                                old_dns.stop().await;
-                            }
-                            services.dns = Some(DnsService {
-                                listen_spec: new_cfg.dns.listen.clone(),
-                                bound_addr: bound,
-                                shutdown_tx: d_tx,
-                                udp_task: t_udp,
-                                tcp_task: t_tcp,
-                            });
-                            rollback.dns_needs_restore = true;
-                            self.hub
-                                .push_log("info", format!("Rebound UDP+TCP DNS to {bound}"));
-                        }
-                        Err(err) => {
-                            self.rollback_failed_transition(&mut services, rollback)
-                                .await;
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    if let Some(old_dns) = services.dns.take() {
-                        old_dns.stop().await;
-                        rollback.dns_needs_restore = true;
-                    }
-                    let (d_tx, d_rx) = watch::channel(false);
-                    match spawn_dynamic_dns_server(
-                        &new_cfg.dns.listen,
-                        Arc::clone(&self.router_slot),
-                        d_rx,
-                    )
-                    .await
-                    {
-                        Ok((bound, t_udp, t_tcp)) => {
-                            new_cfg.dns.listen = bound.to_string();
-                            services.dns = Some(DnsService {
-                                listen_spec: new_cfg.dns.listen.clone(),
-                                bound_addr: bound,
-                                shutdown_tx: d_tx,
-                                udp_task: t_udp,
-                                tcp_task: t_tcp,
-                            });
-                            rollback.dns_needs_restore = true;
-                        }
-                        Err(err) => {
-                            self.rollback_failed_transition(&mut services, rollback)
-                                .await;
-                            return Err(err);
-                        }
-                    }
-                }
+                *self.last_tun_error.write() = None;
             }
         }
 
@@ -3351,6 +3383,17 @@ impl ProxyEngine {
             *self.virtual_tun.lock() = vtun_opt;
             *self.active_os_tun.write() = new_tun_svc.os_guard.clone();
             services.tun = Some(new_tun_svc);
+        }
+        let committed_senders = services.snapshot_shutdown_senders();
+        if *self.shutdown_tx.borrow() {
+            for tx in &committed_senders {
+                let _ = tx.send(true);
+            }
+            if let Some(os_guard) = self.active_os_tun.write().take() {
+                os_guard.stop_now();
+            }
+        } else {
+            *self.service_shutdown_txs.lock() = committed_senders;
         }
         let final_mixed_addr = services.mixed.bound_addr;
         let final_dns_addr = services.dns.as_ref().map(|d| d.bound_addr);
@@ -3572,6 +3615,10 @@ impl ProxyEngine {
         Ok(out)
     }
 
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         for handle in self._bg_tasks.lock().drain(..) {
@@ -3580,6 +3627,9 @@ impl ProxyEngine {
         self.persist_fake_ip_cache();
         if let Some(os_guard) = self.active_os_tun.write().take() {
             os_guard.stop_now();
+        }
+        for tx in self.service_shutdown_txs.lock().drain(..) {
+            let _ = tx.send(true);
         }
         if let Ok(mut guard) = self.services.try_lock() {
             let _ = guard.mixed.shutdown_tx.send(true);
@@ -3593,6 +3643,9 @@ impl ProxyEngine {
                 let _ = t.shutdown_tx.send(true);
             }
         }
+        let _ = self.hub.reset_udp_nat_sessions();
+        let _ = self.router().shutdown_cleanup();
+        let _ = self.hub.close_all_connections();
         if let Some(d) = self.demo_cluster.write().take() {
             d.shutdown();
         }

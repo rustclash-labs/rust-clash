@@ -286,6 +286,9 @@ pub unsafe extern "C" fn rc_ne_start_engine(
         let queue_for_pump = Arc::clone(&egress_queue);
         let pump_task = rt.spawn(async move {
             while let Some(pkt) = egress_rx.recv().await {
+                if pkt.is_empty() || pkt.len() > 65535 {
+                    continue;
+                }
                 loop {
                     let notified = queue_for_pump.space_notify.notified();
                     tokio::pin!(notified);

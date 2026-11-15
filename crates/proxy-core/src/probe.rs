@@ -159,33 +159,78 @@ impl<'a> Default for ProbeOptions<'a> {
     }
 }
 
+fn is_restricted_probe_ipv4(v4: Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 64) // RFC 6598 CGNAT 100.64.0.0/10
+        || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19)) // Fake-IP / RFC 2544 198.18.0.0/15
+        || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0) // IETF 192.0.0.0/24
+        || oct[0] >= 240 // Class E reserved
+}
+
 /// Returns `true` if `raw_ip` belongs to loopback, private, link-local / cloud metadata (`169.254.0.0/16`),
-/// CGNAT (`100.64.0.0/10`), Fake-IP/benchmarking (`198.18.0.0/15`), IPv6 ULA (`fc00::/7`), multicast,
-/// unspecified, documentation, or reserved ranges (including IPv4-mapped IPv6 equivalents).
+/// CGNAT (`100.64.0.0/10`), Fake-IP/benchmarking (`198.18.0.0/15`), IPv6 ULA (`fc00::/7`), NAT64/6to4/Teredo
+/// transition prefixes embedding restricted IPv4s, multicast, unspecified, documentation, or reserved ranges.
 pub fn is_restricted_probe_ip(raw_ip: IpAddr) -> bool {
     match raw_ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            let oct = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 64) // RFC 6598 CGNAT 100.64.0.0/10
-                || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19)) // Fake-IP / RFC 2544 198.18.0.0/15
-                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0) // IETF 192.0.0.0/24
-                || oct[0] >= 240 // Class E reserved
-        }
+        IpAddr::V4(v4) => is_restricted_probe_ipv4(v4),
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            v6.is_loopback()
+            if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // Unique Local fc00::/7 (incl. fd00:ec2::254)
                 || (seg[0] & 0xffc0) == 0xfe80 // Link-Local fe80::/10
                 || (seg[0] == 0x2001 && seg[1] == 0x0db8) // Documentation 2001:db8::/32
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 1)
+            // RFC 8215 local-use NAT64 64:ff9b:1::/48
+            {
+                return true;
+            }
+            // RFC 6052 Well-Known NAT64 prefix 64:ff9b::/96
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let embedded = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                );
+                if is_restricted_probe_ipv4(embedded) {
+                    return true;
+                }
+            }
+            // RFC 3056 6to4 prefix 2002::/16
+            if seg[0] == 0x2002 {
+                let embedded = Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    seg[1] as u8,
+                    (seg[2] >> 8) as u8,
+                    seg[2] as u8,
+                );
+                if is_restricted_probe_ipv4(embedded) {
+                    return true;
+                }
+            }
+            // RFC 4380 Teredo prefix 2001:0000::/32 (obfuscated client IPv4 = !low32)
+            if seg[0] == 0x2001 && seg[1] == 0x0000 {
+                let obf = !(((seg[6] as u32) << 16) | (seg[7] as u32));
+                if is_restricted_probe_ipv4(Ipv4Addr::from(obf)) {
+                    return true;
+                }
+            }
+            false
         }
     }
 }
@@ -201,6 +246,7 @@ pub fn is_restricted_probe_hostname(host: &str) -> bool {
     h == "localhost"
         || h.ends_with(".localhost")
         || h.ends_with(".local")
+        || h.ends_with(".home.arpa")
         || h.ends_with(".internal")
         || h == "metadata"
         || h == "instance-data"
@@ -536,12 +582,84 @@ pub async fn probe_outbound_udp_with_policy(
         };
     }
 
-    let txid: u16 = 0x5A3C;
+    let txid: u16 = (uuid::Uuid::new_v4().as_u128() as u16) | 1;
     let pkt = build_dns_query(txid, "example.com", QTYPE_A);
     let started = Instant::now();
     let bounded = timeout.min(Duration::from_millis(3500));
 
-    match outbound.exchange_udp(&parsed_target, &pkt, bounded).await {
+    let dial_udp_target = if outbound.exit_category() != "PROXY"
+        && let HostName::Domain(dom) = &parsed_target.host
+    {
+        if dom.eq_ignore_ascii_case("localhost") {
+            TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), parsed_target.port)
+        } else {
+            let resolved_addrs = match tokio::time::timeout(
+                bounded,
+                tokio::net::lookup_host((dom.as_str(), parsed_target.port)),
+            )
+            .await
+            {
+                Ok(Ok(iter)) => iter.collect::<Vec<_>>(),
+                Ok(Err(e)) => {
+                    return UdpProbeResult {
+                        status: "blackholed".to_string(),
+                        configured_udp: true,
+                        target: Some(parsed_target.to_string()),
+                        rtt_ms: None,
+                        detail: format!(
+                            "Failed resolving UDP probe host '{dom}': {}",
+                            redact_sensitive_text(&e.to_string())
+                        ),
+                    };
+                }
+                Err(_) => {
+                    return UdpProbeResult {
+                        status: "blackholed".to_string(),
+                        configured_udp: true,
+                        target: Some(parsed_target.to_string()),
+                        rtt_ms: None,
+                        detail: format!("Timed out resolving UDP probe host '{dom}'"),
+                    };
+                }
+            };
+            let Some(first_sa) = resolved_addrs.first().copied() else {
+                return UdpProbeResult {
+                    status: "blackholed".to_string(),
+                    configured_udp: true,
+                    target: Some(parsed_target.to_string()),
+                    rtt_ms: None,
+                    detail: format!("DNS returned no addresses for UDP probe host '{dom}'"),
+                };
+            };
+            if !allow_private_targets {
+                for sa in &resolved_addrs {
+                    if is_restricted_probe_ip(sa.ip())
+                        && !is_whitelisted_private_addr(
+                            sa.ip(),
+                            parsed_target.port,
+                            allowed_private_addrs,
+                        )
+                    {
+                        return UdpProbeResult {
+                            status: "blocked".to_string(),
+                            configured_udp: true,
+                            target: Some(parsed_target.to_string()),
+                            rtt_ms: None,
+                            detail: format!(
+                                "DNS resolved UDP probe host '{dom}' to restricted IP {} (blocked by SSRF protection)",
+                                sa.ip()
+                            ),
+                        };
+                    }
+                }
+            }
+            TargetAddr::new_ip(first_sa.ip(), parsed_target.port)
+        }
+    } else {
+        parsed_target.clone()
+    };
+
+    match outbound.exchange_udp(&dial_udp_target, &pkt, bounded).await {
         Ok(resp) if resp.len() >= 12 && u16::from_be_bytes([resp[0], resp[1]]) == txid => {
             let ms = round_ms(started.elapsed());
             UdpProbeResult {
@@ -771,10 +889,15 @@ pub async fn probe_target_waterfall(
             }
         };
 
-        let host_hdr = if (is_https && port == 443) || (!is_https && port == 80) {
-            host_str.clone()
+        let bracketed_host = if host_str.contains(':') {
+            format!("[{host_str}]")
         } else {
-            format!("{host_str}:{port}")
+            host_str.clone()
+        };
+        let host_hdr = if (is_https && port == 443) || (!is_https && port == 80) {
+            bracketed_host
+        } else {
+            format!("{bracketed_host}:{port}")
         };
         let req_bytes = format!(
             "GET {path_and_query} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rust-clash/{}\r\nAccept: application/json, text/plain, */*\r\nConnection: close\r\n\r\n",
@@ -1162,6 +1285,13 @@ pub struct SiteDiagnosisReport {
 /// Normalize a user-supplied website domain, `host:port`, or full `http(s)://` URL into
 /// `(probe_url, route_target)`.
 pub fn normalize_site_check_input(raw_input: &str) -> Result<(String, TargetAddr)> {
+    let (sanitized_url, _wire_url, target) = normalize_site_check_input_with_wire_url(raw_input)?;
+    Ok((sanitized_url, target))
+}
+
+fn normalize_site_check_input_with_wire_url(
+    raw_input: &str,
+) -> Result<(String, String, TargetAddr)> {
     let trimmed = raw_input.trim();
     if trimmed.is_empty() {
         return Err(ProxyError::Config(
@@ -1189,13 +1319,27 @@ pub fn normalize_site_check_input(raw_input: &str) -> Result<(String, TargetAddr
         format!("https://{trimmed}/")
     };
 
-    let (_is_https, host_str, port, _path_and_query, sanitized_url) =
+    let (is_https, host_str, port, path_and_query, sanitized_url) =
         parse_probe_url(&candidate_url)?;
+    let bracketed_host = if host_str.contains(':') {
+        format!("[{host_str}]")
+    } else {
+        host_str.clone()
+    };
+    let wire_authority = if (is_https && port == 443) || (!is_https && port == 80) {
+        bracketed_host
+    } else {
+        format!("{bracketed_host}:{port}")
+    };
+    let wire_url = format!(
+        "{}://{wire_authority}{path_and_query}",
+        if is_https { "https" } else { "http" }
+    );
     let target = match host_str.parse::<IpAddr>() {
         Ok(ip) => TargetAddr::new_ip(ip, port),
         Err(_) => TargetAddr::new_domain(&host_str, port)?,
     };
-    Ok((sanitized_url, target))
+    Ok((sanitized_url, wire_url, target))
 }
 
 fn format_mode_label_zh(mode: &str) -> &'static str {
@@ -1225,7 +1369,8 @@ pub async fn diagnose_site(
     takeover: SiteTakeoverContext,
     opts: ProbeOptions<'_>,
 ) -> Result<SiteDiagnosisReport> {
-    let (normalized_url, route_target) = normalize_site_check_input(raw_input)?;
+    let (normalized_url, wire_url, route_target) =
+        normalize_site_check_input_with_wire_url(raw_input)?;
     let host_str = match &route_target.host {
         HostName::Ip(ip) => ip.to_string(),
         HostName::Domain(d) => d.clone(),
@@ -1474,7 +1619,7 @@ pub async fn diagnose_site(
         .first()
         .cloned()
         .unwrap_or_else(|| effective_outbound.clone());
-    let wf = probe_target_waterfall(router, config, &probe_entry, &normalized_url, opts).await?;
+    let wf = probe_target_waterfall(router, config, &probe_entry, &wire_url, opts).await?;
 
     let mut stage_checks = Vec::with_capacity(6);
     stage_checks.push(SiteStageCheck {
