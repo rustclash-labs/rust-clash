@@ -103,7 +103,7 @@ fun HomeScreen(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 10.dp),
+            .padding(start = 20.dp, top = 6.dp, end = 20.dp, bottom = 20.dp),
     ) {
         // Top Brand Bar (matching design reference: clean "RustClash" left + overflow menu right)
         Row(
@@ -235,7 +235,7 @@ fun HomeScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         // Hero Connect Section
         Column(
@@ -249,7 +249,7 @@ fun HomeScreen(
                 onClick = onToggleVpn,
             )
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             val statusTitle = when (state.vpnState) {
                 VpnLifecycleState.RUNNING -> if (state.routingPreset == RoutingPresetUi.DIRECT) {
@@ -294,7 +294,7 @@ fun HomeScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(18.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
         // Live Speed & Waveform Card (matching design reference)
         Surface(
@@ -307,7 +307,7 @@ fun HomeScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 6.dp),
+                        .padding(start = 20.dp, end = 20.dp, top = 13.dp, bottom = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -330,13 +330,13 @@ fun HomeScreen(
                     isConnected = isConnected,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(52.dp)
+                        .height(46.dp)
                         .clip(RoundedCornerShape(bottomStart = 18.dp, bottomEnd = 18.dp)),
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Primary Summary Card: Routing Mode & Active Node
         Surface(
@@ -351,7 +351,7 @@ fun HomeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { showRoutingSheet = true }
-                        .padding(horizontal = 18.dp, vertical = 16.dp),
+                        .padding(horizontal = 18.dp, vertical = 13.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -400,7 +400,7 @@ fun HomeScreen(
                                 onNavigateToNodes()
                             }
                         }
-                        .padding(horizontal = 18.dp, vertical = 16.dp),
+                        .padding(horizontal = 18.dp, vertical = 13.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -468,23 +468,32 @@ fun HomeScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { onNavigateToRules(1) }
-                            .padding(horizontal = 18.dp, vertical = 13.dp),
+                            .padding(horizontal = 18.dp, vertical = 11.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        val baseSummary =
+                            "分流：直连 ${state.directDiagnosticCount} · 代理 ${state.proxyDiagnosticCount}"
+                        val fullSummary = if (state.failedDiagnosticCount > 0) {
+                            "$baseSummary · 异常 ${state.failedDiagnosticCount}"
+                        } else {
+                            baseSummary
+                        }
                         Text(
-                            text = "实时分流：直连 ${state.directDiagnosticCount} · 代理 ${state.proxyDiagnosticCount}" +
-                                if (state.failedDiagnosticCount > 0) " · 异常 ${state.failedDiagnosticCount}" else "",
+                            text = fullSummary,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.weight(1f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        Spacer(modifier = Modifier.width(10.dp))
                         Text(
                             text = "诊断明细",
                             style = MaterialTheme.typography.labelMedium,
                             color = extColors.emerald,
                             fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            softWrap = false,
                         )
                         Spacer(modifier = Modifier.width(2.dp))
                         Icon(
@@ -507,7 +516,7 @@ fun HomeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { onNavigateToRules(2) }
-                        .padding(horizontal = 18.dp, vertical = 14.dp),
+                        .padding(horizontal = 18.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -536,8 +545,6 @@ fun HomeScreen(
                 }
             }
         }
-
-        Spacer(modifier = Modifier.height(14.dp))
     }
 
     if (showRoutingSheet) {
@@ -657,13 +664,15 @@ private fun HeroConnectButton(
     onClick: () -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
-    val haloScale = if (isConnected) {
-        val pulseTransition = rememberInfiniteTransition(label = "vpnHalo")
+    // Only animate during active connect/disconnect transitions; steady-state connected aura stays
+    // static to avoid continuous 60-120 Hz idle redraws.
+    val haloScale = if (isTransitioning) {
+        val pulseTransition = rememberInfiniteTransition(label = "vpnTransitionHalo")
         val animatedScale by pulseTransition.animateFloat(
             initialValue = 1.0f,
             targetValue = 1.08f,
             animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 2000, easing = FastOutSlowInEasing),
+                animation = tween(durationMillis = 1200, easing = FastOutSlowInEasing),
                 repeatMode = RepeatMode.Reverse,
             ),
             label = "haloScale",
@@ -692,12 +701,12 @@ private fun HeroConnectButton(
 
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier.size(132.dp),
+        modifier = Modifier.size(120.dp),
     ) {
         // Soft radial emerald aura halo matching the UI design mockup
         Canvas(
             modifier = Modifier
-                .size(132.dp)
+                .size(120.dp)
                 .then(
                     if (haloScale != 1.0f) {
                         Modifier.graphicsLayer {
@@ -727,7 +736,7 @@ private fun HeroConnectButton(
             color = extColors.cardSurface,
             border = BorderStroke(width = 2.6.dp, color = ringColor),
             shadowElevation = if (isConnected) 6.dp else 1.dp,
-            modifier = Modifier.size(88.dp),
+            modifier = Modifier.size(84.dp),
         ) {
             Box(contentAlignment = Alignment.Center) {
                 if (isTransitioning) {

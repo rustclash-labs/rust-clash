@@ -618,15 +618,18 @@ impl TelemetryHub {
         snap: ConnectionSnapshot,
         max_cap: usize,
     ) {
+        let is_unmapped_fake_ip = snap.effective_outbound == "UNMAPPED-FAKE-IP";
+        let coalesce_window_ms = if is_unmapped_fake_ip { 10_000 } else { 1_000 };
         if snap.status == "failed"
             && let Some(existing) = ring.iter_mut().rev().take(16).find(|cand| {
                 cand.status == "failed"
                     && cand.metadata.network == snap.metadata.network
                     && cand.metadata.host == snap.metadata.host
-                    && cand.metadata.destination_port == snap.metadata.destination_port
+                    && (is_unmapped_fake_ip
+                        || cand.metadata.destination_port == snap.metadata.destination_port)
                     && cand.effective_outbound == snap.effective_outbound
-                    && cand.error == snap.error
-                    && snap.start_epoch_ms.saturating_sub(cand.start_epoch_ms) < 1_000
+                    && (is_unmapped_fake_ip || cand.error == snap.error)
+                    && snap.start_epoch_ms.saturating_sub(cand.start_epoch_ms) < coalesce_window_ms
             })
         {
             existing.end_epoch_ms = snap.end_epoch_ms;
@@ -1696,5 +1699,36 @@ mod tests {
 
         hub.clear_diagnostics();
         assert!(hub.diagnostics_in_window(0, u64::MAX, 100).is_empty());
+    }
+
+    #[test]
+    fn unmapped_fake_ip_failures_coalesce_across_destination_ports() {
+        let hub = TelemetryHub::new();
+        let err_ob = crate::outbound::ErrorOutbound::new(
+            "UNMAPPED-FAKE-IP",
+            std::io::ErrorKind::HostUnreachable,
+            "target 198.18.1.24:33861 is an unmapped Fake-IP",
+        );
+        for port in [13861u16, 23861, 33861, 43861] {
+            let target = TargetAddr::new_ip(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 1, 24)),
+                port,
+            );
+            hub.record_instant_failed_diagnostic(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &target,
+                None,
+                "FakeIpMiss",
+                "198.18.0.0/15",
+                vec!["UNMAPPED-FAKE-IP".to_string()],
+                &err_ob,
+                &format!("target 198.18.1.24:{port} is an unmapped Fake-IP"),
+            );
+        }
+        let diags = hub.diagnostics_snapshot(20);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].coalesced_count, 4);
     }
 }

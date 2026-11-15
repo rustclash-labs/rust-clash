@@ -179,7 +179,7 @@ jobs:
             if printf '%s\n' "$CHANGED" | grep -Eq '^(Cargo\.toml$|Cargo\.lock$|crates/proxy-core/Cargo\.toml$|crates/proxy-core/src/platform/|crates/proxy-ffi/|crates/tauri-app/|crates/proxy-cli/|scripts/fetch_wintun\.py$|\.github/workflows/ci\.yml$)'; then
               RUN_WINDOWS="true"
             fi
-            if printf '%s\n' "$CHANGED" | grep -Eq '^(Cargo\.toml$|Cargo\.lock$|crates/proxy-core/Cargo\.toml$|crates/proxy-core/src/platform/|crates/proxy-ffi/|android/|scripts/build_android\.sh$|\.github/workflows/ci\.yml$)'; then
+            if printf '%s\n' "$CHANGED" | grep -Eq '^(\.cargo/config\.toml$|Cargo\.toml$|Cargo\.lock$|crates/proxy-core/Cargo\.toml$|crates/proxy-core/src/platform/|crates/proxy-ffi/|android/|scripts/build_android\.sh$|\.github/workflows/ci\.yml$)'; then
               RUN_ANDROID="true"
             fi
           fi
