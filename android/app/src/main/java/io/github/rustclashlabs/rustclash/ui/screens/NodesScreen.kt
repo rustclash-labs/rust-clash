@@ -524,7 +524,7 @@ fun NodesScreen(
 
             val displayNodes: List<ProxyNodeItem> = when (topCategoryTab) {
                 1 -> filteredConcreteNodes.filter { it.name in state.favoriteNodes }
-                2 -> if (activeGroup != null && activeGroup.name != state.primaryGroup) {
+                2 -> if (activeGroup != null) {
                     val memberSet = activeGroup.members.toSet()
                     val concreteInGroup = filteredConcreteNodes.filter { it.name in memberSet }
                     val syntheticMembers = if (state.nodeSearchQuery.isBlank()) {
@@ -594,8 +594,12 @@ fun NodesScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     items(displayNodes, key = { "${topCategoryTab}:${targetGroupName}:${it.name}" }) { item ->
-                        val isSelected = item.name == selectedMemberInGroup ||
-                            (targetGroupName == state.primaryGroup && item.name == state.effectiveOutbound)
+                        val isSelected = if (topCategoryTab == 2 && activeGroup != null) {
+                            item.name == activeGroup.now
+                        } else {
+                            item.name == selectedMemberInGroup ||
+                                (targetGroupName == state.primaryGroup && item.name == state.effectiveOutbound)
+                        }
                         val isConcrete = concreteMap.containsKey(item.name)
                         val isFavorited = item.name in state.favoriteNodes
                         NodeRowCard(

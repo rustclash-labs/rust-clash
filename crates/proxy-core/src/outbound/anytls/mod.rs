@@ -134,8 +134,12 @@ impl AnyTlsOutbound {
                     drop(guard);
                     return Ok(stream);
                 }
-                Err(_) => {
+                Err(err) => {
+                    let still_healthy = idle_sess.is_healthy();
                     drop(guard);
+                    if still_healthy {
+                        return Err(err);
+                    }
                     continue;
                 }
             }

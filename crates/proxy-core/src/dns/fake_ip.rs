@@ -31,6 +31,7 @@ use crate::{
         wire::{
             DnsAnswerData, DnsQueryPacket, QTYPE_A, QTYPE_AAAA, QTYPE_HTTPS, QTYPE_PTR, QTYPE_SVCB,
             build_dns_query, extract_dns_response_meta, extract_ip_answers,
+            patch_cached_dns_wire_response,
         },
     },
     error::{ProxyError, Result},
@@ -208,6 +209,7 @@ enum CachedIpResolution {
 
 #[derive(Clone, Debug)]
 struct CachedWirePacket {
+    inserted_at: Instant,
     expires_at: Instant,
     wire: Vec<u8>,
 }
@@ -579,7 +581,7 @@ pub struct FakeIpDnsEngine {
     real_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
     direct_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
     proxy_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
-    packet_cache: Mutex<LruCache<(String, u16), CachedWirePacket>>,
+    packet_cache: Mutex<LruCache<(String, u16, u16), CachedWirePacket>>,
     bootstrap_cache: Mutex<LruCache<String, (Instant, Vec<IpAddr>)>>,
     inflight_real: InflightMap,
     inflight_direct: InflightMap,
@@ -1643,6 +1645,13 @@ impl FakeIpDnsEngine {
     ) -> Result<Vec<u8>> {
         let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
         let resp = Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?;
+        if let Some(&flags_hi) = resp.get(2)
+            && (flags_hi & 0x02) != 0
+        {
+            return Err(ProxyError::Dns(
+                "upstream DNS response remained truncated (TC=1)".into(),
+            ));
+        }
         if let Some(&flags_lo) = resp.get(3) {
             let rcode = flags_lo & 0x0F;
             if rcode == 2 || rcode == 5 {
@@ -1773,31 +1782,67 @@ impl FakeIpDnsEngine {
         &self,
         metas: [Option<crate::dns::wire::DnsResponseMeta>; 2],
         want_ipv6: bool,
-    ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
+    ) -> (
+        Vec<IpAddr>,
+        Option<u64>,
+        Option<u64>,
+        bool,
+        bool,
+        Vec<String>,
+    ) {
         let mut resolved = Vec::new();
+        let mut cnames = Vec::new();
         let mut saw_nxdomain = false;
         let mut saw_nodata = false;
         let mut min_pos_ttl: Option<u64> = None;
         let mut min_neg_ttl: Option<u64> = None;
 
         for meta in metas.into_iter().flatten() {
+            if meta.truncated {
+                continue;
+            }
             if meta.rcode == 3 {
                 saw_nxdomain = true;
                 if let Some(t) = meta.min_ttl {
-                    let neg_t = u64::from(t).clamp(MIN_NEGATIVE_TTL_SECS, MAX_NXDOMAIN_TTL_SECS);
+                    let neg_t = if t == 0 {
+                        0
+                    } else {
+                        u64::from(t).clamp(MIN_NEGATIVE_TTL_SECS, MAX_NXDOMAIN_TTL_SECS)
+                    };
                     min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
                 }
             } else if meta.rcode == 0 {
+                for cname in meta.cname_targets {
+                    let norm_c = cname.trim().trim_end_matches('.').to_ascii_lowercase();
+                    if !norm_c.is_empty() && !cnames.contains(&norm_c) {
+                        cnames.push(norm_c);
+                    }
+                }
                 if meta.answers.is_empty() {
-                    saw_nodata = true;
-                    if let Some(t) = meta.min_ttl {
-                        let neg_t =
-                            u64::from(t).clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS);
-                        min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
+                    if cnames.is_empty() {
+                        saw_nodata = true;
+                        if let Some(t) = meta.min_ttl {
+                            let neg_t = if t == 0 {
+                                0
+                            } else {
+                                u64::from(t).clamp(MIN_NEGATIVE_TTL_SECS, MAX_NEGATIVE_TTL_SECS)
+                            };
+                            min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
+                        }
+                    } else if let Some(t) = meta.min_ttl {
+                        let pos_t = if t == 0 {
+                            0
+                        } else {
+                            u64::from(t).clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS)
+                        };
+                        min_pos_ttl = Some(min_pos_ttl.map_or(pos_t, |c| c.min(pos_t)));
                     }
                 } else {
-                    let pos_t = u64::from(meta.min_ttl.unwrap_or(60))
-                        .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
+                    let pos_t = match meta.min_ttl {
+                        Some(0) => 0,
+                        other => u64::from(other.unwrap_or(60))
+                            .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS),
+                    };
                     min_pos_ttl = Some(min_pos_ttl.map_or(pos_t, |c| c.min(pos_t)));
                     for ans in meta.answers {
                         match ans {
@@ -1819,7 +1864,14 @@ impl FakeIpDnsEngine {
                 }
             }
         }
-        (resolved, min_pos_ttl, min_neg_ttl, saw_nxdomain, saw_nodata)
+        (
+            resolved,
+            min_pos_ttl,
+            min_neg_ttl,
+            saw_nxdomain,
+            saw_nodata,
+            cnames,
+        )
     }
 
     async fn query_slice_ips(
@@ -1835,19 +1887,110 @@ impl FakeIpDnsEngine {
         bool,
         Option<String>,
     ) {
-        let (metas, err_detail) = if want_ipv6 {
-            let ((m_a, e_a), (m_aaaa, e_aaaa)) = tokio::join!(
-                self.query_slice_qtype(slice, normalized, QTYPE_A),
-                self.query_slice_qtype(slice, normalized, QTYPE_AAAA)
+        let mut current = normalized.to_string();
+        let mut visited = std::collections::HashSet::with_capacity(6);
+        visited.insert(current.clone());
+        let mut agg_pos_ttl: Option<u64> = None;
+
+        for _ in 0..5 {
+            let (metas, err_detail) = if want_ipv6 {
+                let ((m_a, e_a), (m_aaaa, e_aaaa)) = tokio::join!(
+                    self.query_slice_qtype(slice, &current, QTYPE_A),
+                    self.query_slice_qtype(slice, &current, QTYPE_AAAA)
+                );
+                ([m_a, m_aaaa], e_a.or(e_aaaa))
+            } else {
+                let (m_a, e_a) = self.query_slice_qtype(slice, &current, QTYPE_A).await;
+                ([m_a, None], e_a)
+            };
+            let (resolved, pos_ttl, neg_ttl, saw_nx, saw_nodata, cnames) =
+                self.collect_ips_from_metas(metas, want_ipv6);
+            if let Some(pt) = pos_ttl {
+                agg_pos_ttl = Some(agg_pos_ttl.map_or(pt, |c| c.min(pt)));
+            }
+            if !resolved.is_empty() {
+                return (
+                    resolved,
+                    agg_pos_ttl,
+                    neg_ttl,
+                    saw_nx,
+                    saw_nodata,
+                    err_detail,
+                );
+            }
+            if let Some(next_cname) = cnames.into_iter().find(|c| visited.insert(c.clone())) {
+                if let Some(static_ips) = self.lookup_static_hosts_filtered(&next_cname, want_ipv6)
+                    && !static_ips.is_empty()
+                {
+                    return (static_ips, agg_pos_ttl, None, false, false, None);
+                }
+                current = next_cname;
+                continue;
+            }
+            return (
+                resolved,
+                agg_pos_ttl,
+                neg_ttl,
+                saw_nx,
+                saw_nodata,
+                err_detail,
             );
-            ([m_a, m_aaaa], e_a.or(e_aaaa))
-        } else {
-            let (m_a, e_a) = self.query_slice_qtype(slice, normalized, QTYPE_A).await;
-            ([m_a, None], e_a)
-        };
-        let (resolved, pos_ttl, neg_ttl, saw_nx, saw_nodata) =
-            self.collect_ips_from_metas(metas, want_ipv6);
-        (resolved, pos_ttl, neg_ttl, saw_nx, saw_nodata, err_detail)
+        }
+        (Vec::new(), agg_pos_ttl, None, false, false, None)
+    }
+
+    async fn query_upstream_ips(
+        &self,
+        normalized: &str,
+        want_ipv6: bool,
+    ) -> (Vec<IpAddr>, Option<u64>, Option<u64>, bool, bool) {
+        let mut current = normalized.to_string();
+        let mut visited = std::collections::HashSet::with_capacity(6);
+        visited.insert(current.clone());
+        let mut agg_pos_ttl: Option<u64> = None;
+
+        for _ in 0..5 {
+            let metas = if want_ipv6 {
+                let (m_a, m_aaaa) = tokio::join!(
+                    self.query_upstream_qtype(&current, QTYPE_A),
+                    self.query_upstream_qtype(&current, QTYPE_AAAA)
+                );
+                [m_a, m_aaaa]
+            } else {
+                [self.query_upstream_qtype(&current, QTYPE_A).await, None]
+            };
+            let (resolved, pos_ttl, neg_ttl, saw_nx, saw_nodata, cnames) =
+                self.collect_ips_from_metas(metas, want_ipv6);
+            if let Some(pt) = pos_ttl {
+                agg_pos_ttl = Some(agg_pos_ttl.map_or(pt, |c| c.min(pt)));
+            }
+            if !resolved.is_empty() {
+                return (resolved, agg_pos_ttl, neg_ttl, saw_nx, saw_nodata);
+            }
+            if let Some(next_cname) = cnames.into_iter().find(|c| visited.insert(c.clone())) {
+                if let Some(static_ips) = self.lookup_static_hosts_filtered(&next_cname, want_ipv6)
+                    && !static_ips.is_empty()
+                {
+                    return (static_ips, agg_pos_ttl, None, false, false);
+                }
+                if let Some(policy_ups) =
+                    Self::matching_policy_upstreams(&self.policy_rules, &next_cname)
+                {
+                    let (r, p, n, nx, nd, _) = self
+                        .query_slice_ips(policy_ups, &next_cname, want_ipv6)
+                        .await;
+                    let merged_p = match (agg_pos_ttl, p) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    return (r, merged_p, n, nx, nd);
+                }
+                current = next_cname;
+                continue;
+            }
+            return (resolved, agg_pos_ttl, neg_ttl, saw_nx, saw_nodata);
+        }
+        (Vec::new(), agg_pos_ttl, None, false, false)
     }
 
     /// Resolve a domain name to real IPv4 (and IPv6 if `dns.ipv6: true` and direct IPv6 is reachable)
@@ -1930,16 +2073,7 @@ impl FakeIpDnsEngine {
                     .await;
                 (r, p, n, nx, nd)
             } else if !self.upstreams.is_empty() || !self.fallbacks.is_empty() {
-                let metas = if want_ipv6 {
-                    let (m_a, m_aaaa) = tokio::join!(
-                        self.query_upstream_qtype(&normalized, QTYPE_A),
-                        self.query_upstream_qtype(&normalized, QTYPE_AAAA)
-                    );
-                    [m_a, m_aaaa]
-                } else {
-                    [self.query_upstream_qtype(&normalized, QTYPE_A).await, None]
-                };
-                self.collect_ips_from_metas(metas, want_ipv6)
+                self.query_upstream_ips(&normalized, want_ipv6).await
             } else {
                 (Vec::new(), None, None, false, false)
             };
@@ -2016,16 +2150,18 @@ impl FakeIpDnsEngine {
             return res;
         }
 
-        let ttl = min_pos_ttl.unwrap_or(60);
-        let expires_at = Instant::now() + Duration::from_secs(ttl);
-        self.real_ip_cache.lock().put(
-            normalized,
-            CachedIpResolution::Positive {
-                expires_at,
-                stale_until: expires_at + Duration::from_secs(STALE_IF_ERROR_MAX_AGE_SECS),
-                ips: resolved.clone(),
-            },
-        );
+        if min_pos_ttl != Some(0) {
+            let ttl = min_pos_ttl.unwrap_or(60);
+            let expires_at = Instant::now() + Duration::from_secs(ttl);
+            self.real_ip_cache.lock().put(
+                normalized,
+                CachedIpResolution::Positive {
+                    expires_at,
+                    stale_until: expires_at + Duration::from_secs(STALE_IF_ERROR_MAX_AGE_SECS),
+                    ips: resolved.clone(),
+                },
+            );
+        }
         let res = Ok(resolved);
         if let Some(g) = inflight_guard {
             g.finish(&res);
@@ -2110,16 +2246,18 @@ impl FakeIpDnsEngine {
             .await;
 
         if !resolved.is_empty() {
-            let ttl = min_pos_ttl.unwrap_or(60);
-            let expires_at = Instant::now() + Duration::from_secs(ttl);
-            self.direct_ip_cache.lock().put(
-                normalized,
-                CachedIpResolution::Positive {
-                    expires_at,
-                    stale_until: expires_at + Duration::from_secs(STALE_IF_ERROR_MAX_AGE_SECS),
-                    ips: resolved.clone(),
-                },
-            );
+            if min_pos_ttl != Some(0) {
+                let ttl = min_pos_ttl.unwrap_or(60);
+                let expires_at = Instant::now() + Duration::from_secs(ttl);
+                self.direct_ip_cache.lock().put(
+                    normalized,
+                    CachedIpResolution::Positive {
+                        expires_at,
+                        stale_until: expires_at + Duration::from_secs(STALE_IF_ERROR_MAX_AGE_SECS),
+                        ips: resolved.clone(),
+                    },
+                );
+            }
             let res = Ok(resolved);
             if let Some(g) = inflight_guard {
                 g.finish(&res);
@@ -2243,21 +2381,23 @@ impl FakeIpDnsEngine {
         }
 
         let res = async {
-            let cache_and_return = |ips: Vec<IpAddr>,
-                                    ttl_opt: Option<u64>|
-             -> Result<Vec<IpAddr>> {
-                let ttl = ttl_opt.unwrap_or(60);
-                let expires_at = Instant::now() + Duration::from_secs(ttl);
-                self.proxy_ip_cache.lock().put(
-                    clean.clone(),
-                    CachedIpResolution::Positive {
-                        expires_at,
-                        stale_until: expires_at + Duration::from_secs(STALE_IF_ERROR_MAX_AGE_SECS),
-                        ips: ips.clone(),
-                    },
-                );
-                Ok(ips)
-            };
+            let cache_and_return =
+                |ips: Vec<IpAddr>, ttl_opt: Option<u64>| -> Result<Vec<IpAddr>> {
+                    if ttl_opt != Some(0) {
+                        let ttl = ttl_opt.unwrap_or(60);
+                        let expires_at = Instant::now() + Duration::from_secs(ttl);
+                        self.proxy_ip_cache.lock().put(
+                            clean.clone(),
+                            CachedIpResolution::Positive {
+                                expires_at,
+                                stale_until: expires_at
+                                    + Duration::from_secs(STALE_IF_ERROR_MAX_AGE_SECS),
+                                ips: ips.clone(),
+                            },
+                        );
+                    }
+                    Ok(ips)
+                };
 
             // 1. Dedicated `proxy-server-nameserver-policy`
             if let Some(ps_pol) = Self::matching_policy_upstreams(&self.proxy_policy_rules, &clean)
@@ -2663,8 +2803,8 @@ impl FakeIpDnsEngine {
             return Ok(query.build_response(raw_query, 3, 60, &[]));
         }
 
-        // Enforce `dns.ipv6: false` across ALL modes so IPv6 queries never leak or stall Happy-Eyeballs
-        if !self.ipv6 && query.question.qtype == QTYPE_AAAA {
+        // Enforce `dns.ipv6: false` across ALL modes so IPv6/HTTPS-hint queries never leak or stall Happy-Eyeballs
+        if !self.ipv6 && matches!(query.question.qtype, QTYPE_AAAA | QTYPE_SVCB | QTYPE_HTTPS) {
             self.suppressed_queries.fetch_add(1, Ordering::Relaxed);
             return Ok(query.build_response(raw_query, 0, 5, &[]));
         }
@@ -2748,27 +2888,37 @@ impl FakeIpDnsEngine {
                 }
                 _ => {}
             }
-        } else if query.question.qtype == QTYPE_AAAA
+        } else if matches!(query.question.qtype, QTYPE_AAAA | QTYPE_SVCB | QTYPE_HTTPS)
             && !crate::platform::socket_protect::is_direct_ipv6_reachable()
         {
-            // Suppress real-IP AAAA queries (fake-ip-filter bypassed domains or redir-host/normal
-            // modes) when direct physical IPv6 egress is unreachable so apps never receive
-            // unreachable global IPv6 addresses or stall on upstream AAAA lookups.
+            // Suppress real-IP AAAA and HTTPS/SVCB (`ipv6hint`) queries when direct physical IPv6
+            // egress is unreachable so apps never receive unreachable global IPv6 hints or stall.
             self.suppressed_queries.fetch_add(1, Ordering::Relaxed);
             return Ok(query.build_response(raw_query, 0, 5, &[]));
         }
 
         // Check TTL-aware wire packet cache (`redir-host` / `normal` / bypassed domains)
-        let cache_key = (normalized.clone(), query.question.qtype);
+        let cache_key = (
+            normalized.clone(),
+            query.question.qtype,
+            query.question.qclass,
+        );
+        let now = Instant::now();
         if let Some(cached) = self.packet_cache.lock().get(&cache_key).cloned()
-            && Instant::now() < cached.expires_at
+            && now < cached.expires_at
             && cached.wire.len() >= 12
         {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            let mut hit = cached.wire;
-            hit[0] = raw_query[0];
-            hit[1] = raw_query[1];
-            return Ok(hit);
+            let elapsed_secs = now
+                .saturating_duration_since(cached.inserted_at)
+                .as_secs()
+                .min(u32::MAX as u64) as u32;
+            return Ok(patch_cached_dns_wire_response(
+                &cached.wire,
+                raw_query,
+                &query,
+                elapsed_secs,
+            ));
         }
 
         let upstream_res = if let Some(pol_ups) =
@@ -2780,33 +2930,42 @@ impl FakeIpDnsEngine {
         };
 
         if let Ok(resp) = upstream_res {
-            if let Ok(meta) = extract_dns_response_meta(&resp) {
-                if meta.rcode == 0 && !meta.answers.is_empty() {
-                    let ttl = u64::from(meta.min_ttl.unwrap_or(60))
-                        .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
-                    self.packet_cache.lock().put(
-                        cache_key,
-                        CachedWirePacket {
-                            expires_at: Instant::now() + Duration::from_secs(ttl),
-                            wire: resp.clone(),
-                        },
-                    );
-                } else if meta.rcode == 3 || (meta.rcode == 0 && meta.answers.is_empty()) {
-                    let ttl =
-                        compute_negative_ttl_secs(meta.min_ttl.map(u64::from), meta.rcode == 3);
-                    self.packet_cache.lock().put(
-                        cache_key,
-                        CachedWirePacket {
-                            expires_at: Instant::now() + Duration::from_secs(ttl),
-                            wire: resp.clone(),
-                        },
-                    );
+            if let Ok(meta) = extract_dns_response_meta(&resp)
+                && !meta.truncated
+            {
+                let stored_at = Instant::now();
+                if meta.rcode == 0 && meta.ancount > 0 {
+                    if meta.min_ttl != Some(0) {
+                        let ttl = u64::from(meta.min_ttl.unwrap_or(60))
+                            .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
+                        self.packet_cache.lock().put(
+                            cache_key,
+                            CachedWirePacket {
+                                inserted_at: stored_at,
+                                expires_at: stored_at + Duration::from_secs(ttl),
+                                wire: resp.clone(),
+                            },
+                        );
+                    }
+                } else if meta.rcode == 3 || (meta.rcode == 0 && meta.ancount == 0) {
+                    if meta.min_ttl != Some(0) {
+                        let ttl =
+                            compute_negative_ttl_secs(meta.min_ttl.map(u64::from), meta.rcode == 3);
+                        self.packet_cache.lock().put(
+                            cache_key,
+                            CachedWirePacket {
+                                inserted_at: stored_at,
+                                expires_at: stored_at + Duration::from_secs(ttl),
+                                wire: resp.clone(),
+                            },
+                        );
+                    }
                 } else if meta.rcode == 2 || meta.rcode == 5 {
                     self.packet_cache.lock().put(
                         cache_key,
                         CachedWirePacket {
-                            expires_at: Instant::now()
-                                + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                            inserted_at: stored_at,
+                            expires_at: stored_at + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
                             wire: resp.clone(),
                         },
                     );
@@ -2817,10 +2976,12 @@ impl FakeIpDnsEngine {
 
         // Return SERVFAIL (2) if no upstream responded, caching briefly to suppress retry storms
         let servfail_resp = query.build_response(raw_query, 2, 0, &[]);
+        let stored_at = Instant::now();
         self.packet_cache.lock().put(
             cache_key,
             CachedWirePacket {
-                expires_at: Instant::now() + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
+                inserted_at: stored_at,
+                expires_at: stored_at + Duration::from_secs(SERVFAIL_NEGATIVE_TTL_SECS),
                 wire: servfail_resp.clone(),
             },
         );
@@ -3540,7 +3701,7 @@ mod tests {
             let cached = normal_engine
                 .packet_cache
                 .lock()
-                .peek(&(domain.to_string(), QTYPE_A))
+                .peek(&(domain.to_string(), QTYPE_A, crate::dns::wire::QCLASS_IN))
                 .cloned()
                 .unwrap_or_else(|| panic!("missing packet_cache entry for {domain}"));
             let dur = Duration::from_secs(expected_secs);
@@ -4328,5 +4489,177 @@ mod tests {
         );
         assert_eq!(engine.lookup_ip("primary.example.com"), Some(active_ip));
         assert!(engine.has_unpersisted_entries());
+    }
+
+    #[tokio::test]
+    async fn cname_only_chasing_ttl_zero_bypass_tc_failover_and_https_suppression() {
+        use crate::dns::wire::{QCLASS_IN, QTYPE_CNAME, QTYPE_TXT, encode_domain_name};
+        use bytes::{BufMut, BytesMut};
+
+        // Primary upstream returns unrecovered TC=1 on UDP (and no TCP listener) for `tc.example.test`,
+        // CNAME-only `alias.example.test -> hop2.example.test -> final.example.test`,
+        // TTL=0 for `zero-ttl.example.test`, and TXT TTL=600 for `spf.example.test`.
+        let bad_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_udp.local_addr().unwrap();
+        let good_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_udp.local_addr().unwrap();
+
+        let bad_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = bad_udp.recv_from(&mut buf).await {
+                if let Ok(qp) = DnsQueryPacket::parse(&buf[..n])
+                    && qp.question.name == "tc.example.test"
+                {
+                    let tc = crate::dns::wire::build_truncated_dns_header(&buf[..n], &qp);
+                    let _ = bad_udp.send_to(&tc, peer).await;
+                }
+            }
+        });
+
+        let zero_ttl_hits = Arc::new(AtomicU64::new(0));
+        let zero_ttl_bg = Arc::clone(&zero_ttl_hits);
+        let good_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = good_udp.recv_from(&mut buf).await {
+                let req = &buf[..n];
+                let Ok(qp) = DnsQueryPacket::parse(req) else {
+                    continue;
+                };
+                match (qp.question.name.as_str(), qp.question.qtype) {
+                    ("tc.example.test", QTYPE_A) => {
+                        let resp = qp.build_response(
+                            req,
+                            0,
+                            120,
+                            &[DnsAnswerData::A(Ipv4Addr::new(198, 51, 100, 77))],
+                        );
+                        let _ = good_udp.send_to(&resp, peer).await;
+                    }
+                    ("alias.example.test", QTYPE_A) => {
+                        let mut pkt = BytesMut::new();
+                        pkt.put_u16(qp.id);
+                        pkt.put_u16(0x8180);
+                        pkt.put_u16(1);
+                        pkt.put_u16(1);
+                        pkt.put_u16(0);
+                        pkt.put_u16(0);
+                        pkt.put_slice(&req[12..qp.question.end_offset]);
+                        encode_domain_name("alias.example.test", &mut pkt);
+                        pkt.put_u16(QTYPE_CNAME);
+                        pkt.put_u16(QCLASS_IN);
+                        pkt.put_u32(120);
+                        let mut rdata = BytesMut::new();
+                        encode_domain_name("final.example.test", &mut rdata);
+                        pkt.put_u16(rdata.len() as u16);
+                        pkt.put_slice(&rdata);
+                        let _ = good_udp.send_to(&pkt, peer).await;
+                    }
+                    ("final.example.test", QTYPE_A) => {
+                        let resp = qp.build_response(
+                            req,
+                            0,
+                            90,
+                            &[DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 200))],
+                        );
+                        let _ = good_udp.send_to(&resp, peer).await;
+                    }
+                    ("zero-ttl.example.test", QTYPE_A) => {
+                        let c = zero_ttl_bg.fetch_add(1, Ordering::Relaxed);
+                        let resp = qp.build_response(
+                            req,
+                            0,
+                            0,
+                            &[DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, (10 + c) as u8))],
+                        );
+                        let _ = good_udp.send_to(&resp, peer).await;
+                    }
+                    ("spf.example.test", QTYPE_TXT) => {
+                        let mut pkt = BytesMut::new();
+                        pkt.put_u16(qp.id);
+                        pkt.put_u16(0x8180);
+                        pkt.put_u16(1);
+                        pkt.put_u16(1);
+                        pkt.put_u16(0);
+                        pkt.put_u16(0);
+                        pkt.put_slice(&req[12..qp.question.end_offset]);
+                        encode_domain_name("spf.example.test", &mut pkt);
+                        pkt.put_u16(QTYPE_TXT);
+                        pkt.put_u16(QCLASS_IN);
+                        pkt.put_u32(600);
+                        let txt = [8u8, b'v', b'=', b's', b'p', b'f', b'1', b' ', b'~'];
+                        pkt.put_u16(txt.len() as u16);
+                        pkt.put_slice(&txt);
+                        let _ = good_udp.send_to(&pkt, peer).await;
+                    }
+                    _ => {
+                        let resp = qp.build_response(req, 0, 60, &[]);
+                        let _ = good_udp.send_to(&resp, peer).await;
+                    }
+                }
+            }
+        });
+
+        let cfg = DnsConfig {
+            ipv6: false,
+            nameserver: vec![bad_addr.to_string(), good_addr.to_string()],
+            direct_nameserver: vec![good_addr.to_string()],
+            fallback: Vec::new(),
+            ..DnsConfig::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        // 1. Unrecovered TC=1 on `bad_addr` fails over cleanly to `good_addr`
+        let tc_ips = engine.resolve_real_ips("tc.example.test").await.unwrap();
+        assert_eq!(tc_ips, vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77))]);
+
+        // 2. CNAME-only response chases target (`alias.example.test -> final.example.test`)
+        let cname_ips = engine
+            .resolve_direct_ips("alias.example.test")
+            .await
+            .unwrap();
+        assert_eq!(cname_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))]);
+
+        // 3. TTL=0 response is NOT stored in positive cache (second call hits upstream again)
+        let z1 = engine
+            .resolve_direct_ips("zero-ttl.example.test")
+            .await
+            .unwrap();
+        let z2 = engine
+            .resolve_direct_ips("zero-ttl.example.test")
+            .await
+            .unwrap();
+        assert_eq!(z1, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]);
+        assert_eq!(z2, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11))]);
+        assert_eq!(zero_ttl_hits.load(Ordering::Relaxed), 2);
+
+        // 4. QTYPE_HTTPS & QTYPE_SVCB are suppressed when `ipv6 == false`
+        let q_https = build_dns_query(0x7001, "www.cloudflare.com", QTYPE_HTTPS);
+        let r_https = engine.handle_dns_packet(&q_https).await.unwrap();
+        assert_eq!(dns_response_rcode(&r_https).unwrap(), 0);
+        assert_eq!(extract_dns_response_meta(&r_https).unwrap().ancount, 0);
+        assert_eq!(engine.telemetry_snapshot().suppressed_queries, 1);
+
+        // 5. QTYPE_TXT positive caching uses positive TTL (~600s, not negative <=60s) and preserves DNS-0x20 casing on hit
+        let q_txt1 = build_dns_query(0x7010, "spf.example.test", QTYPE_TXT);
+        let before = Instant::now();
+        let _ = engine.handle_dns_packet(&q_txt1).await.unwrap();
+        let cached_txt = engine
+            .packet_cache
+            .lock()
+            .peek(&("spf.example.test".to_string(), QTYPE_TXT, QCLASS_IN))
+            .cloned()
+            .expect("TXT response must be cached");
+        assert!(
+            cached_txt.expires_at.saturating_duration_since(before) >= Duration::from_secs(500),
+            "TXT positive response should use positive TTL, not 60s negative TTL"
+        );
+
+        let q_txt_0x20 = build_dns_query(0x7011, "SpF.ExAmPlE.TeSt", QTYPE_TXT);
+        let r_txt_0x20 = engine.handle_dns_packet(&q_txt_0x20).await.unwrap();
+        assert_eq!(u16::from_be_bytes([r_txt_0x20[0], r_txt_0x20[1]]), 0x7011);
+        assert_eq!(&r_txt_0x20[12..30], &q_txt_0x20[12..30]);
+
+        bad_task.abort();
+        good_task.abort();
     }
 }

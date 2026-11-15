@@ -353,7 +353,7 @@ async fn main() -> Result<()> {
 
             let ctrl_listen = engine.config_snapshot().external_controller;
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let (api_addr, _api_task) =
+            let (api_addr, api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
             let api_base_url = format_api_base_url(api_addr);
 
@@ -385,8 +385,8 @@ async fn main() -> Result<()> {
             wait_for_shutdown_signal().await?;
             tracing::info!("Shutting down rust-clash...");
             let _ = shutdown_tx.send(true);
-            engine.shutdown();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            engine.shutdown_async().await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
         }
 
         Commands::ElevatedTunHelper { config } => {
@@ -427,7 +427,7 @@ async fn main() -> Result<()> {
             }
             let ctrl_listen = engine.config_snapshot().external_controller;
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let (api_addr, _api_task) =
+            let (api_addr, api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
             let api_base_url = format_api_base_url(api_addr);
             tracing::info!(
@@ -439,8 +439,8 @@ async fn main() -> Result<()> {
             wait_for_shutdown_signal().await?;
             tracing::info!("Shutting down rust-clash elevated TUN helper...");
             let _ = shutdown_tx.send(true);
-            engine.shutdown();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            engine.shutdown_async().await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
             drop(instance_guard);
         }
 

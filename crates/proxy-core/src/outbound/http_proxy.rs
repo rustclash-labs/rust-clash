@@ -271,7 +271,7 @@ impl OutboundHandler for HttpOutbound {
             .and_then(|c| c.parse::<u16>().ok())
             .unwrap_or(0);
 
-        if status_code != 200 {
+        if !(200..300).contains(&status_code) {
             let kind = if status_code == 407 {
                 io::ErrorKind::PermissionDenied
             } else {

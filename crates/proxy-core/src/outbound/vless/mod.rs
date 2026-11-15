@@ -644,7 +644,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessClientStream<S> {
                 Poll::Ready(Ok(())) => {
                     let filled = rbuf.filled();
                     if filled.is_empty() {
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "VLESS response header truncated before EOF",
+                        )));
                     }
                     this.hdr_buf.extend_from_slice(filled);
                 }
@@ -1260,5 +1263,22 @@ mod tests {
         expected.extend_from_slice(&large_buf);
         expected.extend_from_slice(&small_buf);
         assert_eq!(wire, expected);
+    }
+
+    #[tokio::test]
+    async fn vless_stream_returns_unexpected_eof_when_response_header_truncated() {
+        let req_hdr = sample_vless_header();
+        let (c_io, mut s_io) = tokio::io::duplex(256);
+        let mut client = VlessClientStream::new(c_io, req_hdr);
+        // Server closes immediately after sending only 1 byte of the 2-byte VLESS response header
+        s_io.write_all(&[0x00]).await.expect("write 1 byte");
+        drop(s_io);
+
+        let mut buf = [0u8; 16];
+        let err = client
+            .read(&mut buf)
+            .await
+            .expect_err("truncated VLESS response header must return UnexpectedEof");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

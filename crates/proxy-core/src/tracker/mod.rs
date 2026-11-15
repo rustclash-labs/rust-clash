@@ -813,6 +813,33 @@ impl TelemetryHub {
         closed
     }
 
+    /// Close active proxy connections whose leaf `effective_outbound` was deleted or removed
+    /// by a config/profile transition, while preserving `DIRECT` and surviving outbounds.
+    pub fn close_connections_missing_outbounds(&self, valid_outbounds: &HashSet<&str>) -> usize {
+        let stale_ids: Vec<String> = self
+            .connections
+            .iter()
+            .filter_map(|entry| {
+                let conn = entry.value();
+                let ob = conn.effective_outbound.as_str();
+                let is_builtin =
+                    ob.eq_ignore_ascii_case("DIRECT") || ob.eq_ignore_ascii_case("REJECT");
+                if !is_builtin && !valid_outbounds.contains(ob) {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut closed = 0;
+        for id in stale_ids {
+            if self.close_connection(&id) {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     pub fn activity_notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.activity_notify.notified()
     }

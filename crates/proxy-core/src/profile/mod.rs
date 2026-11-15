@@ -430,8 +430,63 @@ fn extract_clash_deeplink_target(line: &str) -> Option<String> {
     let parsed = Url::parse(trimmed).ok()?;
     for (k, v) in parsed.query_pairs() {
         let val = trim_bom_and_controls_str(&v);
-        if k.eq_ignore_ascii_case("url") && !val.is_empty() {
+        if matches!(
+            k.trim().to_ascii_lowercase().as_str(),
+            "url" | "config" | "sub"
+        ) && !val.is_empty()
+        {
             return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Extract optional human-readable profile name hint (`?name=...`, `?title=...`, `?remarks=...`, or `#Name`)
+/// from a `clash://install-config?...` deep link.
+pub fn extract_clash_deeplink_name(raw: &str) -> Option<String> {
+    let first_line = raw
+        .lines()
+        .map(trim_bom_and_controls_str)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+    if !first_line.to_ascii_lowercase().starts_with("clash://") {
+        return None;
+    }
+    let parsed = Url::parse(first_line).ok()?;
+    for (k, v) in parsed.query_pairs() {
+        if matches!(
+            k.trim().to_ascii_lowercase().as_str(),
+            "name" | "title" | "remarks" | "remark"
+        ) {
+            let clean: String = v
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(64)
+                .collect();
+            if !clean.is_empty() {
+                return Some(clean);
+            }
+        }
+    }
+    if let Some(frag) = parsed.fragment() {
+        let decoded = url::form_urlencoded::parse(frag.as_bytes())
+            .next()
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    k.into_owned()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .unwrap_or_default();
+        let clean: String = decoded
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        if !clean.is_empty() {
+            return Some(clean);
         }
     }
     None
@@ -471,7 +526,9 @@ fn classify_import_input_bounded(raw: &str, depth: usize) -> Result<(ImportInput
             return classify_import_input_bounded(&extracted_url, depth + 1);
         }
         let lower = single.to_ascii_lowercase();
-        if lower.starts_with("https://") || lower.starts_with("http://") {
+        if (lower.starts_with("https://") || lower.starts_with("http://"))
+            && !is_proxy_uri_token(single)
+        {
             let parsed = Url::parse(single)
                 .map_err(|_| ProxyError::Config("invalid subscription URL format".into()))?;
             let host = parsed
@@ -623,9 +680,6 @@ fn active_trimmed_rules(rules: &[String]) -> Vec<String> {
 
 /// Check whether `cfg` uses the managed `smart-cn` split-tunneling rule template.
 pub fn is_smart_cn_rule_list(cfg: &ClashConfig) -> bool {
-    if !cfg.rule_providers.is_empty() {
-        return false;
-    }
     let active = active_trimmed_rules(&cfg.rules);
     let mut candidates = vec![
         primary_proxy_group_for_config(cfg),
@@ -1788,6 +1842,11 @@ impl ProfileManager {
     ) -> Result<NodeMutationReport> {
         let (kind, normalized) = classify_import_input(raw_input)
             .map_err(|e| ProxyError::config_clean(redact_sensitive_text(&e.to_string())))?;
+        let deeplink_name = extract_clash_deeplink_name(raw_input);
+        let effective_name_hint = profile_name_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(deeplink_name.as_deref());
 
         match kind {
             ImportInputKind::ShareUris | ImportInputKind::Base64UriList => {
@@ -1812,12 +1871,42 @@ impl ProfileManager {
                 let added_nodes: Vec<String> =
                     cfg.proxies.iter().map(|n| n.name().to_string()).collect();
 
-                if let Some(name_hint) = profile_name_hint.map(str::trim).filter(|s| !s.is_empty())
+                let active_id = self.active_profile_id();
+                let active_is_subscription_fallback_name = if effective_name_hint.is_none() {
+                    let idx = self.index.lock();
+                    if idx
+                        .profiles
+                        .iter()
+                        .find(|p| p.id == active_id)
+                        .is_some_and(|p| p.kind == ProfileKind::Subscription)
+                    {
+                        let mut n = 1usize;
+                        loop {
+                            let candidate = if n == 1 {
+                                "Local YAML".to_string()
+                            } else {
+                                format!("Local YAML ({n})")
+                            };
+                            if !idx.profiles.iter().any(|p| p.name == candidate) {
+                                break Some(candidate);
+                            }
+                            n += 1;
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(name_to_create) = effective_name_hint
+                    .map(ToOwned::to_owned)
+                    .or(active_is_subscription_fallback_name)
                 {
                     let yaml_out = cfg.to_yaml_string()?;
                     let (mut meta, _, _) = self
                         .create_profile_detailed(CreateProfileSpec {
-                            name: name_hint.to_string(),
+                            name: name_to_create,
                             yaml: Some(yaml_out),
                             uris: None,
                             subscription_url: None,
@@ -1850,7 +1939,6 @@ impl ProfileManager {
                     });
                 }
 
-                let active_id = self.active_profile_id();
                 let was_empty_starter = {
                     let idx = self.index.lock();
                     idx.profiles
@@ -1908,9 +1996,7 @@ impl ProfileManager {
                 })
             }
             ImportInputKind::HttpsSubscriptionUrl => {
-                let sub_name = profile_name_hint
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                let sub_name = effective_name_hint
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| {
                         Url::parse(&normalized)
@@ -2840,6 +2926,8 @@ fn attach_nodes_and_update_selections(
     preferred_select_node: Option<&str>,
     auto_select: bool,
 ) {
+    let primary_before = primary_proxy_group_for_config(cfg);
+    let is_single_group_profile = cfg.proxy_groups.len() == 1;
     let mut builtin_only_groups = HashSet::new();
     if cfg.proxy_groups.is_empty() {
         builtin_only_groups.insert("PROXY".to_string());
@@ -2861,11 +2949,18 @@ fn attach_nodes_and_update_selections(
         }
     } else {
         for g in &mut cfg.proxy_groups {
-            let had_only_builtins = g.proxies.iter().all(|m| m == "DIRECT" || m == "REJECT");
-            if had_only_builtins {
+            let all_builtins = g.proxies.iter().all(|m| m == "DIRECT" || m == "REJECT");
+            let is_reject_only_group =
+                all_builtins && g.proxies.first().map(String::as_str) == Some("REJECT");
+            if is_reject_only_group {
+                continue;
+            }
+            let is_starter_placeholder =
+                all_builtins && (is_single_group_profile || g.name == primary_before);
+            if is_starter_placeholder {
                 builtin_only_groups.insert(g.name.clone());
             }
-            let starts_with_intentional_builtin = !had_only_builtins
+            let starts_with_intentional_builtin = !is_starter_placeholder
                 && matches!(
                     g.proxies.first().map(String::as_str),
                     Some("DIRECT" | "REJECT")
@@ -3229,7 +3324,7 @@ pub async fn fetch_subscription_http_with_proxy(
         };
 
         let req_bytes = format!(
-            "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: rust-clash/{} Clash.Meta/1.18 mihomo/1.18\r\nAccept: */*\r\nAccept-Encoding: gzip, identity\r\nConnection: close\r\n\r\n",
+            "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: rust-clash/{} Clash.Meta/1.18 mihomo/1.18\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate, identity\r\nConnection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
         );
 
@@ -3242,6 +3337,7 @@ pub async fn fetch_subscription_http_with_proxy(
                 tcp.write_all(req_bytes.as_bytes())
                     .await
                     .map_err(ProxyError::Io)?;
+                let _ = tcp.flush().await;
                 read_bounded_stream(&mut tcp).await
             }
         }
@@ -3291,7 +3387,7 @@ pub async fn fetch_subscription_http_with_proxy(
         };
 
         let (status, headers, body_bytes_raw) = parse_http11_response(&raw_resp)?;
-        if matches!(status, 301 | 302 | 307 | 308) {
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let loc = headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("location"))
@@ -3363,17 +3459,46 @@ pub async fn fetch_subscription_http_with_proxy(
 }
 
 fn maybe_decompress_http_body(headers: &HttpHeaderList, body: Vec<u8>) -> Result<Vec<u8>> {
-    let has_gzip_header = headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("content-encoding")
-            && (v.to_ascii_lowercase().contains("gzip")
-                || v.to_ascii_lowercase().contains("x-gzip"))
-    });
+    use std::io::Read;
+
+    let content_encoding = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, v)| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    let has_gzip_header = content_encoding.contains("gzip") || content_encoding.contains("x-gzip");
+    let has_deflate_header = !has_gzip_header && content_encoding.contains("deflate");
     let has_gzip_magic = body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b;
+
+    if has_deflate_header {
+        let mut decompressed = Vec::new();
+        let zlib_ok = flate2::read::ZlibDecoder::new(body.as_slice())
+            .take((MAX_SUBSCRIPTION_BYTES + 1) as u64)
+            .read_to_end(&mut decompressed)
+            .is_ok();
+        if !zlib_ok {
+            decompressed.clear();
+            flate2::read::DeflateDecoder::new(body.as_slice())
+                .take((MAX_SUBSCRIPTION_BYTES + 1) as u64)
+                .read_to_end(&mut decompressed)
+                .map_err(|e| {
+                    ProxyError::Config(format!(
+                        "failed decompressing deflate subscription payload: {e}"
+                    ))
+                })?;
+        }
+        if decompressed.len() > MAX_SUBSCRIPTION_BYTES {
+            return Err(ProxyError::Config(
+                "decompressed subscription payload exceeds 8 MiB safety limit".into(),
+            ));
+        }
+        return Ok(decompressed);
+    }
+
     if !has_gzip_header && !has_gzip_magic {
         return Ok(body);
     }
 
-    use std::io::Read;
     let decoder = flate2::read::GzDecoder::new(body.as_slice());
     let mut limited = decoder.take((MAX_SUBSCRIPTION_BYTES + 1) as u64);
     let mut decompressed = Vec::new();
@@ -3420,7 +3545,44 @@ where
         .write_all(req_bytes.as_bytes())
         .await
         .map_err(ProxyError::Io)?;
+    tls_stream.flush().await.map_err(ProxyError::Io)?;
     read_bounded_stream(&mut tls_stream).await
+}
+
+fn http11_response_is_complete(raw: &[u8]) -> bool {
+    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head_str) = std::str::from_utf8(&raw[..hdr_end]) else {
+        return false;
+    };
+    let body_raw = &raw[hdr_end + 4..];
+    let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in head_str.split("\r\n").skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("transfer-encoding")
+                && val
+                    .split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+            {
+                is_chunked = true;
+            } else if key.eq_ignore_ascii_case("content-length")
+                && let Ok(len) = val.parse::<usize>()
+            {
+                content_length = Some(len);
+            }
+        }
+    }
+    if is_chunked {
+        decode_chunked_body(body_raw).is_ok()
+    } else if let Some(expected_len) = content_length {
+        body_raw.len() >= expected_len
+    } else {
+        false
+    }
 }
 
 async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
@@ -3434,10 +3596,20 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
                 "subscription download timed out".to_string(),
             ));
         }
-        let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+        let read_res = tokio::time::timeout(remaining, stream.read(&mut chunk))
             .await
-            .map_err(|_| ProxyError::Config("subscription download timed out".into()))?
-            .map_err(ProxyError::Io)?;
+            .map_err(|_| ProxyError::Config("subscription download timed out".into()))?;
+        let n = match read_res {
+            Ok(n) => n,
+            Err(io_err)
+                if io_err.kind() == std::io::ErrorKind::UnexpectedEof
+                    && !out.is_empty()
+                    && out.windows(4).any(|w| w == b"\r\n\r\n") =>
+            {
+                break;
+            }
+            Err(io_err) => return Err(ProxyError::Io(io_err)),
+        };
         if n == 0 {
             break;
         }
@@ -3447,6 +3619,9 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
             ));
         }
         out.extend_from_slice(&chunk[..n]);
+        if http11_response_is_complete(&out) {
+            break;
+        }
     }
     Ok(out)
 }
@@ -4642,6 +4817,125 @@ rules:
             preserved_custom.dns.direct_nameserver,
             vec!["223.5.5.5:53".to_string(), "119.29.29.29:53".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn manual_import_preserves_reject_and_direct_groups_and_deflate_keepalive_fetch_works() {
+        use std::io::Write;
+
+        // 1. Verify [REJECT, DIRECT] and non-primary [DIRECT] groups are preserved on manual node import
+        let clash_yaml = "\
+proxies:
+  - name: HK-01
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies: [HK-01, DIRECT]
+  - name: 🎯 全球直连
+    type: select
+    proxies: [DIRECT]
+  - name: 🛑 广告拦截
+    type: select
+    proxies: [REJECT, DIRECT]
+rules:
+  - MATCH,🚀 节点选择
+";
+        let dir = std::env::temp_dir().join(format!("rc-reject-preserve-{}", Uuid::new_v4()));
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+        mgr.import_unified_input_with_options(clash_yaml, None, true, true, None)
+            .await
+            .unwrap();
+        mgr.save_group_selection("GLOBAL", "DIRECT").unwrap();
+
+        let report = mgr
+            .import_nodes_to_active("socks5://127.0.0.1:1081#Manual-US", true, true)
+            .unwrap();
+        assert_eq!(
+            report
+                .selected_groups
+                .get("🛑 广告拦截")
+                .map(String::as_str),
+            Some("REJECT")
+        );
+        assert_eq!(
+            report
+                .selected_groups
+                .get("🎯 全球直连")
+                .map(String::as_str),
+            Some("DIRECT")
+        );
+        assert_eq!(
+            report.selected_groups.get("GLOBAL").map(String::as_str),
+            Some("DIRECT")
+        );
+        let adblock_grp = report
+            .config
+            .proxy_groups
+            .iter()
+            .find(|g| g.name == "🛑 广告拦截")
+            .unwrap();
+        assert_eq!(adblock_grp.proxies, vec!["REJECT", "DIRECT"]);
+
+        // 2. Verify clash:// deep link config/sub keys and name extraction
+        let deeplink =
+            "clash://install-config?config=https%3A%2F%2Fsub.example.com%2Fyaml&name=My%20Airport";
+        assert_eq!(
+            extract_clash_deeplink_name(deeplink).as_deref(),
+            Some("My Airport")
+        );
+        let (kind, target) = classify_import_input(deeplink).unwrap();
+        assert_eq!(kind, ImportInputKind::HttpsSubscriptionUrl);
+        assert_eq!(target, "https://sub.example.com/yaml");
+
+        // 3. Verify both RFC 1950 zlib and raw RFC 1951 deflate Content-Encoding decompression
+        let sample_payload = b"socks5://127.0.0.1:1080#Deflate-Node\n";
+        let mut zlib_enc =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib_enc.write_all(sample_payload).unwrap();
+        let zlib_bytes = zlib_enc.finish().unwrap();
+        let headers = vec![("Content-Encoding".to_string(), "deflate".to_string())];
+        assert_eq!(
+            maybe_decompress_http_body(&headers, zlib_bytes).unwrap(),
+            sample_payload
+        );
+
+        let mut raw_def =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        raw_def.write_all(sample_payload).unwrap();
+        let raw_bytes = raw_def.finish().unwrap();
+        assert_eq!(
+            maybe_decompress_http_body(&headers, raw_bytes).unwrap(),
+            sample_payload
+        );
+
+        // 4. Verify keep-alive Content-Length response returns immediately without waiting 15s for EOF
+        let (mut client_io, mut server_io) = tokio::io::duplex(4096);
+        let body = b"socks5://127.0.0.1:1080#Fast-KeepAlive\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        );
+        let server_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            server_io.write_all(resp.as_bytes()).await.unwrap();
+            server_io.write_all(body).await.unwrap();
+            // Hold stream open for 30s without closing
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let read_bytes =
+            tokio::time::timeout(Duration::from_secs(2), read_bounded_stream(&mut client_io))
+                .await
+                .expect("keep-alive Content-Length must return immediately")
+                .unwrap();
+        let (st, _, parsed_body) = parse_http11_response(&read_bytes).unwrap();
+        assert_eq!(st, 200);
+        assert_eq!(parsed_body, body);
+        server_task.abort();
 
         let _ = fs::remove_dir_all(&dir);
     }

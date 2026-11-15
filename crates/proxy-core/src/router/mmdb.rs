@@ -133,7 +133,9 @@ impl MmdbReader {
         };
 
         if ip_version == 6 {
-            // Pre-walk the 96 zero bits (::0:0/96) or IPv4-mapped prefix used by MaxMind v6 trees
+            // Pre-walk the 96 zero bits (::0:0/96) or IPv4-mapped prefix used by MaxMind v6 trees.
+            // Store `node` unconditionally even when `node >= node_count` (sentinel empty leaf)
+            // so IPv6-only MMDBs return `None` for IPv4 queries instead of walking from root `0`.
             let mut node = 0usize;
             for _ in 0..96 {
                 if node >= node_count {
@@ -141,9 +143,7 @@ impl MmdbReader {
                 }
                 node = reader.read_record(node, 0)?;
             }
-            if node < node_count {
-                reader.ipv4_start_node = node;
-            }
+            reader.ipv4_start_node = node;
         }
 
         Ok(reader)
@@ -664,5 +664,18 @@ mod tests {
             Some("CN".to_string())
         );
         assert_eq!(reader.lookup_country_code("9.9.9.9".parse().unwrap()), None);
+
+        // IPv6-only MMDB (`::0:0/96` subtree is empty) must NOT leave `ipv4_start_node == 0`
+        let v6_only_blob =
+            build_synthetic_country_mmdb(&[("2606:4700::/32".parse().unwrap(), "US")]);
+        let v6_only_reader = MmdbReader::from_bytes(v6_only_blob).unwrap();
+        assert_eq!(
+            v6_only_reader.lookup_country_code("2606:4700::1".parse().unwrap()),
+            Some("US".to_string())
+        );
+        assert_eq!(
+            v6_only_reader.lookup_country_code("42.0.0.1".parse().unwrap()),
+            None
+        );
     }
 }

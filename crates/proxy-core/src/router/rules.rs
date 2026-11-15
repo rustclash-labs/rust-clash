@@ -217,15 +217,19 @@ impl CompiledRule {
             "DOMAIN" => RuleMatcher::Domain(payload.trim_end_matches('.').to_ascii_lowercase()),
             "DOMAIN-SUFFIX" => RuleMatcher::DomainSuffix(
                 payload
+                    .trim_start_matches("+.")
                     .trim_start_matches('.')
                     .trim_end_matches('.')
                     .to_ascii_lowercase(),
             ),
             "DOMAIN-KEYWORD" => RuleMatcher::DomainKeyword(payload.to_ascii_lowercase()),
             "DOMAIN-REGEX" => {
-                let regex = Regex::new(payload).map_err(|e| {
-                    ProxyError::Config(format!("invalid DOMAIN-REGEX '{payload}': {e}"))
-                })?;
+                let regex = regex::RegexBuilder::new(payload)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| {
+                        ProxyError::Config(format!("invalid DOMAIN-REGEX '{payload}': {e}"))
+                    })?;
                 RuleMatcher::DomainRegex {
                     raw: payload.to_string(),
                     regex,
@@ -435,17 +439,34 @@ impl CompiledRule {
                 .and_then(|sa| find_local_process(transport, sa))
                 .is_some_and(|info| info.matches_path(expected_path)),
             RuleMatcher::IpCidr { net, no_resolve } => {
-                if let Some(ip) = target.host.as_ip() {
+                let net_contains = |ip: IpAddr| -> bool {
                     net.contains(&ip)
+                        || match ip {
+                            IpAddr::V6(v6) => v6
+                                .to_ipv4_mapped()
+                                .is_some_and(|v4| net.contains(&IpAddr::V4(v4))),
+                            IpAddr::V4(_) => false,
+                        }
+                };
+                if let Some(ip) = target.host.as_ip() {
+                    net_contains(ip)
                 } else if !*no_resolve {
-                    resolved_ips.iter().any(|ip| net.contains(ip))
+                    resolved_ips.iter().copied().any(net_contains)
                 } else {
                     false
                 }
             }
             RuleMatcher::SrcIpCidr(net) => src_ip
                 .or_else(|| src_addr.map(|sa| sa.ip()))
-                .is_some_and(|ip| net.contains(&ip)),
+                .is_some_and(|ip| {
+                    net.contains(&ip)
+                        || match ip {
+                            IpAddr::V6(v6) => v6
+                                .to_ipv4_mapped()
+                                .is_some_and(|v4| net.contains(&IpAddr::V4(v4))),
+                            IpAddr::V4(_) => false,
+                        }
+                }),
             RuleMatcher::DstPort { ranges, .. } => ranges
                 .iter()
                 .any(|(lo, hi)| target.port >= *lo && target.port <= *hi),
@@ -622,5 +643,45 @@ mod tests {
             None,
             &TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 210, 0, 1)), 443)
         ));
+
+        // +.foo in DOMAIN-SUFFIX, case-insensitive DOMAIN-REGEX, IPv4-mapped IPv6 CIDR, and GEOIP,LAN + PRIVATE MMDB
+        let plus_suffix = CompiledRule::parse("DOMAIN-SUFFIX,+.Example.COM,PROXY").unwrap();
+        assert!(plus_suffix.matches(None, &TargetAddr::new_domain("example.com", 443).unwrap()));
+        assert!(plus_suffix.matches(
+            None,
+            &TargetAddr::new_domain("sub.example.com", 443).unwrap()
+        ));
+
+        let rx_rule =
+            CompiledRule::parse("DOMAIN-REGEX,^api-[0-9]+\\.example\\.com$,PROXY").unwrap();
+        assert!(rx_rule.matches(
+            None,
+            &TargetAddr::new_domain("API-42.Example.COM", 443).unwrap()
+        ));
+
+        let cidr_rule = CompiledRule::parse("IP-CIDR,192.168.1.0/24,DIRECT").unwrap();
+        assert!(cidr_rule.matches(
+            None,
+            &TargetAddr::new_ip("::ffff:192.168.1.55".parse().unwrap(), 80)
+        ));
+        let src_cidr_rule = CompiledRule::parse("SRC-IP-CIDR,10.0.0.0/8,DIRECT").unwrap();
+        assert!(src_cidr_rule.matches(
+            Some("::ffff:10.1.2.3".parse().unwrap()),
+            &TargetAddr::new_domain("example.com", 80).unwrap()
+        ));
+
+        let mmdb_blob = crate::router::mmdb::build_synthetic_country_mmdb(&[
+            ("192.168.0.0/16".parse().unwrap(), "PRIVATE"),
+            ("8.8.8.0/24".parse().unwrap(), "US"),
+        ]);
+        let mmdb = Arc::new(MmdbReader::from_bytes(mmdb_blob).unwrap());
+        let lan_rule =
+            CompiledRule::parse_with_context("GEOIP,LAN,DIRECT", Some(&mmdb), None).unwrap();
+        assert!(lan_rule.matches(
+            None,
+            &TargetAddr::new_ip("192.168.10.20".parse().unwrap(), 80)
+        ));
+        assert!(lan_rule.matches(None, &TargetAddr::new_ip("100.64.1.1".parse().unwrap(), 80)));
+        assert!(!lan_rule.matches(None, &TargetAddr::new_ip("8.8.8.8".parse().unwrap(), 80)));
     }
 }

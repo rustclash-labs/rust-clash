@@ -29,7 +29,8 @@ use crate::{
     api::embedded::serve_embedded_spa,
     config::{ClashConfig, ProxyNodeConfig, REDACTED_SECRET, RunMode, uri::export_proxy_uri},
     dns::wire::{
-        DnsAnswerData, QTYPE_A, QTYPE_AAAA, build_dns_query, dns_response_rcode, extract_ip_answers,
+        build_dns_query, dns_response_rcode, extract_dns_display_answers, format_qtype_name,
+        parse_qtype_str,
     },
     engine::ProxyEngine,
     error::{ProxyError, Result},
@@ -1379,42 +1380,47 @@ async fn query_dns_api(
     State(engine): State<Arc<ProxyEngine>>,
     Query(q): Query<DnsApiQuery>,
 ) -> impl IntoResponse {
-    let qt = match q.qtype.to_ascii_uppercase().as_str() {
-        "AAAA" | "28" => QTYPE_AAAA,
-        _ => QTYPE_A,
+    let Some(qt) = parse_qtype_str(&q.qtype) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": format!("unsupported DNS record type '{}'", q.qtype)
+            })),
+        )
+            .into_response();
     };
     let wire_req = build_dns_query(0x1337, &q.name, qt);
     let dns = Arc::clone(engine.router().dns());
     match dns.handle_dns_packet(&wire_req).await {
         Ok(wire_resp) => {
             let status_rcode = dns_response_rcode(&wire_resp).unwrap_or(0);
-            let answers = extract_ip_answers(&wire_resp).unwrap_or_default();
+            let answers = extract_dns_display_answers(&wire_resp).unwrap_or_default();
             let formatted: Vec<serde_json::Value> = answers
                 .into_iter()
-                .map(|a| match a {
-                    DnsAnswerData::A(v4) => serde_json::json!({
-                        "type": "A",
-                        "data": v4.to_string(),
-                        "is_fake_ip": dns.is_fake_ip(std::net::IpAddr::V4(v4)),
-                        "restored_domain": dns.lookup_domain(std::net::IpAddr::V4(v4)),
-                    }),
-                    DnsAnswerData::Aaaa(v6) => serde_json::json!({
-                        "type": "AAAA",
-                        "data": v6.to_string(),
-                        "is_fake_ip": false,
-                    }),
-                    DnsAnswerData::Txt(txt) => serde_json::json!({
-                        "type": "TXT",
-                        "data": txt,
-                        "is_fake_ip": false,
-                    }),
+                .map(|(rec_type, data)| {
+                    if rec_type == "A"
+                        && let Ok(v4) = data.parse::<std::net::Ipv4Addr>()
+                    {
+                        serde_json::json!({
+                            "type": rec_type,
+                            "data": data,
+                            "is_fake_ip": dns.is_fake_ip(std::net::IpAddr::V4(v4)),
+                            "restored_domain": dns.lookup_domain(std::net::IpAddr::V4(v4)),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": rec_type,
+                            "data": data,
+                            "is_fake_ip": false,
+                        })
+                    }
                 })
                 .collect();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "Status": status_rcode,
-                    "Question": { "name": q.name, "type": q.qtype.to_ascii_uppercase() },
+                    "Question": { "name": q.name, "type": format_qtype_name(qt) },
                     "bypass_fake_ip": dns.should_bypass_fake_ip(&q.name),
                     "Answer": formatted,
                 })),
@@ -1440,13 +1446,47 @@ pub fn parse_explain_target(raw: &str) -> std::result::Result<crate::addr::Targe
     if trimmed.is_empty() {
         return Err("target parameter cannot be empty".to_string());
     }
-    if let Ok(t) = trimmed.parse::<crate::addr::TargetAddr>() {
+    if trimmed.contains("://") {
+        let parsed_url =
+            url::Url::parse(trimmed).map_err(|e| format!("invalid target URL: {e}"))?;
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| "target URL is missing host".to_string())?;
+        let clean_host = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        let default_port = match parsed_url.scheme().to_ascii_lowercase().as_str() {
+            "http" | "ws" => 80,
+            _ => 443,
+        };
+        let port = parsed_url.port().unwrap_or(default_port);
+        if let Ok(ip) = clean_host.parse::<IpAddr>() {
+            return Ok(crate::addr::TargetAddr::new_ip(ip, port));
+        }
+        return crate::addr::TargetAddr::new_domain(clean_host, port).map_err(|e| e.to_string());
+    }
+    let authority = match trimmed.find(['/', '?', '#']) {
+        Some(idx) => trimmed[..idx].trim(),
+        None => trimmed,
+    };
+    if authority.is_empty() {
+        return Err("target host cannot be empty".to_string());
+    }
+    if let Some(inner) = authority
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        && let Ok(v6) = inner.parse::<std::net::Ipv6Addr>()
+    {
+        return Ok(crate::addr::TargetAddr::new_ip(IpAddr::V6(v6), 443));
+    }
+    if let Ok(t) = authority.parse::<crate::addr::TargetAddr>() {
         return Ok(t);
     }
-    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+    if let Ok(ip) = authority.parse::<IpAddr>() {
         return Ok(crate::addr::TargetAddr::new_ip(ip, 443));
     }
-    format!("{trimmed}:443")
+    format!("{authority}:443")
         .parse::<crate::addr::TargetAddr>()
         .map_err(|e| e.to_string())
 }
@@ -3050,6 +3090,7 @@ async fn fetch_via_outbound_https_text(
     tls_sni: &str,
     host_header: &str,
     path_and_query: &str,
+    extra_ca_der: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Option<String> {
     let stream = outbound.connect_tcp(target).await.ok()?;
     let req = format!(
@@ -3057,11 +3098,13 @@ async fn fetch_via_outbound_https_text(
     );
     let mut raw_buf = Vec::with_capacity(2048);
     let tls_cfg =
-        crate::crypto::tls::build_tls_client_config(false, &[], &[b"http/1.1".to_vec()]).ok()?;
+        crate::crypto::tls::build_tls_client_config(false, extra_ca_der, &[b"http/1.1".to_vec()])
+            .ok()?;
     let connector = tokio_rustls::TlsConnector::from(tls_cfg);
     let server_name = rustls::pki_types::ServerName::try_from(tls_sni.to_string()).ok()?;
     let mut tls_stream = connector.connect(server_name, stream).await.ok()?;
     tls_stream.write_all(req.as_bytes()).await.ok()?;
+    tls_stream.flush().await.ok()?;
     let _ = (&mut tls_stream)
         .take(65_536)
         .read_to_end(&mut raw_buf)
@@ -3069,14 +3112,54 @@ async fn fetch_via_outbound_https_text(
     extract_http_response_body_str(&raw_buf)
 }
 
+fn parse_cloudflare_trace_exit_ip(body: &str) -> Option<ExitIpProbeData> {
+    let mut ip = None;
+    let mut loc = String::new();
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("ip=") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                ip = Some(trimmed.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("loc=") {
+            loc = v.trim().to_string();
+        }
+    }
+    let found_ip = ip?;
+    Some(ExitIpProbeData {
+        ip: found_ip,
+        country: if loc.is_empty() {
+            "Unknown".to_string()
+        } else {
+            loc.clone()
+        },
+        country_code: loc,
+        isp: String::new(),
+        asn: String::new(),
+        ip_type: "Unknown".to_string(),
+    })
+}
+
 async fn probe_exit_ip_via_outbound(
     outbound: &dyn crate::outbound::OutboundHandler,
+    extra_ca_der: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Option<ExitIpProbeData> {
+    let step_timeout = Duration::from_millis(2400);
+
     // 1. Primary (HTTPS :443): https://api.ip.sb/geoip
     if let Ok(target) = crate::addr::TargetAddr::new_domain("api.ip.sb", 443)
-        && let Some(body) =
-            fetch_via_outbound_https_text(outbound, &target, "api.ip.sb", "api.ip.sb", "/geoip")
-                .await
+        && let Ok(Some(body)) = tokio::time::timeout(
+            step_timeout,
+            fetch_via_outbound_https_text(
+                outbound,
+                &target,
+                "api.ip.sb",
+                "api.ip.sb",
+                "/geoip",
+                extra_ca_der,
+            ),
+        )
+        .await
         && let Ok(val) = serde_json::from_str::<serde_json::Value>(body.trim())
         && let Some(ip) = val
             .get("ip")
@@ -3122,44 +3205,42 @@ async fn probe_exit_ip_via_outbound(
         });
     }
 
-    // 2. Fallback (HTTPS :443 only — plaintext HTTP :80 GeoIP endpoints are never used):
-    //    https://1.1.1.1/cdn-cgi/trace
+    // 2. Fallback #1 (HTTPS :443 IP literal): https://1.1.1.1/cdn-cgi/trace
     let cf_target = crate::addr::TargetAddr::new_ip(IpAddr::from([1, 1, 1, 1]), 443);
-    if let Some(body) = fetch_via_outbound_https_text(
-        outbound,
-        &cf_target,
-        "cloudflare-dns.com",
-        "1.1.1.1",
-        "/cdn-cgi/trace",
+    if let Ok(Some(body)) = tokio::time::timeout(
+        step_timeout,
+        fetch_via_outbound_https_text(
+            outbound,
+            &cf_target,
+            "cloudflare-dns.com",
+            "1.1.1.1",
+            "/cdn-cgi/trace",
+            extra_ca_der,
+        ),
     )
     .await
+        && let Some(data) = parse_cloudflare_trace_exit_ip(&body)
     {
-        let mut ip = None;
-        let mut loc = String::new();
-        for line in body.lines() {
-            if let Some(v) = line.strip_prefix("ip=") {
-                let trimmed = v.trim();
-                if !trimmed.is_empty() {
-                    ip = Some(trimmed.to_string());
-                }
-            } else if let Some(v) = line.strip_prefix("loc=") {
-                loc = v.trim().to_string();
-            }
-        }
-        if let Some(found_ip) = ip {
-            return Some(ExitIpProbeData {
-                ip: found_ip,
-                country: if loc.is_empty() {
-                    "Unknown".to_string()
-                } else {
-                    loc.clone()
-                },
-                country_code: loc,
-                isp: String::new(),
-                asn: String::new(),
-                ip_type: "Unknown".to_string(),
-            });
-        }
+        return Some(data);
+    }
+
+    // 3. Fallback #2 (HTTPS :443 domain): https://www.cloudflare.com/cdn-cgi/trace
+    if let Ok(cf_dom) = crate::addr::TargetAddr::new_domain("www.cloudflare.com", 443)
+        && let Ok(Some(body)) = tokio::time::timeout(
+            step_timeout,
+            fetch_via_outbound_https_text(
+                outbound,
+                &cf_dom,
+                "www.cloudflare.com",
+                "www.cloudflare.com",
+                "/cdn-cgi/trace",
+                extra_ca_der,
+            ),
+        )
+        .await
+        && let Some(data) = parse_cloudflare_trace_exit_ip(&body)
+    {
+        return Some(data);
     }
 
     None
@@ -3229,7 +3310,18 @@ async fn get_exit_ip_api(
             .into_response();
     }
 
-    let cache_key = format!("{}:{}", cfg.mode.as_str(), eff.effective_outbound);
+    let outbound_opt = router.concrete_outbound(&eff.effective_outbound);
+    let probe_ref = crate::addr::TargetAddr::new_ip(IpAddr::from([1, 1, 1, 1]), 443);
+    let outbound_ep = outbound_opt
+        .as_ref()
+        .map(|ob| ob.remote_endpoint(&probe_ref))
+        .unwrap_or_default();
+    let cache_key = format!(
+        "{}:{}:{}",
+        cfg.mode.as_str(),
+        eff.effective_outbound,
+        outbound_ep
+    );
     if !force_refresh
         && let Some((cached_key, ts, mut cached_val)) = EXIT_IP_CACHE.lock().clone()
         && cached_key == cache_key
@@ -3241,11 +3333,12 @@ async fn get_exit_ip_api(
         return (StatusCode::OK, Json(cached_val)).into_response();
     }
 
+    let extra_ca = engine.extra_ca_der();
     let probe_start = Instant::now();
-    if let Some(outbound) = router.concrete_outbound(&eff.effective_outbound)
+    if let Some(outbound) = outbound_opt
         && let Ok(Some(probe)) = tokio::time::timeout(
-            Duration::from_secs(4),
-            probe_exit_ip_via_outbound(outbound.as_ref()),
+            Duration::from_millis(6000),
+            probe_exit_ip_via_outbound(outbound.as_ref(), &extra_ca),
         )
         .await
     {
@@ -4247,5 +4340,43 @@ rules:
         let _ = server_handle.await;
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn parse_explain_target_accepts_full_urls_paths_and_bracketed_ipv6() {
+        assert_eq!(
+            parse_explain_target("https://chatgpt.com/g/g-123?foo=bar")
+                .unwrap()
+                .to_string(),
+            "chatgpt.com:443"
+        );
+        assert_eq!(
+            parse_explain_target("http://example.com/healthz")
+                .unwrap()
+                .to_string(),
+            "example.com:80"
+        );
+        assert_eq!(
+            parse_explain_target("http://[::1]:8080/api/v1")
+                .unwrap()
+                .to_string(),
+            "[::1]:8080"
+        );
+        assert_eq!(
+            parse_explain_target("[2606:4700:4700::1111]")
+                .unwrap()
+                .to_string(),
+            "[2606:4700:4700::1111]:443"
+        );
+        assert_eq!(
+            parse_explain_target("github.com/rust-lang/rust")
+                .unwrap()
+                .to_string(),
+            "github.com:443"
+        );
+        assert_eq!(
+            parse_explain_target("1.1.1.1").unwrap().to_string(),
+            "1.1.1.1:443"
+        );
     }
 }

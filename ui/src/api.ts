@@ -13,6 +13,7 @@ import type {
   DesktopPrefs,
   DnsFlushResponse,
   DnsQueryResponse,
+  DnsRecordQueryType,
   EndpointMatrixReport,
   ExitIpInfo,
   FakeIpPoolResponse,
@@ -725,9 +726,9 @@ export const clashApi = {
     ),
   clearConnectionDiagnostics: () =>
     apiFetch<void>("/connections/diagnostics", { method: "DELETE" }),
-  queryDns: (name: string, qtype: "A" | "AAAA" = "A") =>
+  queryDns: (name: string, qtype: DnsRecordQueryType = "A") =>
     apiFetch<DnsQueryResponse>(
-      `/dns/query?name=${encodeURIComponent(name)}&type=${qtype}`,
+      `/dns/query?name=${encodeURIComponent(name)}&type=${encodeURIComponent(qtype)}`,
     ),
   flushDnsCache: () =>
     apiFetch<DnsFlushResponse>("/dns/flush", { method: "POST" }),

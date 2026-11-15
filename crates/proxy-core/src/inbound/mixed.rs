@@ -666,7 +666,7 @@ async fn handle_socks5(
 
             let local_ip = tcp
                 .local_addr()
-                .map(|a| a.ip())
+                .map(|a| canonical_ip(a.ip()))
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
             let udp_sock = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
             let bound = udp_sock.local_addr()?;
@@ -866,6 +866,49 @@ fn check_http_proxy_auth<'a>(
     false
 }
 
+fn parse_host_or_authority_with_default_port(
+    raw: &str,
+    default_port: u16,
+) -> io::Result<TargetAddr> {
+    let trimmed = raw.trim();
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let v6: std::net::Ipv6Addr = inner.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid bracketed IPv6 host '{trimmed}': {e}"),
+            )
+        })?;
+        return Ok(TargetAddr::new_ip(IpAddr::V6(v6), default_port));
+    }
+    if trimmed.contains(':') {
+        trimmed.parse()
+    } else {
+        TargetAddr::new_domain(trimmed, default_port)
+    }
+}
+
+fn extract_raw_http_origin_path(uri_part: &str) -> String {
+    let after_scheme = match uri_part.find("://") {
+        Some(idx) => &uri_part[idx + 3..],
+        None => uri_part,
+    };
+    let tail = match after_scheme.find(['/', '?', '#']) {
+        Some(idx) => &after_scheme[idx..],
+        None => return "/".to_string(),
+    };
+    let without_frag = match tail.find('#') {
+        Some(idx) => &tail[..idx],
+        None => tail,
+    };
+    if without_frag.is_empty() {
+        "/".to_string()
+    } else if without_frag.starts_with('?') {
+        format!("/{without_frag}")
+    } else {
+        without_frag.to_string()
+    }
+}
+
 async fn handle_http_proxy(
     tcp: &mut TcpStream,
     peer: SocketAddr,
@@ -934,11 +977,7 @@ async fn handle_http_proxy(
     }
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let raw_target: TargetAddr = if uri_part.contains(':') {
-            uri_part.parse()?
-        } else {
-            TargetAddr::new_domain(uri_part, 443)?
-        };
+        let raw_target = parse_host_or_authority_with_default_port(uri_part, 443)?;
         if let Err(err) = reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
         {
             hub.push_log(
@@ -1051,15 +1090,7 @@ async fn handle_http_proxy(
                     )
                 })?;
                 let port = url.port_or_known_default().unwrap_or(80);
-                let mut p = if url.path().is_empty() {
-                    "/".to_string()
-                } else {
-                    url.path().to_string()
-                };
-                if let Some(q) = url.query() {
-                    p.push('?');
-                    p.push_str(q);
-                }
+                let p = extract_raw_http_origin_path(uri_part);
                 let clean_host = host.trim_start_matches('[').trim_end_matches(']');
                 (TargetAddr::new_domain(clean_host, port)?, p)
             } else {
@@ -1079,11 +1110,7 @@ async fn handle_http_proxy(
                         "missing Host header in HTTP request",
                     )
                 })?;
-                let target = if host_val.contains(':') {
-                    host_val.parse()?
-                } else {
-                    TargetAddr::new_domain(host_val, 80)?
-                };
+                let target = parse_host_or_authority_with_default_port(host_val, 80)?;
                 (target, uri_part.to_string())
             };
 
@@ -2232,5 +2259,35 @@ mod tests {
         let _ = shutdown_tx.send(true);
         mixed_jh.abort();
         let _ = flood_srv_jh.await;
+    }
+
+    #[test]
+    fn http_proxy_authority_supports_bare_bracketed_ipv6_and_preserves_raw_origin_path() {
+        assert_eq!(
+            parse_host_or_authority_with_default_port("[2001:db8::1]", 443).unwrap(),
+            TargetAddr::new_ip("2001:db8::1".parse().unwrap(), 443)
+        );
+        assert_eq!(
+            parse_host_or_authority_with_default_port("[::1]", 80).unwrap(),
+            TargetAddr::new_ip("::1".parse().unwrap(), 80)
+        );
+        assert_eq!(
+            parse_host_or_authority_with_default_port("[::1]:8080", 80).unwrap(),
+            TargetAddr::new_ip("::1".parse().unwrap(), 8080)
+        );
+        assert_eq!(
+            parse_host_or_authority_with_default_port("example.com", 443).unwrap(),
+            TargetAddr::new_domain("example.com", 443).unwrap()
+        );
+
+        assert_eq!(
+            extract_raw_http_origin_path("http://s3.example.com/bucket/a%2Fb/../raw?X-Amz-Sig=1+2"),
+            "/bucket/a%2Fb/../raw?X-Amz-Sig=1+2"
+        );
+        assert_eq!(
+            extract_raw_http_origin_path("http://[::1]:8080?foo=bar#frag"),
+            "/?foo=bar"
+        );
+        assert_eq!(extract_raw_http_origin_path("http://example.com"), "/");
     }
 }

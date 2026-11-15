@@ -19,7 +19,7 @@ use tokio_rustls::TlsConnector;
 use crate::{
     addr::{HostName, TargetAddr},
     outbound::{BoxedStream, DirectOutbound, OutboundHandler, OutboundUdpSession},
-    platform::socket_protect::{protected_tcp_connect_host_with_dns, protected_udp_bind},
+    platform::socket_protect::{bind_protected_udp_addrs, protected_tcp_connect_host_with_dns},
 };
 
 #[derive(Clone)]
@@ -363,37 +363,40 @@ impl OutboundHandler for Socks5Outbound {
             ));
         }
 
-        let relay_ip = match bnd.host {
-            HostName::Ip(ip) if !ip.is_unspecified() => ip,
-            HostName::Ip(_) => peer_ip,
+        let relay_addrs: Vec<SocketAddr> = match bnd.host {
+            HostName::Ip(ip) if !ip.is_unspecified() => vec![SocketAddr::new(ip, bnd.port)],
+            HostName::Ip(_) => vec![SocketAddr::new(peer_ip, bnd.port)],
             HostName::Domain(ref d) => {
                 if let Some(dns) = &self.inner.dns {
-                    *dns.resolve_proxy_server_ips(d)
+                    let ips = dns
+                        .resolve_proxy_server_ips(d)
                         .await
-                        .map_err(|e| e.into_io())?
-                        .first()
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::HostUnreachable, "empty SOCKS5 relay DNS")
-                        })?
+                        .map_err(|e| e.into_io())?;
+                    if ips.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::HostUnreachable,
+                            "empty SOCKS5 relay DNS",
+                        ));
+                    }
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, bnd.port))
+                        .collect()
                 } else {
-                    crate::router::geodata::resolve_host_bypassing_fake_ip(d, bnd.port)
-                        .await
-                        .map_err(|e| e.into_io())?
-                        .first()
-                        .map(SocketAddr::ip)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::HostUnreachable, "empty SOCKS5 relay DNS")
-                        })?
+                    let resolved =
+                        crate::router::geodata::resolve_host_bypassing_fake_ip(d, bnd.port)
+                            .await
+                            .map_err(|e| e.into_io())?;
+                    if resolved.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::HostUnreachable,
+                            "empty SOCKS5 relay DNS",
+                        ));
+                    }
+                    resolved
                 }
             }
         };
-        let relay_addr = SocketAddr::new(relay_ip, bnd.port);
-        let local_bind = if relay_addr.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        };
-        let udp_sock = protected_udp_bind(local_bind, Some(relay_addr))?;
+        let (udp_sock, relay_addr) = bind_protected_udp_addrs(&relay_addrs)?;
 
         Ok(Box::new(Socks5UdpSession {
             ctrl_tcp: tokio::sync::Mutex::new(ctrl_tcp),
