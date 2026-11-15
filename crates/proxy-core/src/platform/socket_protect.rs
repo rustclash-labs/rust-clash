@@ -576,10 +576,14 @@ pub fn global_socket_protector() -> Arc<dyn SocketProtector> {
     Arc::clone(&protector_slot().read())
 }
 
-const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Per-socket TCP `connect()` timeout: 5s covers Linux/Android RFC 6298 initial SYN (`0s`) plus two
+/// retransmissions (`+1s` at `1.0s`, `+2s` at `3.0–3.2s`) with `~1.8s` cellular RRC wake-up / bufferbloat RTT headroom.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const MAX_HAPPY_EYEBALLS_CANDIDATES: usize = 6;
-const HAPPY_EYEBALLS_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
+/// Overall Happy Eyeballs ceiling (`>= (MAX_HAPPY_EYEBALLS_CANDIDATES - 1) * 250ms + TCP_CONNECT_TIMEOUT`)
+/// so staggered IPv4/IPv6 fallback candidates receive their full per-socket connect budget.
+const HAPPY_EYEBALLS_TOTAL_TIMEOUT: Duration = Duration::from_millis(6500);
 
 fn sync_recent_failed_generation(map: &mut HashMap<SocketAddr, Instant>) {
     let gen_now = network_generation();
@@ -813,17 +817,48 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
 
     let mut ordered = prioritize_healthy_happy_eyeballs_addrs(addrs);
     ordered.truncate(MAX_HAPPY_EYEBALLS_CANDIDATES);
-    let primary_candidate = ordered[0];
+    race_happy_eyeballs_candidates(
+        ordered,
+        HAPPY_EYEBALLS_DELAY,
+        HAPPY_EYEBALLS_TOTAL_TIMEOUT,
+        protected_tcp_connect_addr,
+    )
+    .await
+}
 
-    tokio::time::timeout(HAPPY_EYEBALLS_TOTAL_TIMEOUT, async move {
-        let mut join_set = tokio::task::JoinSet::new();
-        join_set.spawn(protected_tcp_connect_addr(ordered[0]));
+async fn race_happy_eyeballs_candidates<T, F, Fut>(
+    ordered: Vec<SocketAddr>,
+    stagger_delay: Duration,
+    total_timeout: Duration,
+    mut dial: F,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    let primary_candidate = ordered[0];
+    let mut join_set: tokio::task::JoinSet<(SocketAddr, io::Result<T>)> =
+        tokio::task::JoinSet::new();
+    let mut inflight: Vec<SocketAddr> = Vec::with_capacity(ordered.len());
+
+    let spawn_candidate = |addr: SocketAddr,
+                           join_set: &mut tokio::task::JoinSet<(SocketAddr, io::Result<T>)>,
+                           inflight: &mut Vec<SocketAddr>,
+                           dial: &mut F| {
+        inflight.push(addr);
+        let fut = dial(addr);
+        join_set.spawn(async move { (addr, fut.await) });
+    };
+
+    let race_res = tokio::time::timeout(total_timeout, async {
+        spawn_candidate(ordered[0], &mut join_set, &mut inflight, &mut dial);
         let mut next_idx = 1usize;
         let mut last_err: Option<io::Error> = None;
 
         while !join_set.is_empty() || next_idx < ordered.len() {
             if join_set.is_empty() {
-                join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
+                spawn_candidate(ordered[next_idx], &mut join_set, &mut inflight, &mut dial);
                 next_idx += 1;
             }
             if next_idx < ordered.len() {
@@ -831,30 +866,44 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
                     biased;
                     joined = join_set.join_next() => {
                         match joined {
-                            Some(Ok(Ok(stream))) => {
+                            Some(Ok((addr, Ok(stream)))) => {
+                                inflight.retain(|a| *a != addr);
                                 join_set.abort_all();
                                 return Ok(stream);
                             }
-                            Some(Ok(Err(e))) => {
+                            Some(Ok((addr, Err(e)))) => {
+                                inflight.retain(|a| *a != addr);
                                 last_err = Some(e);
-                                join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
+                                spawn_candidate(
+                                    ordered[next_idx],
+                                    &mut join_set,
+                                    &mut inflight,
+                                    &mut dial,
+                                );
                                 next_idx += 1;
                             }
                             Some(Err(_)) | None => {}
                         }
                     }
-                    _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
-                        join_set.spawn(protected_tcp_connect_addr(ordered[next_idx]));
+                    _ = tokio::time::sleep(stagger_delay) => {
+                        spawn_candidate(
+                            ordered[next_idx],
+                            &mut join_set,
+                            &mut inflight,
+                            &mut dial,
+                        );
                         next_idx += 1;
                     }
                 }
             } else {
                 match join_set.join_next().await {
-                    Some(Ok(Ok(stream))) => {
+                    Some(Ok((addr, Ok(stream)))) => {
+                        inflight.retain(|a| *a != addr);
                         join_set.abort_all();
                         return Ok(stream);
                     }
-                    Some(Ok(Err(e))) => {
+                    Some(Ok((addr, Err(e)))) => {
+                        inflight.retain(|a| *a != addr);
                         last_err = Some(e);
                     }
                     Some(Err(_)) => {}
@@ -866,12 +915,24 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
         Err(last_err
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::HostUnreachable, "unable to connect")))
     })
-    .await
-    .unwrap_or_else(|_| {
-        let err = io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out");
-        note_tcp_connect_outcome_at(primary_candidate, Err(&err), Instant::now());
-        Err(err)
-    })
+    .await;
+
+    match race_res {
+        Ok(res) => res,
+        Err(_) => {
+            join_set.abort_all();
+            let err = io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out");
+            let now = Instant::now();
+            if inflight.is_empty() {
+                note_tcp_connect_outcome_at(primary_candidate, Err(&err), now);
+            } else {
+                for addr in inflight {
+                    note_tcp_connect_outcome_at(addr, Err(&err), now);
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Resolve `host:port` for outbound proxy server dials while strictly rejecting `198.18.0.0/15` Fake-IPs
@@ -1272,6 +1333,89 @@ mod tests {
                 prioritize_healthy_happy_eyeballs_addrs(&[live_loopback, dead_loopback]),
                 vec![live_loopback, dead_loopback]
             );
+        });
+    }
+
+    #[test]
+    fn happy_eyeballs_gives_staggered_fallbacks_full_budget_and_demotes_stalled_secondary_candidates()
+     {
+        let _guard = lock_ipv6_reachability_for_test();
+        assert!(
+            HAPPY_EYEBALLS_TOTAL_TIMEOUT
+                >= TCP_CONNECT_TIMEOUT
+                    + HAPPY_EYEBALLS_DELAY * (MAX_HAPPY_EYEBALLS_CANDIDATES as u32 - 1),
+            "HAPPY_EYEBALLS_TOTAL_TIMEOUT must give every staggered candidate a full TCP_CONNECT_TIMEOUT budget"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let fast_refused: SocketAddr = "198.51.100.10:443".parse().unwrap();
+            let stalled_blackhole: SocketAddr = "198.51.100.11:443".parse().unwrap();
+            let healthy_fallback: SocketAddr = "198.51.100.12:443".parse().unwrap();
+
+            // 1. Primary fails fast (5ms ConnectionRefused), secondary hangs past total_timeout (70ms):
+            //    BOTH `fast_refused` AND `stalled_blackhole` must be demoted in `RECENT_FAILED_ADDRS`
+            //    so `healthy_fallback` becomes primary on the next attempt.
+            clear_recent_failed_addrs();
+            let err = race_happy_eyeballs_candidates(
+                vec![fast_refused, stalled_blackhole],
+                Duration::from_millis(30),
+                Duration::from_millis(70),
+                move |addr| async move {
+                    if addr == fast_refused {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        let e = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+                        note_tcp_connect_outcome_at(addr, Err(&e), Instant::now());
+                        Err::<SocketAddr, io::Error>(e)
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(addr)
+                    }
+                },
+            )
+            .await
+            .expect_err("race must time out when secondary blackholes");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!(RECENT_FAILED_ADDRS.lock().contains_key(&fast_refused));
+            assert!(
+                RECENT_FAILED_ADDRS.lock().contains_key(&stalled_blackhole),
+                "stalled secondary candidate must also be demoted on outer Happy Eyeballs timeout"
+            );
+            assert_eq!(
+                prioritize_healthy_happy_eyeballs_addrs(&[
+                    fast_refused,
+                    stalled_blackhole,
+                    healthy_fallback
+                ]),
+                vec![healthy_fallback, fast_refused, stalled_blackhole]
+            );
+
+            // 2. Staggered secondary candidate spawned at +30ms taking 65ms (completing at ~95ms > 80ms
+            //    per-addr timeout from t=0) succeeds cleanly when total_timeout covers stagger + per-addr budget.
+            clear_recent_failed_addrs();
+            let winner = race_happy_eyeballs_candidates(
+                vec![stalled_blackhole, healthy_fallback],
+                Duration::from_millis(30),
+                Duration::from_millis(160),
+                move |addr| async move {
+                    if addr == stalled_blackhole {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        let e = io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out");
+                        note_tcp_connect_outcome_at(addr, Err(&e), Instant::now());
+                        Err(e)
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(65)).await;
+                        note_tcp_connect_outcome_at(addr, Ok(()), Instant::now());
+                        Ok(addr)
+                    }
+                },
+            )
+            .await
+            .expect("staggered fallback candidate must receive full connect budget");
+            assert_eq!(winner, healthy_fallback);
         });
     }
 }
