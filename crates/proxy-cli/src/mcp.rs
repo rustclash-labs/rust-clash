@@ -210,6 +210,18 @@ fn sanitize_source_label(src: &str, include_network_metadata: bool) -> String {
     }
 }
 
+fn has_yaml_extension_and_stem(path: &std::path::Path) -> bool {
+    let has_yaml_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+    let has_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| !s.is_empty());
+    has_yaml_ext && has_stem
+}
+
 fn validate_audit_config_path(raw: &str) -> std::result::Result<PathBuf, &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
@@ -225,35 +237,113 @@ fn validate_audit_config_path(raw: &str) -> std::result::Result<PathBuf, &'stati
     {
         return Err("invalid config_path: parent directory traversal ('..') is forbidden");
     }
-    let has_yaml_ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
-    let has_stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| !s.is_empty());
-    if !has_yaml_ext || !has_stem {
+    if !has_yaml_extension_and_stem(&path) {
         return Err("invalid config_path: only '.yaml' or '.yml' configuration files are allowed");
     }
-    if let Ok(meta) = std::fs::metadata(&path)
-        && !meta.is_file()
-    {
+
+    let sym_meta = std::fs::symlink_metadata(&path)
+        .map_err(|_| "failed to load config_path: file does not exist or is unreadable")?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("invalid config_path: symbolic links are forbidden");
+    }
+    if !sym_meta.file_type().is_file() {
         return Err("invalid config_path: target must be a regular '.yaml' or '.yml' file");
     }
-    Ok(path)
+
+    let canon = std::fs::canonicalize(&path)
+        .map_err(|_| "failed to load config_path: file does not exist or is unreadable")?;
+    if !has_yaml_extension_and_stem(&canon) {
+        return Err(
+            "invalid config_path: canonicalized target must be a '.yaml' or '.yml' configuration file",
+        );
+    }
+    let canon_meta = std::fs::metadata(&canon)
+        .map_err(|_| "failed to load config_path: file does not exist or is unreadable")?;
+    if !canon_meta.is_file() {
+        return Err("invalid config_path: target must be a regular '.yaml' or '.yml' file");
+    }
+    Ok(canon)
 }
 
 fn sanitize_audit_file_error(path: &std::path::Path) -> &'static str {
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Err(_) => "failed to load config_path: file does not exist or is unreadable",
-        Ok(meta) if !meta.is_file() => {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            "invalid config_path: symbolic links are forbidden"
+        }
+        Ok(meta) if !meta.file_type().is_file() => {
             "invalid config_path: target must be a regular '.yaml' or '.yml' file"
         }
         Ok(_) => {
             "failed to parse or validate Clash YAML at config_path (syntax or schema error; raw file contents redacted)"
         }
     }
+}
+
+fn looks_like_ip_or_sockaddr_token(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    if tok.parse::<std::net::IpAddr>().is_ok() || tok.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    if let Some(inner) = tok.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && inner.parse::<std::net::IpAddr>().is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+fn scrub_text_network_tokens(raw: &str, extra_needles: &[String]) -> String {
+    let mut out = redact_sensitive_text(raw);
+    let mut sorted_needles: Vec<&str> = extra_needles
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty() && *s != "<redacted>" && *s != "[endpoint-redacted]")
+        .collect();
+    sorted_needles.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    sorted_needles.dedup();
+    for needle in sorted_needles {
+        out = out.replace(needle, "<redacted>");
+    }
+
+    let mut rebuilt = String::with_capacity(out.len());
+    for chunk in out.split_inclusive(char::is_whitespace) {
+        let ws_idx = chunk.find(char::is_whitespace).unwrap_or(chunk.len());
+        let (word, trailing_ws) = chunk.split_at(ws_idx);
+        let core = word.trim_matches(|c: char| {
+            matches!(
+                c,
+                '\'' | '"' | '`' | '(' | ')' | ',' | ';' | '.' | '<' | '>'
+            )
+        });
+        if !core.is_empty() && looks_like_ip_or_sockaddr_token(core) {
+            rebuilt.push_str(&word.replacen(core, "<redacted>", 1));
+        } else {
+            rebuilt.push_str(word);
+        }
+        rebuilt.push_str(trailing_ws);
+    }
+    rebuilt
+}
+
+fn scrub_quoted_audit_endpoints(raw: &str) -> String {
+    let mut out = raw.to_string();
+    for marker in ["server '", "set to '"] {
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = out[search_from..].find(marker) {
+            let val_start = search_from + rel_idx + marker.len();
+            if let Some(end_rel) = out[val_start..].find('\'') {
+                let val_end = val_start + end_rel;
+                out.replace_range(val_start..val_end, "<redacted>");
+                search_from = val_start + "<redacted>".len() + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
@@ -264,6 +354,14 @@ fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
     payload["metadata_privacy_mode"] = json!(
         "redacted (proxy server endpoints hidden by default; relaunch with --include-network-metadata to expose)"
     );
+    if payload.get("controller").is_some() && !payload["controller"].is_null() {
+        payload["controller"] = json!("<redacted>");
+    }
+    if let Some(src) = payload.get("source").and_then(|v| v.as_str())
+        && src.starts_with("live_controller:")
+    {
+        payload["source"] = json!("live_controller:<redacted>");
+    }
 
     if let Some(findings) = payload
         .get_mut("audit")
@@ -271,12 +369,46 @@ fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
         .and_then(|f| f.as_array_mut())
     {
         for finding in findings {
-            if let Some(loc) = finding.get("location").and_then(|v| v.as_str())
-                && loc.starts_with("proxies[")
-                && let Some(paren_idx) = loc.find(" (")
+            let mut extracted_needles: Vec<String> = Vec::new();
+
+            if let Some(loc) = finding
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
             {
-                let scrubbed_loc = format!("{} ([endpoint-redacted])", &loc[..paren_idx]);
-                finding["location"] = json!(scrubbed_loc);
+                if loc.starts_with("proxies[")
+                    && let Some(paren_idx) = loc.find(" (")
+                {
+                    let inner = loc[paren_idx + 2..].trim_end_matches(')');
+                    if !inner.is_empty() {
+                        extracted_needles.push(inner.to_string());
+                    }
+                    let scrubbed_loc = format!("{} ([endpoint-redacted])", &loc[..paren_idx]);
+                    finding["location"] = json!(scrubbed_loc);
+                } else if let Some(rest) = loc.strip_prefix("external-controller (") {
+                    let inner = rest.trim_end_matches(')');
+                    if !inner.is_empty() {
+                        extracted_needles.push(inner.to_string());
+                    }
+                    finding["location"] = json!("external-controller (<redacted>)");
+                } else if let Some(bind_idx) = loc.find("bind-address=") {
+                    let bind_val = loc[bind_idx + "bind-address=".len()..].trim();
+                    if !matches!(bind_val, "" | "*" | "0.0.0.0" | "::" | "[::]") {
+                        extracted_needles.push(bind_val.to_string());
+                        let scrubbed_loc = format!("{}bind-address=<redacted>", &loc[..bind_idx]);
+                        finding["location"] = json!(scrubbed_loc);
+                    }
+                }
+            }
+
+            if let Some(detail) = finding
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                let after_quotes = scrub_quoted_audit_endpoints(&detail);
+                let scrubbed_detail = scrub_text_network_tokens(&after_quotes, &extracted_needles);
+                finding["detail"] = json!(scrubbed_detail);
             }
         }
     }
@@ -286,6 +418,9 @@ fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
             for p in added {
                 if p.get("server").is_some() {
                     p["server"] = json!("[endpoint-redacted]");
+                }
+                if p.get("port").is_some() {
+                    p["port"] = json!("<redacted>");
                 }
             }
         }
@@ -303,6 +438,244 @@ fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+fn collect_waterfall_needles(report: &Value, needles: &mut Vec<String>) {
+    for key in [
+        "requested_proxy",
+        "effective_outbound",
+        "url",
+        "target_host",
+        "server_header",
+    ] {
+        if let Some(s) = report.get(key).and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            needles.push(s.to_string());
+        }
+    }
+    if let (Some(host), Some(port)) = (
+        report.get("target_host").and_then(|v| v.as_str()),
+        report.get("target_port").and_then(|v| v.as_u64()),
+    ) && !host.is_empty()
+    {
+        needles.push(format!("{host}:{port}"));
+    }
+    if let Some(chains) = report.get("chains").and_then(|v| v.as_array()) {
+        for ch in chains {
+            if let Some(s) = ch.as_str()
+                && !s.is_empty()
+            {
+                needles.push(s.to_string());
+            }
+        }
+    }
+    if let Some(udp_target) = report
+        .get("udp_probe")
+        .and_then(|u| u.get("target"))
+        .and_then(|v| v.as_str())
+        && !udp_target.is_empty()
+    {
+        needles.push(udp_target.to_string());
+    }
+}
+
+fn scrub_waterfall_report_in_place(report: &mut Value, extra_needles: &[String]) {
+    let mut needles = extra_needles.to_vec();
+    collect_waterfall_needles(report, &mut needles);
+
+    let Some(obj) = report.as_object_mut() else {
+        return;
+    };
+
+    if obj.contains_key("chains") {
+        obj.insert("chains".to_string(), json!(["<redacted>"]));
+    }
+    for key in [
+        "requested_proxy",
+        "effective_outbound",
+        "url",
+        "target_host",
+        "target_port",
+    ] {
+        if obj.contains_key(key) {
+            obj.insert(key.to_string(), json!("<redacted>"));
+        }
+    }
+    if let Some(sh) = obj.get_mut("server_header")
+        && !sh.is_null()
+    {
+        *sh = json!("<redacted>");
+    }
+    for text_key in ["note", "error"] {
+        if let Some(s) = obj
+            .get(text_key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            obj.insert(
+                text_key.to_string(),
+                json!(scrub_text_network_tokens(&s, &needles)),
+            );
+        }
+    }
+    if let Some(udp_obj) = obj.get_mut("udp_probe").and_then(|u| u.as_object_mut()) {
+        if let Some(tgt) = udp_obj.get_mut("target")
+            && !tgt.is_null()
+        {
+            *tgt = json!("<redacted>");
+        }
+        if let Some(det) = udp_obj
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            udp_obj.insert(
+                "detail".to_string(),
+                json!(scrub_text_network_tokens(&det, &needles)),
+            );
+        }
+    }
+}
+
+fn scrub_waterfall_payload(
+    payload: &mut Value,
+    include_network_metadata: bool,
+    extra_needles: &[String],
+) {
+    if include_network_metadata {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("metadata_privacy_mode".to_string(), json!("full"));
+        }
+        return;
+    }
+    scrub_waterfall_report_in_place(payload, extra_needles);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("metadata_privacy_mode".to_string(), json!("redacted"));
+    }
+}
+
+fn scrub_matrix_payload(
+    payload: &mut Value,
+    include_network_metadata: bool,
+    extra_needles: &[String],
+) {
+    if include_network_metadata {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("metadata_privacy_mode".to_string(), json!("full"));
+        }
+        return;
+    }
+
+    let mut needles = extra_needles.to_vec();
+    for key in ["requested_proxy", "effective_outbound"] {
+        if let Some(s) = payload.get(key).and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            needles.push(s.to_string());
+        }
+    }
+    if let Some(chains) = payload.get("chains").and_then(|v| v.as_array()) {
+        for ch in chains {
+            if let Some(s) = ch.as_str()
+                && !s.is_empty()
+            {
+                needles.push(s.to_string());
+            }
+        }
+    }
+    if let Some(udp_tgt) = payload
+        .get("udp_probe")
+        .and_then(|u| u.get("target"))
+        .and_then(|v| v.as_str())
+        && !udp_tgt.is_empty()
+    {
+        needles.push(udp_tgt.to_string());
+    }
+    if let Some(items) = payload.get("items").and_then(|v| v.as_array()) {
+        for item in items {
+            if let Some(u) = item.get("url").and_then(|v| v.as_str())
+                && !u.is_empty()
+            {
+                needles.push(u.to_string());
+            }
+            if let Some(rep) = item.get("report") {
+                collect_waterfall_needles(rep, &mut needles);
+            }
+        }
+    }
+
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    obj.insert("metadata_privacy_mode".to_string(), json!("redacted"));
+    if obj.contains_key("chains") {
+        obj.insert("chains".to_string(), json!(["<redacted>"]));
+    }
+    for key in ["requested_proxy", "effective_outbound"] {
+        if obj.contains_key(key) {
+            obj.insert(key.to_string(), json!("<redacted>"));
+        }
+    }
+    if let Some(note) = obj
+        .get("ai_status_note")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    {
+        obj.insert(
+            "ai_status_note".to_string(),
+            json!(scrub_text_network_tokens(&note, &needles)),
+        );
+    }
+    if let Some(udp_obj) = obj.get_mut("udp_probe").and_then(|u| u.as_object_mut()) {
+        if let Some(tgt) = udp_obj.get_mut("target")
+            && !tgt.is_null()
+        {
+            *tgt = json!("<redacted>");
+        }
+        if let Some(det) = udp_obj
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            udp_obj.insert(
+                "detail".to_string(),
+                json!(scrub_text_network_tokens(&det, &needles)),
+            );
+        }
+    }
+    if let Some(items) = obj.get_mut("items").and_then(|v| v.as_array_mut()) {
+        for item in items {
+            if let Some(item_obj) = item.as_object_mut() {
+                if item_obj.contains_key("url") {
+                    item_obj.insert("url".to_string(), json!("<redacted>"));
+                }
+                if let Some(rep) = item_obj.get_mut("report") {
+                    scrub_waterfall_report_in_place(rep, &needles);
+                }
+            }
+        }
+    }
+}
+
+fn scrub_probe_error_payload(
+    payload: &mut Value,
+    include_network_metadata: bool,
+    extra_needles: &[String],
+) {
+    if include_network_metadata {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        for key in ["error", "message", "detail", "raw"] {
+            if let Some(s) = obj.get(key).and_then(|v| v.as_str()).map(str::to_string) {
+                obj.insert(
+                    key.to_string(),
+                    json!(scrub_text_network_tokens(&s, extra_needles)),
+                );
             }
         }
     }
@@ -571,6 +944,7 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                         );
                         let mut out = json!({
                             "source": src,
+                            "controller": draft_cfg.external_controller,
                             "audit": report,
                             "diff": diff,
                         });
@@ -595,6 +969,7 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 {
                     let mut out = json!({
                         "source": format!("live_controller:{}", c.host_port),
+                        "controller": c.host_port,
                         "audit": resp,
                     });
                     scrub_audit_payload(&mut out, opts.include_network_metadata);
@@ -606,6 +981,7 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                         let report = audit_config(&cfg);
                         let mut out = json!({
                             "source": sanitize_source_label(&src, opts.include_network_metadata),
+                            "controller": cfg.external_controller,
                             "audit": report,
                         });
                         scrub_audit_payload(&mut out, opts.include_network_metadata);
@@ -731,10 +1107,11 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 Some(explicit) => explicit.to_string(),
                 None => pick_default_proxy_name(ctrl.as_ref(), &default_cfg).await,
             };
+            let req_needles = vec![proxy_name.clone(), url.to_string()];
 
             if let Some(ref c) = ctrl {
                 let path = format!("/proxies/{}/probe", url_encode_component(&proxy_name));
-                if let Ok((status, resp)) = c
+                if let Ok((status, mut resp)) = c
                     .request_json(
                         "POST",
                         &path,
@@ -748,9 +1125,19 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     .await
                 {
                     if (200..300).contains(&status) {
+                        scrub_waterfall_payload(
+                            &mut resp,
+                            opts.include_network_metadata,
+                            &req_needles,
+                        );
                         return mcp_tool_result(&resp, false);
                     }
                     if matches!(status, 400 | 404 | 429) {
+                        scrub_probe_error_payload(
+                            &mut resp,
+                            opts.include_network_metadata,
+                            &req_needles,
+                        );
                         return mcp_tool_result(&resp, true);
                     }
                 }
@@ -772,17 +1159,33 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     };
                     match probe_target_waterfall(&router, &cfg, &proxy_name, url, probe_opts).await
                     {
-                        Ok(report) => mcp_tool_result(&json!(report), false),
-                        Err(e) => mcp_tool_result(
-                            &json!({ "error": redact_sensitive_text(&e.to_string()) }),
-                            true,
-                        ),
+                        Ok(report) => {
+                            let mut val = json!(report);
+                            scrub_waterfall_payload(
+                                &mut val,
+                                opts.include_network_metadata,
+                                &req_needles,
+                            );
+                            mcp_tool_result(&val, false)
+                        }
+                        Err(e) => {
+                            let err_msg = if opts.include_network_metadata {
+                                redact_sensitive_text(&e.to_string())
+                            } else {
+                                scrub_text_network_tokens(&e.to_string(), &req_needles)
+                            };
+                            mcp_tool_result(&json!({ "error": err_msg }), true)
+                        }
                     }
                 }
-                Err(e) => mcp_tool_result(
-                    &json!({ "error": redact_sensitive_text(&e.to_string()) }),
-                    true,
-                ),
+                Err(e) => {
+                    let err_msg = if opts.include_network_metadata {
+                        redact_sensitive_text(&e.to_string())
+                    } else {
+                        scrub_text_network_tokens(&e.to_string(), &req_needles)
+                    };
+                    mcp_tool_result(&json!({ "error": err_msg }), true)
+                }
             }
         }
 
@@ -802,10 +1205,11 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 Some(explicit) => explicit.to_string(),
                 None => pick_default_proxy_name(ctrl.as_ref(), &default_cfg).await,
             };
+            let req_needles = vec![proxy_name.clone()];
 
             if let Some(ref c) = ctrl {
                 let path = format!("/proxies/{}/matrix", url_encode_component(&proxy_name));
-                if let Ok((status, resp)) = c
+                if let Ok((status, mut resp)) = c
                     .request_json(
                         "POST",
                         &path,
@@ -815,9 +1219,19 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     .await
                 {
                     if (200..300).contains(&status) {
+                        scrub_matrix_payload(
+                            &mut resp,
+                            opts.include_network_metadata,
+                            &req_needles,
+                        );
                         return mcp_tool_result(&resp, false);
                     }
                     if matches!(status, 400 | 404 | 429) {
+                        scrub_probe_error_payload(
+                            &mut resp,
+                            opts.include_network_metadata,
+                            &req_needles,
+                        );
                         return mcp_tool_result(&resp, true);
                     }
                 }
@@ -846,17 +1260,33 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     )
                     .await
                     {
-                        Ok(report) => mcp_tool_result(&json!(report), false),
-                        Err(e) => mcp_tool_result(
-                            &json!({ "error": redact_sensitive_text(&e.to_string()) }),
-                            true,
-                        ),
+                        Ok(report) => {
+                            let mut val = json!(report);
+                            scrub_matrix_payload(
+                                &mut val,
+                                opts.include_network_metadata,
+                                &req_needles,
+                            );
+                            mcp_tool_result(&val, false)
+                        }
+                        Err(e) => {
+                            let err_msg = if opts.include_network_metadata {
+                                redact_sensitive_text(&e.to_string())
+                            } else {
+                                scrub_text_network_tokens(&e.to_string(), &req_needles)
+                            };
+                            mcp_tool_result(&json!({ "error": err_msg }), true)
+                        }
                     }
                 }
-                Err(e) => mcp_tool_result(
-                    &json!({ "error": redact_sensitive_text(&e.to_string()) }),
-                    true,
-                ),
+                Err(e) => {
+                    let err_msg = if opts.include_network_metadata {
+                        redact_sensitive_text(&e.to_string())
+                    } else {
+                        scrub_text_network_tokens(&e.to_string(), &req_needles)
+                    };
+                    mcp_tool_result(&json!({ "error": err_msg }), true)
+                }
             }
         }
 
@@ -904,14 +1334,35 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     .unwrap_or_else(|| json!([]));
                 scrub_diagnostic_entries(&mut recent_diags, opts.include_network_metadata);
 
+                let mut tun_val = cfg_val.as_ref().and_then(|v| v.get("tun").cloned());
+                if !opts.include_network_metadata
+                    && let Some(health) = tun_val
+                        .as_mut()
+                        .and_then(|t| t.get_mut("health"))
+                        .and_then(|h| h.as_object_mut())
+                {
+                    if health
+                        .get("default_egress_gateway")
+                        .is_some_and(|v| !v.is_null())
+                    {
+                        health.insert("default_egress_gateway".to_string(), json!("<redacted>"));
+                    }
+                    if health
+                        .get("default_egress_iface")
+                        .is_some_and(|v| !v.is_null())
+                    {
+                        health.insert("default_egress_iface".to_string(), json!("<redacted>"));
+                    }
+                }
+
                 return mcp_tool_result(
                     &json!({
                         "daemon_connected": true,
                         "metadata_privacy_mode": if opts.include_network_metadata { "full" } else { "redacted" },
-                        "controller": c.host_port,
+                        "controller": if opts.include_network_metadata { json!(c.host_port) } else { json!("<redacted>") },
                         "mode": cfg_val.as_ref().and_then(|v| v.get("mode")),
                         "mixed_port": cfg_val.as_ref().and_then(|v| v.get("mixed-port")),
-                        "tun": cfg_val.as_ref().and_then(|v| v.get("tun")),
+                        "tun": tun_val,
                         "effective_outbound": proxies_val.get("effective-outbound"),
                         "groups": groups_summary,
                         "recent_failure_diagnostics": recent_diags,
@@ -926,6 +1377,7 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                         &json!({
                             "daemon_connected": false,
                             "metadata_privacy_mode": if opts.include_network_metadata { "full" } else { "redacted" },
+                            "controller": if opts.include_network_metadata { json!(cfg.external_controller) } else { json!("<redacted>") },
                             "source": sanitize_source_label(&src, opts.include_network_metadata),
                             "mode": cfg.mode,
                             "mixed_port": cfg.mixed_port,
@@ -1037,9 +1489,17 @@ pub async fn handle_mcp_request(req: &Value, opts: &McpServerOptions) -> Option<
                 }
             }));
         }
-        let mut responses = Vec::with_capacity(batch.len());
+        let mut handles = Vec::with_capacity(batch.len());
         for item in batch {
-            if let Some(resp) = handle_single_mcp_request(item, opts).await {
+            let item_cloned = item.clone();
+            let opts_cloned = opts.clone();
+            handles.push(tokio::spawn(async move {
+                handle_single_mcp_request(&item_cloned, &opts_cloned).await
+            }));
+        }
+        let mut responses = Vec::with_capacity(handles.len());
+        for handle in handles {
+            if let Ok(Some(resp)) = handle.await {
                 responses.push(resp);
             }
         }
@@ -1051,6 +1511,25 @@ pub async fn handle_mcp_request(req: &Value, opts: &McpServerOptions) -> Option<
     }
 
     handle_single_mcp_request(req, opts).await
+}
+
+fn is_valid_jsonrpc_id(v: &Value) -> bool {
+    v.is_string() || v.is_number() || v.is_null()
+}
+
+fn frame_contains_mutation(req: &Value) -> bool {
+    let check_obj = |v: &Value| -> bool {
+        v.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+            && v.get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                == Some("switch_proxy_selector")
+    };
+    if let Some(arr) = req.as_array() {
+        arr.iter().any(check_obj)
+    } else {
+        check_obj(req)
+    }
 }
 
 async fn handle_single_mcp_request(req: &Value, opts: &McpServerOptions) -> Option<Value> {
@@ -1065,7 +1544,21 @@ async fn handle_single_mcp_request(req: &Value, opts: &McpServerOptions) -> Opti
         }));
     };
 
-    let id = obj.get("id").cloned();
+    let raw_id = obj.get("id");
+    if let Some(id_val) = raw_id
+        && !is_valid_jsonrpc_id(id_val)
+    {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request: 'id' must be a string, number, or null"
+            }
+        }));
+    }
+    let id = raw_id.cloned();
+
     if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         return Some(json!({
             "jsonrpc": "2.0",
@@ -1077,21 +1570,36 @@ async fn handle_single_mcp_request(req: &Value, opts: &McpServerOptions) -> Opti
         }));
     }
 
-    let method = obj.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-    // Notifications do not carry an `id` and must not receive a JSON-RPC response.
-    let req_id = id?;
-
-    if method.is_empty() {
+    let Some(method) = obj
+        .get("method")
+        .and_then(|m| m.as_str())
+        .filter(|s| !s.is_empty())
+    else {
         return Some(json!({
             "jsonrpc": "2.0",
-            "id": req_id,
+            "id": id.unwrap_or(Value::Null),
             "error": {
                 "code": -32600,
-                "message": "Invalid Request: missing method"
+                "message": "Invalid Request: missing or non-string 'method'"
+            }
+        }));
+    };
+
+    if let Some(p) = obj.get("params")
+        && !(p.is_object() || p.is_array() || p.is_null())
+    {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request: 'params' must be structured (object or array)"
             }
         }));
     }
+
+    // Valid notifications omit `id` and must not receive a JSON-RPC response.
+    let req_id = id?;
 
     let params = obj.get("params").unwrap_or(&Value::Null);
 
@@ -1264,25 +1772,33 @@ async fn read_next_mcp_frame<R: AsyncRead + Unpin>(
     }
 }
 
+async fn write_encoded_mcp_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoded: &[u8],
+    mode: FrameMode,
+) -> Result<()> {
+    match mode {
+        FrameMode::NewlineJson => {
+            writer.write_all(encoded).await?;
+            writer.write_all(b"\n").await?;
+        }
+        FrameMode::ContentLength => {
+            let hdr = format!("Content-Length: {}\r\n\r\n", encoded.len());
+            writer.write_all(hdr.as_bytes()).await?;
+            writer.write_all(encoded).await?;
+        }
+    }
+    writer.flush().await?;
+    Ok(())
+}
+
 async fn write_mcp_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     resp: &Value,
     mode: FrameMode,
 ) -> Result<()> {
     let encoded = serde_json::to_vec(resp)?;
-    match mode {
-        FrameMode::NewlineJson => {
-            writer.write_all(&encoded).await?;
-            writer.write_all(b"\n").await?;
-        }
-        FrameMode::ContentLength => {
-            let hdr = format!("Content-Length: {}\r\n\r\n", encoded.len());
-            writer.write_all(hdr.as_bytes()).await?;
-            writer.write_all(&encoded).await?;
-        }
-    }
-    writer.flush().await?;
-    Ok(())
+    write_encoded_mcp_frame(writer, &encoded, mode).await
 }
 
 pub async fn serve_mcp_io<R, W>(input: R, mut output: W, opts: McpServerOptions) -> Result<()>
@@ -1292,27 +1808,75 @@ where
 {
     let mut reader = BufReader::new(input);
     let mut last_mode = FrameMode::NewlineJson;
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, FrameMode)>();
+    let mut tasks = tokio::task::JoinSet::new();
+
     loop {
-        match read_next_mcp_frame(&mut reader, &mut last_mode).await {
-            Ok(Some((req, mode))) => {
-                if let Some(resp) = handle_mcp_request(&req, &opts).await {
-                    write_mcp_frame(&mut output, &resp, mode).await?;
+        tokio::select! {
+            biased;
+            Some((encoded, mode)) = resp_rx.recv() => {
+                write_encoded_mcp_frame(&mut output, &encoded, mode).await?;
+            }
+            Some(_done) = tasks.join_next(), if !tasks.is_empty() => {}
+            frame_res = read_next_mcp_frame(&mut reader, &mut last_mode) => {
+                match frame_res {
+                    Ok(Some((req, mode))) => {
+                        if frame_contains_mutation(&req) {
+                            while !tasks.is_empty() {
+                                tokio::select! {
+                                    Some((encoded, m)) = resp_rx.recv() => {
+                                        write_encoded_mcp_frame(&mut output, &encoded, m).await?;
+                                    }
+                                    Some(_) = tasks.join_next() => {}
+                                }
+                            }
+                            while let Ok((encoded, m)) = resp_rx.try_recv() {
+                                write_encoded_mcp_frame(&mut output, &encoded, m).await?;
+                            }
+                            if let Some(resp) = handle_mcp_request(&req, &opts).await {
+                                write_mcp_frame(&mut output, &resp, mode).await?;
+                            }
+                        } else {
+                            let tx = resp_tx.clone();
+                            let task_opts = opts.clone();
+                            tasks.spawn(async move {
+                                if let Some(resp) = handle_mcp_request(&req, &task_opts).await
+                                    && let Ok(encoded) = serde_json::to_vec(&resp)
+                                {
+                                    let _ = tx.send((encoded, mode));
+                                }
+                            });
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let err_resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": Value::Null,
+                            "error": {
+                                "code": -32700,
+                                "message": format!("Parse error: {}", redact_sensitive_text(&err.to_string()))
+                            }
+                        });
+                        write_mcp_frame(&mut output, &err_resp, last_mode).await?;
+                        return Ok(());
+                    }
                 }
             }
-            Ok(None) => break,
-            Err(err) => {
-                let err_resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {
-                        "code": -32700,
-                        "message": format!("Parse error: {}", redact_sensitive_text(&err.to_string()))
-                    }
-                });
-                write_mcp_frame(&mut output, &err_resp, last_mode).await?;
-                break;
-            }
         }
+    }
+
+    drop(resp_tx);
+    while !tasks.is_empty() {
+        tokio::select! {
+            Some((encoded, mode)) = resp_rx.recv() => {
+                write_encoded_mcp_frame(&mut output, &encoded, mode).await?;
+            }
+            Some(_) = tasks.join_next() => {}
+        }
+    }
+    while let Some((encoded, mode)) = resp_rx.recv().await {
+        write_encoded_mcp_frame(&mut output, &encoded, mode).await?;
     }
     Ok(())
 }
@@ -1542,31 +2106,44 @@ rules:
             "Default MCP privacy mode must hide proxy server IP ({proxy_server_ip}): {out_str}"
         );
 
+        assert!(
+            !out_str.contains(&api_addr.to_string()),
+            "Default MCP privacy mode must redact controller host:port ({api_addr}): {out_str}"
+        );
+
         let frames: Vec<Value> = out_str
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(frames.len(), 4);
-        assert_eq!(frames[0]["result"]["isError"], false);
+        let by_id = |target_id: i64| -> &Value {
+            frames
+                .iter()
+                .find(|f| f["id"] == target_id)
+                .unwrap_or_else(|| panic!("missing response frame for id={target_id}: {out_str}"))
+        };
+
+        let f10 = by_id(10);
+        assert_eq!(f10["result"]["isError"], false);
+        let f10_text = f10["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(f10_text.contains("SEC-TLS-SKIP-VERIFY"));
+        assert!(f10_text.contains("\"controller\": \"<redacted>\""));
+
+        let f11 = by_id(11);
         assert!(
-            frames[0]["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("SEC-TLS-SKIP-VERIFY")
-        );
-        assert!(
-            frames[1]["result"]["content"][0]["text"]
+            f11["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .contains("Node-A")
         );
-        assert_eq!(frames[2]["result"]["isError"], false);
-        assert!(
-            frames[3]["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("\"now\": \"DIRECT\"")
-        );
+
+        let f12 = by_id(12);
+        assert_eq!(f12["result"]["isError"], false);
+
+        let f13 = by_id(13);
+        let f13_text = f13["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(f13_text.contains("\"now\": \"DIRECT\""));
+        assert!(f13_text.contains("\"controller\": \"<redacted>\""));
 
         // 2. Opt-in `--include-network-metadata` exposes proxy server IP while STILL redacting credentials!
         let _ = handle_mcp_request(
@@ -1606,7 +2183,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn mcp_audit_config_path_blocks_traversal_non_yaml_and_redacts_parse_errors() {
+    async fn mcp_audit_config_path_blocks_traversal_non_yaml_symlinks_and_redacts_parse_errors() {
         let ro_opts = McpServerOptions {
             config_path: None,
             controller: Some("127.0.0.1:1".to_string()),
@@ -1647,6 +2224,38 @@ rules:
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+
+        #[cfg(unix)]
+        {
+            let real_yaml = std::env::temp_dir()
+                .join(format!("rc-mcp-real-{}-{nanos}.yaml", std::process::id()));
+            let symlink_yaml = std::env::temp_dir()
+                .join(format!("rc-mcp-link-{}-{nanos}.yaml", std::process::id()));
+            std::fs::write(&real_yaml, "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n").unwrap();
+            std::os::unix::fs::symlink(&real_yaml, &symlink_yaml).unwrap();
+
+            let sym_resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 93,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "audit_config_security",
+                        "arguments": { "config_path": symlink_yaml.to_string_lossy() }
+                    }
+                }),
+                &ro_opts,
+            )
+            .await
+            .unwrap();
+            let _ = std::fs::remove_file(&symlink_yaml);
+            let _ = std::fs::remove_file(&real_yaml);
+            assert_eq!(
+                sym_resp["result"]["isError"], true,
+                "symlink config_path must be rejected: {sym_resp}"
+            );
+        }
+
         let secret_marker = "TOP_SECRET_ARBITRARY_FILE_CONTENT_991122";
         let fake_yaml_path = std::env::temp_dir().join(format!(
             "rc-mcp-non-yaml-{}-{nanos}.yaml",
@@ -1680,6 +2289,408 @@ rules:
             !serialized.contains(secret_marker),
             "parse failure must never echo arbitrary file contents back to MCP caller: {serialized}"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_redacts_network_metadata_on_probe_waterfall_probe_ai_matrix_and_audit_details() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let draft_yaml_path = std::env::temp_dir().join(format!(
+            "rc-mcp-audit-detail-{}-{nanos}.yaml",
+            std::process::id()
+        ));
+        let plaintext_srv = "tyo-plain.secret-edge.example";
+        let lan_ctrl = "192.168.77.88:9095";
+        std::fs::write(
+            &draft_yaml_path,
+            format!(
+                r#"
+mixed-port: 7890
+allow-lan: true
+bind-address: 192.168.77.88
+external-controller: {lan_ctrl}
+proxies:
+  - name: Plain-HTTP
+    type: http
+    server: {plaintext_srv}
+    port: 8080
+    tls: false
+rules:
+  - MATCH,Plain-HTTP
+"#
+            ),
+        )
+        .unwrap();
+
+        // Mock HTTP controller returning realistic probe_waterfall and probe_ai_matrix payloads
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_head = String::from_utf8_lossy(&buf[..n]);
+                    let body_json = if req_head.contains("/probe") {
+                        json!({
+                            "requested_proxy": "🚀 VIP-Group",
+                            "effective_outbound": "HK-Secret-Node-01",
+                            "protocol": "vless",
+                            "chains": ["🚀 VIP-Group", "HK-Secret-Node-01"],
+                            "url": "https://internal.corp.example:8443/health",
+                            "target_host": "internal.corp.example",
+                            "target_port": 8443,
+                            "remote_dns": true,
+                            "dns_mode": "remote",
+                            "total_ms": 48.2,
+                            "overall_probe_duration_ms": 50.1,
+                            "http_status": 200,
+                            "server_header": "nginx-private-gw/1.25",
+                            "cf_mitigated": false,
+                            "verdict": "reachable",
+                            "note": "Connected via HK-Secret-Node-01 to internal.corp.example (10.20.30.40:8443)",
+                            "error": "transient warning from 192.168.99.1",
+                            "udp_probe": {
+                                "status": "verified",
+                                "configured_udp": true,
+                                "target": "1.1.1.1:53",
+                                "rtt_ms": 19.4,
+                                "detail": "UDP DNS response from 1.1.1.1:53 via HK-Secret-Node-01"
+                            }
+                        })
+                    } else {
+                        json!({
+                            "requested_proxy": "🚀 VIP-Group",
+                            "effective_outbound": "HK-Secret-Node-01",
+                            "protocol": "vless",
+                            "chains": ["🚀 VIP-Group", "HK-Secret-Node-01"],
+                            "reachable_count": 1,
+                            "auth_required_count": 0,
+                            "rate_limited_count": 0,
+                            "blocked_count": 0,
+                            "unreachable_count": 0,
+                            "ai_egress_unblocked": true,
+                            "ai_status_note": "AI endpoints reachable via HK-Secret-Node-01 (exit 203.0.113.200)",
+                            "udp_probe": {
+                                "status": "verified",
+                                "configured_udp": true,
+                                "target": "8.8.8.8:53",
+                                "rtt_ms": 21.0,
+                                "detail": "UDP verified against 8.8.8.8:53"
+                            },
+                            "items": [
+                                {
+                                    "id": "openai",
+                                    "label": "OpenAI API",
+                                    "category": "ai",
+                                    "report": {
+                                        "requested_proxy": "🚀 VIP-Group",
+                                        "effective_outbound": "HK-Secret-Node-01",
+                                        "protocol": "vless",
+                                        "chains": ["🚀 VIP-Group", "HK-Secret-Node-01"],
+                                        "url": "https://api.openai.com/v1/models",
+                                        "target_host": "api.openai.com",
+                                        "target_port": 443,
+                                        "remote_dns": true,
+                                        "dns_mode": "remote",
+                                        "total_ms": 88.0,
+                                        "overall_probe_duration_ms": 88.0,
+                                        "http_status": 401,
+                                        "server_header": "cloudflare-edge-secret",
+                                        "cf_mitigated": false,
+                                        "verdict": "auth_required",
+                                        "note": "HTTP 401 from api.openai.com via 10.99.88.77",
+                                        "error": Value::Null,
+                                        "udp_probe": Value::Null
+                                    }
+                                }
+                            ]
+                        })
+                    };
+                    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+                    let resp = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body_bytes.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(&body_bytes).await;
+                });
+            }
+        });
+
+        let redacted_opts = McpServerOptions {
+            config_path: None,
+            controller: Some(mock_addr.to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. Audit config security redacts server host:port, controller, and bind-address in both location & detail
+        let audit_resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 201,
+                "method": "tools/call",
+                "params": {
+                    "name": "audit_config_security",
+                    "arguments": { "config_path": draft_yaml_path.to_string_lossy() }
+                }
+            }),
+            &redacted_opts,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&draft_yaml_path);
+        let audit_text = audit_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(audit_text.contains("SEC-PLAINTEXT-NODE"));
+        assert!(audit_text.contains("SEC-CONTROLLER-NO-SECRET"));
+        assert!(audit_text.contains("\"controller\": \"<redacted>\""));
+        for leaked in [plaintext_srv, "8080", lan_ctrl, "192.168.77.88"] {
+            assert!(
+                !audit_text.contains(leaked),
+                "audit_config_security leaked '{leaked}' when !include_network_metadata: {audit_text}"
+            );
+        }
+
+        // 2. probe_waterfall redacts chains, proxy names, URL/host/port, server_header, udp_probe.target, and IPs in note/error/detail
+        let wf_resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 202,
+                "method": "tools/call",
+                "params": {
+                    "name": "probe_waterfall",
+                    "arguments": {
+                        "proxy": "🚀 VIP-Group",
+                        "url": "https://internal.corp.example:8443/health"
+                    }
+                }
+            }),
+            &redacted_opts,
+        )
+        .await
+        .unwrap();
+        let wf_text = wf_resp["result"]["content"][0]["text"].as_str().unwrap();
+        for leaked in [
+            "VIP-Group",
+            "HK-Secret-Node-01",
+            "internal.corp.example",
+            "8443",
+            "nginx-private-gw",
+            "1.1.1.1",
+            "10.20.30.40",
+            "192.168.99.1",
+        ] {
+            assert!(
+                !wf_text.contains(leaked),
+                "probe_waterfall leaked '{leaked}' when !include_network_metadata: {wf_text}"
+            );
+        }
+
+        // 3. probe_ai_matrix redacts top-level & nested item fields + private/public IPs in notes
+        let mx_resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 203,
+                "method": "tools/call",
+                "params": {
+                    "name": "probe_ai_matrix",
+                    "arguments": { "proxy": "🚀 VIP-Group" }
+                }
+            }),
+            &redacted_opts,
+        )
+        .await
+        .unwrap();
+        let mx_text = mx_resp["result"]["content"][0]["text"].as_str().unwrap();
+        for leaked in [
+            "VIP-Group",
+            "HK-Secret-Node-01",
+            "api.openai.com",
+            "cloudflare-edge-secret",
+            "8.8.8.8",
+            "203.0.113.200",
+            "10.99.88.77",
+        ] {
+            assert!(
+                !mx_text.contains(leaked),
+                "probe_ai_matrix leaked '{leaked}' when !include_network_metadata: {mx_text}"
+            );
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_invalid_jsonrpc_primitives_return_32600_and_slow_probe_does_not_hol_block_ping() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. Non-object primitives (`42`, `"str"`, `true`, `null`), empty batch `[]`, and method-less `{ "jsonrpc": "2.0" }`
+        // MUST return JSON-RPC `-32600 Invalid Request` with `id: null` and never be silently dropped.
+        let invalid_lines = [
+            "42",
+            "\"str\"",
+            "true",
+            "null",
+            "[]",
+            "{\"jsonrpc\":\"2.0\"}",
+        ]
+        .join("\n")
+            + "\n";
+        let mut invalid_out = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(invalid_lines.into_bytes()),
+            &mut invalid_out,
+            ro_opts,
+        )
+        .await
+        .unwrap();
+        let invalid_frames: Vec<Value> = String::from_utf8(invalid_out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(invalid_frames.len(), 6);
+        for f in &invalid_frames {
+            assert_eq!(f["error"]["code"], -32600, "unexpected frame: {f}");
+            assert!(
+                f["id"].is_null(),
+                "expected id: null on invalid request: {f}"
+            );
+        }
+
+        // 2. Concurrent dispatch: a slow in-flight `probe_waterfall` MUST NOT head-of-line block `ping` or `notifications/cancelled`.
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        let (probe_started_tx, probe_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let slow_ctrl_task = tokio::spawn(async move {
+            let (mut sock, _) = slow_listener.accept().await.unwrap();
+            let mut req_buf = vec![0u8; 2048];
+            let _ = sock.read(&mut req_buf).await;
+            let _ = probe_started_tx.send(());
+            let _ = release_probe_rx.await;
+            let body = serde_json::to_vec(&json!({
+                "requested_proxy": "DIRECT",
+                "effective_outbound": "DIRECT",
+                "protocol": "direct",
+                "chains": ["DIRECT"],
+                "url": "https://example.com/",
+                "target_host": "example.com",
+                "target_port": 443,
+                "remote_dns": false,
+                "dns_mode": "local",
+                "total_ms": 12.0,
+                "overall_probe_duration_ms": 12.0,
+                "verdict": "reachable",
+                "cf_mitigated": false,
+                "note": "ok"
+            }))
+            .unwrap();
+            let head = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+
+        let (mut client_in, server_in) = tokio::io::duplex(16 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(16 * 1024);
+        let conc_opts = McpServerOptions {
+            config_path: None,
+            controller: Some(slow_addr.to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let mcp_task = tokio::spawn(async move {
+            serve_mcp_io(server_in, server_out, conc_opts)
+                .await
+                .unwrap();
+        });
+
+        let mut out_reader = BufReader::new(client_out);
+
+        // Send slow `probe_waterfall` (id=100)
+        let slow_req = json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "probe_waterfall",
+                "arguments": { "proxy": "DIRECT", "url": "https://example.com/", "timeout_ms": 5000 }
+            }
+        })
+        .to_string()
+            + "\n";
+        client_in.write_all(slow_req.as_bytes()).await.unwrap();
+        client_in.flush().await.unwrap();
+
+        // Wait until the mock controller confirms `probe_waterfall` is actively blocked on I/O
+        tokio::time::timeout(Duration::from_secs(2), probe_started_rx)
+            .await
+            .expect("probe_waterfall started")
+            .unwrap();
+
+        // Now send `notifications/cancelled` + `ping` (id=101) while `probe_waterfall` is still blocked!
+        let fast_frames = format!(
+            "{}\n{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 100, "reason": "user cancelled" }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "ping"
+            })
+        );
+        client_in.write_all(fast_frames.as_bytes()).await.unwrap();
+        client_in.flush().await.unwrap();
+
+        // `ping` response (id=101) MUST arrive immediately without waiting for `release_probe_tx`!
+        let mut first_line = String::new();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            out_reader.read_line(&mut first_line),
+        )
+        .await
+        .expect("ping must not be head-of-line blocked by slow probe_waterfall")
+        .unwrap();
+        let first_val: Value = serde_json::from_str(first_line.trim()).unwrap();
+        assert_eq!(first_val["id"], 101);
+
+        // Release slow `probe_waterfall` and verify id=100 completes cleanly
+        let _ = release_probe_tx.send(());
+        let mut second_line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            out_reader.read_line(&mut second_line),
+        )
+        .await
+        .expect("slow probe response arrives after release")
+        .unwrap();
+        let second_val: Value = serde_json::from_str(second_line.trim()).unwrap();
+        assert_eq!(second_val["id"], 100);
+
+        drop(client_in);
+        mcp_task.await.unwrap();
+        slow_ctrl_task.await.unwrap();
     }
 
     #[tokio::test]

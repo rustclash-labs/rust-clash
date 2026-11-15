@@ -116,13 +116,14 @@ fn build_api_router_with_addr_and_shutdown(
             "/configs",
             get(get_configs).patch(patch_configs).put(put_configs),
         )
-        .route("/configs/raw", get(get_raw_yaml))
+        .route("/configs/raw", get(get_raw_yaml).put(put_configs))
         .route("/proxies", get(get_proxies))
         .route(
             "/proxies/{name}",
             get(get_proxy_by_name).put(select_proxy_in_group),
         )
         .route("/proxies/{name}/delay", get(get_proxy_delay))
+        .route("/group/{name}/delay", get(get_group_delay))
         .route(
             "/proxies/{name}/probe",
             post(post_proxy_waterfall_probe_api),
@@ -229,7 +230,7 @@ pub async fn spawn_api_server(
         .config_snapshot()
         .secret
         .as_ref()
-        .is_some_and(|s| !s.is_empty());
+        .is_some_and(|s| !s.trim().is_empty());
     if !canonical_ip(bound.ip()).is_loopback() && !has_secret {
         engine.hub().push_log(
             "warn",
@@ -277,6 +278,7 @@ fn is_api_endpoint_path(path: &str) -> bool {
             | "/configs"
             | "/configs/raw"
             | "/proxies"
+            | "/group"
             | "/rules"
             | "/rules/explain"
             | "/connections"
@@ -299,6 +301,7 @@ fn is_api_endpoint_path(path: &str) -> bool {
             | "/memory"
             | "/logs"
     ) || path.starts_with("/proxies/")
+        || path.starts_with("/group/")
         || path.starts_with("/connections/")
         || path.starts_with("/profiles/")
         || path.starts_with("/geodata/")
@@ -492,19 +495,45 @@ async fn security_and_auth_middleware(
         .engine
         .config_snapshot()
         .secret
-        .filter(|s| !s.is_empty());
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let has_configured_secret = configured_secret.is_some();
     let has_valid_secret = configured_secret
         .as_deref()
         .is_some_and(|sec| verify_request_secret(&req, sec));
 
-    // 1. Anti-DNS-Rebinding: reject untrusted `Host` headers on ALL endpoints (including UI shell)
-    if !is_allowed_host_header(
-        req.headers(),
-        state.bound_addr,
-        has_configured_secret,
-        has_valid_secret,
-    ) {
+    let path = req.uri().path();
+    let is_api = is_api_endpoint_path(path);
+    let is_static_spa_read = !is_api
+        && !is_websocket_upgrade(req.headers())
+        && matches!(*req.method(), Method::GET | Method::HEAD);
+    let asks_for_auth_hdr = req.method() == Method::OPTIONS
+        && req
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|h| h.to_ascii_lowercase().contains("authorization"));
+    let has_nonempty_host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| !extract_host_without_port(h).is_empty());
+
+    // 1. Anti-DNS-Rebinding: reject untrusted `Host` headers on all unauthenticated API/WS endpoints,
+    //    while allowing static embedded SPA `GET`/`HEAD` routes (`/`, `/index.html`, `/assets/*`)
+    //    over LAN hostnames (e.g. `router.local:9090`) so browsers can load the login shell.
+    let allow_lan_hostname_bypass =
+        has_nonempty_host && (is_static_spa_read || (has_configured_secret && asks_for_auth_hdr));
+    if !allow_lan_hostname_bypass
+        && !is_allowed_host_header(
+            req.headers(),
+            state.bound_addr,
+            has_configured_secret,
+            has_valid_secret,
+        )
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -514,8 +543,6 @@ async fn security_and_auth_middleware(
             .into_response();
     }
 
-    let path = req.uri().path();
-    let is_api = is_api_endpoint_path(path);
     let peer_addr = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -533,12 +560,6 @@ async fn security_and_auth_middleware(
 
     // 2. Handle CORS preflight (`OPTIONS`) strictly
     if req.method() == Method::OPTIONS {
-        let asks_for_auth_hdr = req
-            .headers()
-            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|h| h.to_ascii_lowercase().contains("authorization"));
-
         if origin_is_trusted || (has_configured_secret && asks_for_auth_hdr) {
             let mut resp = StatusCode::NO_CONTENT.into_response();
             attach_cors_headers(&mut resp, origin_opt.as_deref());
@@ -723,7 +744,7 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
         "allow-lan": cfg.allow_lan,
         "lan-allowed-ips": cfg.lan_allowed_ips,
         "authentication-enabled": !cfg.authentication.is_empty(),
-        "secret-configured": cfg.secret.as_ref().is_some_and(|s| !s.is_empty()),
+        "secret-configured": cfg.secret.as_ref().is_some_and(|s| !s.trim().is_empty()),
         "bind-address": cfg.bind_address,
         "mode": cfg.mode.as_str(),
         "unified-delay": cfg.unified_delay,
@@ -773,9 +794,12 @@ struct PatchConfigReq {
     mode: Option<RunMode>,
     #[serde(rename = "unified-delay", alias = "unified_delay")]
     unified_delay: Option<bool>,
-    #[serde(rename = "allow-lan")]
+    #[serde(rename = "allow-lan", alias = "allow_lan")]
     allow_lan: Option<bool>,
-    #[serde(rename = "log-level")]
+    #[serde(rename = "mixed-port", alias = "mixed_port")]
+    mixed_port: Option<u16>,
+    ipv6: Option<bool>,
+    #[serde(rename = "log-level", alias = "log_level")]
     log_level: Option<String>,
     tun: Option<PatchTunReq>,
 }
@@ -783,7 +807,7 @@ struct PatchConfigReq {
 #[derive(Deserialize)]
 struct PatchTunReq {
     enable: Option<bool>,
-    #[serde(rename = "strict-route")]
+    #[serde(rename = "strict-route", alias = "strict_route")]
     strict_route: Option<bool>,
     ipv6: Option<bool>,
 }
@@ -792,6 +816,13 @@ async fn patch_configs(
     State(engine): State<Arc<ProxyEngine>>,
     Json(patch): Json<PatchConfigReq>,
 ) -> Response {
+    if patch.mixed_port == Some(0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "mixed-port must be between 1 and 65535" })),
+        )
+            .into_response();
+    }
     if let Some(mode) = patch.mode {
         engine.set_mode(mode);
     }
@@ -801,19 +832,25 @@ async fn patch_configs(
     if let Some(level) = patch.log_level {
         engine.set_log_level(level);
     }
-    if let Some(allow_lan) = patch.allow_lan
-        && let Err(err) = engine.set_allow_lan(allow_lan).await
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": err.to_string() })),
-        )
-            .into_response();
-    }
-    if let Some(tun) = patch.tun
-        && (tun.enable.is_some() || tun.strict_route.is_some() || tun.ipv6.is_some())
+    let (tun_enable, tun_strict_route, tun_ipv6) = match patch.tun {
+        Some(t) => (t.enable, t.strict_route, t.ipv6),
+        None => (None, None, None),
+    };
+    if (patch.allow_lan.is_some()
+        || patch.mixed_port.is_some()
+        || patch.ipv6.is_some()
+        || tun_enable.is_some()
+        || tun_strict_route.is_some()
+        || tun_ipv6.is_some())
         && let Err(err) = engine
-            .update_tun_options(tun.enable, tun.strict_route, tun.ipv6)
+            .apply_config_patch(
+                patch.allow_lan,
+                patch.mixed_port,
+                patch.ipv6,
+                tun_enable,
+                tun_strict_route,
+                tun_ipv6,
+            )
             .await
     {
         return (
@@ -828,6 +865,7 @@ async fn patch_configs(
 #[derive(Deserialize)]
 struct PutConfigsReq {
     path: Option<String>,
+    #[serde(alias = "yaml")]
     payload: Option<String>,
 }
 
@@ -987,6 +1025,50 @@ async fn get_proxy_delay(
         )
             .into_response(),
     }
+}
+
+async fn get_group_delay(
+    State(engine): State<Arc<ProxyEngine>>,
+    Path(name): Path<String>,
+    Query(q): Query<DelayQuery>,
+) -> Response {
+    let router = engine.router();
+    let Some(members) = router
+        .proxies_snapshot()
+        .get(&name)
+        .and_then(|snap| snap.all.clone())
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": format!("proxy group '{name}' not found") })),
+        )
+            .into_response();
+    };
+
+    let default_url = {
+        let d = engine.demo_info();
+        if d.enabled && !d.http_benchmark_origin.is_empty() {
+            format!("{}/generate_204", d.http_benchmark_origin)
+        } else {
+            "http://www.gstatic.com/generate_204".to_string()
+        }
+    };
+    let probe_url = q.url.as_deref().unwrap_or(&default_url);
+    let timeout = Duration::from_millis(q.timeout.clamp(200, 15_000));
+
+    let _ = router.test_delay(&name, probe_url, timeout).await;
+
+    let mut alive_delays = serde_json::Map::with_capacity(members.len());
+    for member in members {
+        if let Some(ms) = router.effective_member_delay(&member) {
+            alive_delays.insert(member, serde_json::Value::from(ms));
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::Value::Object(alive_delays)),
+    )
+        .into_response()
 }
 
 async fn get_rules(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
@@ -1200,12 +1282,14 @@ async fn put_routing_preset_api(
                 .into_response();
         }
     };
+    let checkpoint = mgr.capture_checkpoint();
     match mgr.apply_routing_preset(choice) {
         Ok((snap, cfg)) => {
             if let Err(err) = engine
                 .activate_profile_config_with_selections(cfg, Some(&snap.selected_groups))
                 .await
             {
+                mgr.restore_checkpoint(checkpoint);
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "message": err.to_string() })),
@@ -1214,11 +1298,14 @@ async fn put_routing_preset_api(
             }
             (StatusCode::OK, Json(serde_json::json!(snap))).into_response()
         }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": err.to_string() })),
-        )
-            .into_response(),
+        Err(err) => {
+            mgr.restore_checkpoint(checkpoint);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": err.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1250,12 +1337,14 @@ async fn put_routing_custom_rules_api(
                 .into_response();
         }
     };
+    let checkpoint = mgr.capture_checkpoint();
     match mgr.save_custom_rules(req.rules) {
         Ok((snap, cfg)) => {
             if let Err(err) = engine
                 .activate_profile_config_with_selections(cfg, Some(&snap.selected_groups))
                 .await
             {
+                mgr.restore_checkpoint(checkpoint);
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "message": err.to_string() })),
@@ -1264,11 +1353,14 @@ async fn put_routing_custom_rules_api(
             }
             (StatusCode::OK, Json(serde_json::json!(snap))).into_response()
         }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": err.to_string() })),
-        )
-            .into_response(),
+        Err(err) => {
+            mgr.restore_checkpoint(checkpoint);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": err.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1624,10 +1716,9 @@ async fn post_import_uris(
     Json(req): Json<ImportUrisReq>,
 ) -> impl IntoResponse {
     if req.apply {
-        let prev_secret = engine
-            .config_snapshot()
-            .secret
-            .filter(|s| !s.trim().is_empty());
+        let prev_snap = engine.config_snapshot();
+        let prev_is_ephemeral = prev_snap.is_ephemeral_secret;
+        let prev_secret = prev_snap.secret.filter(|s| !s.trim().is_empty());
         match engine
             .import_unified_live_with_options(
                 &req.uris,
@@ -1651,6 +1742,7 @@ async fn post_import_uris(
                 {
                     let mut live_cfg = engine.config_snapshot();
                     live_cfg.secret = Some(sec);
+                    live_cfg.is_ephemeral_secret = prev_is_ephemeral;
                     let _ = engine
                         .activate_profile_config_with_selections(
                             live_cfg,
@@ -2418,26 +2510,28 @@ async fn post_create_profile_api(
         }
     };
 
-    let prev_secret = engine
-        .config_snapshot()
-        .secret
-        .filter(|s| !s.trim().is_empty());
+    let prev_snap = engine.config_snapshot();
+    let prev_is_ephemeral = prev_snap.is_ephemeral_secret;
+    let prev_secret = prev_snap.secret.filter(|s| !s.trim().is_empty());
+    let checkpoint = mgr.capture_checkpoint();
 
     match mgr.create_profile_detailed(spec).await {
         Ok((meta, maybe_cfg, skipped_unsupported)) => {
             if let Some(mut cfg) = maybe_cfg {
                 if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
                     cfg.secret = prev_secret;
+                    cfg.is_ephemeral_secret = prev_is_ephemeral;
                 }
                 if let Err(err) = engine
                     .activate_profile_config_with_selections(cfg, Some(&meta.selected_groups))
                     .await
                 {
+                    mgr.restore_checkpoint(checkpoint);
                     let safe_err = crate::config::uri::redact_sensitive_text(&err.to_string());
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({
-                            "message": format!("profile saved as '{}', but runtime activation failed: {safe_err}", meta.id)
+                            "message": format!("profile activation failed and was rolled back: {safe_err}")
                         })),
                     )
                         .into_response();
@@ -2460,11 +2554,14 @@ async fn post_create_profile_api(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
-        )
-            .into_response(),
+        Err(e) => {
+            mgr.restore_checkpoint(checkpoint);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2483,15 +2580,16 @@ async fn put_activate_profile_api(
         }
     };
 
-    let prev_secret = engine
-        .config_snapshot()
-        .secret
-        .filter(|s| !s.trim().is_empty());
+    let prev_snap = engine.config_snapshot();
+    let prev_is_ephemeral = prev_snap.is_ephemeral_secret;
+    let prev_secret = prev_snap.secret.filter(|s| !s.trim().is_empty());
+    let checkpoint = mgr.capture_checkpoint();
 
     match mgr.set_active_profile(&id) {
         Ok(mut cfg) => {
             if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
                 cfg.secret = prev_secret;
+                cfg.is_ephemeral_secret = prev_is_ephemeral;
             }
             let sel = mgr.active_selected_groups();
             match engine
@@ -2504,18 +2602,24 @@ async fn put_activate_profile_api(
                         .push_log("info", format!("Activated profile '{id}'"));
                     (StatusCode::OK, Json(mgr.snapshot())).into_response()
                 }
-                Err(e) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
-                )
-                    .into_response(),
+                Err(e) => {
+                    mgr.restore_checkpoint(checkpoint);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+                    )
+                        .into_response()
+                }
             }
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
-        )
-            .into_response(),
+        Err(e) => {
+            mgr.restore_checkpoint(checkpoint);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2535,10 +2639,10 @@ async fn post_refresh_profile_api(
     };
 
     let prev_cfg_opt = mgr.load_profile_config_by_id(&id);
-    let prev_secret = engine
-        .config_snapshot()
-        .secret
-        .filter(|s| !s.trim().is_empty());
+    let prev_snap = engine.config_snapshot();
+    let prev_is_ephemeral = prev_snap.is_ephemeral_secret;
+    let prev_secret = prev_snap.secret.filter(|s| !s.trim().is_empty());
+    let checkpoint = mgr.capture_checkpoint();
 
     match mgr.refresh_subscription(&id).await {
         Ok((meta, mut cfg, is_active)) => {
@@ -2550,11 +2654,13 @@ async fn post_refresh_profile_api(
             if is_active && !engine.demo_info().enabled {
                 if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
                     cfg.secret = prev_secret;
+                    cfg.is_ephemeral_secret = prev_is_ephemeral;
                 }
                 if let Err(e) = engine
                     .activate_profile_config_with_selections(cfg, Some(&meta.selected_groups))
                     .await
                 {
+                    mgr.restore_checkpoint(checkpoint);
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
@@ -2581,11 +2687,14 @@ async fn post_refresh_profile_api(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
-        )
-            .into_response(),
+        Err(e) => {
+            mgr.restore_checkpoint(checkpoint);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2753,6 +2862,7 @@ async fn get_profile_raw_yaml_api(
 
 #[derive(Deserialize)]
 struct PutProfileRawYamlReq {
+    #[serde(alias = "yaml")]
     payload: String,
 }
 
@@ -2783,18 +2893,25 @@ async fn put_profile_raw_yaml_api(
     };
 
     if mgr.active_profile_id() == id && !engine.demo_info().enabled {
+        let checkpoint = mgr.capture_checkpoint();
         return match engine.reload_yaml(&req.payload).await {
             Ok(()) => (StatusCode::OK, Json(mgr.snapshot())).into_response(),
-            Err(ProxyError::Routing(msg)) => (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&msg) })),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
-            )
-                .into_response(),
+            Err(ProxyError::Routing(msg)) => {
+                mgr.restore_checkpoint(checkpoint);
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&msg) })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                mgr.restore_checkpoint(checkpoint);
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": crate::config::uri::redact_sensitive_text(&e.to_string()) })),
+                )
+                    .into_response()
+            }
         };
     }
 
@@ -2811,6 +2928,7 @@ async fn put_profile_raw_yaml_api(
         }
     };
     parsed.restore_redacted_from(&prev_cfg);
+    parsed.normalize_secret();
     if let Err(e) = parsed.validate() {
         return (
             StatusCode::BAD_REQUEST,
@@ -3204,6 +3322,24 @@ async fn post_demo_toggle_api(
     }
 }
 
+/// Compute the target proxy host to configure in the OS System Proxy for `cfg`.
+pub fn effective_sysproxy_host(cfg: &ClashConfig) -> String {
+    if cfg.allow_lan {
+        return "127.0.0.1".to_string();
+    }
+    let trimmed = cfg.bind_address.trim();
+    match trimmed {
+        "" | "*" | "0.0.0.0" | "::" | "[::]" | "127.0.0.1" => "127.0.0.1".to_string(),
+        "::1" | "[::1]" => "::1".to_string(),
+        other if other.eq_ignore_ascii_case("localhost") => "127.0.0.1".to_string(),
+        other => other
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(other)
+            .to_string(),
+    }
+}
+
 async fn get_sysproxy_api(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
     Json(query_sysproxy_status(&engine.state_dir()))
 }
@@ -3220,14 +3356,15 @@ async fn patch_sysproxy_api(
 ) -> Response {
     let state_dir = engine.state_dir();
     if req.enable {
+        let cfg = engine.config_snapshot();
+        let host = effective_sysproxy_host(&cfg);
         let port = engine.mixed_addr().port();
         let bypass = req.bypass.unwrap_or_default();
-        match enable_system_proxy("127.0.0.1", port, &bypass, &state_dir) {
+        match enable_system_proxy(&host, port, &bypass, &state_dir) {
             Ok(status) => {
-                engine.hub().push_log(
-                    "info",
-                    format!("Enabled OS System Proxy -> 127.0.0.1:{port}"),
-                );
+                engine
+                    .hub()
+                    .push_log("info", format!("Enabled OS System Proxy -> {host}:{port}"));
                 (StatusCode::OK, Json(status)).into_response()
             }
             Err(e) => (
@@ -3337,9 +3474,9 @@ async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> i
     let cfg = engine.config_snapshot();
     let mut known_secrets = Vec::new();
     if let Some(ref s) = cfg.secret
-        && !s.is_empty()
+        && !s.trim().is_empty()
     {
-        known_secrets.push(s.clone());
+        known_secrets.push(s.trim().to_string());
     }
     for auth in &cfg.authentication {
         known_secrets.push(auth.clone());
@@ -3968,6 +4105,146 @@ rules:
             .unwrap();
         let _ = ws_stream.close(None).await;
 
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn patch_configs_rebinds_mixed_port_toggles_ipv6_allows_lan_spa_and_serves_group_delay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp_dir = std::env::temp_dir().join(format!("rc-api-patch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let yaml = "\
+mixed-port: 0
+mode: rule
+ipv6: true
+dns:
+  enable: false
+  ipv6: true
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,PROXY
+";
+        let cfg = ClashConfig::from_yaml_str(yaml).unwrap();
+        let engine = ProxyEngine::start_with_state_dir(cfg, tmp_dir.clone())
+            .await
+            .expect("start engine");
+        let initial_mixed_port = engine.mixed_addr().port();
+
+        let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_new_port = probe_listener.local_addr().unwrap().port();
+        drop(probe_listener);
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (bound, server_handle) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), stop_rx)
+            .await
+            .expect("spawn api server");
+
+        // 1. Unauthenticated LAN hostname (`router.local`) is permitted on static SPA `GET /` (#20)
+        //    but rejected with 403 on unauthenticated API routes (DNS-rebinding defense preserved).
+        let mut spa_conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        spa_conn
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: router.local:{}\r\nConnection: close\r\n\r\n",
+                    bound.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut spa_raw = Vec::new();
+        spa_conn.read_to_end(&mut spa_raw).await.unwrap();
+        let spa_head = String::from_utf8_lossy(&spa_raw);
+        assert!(
+            spa_head.starts_with("HTTP/1.1 200"),
+            "LAN hostname GET / should serve SPA shell, got: {spa_head}"
+        );
+
+        let mut rebind_conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        rebind_conn
+            .write_all(
+                format!(
+                    "GET /configs HTTP/1.1\r\nHost: router.local:{}\r\nConnection: close\r\n\r\n",
+                    bound.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut rebind_raw = Vec::new();
+        rebind_conn.read_to_end(&mut rebind_raw).await.unwrap();
+        assert!(String::from_utf8_lossy(&rebind_raw).starts_with("HTTP/1.1 403"));
+
+        // 2. PATCH /configs updates `mixed-port` and top-level `ipv6` live (#18a)
+        let patch_body = serde_json::json!({
+            "mixed-port": target_new_port,
+            "ipv6": false,
+            "tun": { "ipv6": false }
+        })
+        .to_string();
+        let mut patch_conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        patch_conn
+            .write_all(
+                format!(
+                    "PATCH /configs HTTP/1.1\r\nHost: {bound}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    patch_body.len(),
+                    patch_body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut patch_raw = Vec::new();
+        patch_conn.read_to_end(&mut patch_raw).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&patch_raw).starts_with("HTTP/1.1 204"),
+            "PATCH /configs failed: {}",
+            String::from_utf8_lossy(&patch_raw)
+        );
+        assert_eq!(engine.mixed_addr().port(), target_new_port);
+        assert_ne!(engine.mixed_addr().port(), initial_mixed_port);
+        assert!(!engine.config_snapshot().dns.ipv6);
+        assert!(!engine.config_snapshot().tun.ipv6);
+
+        // 3. GET /group/PROXY/delay against a local mock HTTP server returns member delay map
+        let bench_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bench_addr = bench_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = bench_listener.accept().await {
+                let mut b = [0u8; 512];
+                let _ = s.read(&mut b).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let mut grp_conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        grp_conn
+            .write_all(
+                format!(
+                    "GET /group/PROXY/delay?url=http%3A%2F%2F127.0.0.1%3A{}%2Fgenerate_204&timeout=2000 HTTP/1.1\r\nHost: {bound}\r\nConnection: close\r\n\r\n",
+                    bench_addr.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut grp_raw = Vec::new();
+        grp_conn.read_to_end(&mut grp_raw).await.unwrap();
+        assert!(String::from_utf8_lossy(&grp_raw).starts_with("HTTP/1.1 200"));
+        let grp_body = extract_http_response_body_str(&grp_raw).unwrap();
+        let grp_json: serde_json::Value = serde_json::from_str(&grp_body).unwrap();
+        assert!(grp_json["DIRECT"].as_u64().is_some());
+
+        let _ = stop_tx.send(true);
+        let _ = server_handle.await;
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

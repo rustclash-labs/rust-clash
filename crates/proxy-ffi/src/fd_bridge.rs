@@ -155,6 +155,9 @@ impl UnixPacketFdBridge {
                         continue;
                     }
                     loop {
+                        if stop_rx.load(Ordering::Acquire) {
+                            break;
+                        }
                         // SAFETY: `read` writes at most `buf.len()` bytes into `buf`.
                         let n = unsafe {
                             libc::read(
@@ -180,8 +183,21 @@ impl UnixPacketFdBridge {
                         if first == 4 || first == 6 {
                             rx_cnt.fetch_add(1, Ordering::Release);
                             rx_byte_cnt.fetch_add(len as u64, Ordering::Relaxed);
-                            if ingress_tx.blocking_send(buf[..len].to_vec()).is_err() {
-                                return;
+                            let mut pending = buf[..len].to_vec();
+                            loop {
+                                match ingress_tx.try_send(pending) {
+                                    Ok(()) => break,
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        return;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                                        if stop_rx.load(Ordering::Acquire) {
+                                            return;
+                                        }
+                                        pending = returned;
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    }
+                                }
                             }
                         }
                     }

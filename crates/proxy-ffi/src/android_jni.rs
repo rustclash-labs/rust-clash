@@ -112,6 +112,15 @@ static STOP_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ANDROID_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 /// Serializes offline `ProfileManager::open_or_init` mutations so concurrent JNI calls never race on `profiles_index.json`.
 static OFFLINE_PROFILE_LOCK: Mutex<()> = Mutex::new(());
+/// Caches the most recent non-empty Android `state_dir` so `nativeFlushDns` (which takes no arguments)
+/// can also remove `<state_dir>/fake_ip_cache.json` when VPN is disconnected.
+static LAST_KNOWN_STATE_DIR: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+
+fn record_state_dir(state_dir: &Path) {
+    if !state_dir.as_os_str().is_empty() {
+        *LAST_KNOWN_STATE_DIR.lock() = Some(state_dir.to_path_buf());
+    }
+}
 
 fn sync_delays_from_router(router: &Router) {
     let snap = router.proxies_snapshot();
@@ -189,11 +198,41 @@ fn generate_ephemeral_api_secret() -> String {
     out
 }
 
+fn is_non_loopback_dns_listen(spec: &str) -> bool {
+    let trimmed = spec.trim();
+    match trimmed.parse::<std::net::SocketAddr>() {
+        Ok(addr) => !addr.ip().is_loopback(),
+        Err(_) => true,
+    }
+}
+
+fn is_non_loopback_controller(spec: &str) -> bool {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(port_str) = trimmed.strip_prefix("localhost:")
+        && port_str.parse::<u16>().is_ok()
+    {
+        return false;
+    }
+    match trimmed.parse::<std::net::SocketAddr>() {
+        Ok(addr) => !addr.ip().is_loopback(),
+        Err(_) => true,
+    }
+}
+
 fn enforce_android_local_only_config(cfg: &mut ClashConfig) {
     cfg.allow_lan = false;
     cfg.bind_address = "127.0.0.1".to_string();
     cfg.lan_allowed_ips.clear();
     cfg.authentication.clear();
+    if is_non_loopback_dns_listen(&cfg.dns.listen) {
+        cfg.dns.listen = "127.0.0.1:0".to_string();
+    }
+    if is_non_loopback_controller(&cfg.external_controller) {
+        cfg.external_controller = "127.0.0.1:0".to_string();
+    }
 }
 
 fn needs_local_only_sanitization(cfg: &ClashConfig) -> bool {
@@ -201,6 +240,8 @@ fn needs_local_only_sanitization(cfg: &ClashConfig) -> bool {
         || cfg.bind_address != "127.0.0.1"
         || !cfg.lan_allowed_ips.is_empty()
         || !cfg.authentication.is_empty()
+        || is_non_loopback_dns_listen(&cfg.dns.listen)
+        || is_non_loopback_controller(&cfg.external_controller)
 }
 
 fn yaml_mentions_listener_exposure(yaml_text: &str) -> bool {
@@ -212,6 +253,8 @@ fn yaml_mentions_listener_exposure(yaml_text: &str) -> bool {
         || lower.contains("lan-allowed-ips")
         || lower.contains("lan_allowed_ips")
         || lower.contains("authentication")
+        || lower.contains("external-controller")
+        || lower.contains("external_controller")
 }
 
 fn clear_pending_jni_exception(env: &mut JNIEnv<'_>) -> bool {
@@ -513,6 +556,9 @@ fn get_or_build_offline_router(
     ),
     String,
 > {
+    if let Some(dir) = state_dir {
+        record_state_dir(dir);
+    }
     let normalized = default_selected_groups_for_config(cfg, saved_selections);
     let config_fp = offline_config_fingerprint(cfg, state_dir);
     let state_dir_buf = state_dir.map(Path::to_path_buf);
@@ -704,6 +750,9 @@ fn start_android_vpn_with_state_dir_and_jvm(
     protector: Arc<CallbackSocketProtector>,
     jvm: Option<Arc<JavaVM>>,
 ) -> Result<serde_json::Value, String> {
+    if let Some(dir) = state_dir {
+        record_state_dir(dir);
+    }
     let _lifecycle_guard = LIFECYCLE_LOCK.lock();
     let start_gen = STOP_GENERATION.load(Ordering::Acquire);
 
@@ -1149,6 +1198,7 @@ fn build_android_mutation_json(
 ) -> serde_json::Value {
     let redacted_nodes = mgr.list_active_nodes_redacted().unwrap_or_default();
     let state_dir = mgr.state_dir();
+    record_state_dir(&state_dir);
     let eff = live_eff.unwrap_or_else(|| {
         compute_offline_effective_summary(&report.config, &report.selected_groups, Some(&state_dir))
     });
@@ -1156,6 +1206,8 @@ fn build_android_mutation_json(
     serde_json::json!({
         "ok": true,
         "vpnRunning": vpn_running,
+        "demoActive": false,
+        "demo_mode": false,
         "activeProfileId": mgr.active_profile_id(),
         "inputKind": report.input_kind,
         "count": report.added_nodes.len(),
@@ -1176,6 +1228,7 @@ fn build_android_mutation_json(
 /// Offline + Live unified snapshot of saved nodes, groups, routing preset, rules, GeoData, delays,
 /// active profile, and effective outbound.
 pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -1218,6 +1271,7 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
             "ok": true,
             "vpnRunning": true,
             "demoActive": demo_active,
+            "demo_mode": demo_active,
             "routerEpoch": router.epoch(),
             "delaysRevision": router.delays().revision(),
             "activeProfileId": mgr.active_profile_id(),
@@ -1274,6 +1328,7 @@ pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json
         "ok": true,
         "vpnRunning": false,
         "demoActive": false,
+        "demo_mode": false,
         "routerEpoch": 0,
         "delaysRevision": 0,
         "activeProfileId": mgr.active_profile_id(),
@@ -1299,6 +1354,7 @@ pub fn android_import_unified_core(
     deduplicate: bool,
     auto_select: bool,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -1427,6 +1483,7 @@ pub fn android_select_proxy_persisted_core(
     group_name: &str,
     proxy_name: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let _ = engine
             .ensure_profile_manager()
@@ -1454,6 +1511,7 @@ pub fn android_upsert_node_core(
     node_json: &str,
     auto_select: bool,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let node: ProxyNodeConfig = serde_json::from_str(node_json)
         .map_err(|e| redact_sensitive_text(&format!("invalid node JSON: {e}")))?;
 
@@ -1482,6 +1540,7 @@ pub fn android_delete_node_core(
     state_dir: &Path,
     target_name: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -1504,6 +1563,7 @@ pub fn android_delete_node_core(
 
 /// Offline + Live deduplication of saved proxy nodes.
 pub fn android_deduplicate_nodes_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -1931,18 +1991,28 @@ pub fn android_flush_dns_core() -> bool {
         .lock()
         .as_ref()
         .and_then(|c| c.state_dir.clone());
+    let cached_dir = LAST_KNOWN_STATE_DIR.lock().clone();
     clear_offline_router_cache();
-    if let Some(dir) = offline_dir
+    let mut removed_persisted = false;
+    if let Some(ref dir) = offline_dir
         && !dir.as_os_str().is_empty()
+        && std::fs::remove_file(dir.join("fake_ip_cache.json")).is_ok()
     {
-        let _ = std::fs::remove_file(dir.join("fake_ip_cache.json"));
+        removed_persisted = true;
+    }
+    if let Some(ref dir) = cached_dir
+        && !dir.as_os_str().is_empty()
+        && offline_dir.as_ref() != Some(dir)
+        && std::fs::remove_file(dir.join("fake_ip_cache.json")).is_ok()
+    {
+        removed_persisted = true;
     }
     proxy_core::dns::upstream::clear_dns_upstream_pools();
     if let Some((_, engine)) = live_handle_and_engine() {
         engine.flush_dns();
         true
     } else {
-        false
+        removed_persisted
     }
 }
 
@@ -2020,6 +2090,7 @@ pub fn android_clear_diagnostics_core() -> bool {
 
 /// Offline + Live routing preset snapshot (`smart-cn`, `global`, `direct`, `custom`).
 pub fn android_get_routing_snapshot_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -2051,6 +2122,7 @@ pub fn android_set_routing_preset_core(
     state_dir: &Path,
     preset_str: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let choice = RoutingPresetChoice::parse_str(preset_str)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
 
@@ -2085,14 +2157,17 @@ pub fn android_set_routing_preset_core(
         return android_node_manager_snapshot_core(state_dir);
     }
 
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let (_, mut cfg) = mgr
-        .apply_routing_preset(choice)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    if needs_local_only_sanitization(&cfg) {
-        enforce_android_local_only_config(&mut cfg);
-        let _ = mgr.persist_active_yaml(&cfg, None, None);
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let (_, mut cfg) = mgr
+            .apply_routing_preset(choice)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            let _ = mgr.persist_active_yaml(&cfg, None, None);
+        }
     }
     android_node_manager_snapshot_core(state_dir)
 }
@@ -2115,6 +2190,7 @@ pub fn android_save_custom_rules_core(
     state_dir: &Path,
     rules_payload: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let rules = parse_custom_rules_input(rules_payload);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
@@ -2137,20 +2213,24 @@ pub fn android_save_custom_rules_core(
         return android_node_manager_snapshot_core(state_dir);
     }
 
-    let mgr = ProfileManager::open_or_init(state_dir)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    let (_, mut cfg) = mgr
-        .save_custom_rules(rules)
-        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-    if needs_local_only_sanitization(&cfg) {
-        enforce_android_local_only_config(&mut cfg);
-        let _ = mgr.persist_active_yaml(&cfg, None, None);
+    {
+        let _offline_guard = OFFLINE_PROFILE_LOCK.lock();
+        let mgr = ProfileManager::open_or_init(state_dir)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        let (_, mut cfg) = mgr
+            .save_custom_rules(rules)
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+        if needs_local_only_sanitization(&cfg) {
+            enforce_android_local_only_config(&mut cfg);
+            let _ = mgr.persist_active_yaml(&cfg, None, None);
+        }
     }
     android_node_manager_snapshot_core(state_dir)
 }
 
 /// Query GeoSite / GeoIP database status (persisted cache vs built-in baseline, entry counts, expiration).
 pub fn android_geodata_status_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let st = engine.geodata_status();
         return Ok(serde_json::json!({
@@ -2167,6 +2247,7 @@ pub fn android_geodata_status_core(state_dir: &Path) -> Result<serde_json::Value
 
 /// Trigger an immediate GeoSite / GeoIP rule database update across mirrors (preserving existing data on failure).
 pub fn android_update_geodata_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let st = handle
             .block_on(engine.update_geodata())
@@ -2197,6 +2278,7 @@ pub fn android_explain_rule_with_state_dir_core(
     state_dir: &Path,
     target_raw: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let target = parse_explain_target(target_raw)?;
     if let Some((handle, engine)) = live_handle_and_engine() {
         let router = engine.router();
@@ -2279,6 +2361,7 @@ pub fn android_test_latency_core(
     probe_url: Option<&str>,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let clean_target = target_name
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -2350,14 +2433,18 @@ pub fn android_test_latency_core(
 
 /// Offline + Live snapshot of all saved profiles in `ProfileManager`.
 pub fn android_profiles_snapshot_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let snap = mgr.snapshot();
+        let demo_active = engine.demo_info().enabled;
         return Ok(serde_json::json!({
             "ok": true,
             "vpnRunning": true,
+            "demoActive": demo_active,
+            "demo_mode": demo_active,
             "profilesSnapshot": snap,
         }));
     }
@@ -2367,6 +2454,8 @@ pub fn android_profiles_snapshot_core(state_dir: &Path) -> Result<serde_json::Va
     Ok(serde_json::json!({
         "ok": true,
         "vpnRunning": false,
+        "demoActive": false,
+        "demo_mode": false,
         "profilesSnapshot": snap,
     }))
 }
@@ -2376,6 +2465,7 @@ pub fn android_activate_profile_core(
     state_dir: &Path,
     profile_id: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -2415,6 +2505,7 @@ pub fn android_delete_profile_core(
     state_dir: &Path,
     profile_id: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -2438,6 +2529,7 @@ pub fn android_refresh_profile_core(
     state_dir: &Path,
     profile_id: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -2514,6 +2606,7 @@ pub fn android_refresh_profile_core(
 
 /// Retrieve the active profile's redacted YAML + rules list offline or live.
 pub fn android_get_active_yaml_core(state_dir: &Path) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((_, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -2560,6 +2653,7 @@ pub fn android_save_active_yaml_core(
     state_dir: &Path,
     yaml_text: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
@@ -2570,21 +2664,22 @@ pub fn android_save_active_yaml_core(
         let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml_text)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         parsed.restore_redacted_from(&prev_disk_cfg);
+        let needs_sanitize = needs_local_only_sanitization(&parsed);
         enforce_android_local_only_config(&mut parsed);
-        let raw_override =
-            if yaml_text.contains(REDACTED_SECRET) || yaml_mentions_listener_exposure(yaml_text) {
-                None
-            } else {
-                Some(yaml_text)
-            };
+        let raw_override = if yaml_text.contains(REDACTED_SECRET)
+            || needs_sanitize
+            || yaml_mentions_listener_exposure(yaml_text)
+        {
+            None
+        } else {
+            Some(yaml_text)
+        };
         let sel = mgr
             .persist_active_yaml(&parsed, raw_override, None)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        if !engine.demo_info().enabled {
-            handle
-                .block_on(engine.activate_profile_config_with_selections(parsed, Some(&sel)))
-                .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        }
+        handle
+            .block_on(engine.activate_profile_config_with_selections(parsed, Some(&sel)))
+            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         return android_node_manager_snapshot_core(state_dir);
     }
 
@@ -2598,13 +2693,16 @@ pub fn android_save_active_yaml_core(
         let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml_text)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         parsed.restore_redacted_from(&prev_disk_cfg);
+        let needs_sanitize = needs_local_only_sanitization(&parsed);
         enforce_android_local_only_config(&mut parsed);
-        let raw_override =
-            if yaml_text.contains(REDACTED_SECRET) || yaml_mentions_listener_exposure(yaml_text) {
-                None
-            } else {
-                Some(yaml_text)
-            };
+        let raw_override = if yaml_text.contains(REDACTED_SECRET)
+            || needs_sanitize
+            || yaml_mentions_listener_exposure(yaml_text)
+        {
+            None
+        } else {
+            Some(yaml_text)
+        };
         let _ = mgr
             .persist_active_yaml(&parsed, raw_override, None)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2915,6 +3013,7 @@ pub fn android_update_profile_settings_core(
     name: Option<String>,
     auto_update_interval_secs: Option<Option<u64>>,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let patch = proxy_core::profile::ProfileSettingsPatch {
         name,
         auto_update_interval_secs,
@@ -3431,6 +3530,7 @@ pub fn android_collect_debug_snapshot_window_core(
     since_epoch_ms: u64,
     until_epoch_ms: u64,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     let captured_at_ms = proxy_core::tracker::TelemetryHub::now_ms();
     let debug_mode = ANDROID_DEBUG_LOGGING.load(Ordering::Acquire);
     let until_json = if until_epoch_ms == u64::MAX {
@@ -3702,6 +3802,7 @@ pub fn android_diagnose_site_core(
     state_dir: &Path,
     target_raw: &str,
 ) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
     if let Some((handle, engine)) = live_handle_and_engine() {
         let demo = engine.demo_info();
         let mut allowed_private = Vec::new();
@@ -4501,5 +4602,38 @@ mod tests {
         assert_eq!(second_carry["uploadBytes"], 15 * 1024 * 1024);
         assert_eq!(second_carry["downloadBytes"], 2 * 1024 * 1024);
         assert_eq!(second_carry["ageMs"], until_ms - 4_500);
+    }
+
+    #[test]
+    fn local_only_sanitizes_dns_listen_and_offline_flush_dns_removes_persisted_fake_ip_cache() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+
+        let mut exposed_cfg =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        exposed_cfg.dns.listen = "0.0.0.0:5353".to_string();
+        exposed_cfg.external_controller = "0.0.0.0:9090".to_string();
+        assert!(needs_local_only_sanitization(&exposed_cfg));
+        enforce_android_local_only_config(&mut exposed_cfg);
+        assert_eq!(exposed_cfg.dns.listen, "127.0.0.1:0");
+        assert_eq!(exposed_cfg.external_controller, "127.0.0.1:0");
+        assert!(!needs_local_only_sanitization(&exposed_cfg));
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustclash-jni-offline-flush-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let _ = android_node_manager_snapshot_core(&tmp_dir).expect("offline snapshot caches dir");
+        clear_offline_router_cache();
+
+        let cache_file = tmp_dir.join("fake_ip_cache.json");
+        std::fs::write(&cache_file, b"{\"entries\":[]}").expect("write fake_ip_cache.json");
+        assert!(cache_file.exists());
+        assert!(android_flush_dns_core());
+        assert!(!cache_file.exists());
+        assert!(!android_flush_dns_core());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

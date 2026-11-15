@@ -878,6 +878,13 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+pub struct ProfileStateCheckpoint {
+    index: ProfileIndex,
+    yaml_files: HashMap<String, Option<Vec<u8>>>,
+    manual_files: HashMap<String, Option<Vec<u8>>>,
+    existing_ids: HashSet<String>,
+}
+
 /// Persistent Profile & HTTPS Subscription Manager with OS `SecretVault` credential protection
 /// and atomic `.bak` rollback on failed updates.
 pub struct ProfileManager {
@@ -1201,13 +1208,84 @@ impl ProfileManager {
         save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)
     }
 
+    pub fn capture_checkpoint(&self) -> ProfileStateCheckpoint {
+        let index = self.index.lock().clone();
+        let mut yaml_files = HashMap::with_capacity(index.profiles.len());
+        let mut manual_files = HashMap::with_capacity(index.profiles.len());
+        let mut existing_ids = HashSet::with_capacity(index.profiles.len());
+        for p in &index.profiles {
+            existing_ids.insert(p.id.clone());
+            yaml_files.insert(p.id.clone(), fs::read(self.profile_yaml_path(&p.id)).ok());
+            manual_files.insert(p.id.clone(), fs::read(self.manual_overlay_path(&p.id)).ok());
+        }
+        ProfileStateCheckpoint {
+            index,
+            yaml_files,
+            manual_files,
+            existing_ids,
+        }
+    }
+
+    pub fn restore_checkpoint(&self, checkpoint: ProfileStateCheckpoint) {
+        let current_ids: Vec<String> = self
+            .index
+            .lock()
+            .profiles
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        for cur_id in current_ids {
+            if !checkpoint.existing_ids.contains(&cur_id) {
+                self.last_attempt_ms.lock().remove(&cur_id);
+                let _ = self.vault.delete_secret(&Self::sub_vault_key(&cur_id));
+                let yp = self.profile_yaml_path(&cur_id);
+                let _ = fs::remove_file(&yp);
+                let _ = fs::remove_file(yp.with_extension("yaml.bak"));
+                let mp = self.manual_overlay_path(&cur_id);
+                let _ = fs::remove_file(&mp);
+                let _ = fs::remove_file(mp.with_extension("yaml.bak"));
+            }
+        }
+        for (id, bytes_opt) in checkpoint.yaml_files {
+            let yp = self.profile_yaml_path(&id);
+            match bytes_opt {
+                Some(bytes) => {
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        let _ = write_atomic_with_backup(&yp, &text);
+                    }
+                }
+                None => {
+                    let _ = fs::remove_file(&yp);
+                    let _ = fs::remove_file(yp.with_extension("yaml.bak"));
+                }
+            }
+        }
+        for (id, bytes_opt) in checkpoint.manual_files {
+            let mp = self.manual_overlay_path(&id);
+            match bytes_opt {
+                Some(bytes) => {
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        let _ = write_atomic_with_backup(&mp, &text);
+                    }
+                }
+                None => {
+                    let _ = fs::remove_file(&mp);
+                    let _ = fs::remove_file(mp.with_extension("yaml.bak"));
+                }
+            }
+        }
+        let mut idx = self.index.lock();
+        *idx = checkpoint.index;
+        let _ = save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx);
+    }
+
     pub fn save_active_mode(&self, mode: RunMode) -> Result<()> {
         let (mut cfg, path) = self.load_active_config()?;
         if cfg.mode == mode {
             return Ok(());
         }
         cfg.mode = mode;
-        let yaml = cfg.to_yaml_string()?;
+        let yaml = cfg.to_disk_yaml_string()?;
         write_atomic_with_backup(&path, &yaml)
     }
 
@@ -1440,7 +1518,7 @@ impl ProfileManager {
         let (proxy_count, rule_count) = validate_profile_config(cfg, &self.extra_ca_der)?;
         let yaml = match raw_yaml_override {
             Some(s) => s.to_string(),
-            None => cfg.to_yaml_string()?,
+            None => cfg.to_disk_yaml_string()?,
         };
         let path = self.profile_yaml_path(profile_id);
         write_atomic_with_backup(&path, &yaml)?;
@@ -3327,6 +3405,10 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
 
 type HttpHeaderList = Vec<(String, String)>;
 
+fn decode_chunked_body(raw_body: &[u8]) -> Result<Vec<u8>> {
+    crate::config::decode_http_chunked_body(raw_body, MAX_SUBSCRIPTION_BYTES)
+}
+
 fn parse_http11_response(raw: &[u8]) -> Result<(u16, HttpHeaderList, Vec<u8>)> {
     let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
         return Err(ProxyError::Config(
@@ -3347,23 +3429,76 @@ fn parse_http11_response(raw: &[u8]) -> Result<(u16, HttpHeaderList, Vec<u8>)> {
         .ok_or_else(|| ProxyError::Config(format!("invalid HTTP status line '{status_line}'")))?;
 
     let mut headers = Vec::new();
+    let mut has_transfer_encoding = false;
     let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim().to_string();
             let val = v.trim().to_string();
-            if key.eq_ignore_ascii_case("transfer-encoding")
-                && val.to_ascii_lowercase().contains("chunked")
-            {
-                is_chunked = true;
+            if key.eq_ignore_ascii_case("transfer-encoding") {
+                has_transfer_encoding = true;
+                if val
+                    .split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+                {
+                    is_chunked = true;
+                } else {
+                    return Err(ProxyError::Config(format!(
+                        "unsupported Transfer-Encoding '{val}' in subscription response"
+                    )));
+                }
+            } else if key.eq_ignore_ascii_case("content-length") {
+                if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ProxyError::Config(format!(
+                        "invalid Content-Length header '{val}' in subscription response"
+                    )));
+                }
+                let parsed_len = val.parse::<usize>().map_err(|_| {
+                    ProxyError::Config(format!(
+                        "invalid Content-Length header '{val}' in subscription response"
+                    ))
+                })?;
+                if parsed_len > MAX_SUBSCRIPTION_BYTES {
+                    return Err(ProxyError::Config(
+                        "subscription Content-Length exceeds 8 MiB safety limit".into(),
+                    ));
+                }
+                if let Some(prev_len) = content_length
+                    && prev_len != parsed_len
+                {
+                    return Err(ProxyError::Config(
+                        "conflicting duplicate Content-Length headers in subscription response"
+                            .into(),
+                    ));
+                }
+                content_length = Some(parsed_len);
             }
             headers.push((key, val));
         }
     }
 
+    if has_transfer_encoding && content_length.is_some() {
+        return Err(ProxyError::Config(
+            "conflicting Transfer-Encoding and Content-Length headers in subscription response"
+                .into(),
+        ));
+    }
+
     let body_raw = &raw[hdr_end + 4..];
     let body = if is_chunked {
-        crate::config::decode_http_chunked_body(body_raw, MAX_SUBSCRIPTION_BYTES)?
+        decode_chunked_body(body_raw)?
+    } else if let Some(expected_len) = content_length {
+        if body_raw.len() < expected_len {
+            return Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "truncated HTTP subscription response: expected {expected_len} bytes from Content-Length, received {} bytes",
+                    body_raw.len()
+                ),
+            )));
+        }
+        body_raw[..expected_len].to_vec()
     } else {
         body_raw.to_vec()
     };
@@ -4101,6 +4236,218 @@ rules:
             preserved_custom.rules, untouched_custom_rules,
             "RulePreset::Custom profile must NEVER be modified by smart-cn template migration"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn truncated_content_length_and_chunked_subscriptions_are_rejected_and_preserve_existing_profile()
+     {
+        // 1. Direct unit checks on `parse_http11_response` and `decode_chunked_body`
+        let truncated_cl = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nvless://11111111-1111-1111-1111-111111111111@127.0.0.1:443#ValidPrefix";
+        assert!(
+            parse_http11_response(truncated_cl).is_err(),
+            "body shorter than Content-Length must fail"
+        );
+
+        let extra_trailing_cl = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTRAILING";
+        let (_, _, exact_body) = parse_http11_response(extra_trailing_cl).unwrap();
+        assert_eq!(exact_body, b"hello");
+
+        let conflicting_te_cl =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert!(
+            parse_http11_response(conflicting_te_cl).is_err(),
+            "conflicting Transfer-Encoding and Content-Length must be rejected"
+        );
+
+        let invalid_cl = b"HTTP/1.1 200 OK\r\nContent-Length: 12abc\r\n\r\n123456789012";
+        assert!(
+            parse_http11_response(invalid_cl).is_err(),
+            "non-numeric Content-Length must be rejected"
+        );
+
+        let missing_zero_chunk = b"5\r\nhello\r\n";
+        assert!(
+            decode_chunked_body(missing_zero_chunk).is_err(),
+            "chunked body missing terminal 0-size chunk must fail"
+        );
+
+        let mid_chunk_eof = b"a\r\n12345";
+        assert!(
+            decode_chunked_body(mid_chunk_eof).is_err(),
+            "chunked body cut mid-chunk must fail"
+        );
+
+        let chunked_with_trailer = b"5\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: ok\r\n\r\n";
+        assert_eq!(
+            decode_chunked_body(chunked_with_trailer).unwrap(),
+            b"hello world"
+        );
+
+        // 2. End-to-end TLS subscription test verifying truncated valid node lines/Base64 NEVER overwrite existing `<id>.yaml`
+        let dir = std::env::temp_dir().join(format!("rc-sub-trunc-{}", Uuid::new_v4()));
+        let (server_tls_cfg, ca_der) =
+            generate_self_signed_server_config(&["localhost".into(), "127.0.0.1".into()], &[])
+                .unwrap();
+        let acceptor = TlsAcceptor::from(server_tls_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let u_partial = Uuid::new_v4();
+        let full_two_node_uris = format!(
+            "vless://{u1}@127.0.0.1:8443?security=none#Node-Alpha\nvless://{u2}@127.0.0.1:8444?security=none#Node-Beta"
+        );
+        let full_b64 = STANDARD.encode(&full_two_node_uris);
+        let partial_valid_uri =
+            format!("vless://{u_partial}@127.0.0.1:8445?security=none#Truncated-Survivor\n");
+        let partial_valid_b64 = STANDARD.encode(partial_valid_uri.trim());
+
+        // mode 0 = valid full response, 1 = truncated Content-Length (with valid URI prefix), 2 = truncated chunked (with valid Base64 chunk, missing 0\r\n\r\n)
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let mode_srv = Arc::clone(&mode);
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                let m = mode_srv.load(std::sync::atomic::Ordering::Acquire);
+                let good = full_b64.clone();
+                let partial_uri = partial_valid_uri.clone();
+                let partial_b64 = partial_valid_b64.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acc.accept(tcp).await else {
+                        return;
+                    };
+                    let mut req_buf = [0u8; 2048];
+                    let _ = tls.read(&mut req_buf).await;
+                    let resp = match m {
+                        0 => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            good.len(),
+                            good
+                        ),
+                        1 => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            partial_uri.len() + 64,
+                            partial_uri
+                        ),
+                        _ => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n",
+                            partial_b64.len(),
+                            partial_b64
+                        ),
+                    };
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        let mgr = ProfileManager::open_or_init_with_ca(&dir, vec![ca_der]).unwrap();
+        let sub_url = format!("https://localhost:{}/sub", addr.port());
+        let (meta, _) = mgr
+            .create_profile(CreateProfileSpec {
+                name: "Truncation Guard Sub".into(),
+                yaml: None,
+                uris: None,
+                subscription_url: Some(sub_url),
+                auto_update_interval_secs: Some(3600),
+                activate: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(meta.proxy_count, 2);
+        let original_disk_yaml = fs::read_to_string(mgr.profile_yaml_path(&meta.id)).unwrap();
+
+        // Mode 1: truncated Content-Length carrying a syntactically valid 1-node URI prefix
+        mode.store(1, std::sync::atomic::Ordering::Release);
+        assert!(
+            mgr.refresh_subscription(&meta.id).await.is_err(),
+            "truncated Content-Length subscription must fail even when partial body is valid URI"
+        );
+        assert_eq!(
+            fs::read_to_string(mgr.profile_yaml_path(&meta.id)).unwrap(),
+            original_disk_yaml,
+            "truncated Content-Length must never overwrite existing <id>.yaml"
+        );
+        assert_eq!(mgr.load_active_config().unwrap().0.proxies.len(), 2);
+
+        // Mode 2: truncated Transfer-Encoding: chunked carrying a valid Base64 chunk without terminal 0-chunk
+        mode.store(2, std::sync::atomic::Ordering::Release);
+        assert!(
+            mgr.refresh_subscription(&meta.id).await.is_err(),
+            "truncated chunked subscription missing 0-chunk must fail even when first chunk is valid Base64"
+        );
+        assert_eq!(
+            fs::read_to_string(mgr.profile_yaml_path(&meta.id)).unwrap(),
+            original_disk_yaml,
+            "truncated chunked download must never overwrite existing <id>.yaml"
+        );
+        assert_eq!(mgr.load_active_config().unwrap().0.proxies.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_rolls_back_disk_yaml_and_active_profile_id() {
+        let dir = std::env::temp_dir().join(format!("rc-checkpoint-rb-{}", Uuid::new_v4()));
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+
+        let u1 = Uuid::new_v4();
+        mgr.import_nodes_to_active(
+            &format!("vless://{u1}@127.0.0.1:18443?security=none#Initial-Node"),
+            true,
+            true,
+        )
+        .unwrap();
+        let initial_active_id = mgr.active_profile_id();
+        let initial_yaml = fs::read_to_string(mgr.profile_yaml_path(&initial_active_id)).unwrap();
+
+        let cp = mgr.capture_checkpoint();
+
+        // Mutate active profile YAML + create and activate a brand-new profile
+        let u2 = Uuid::new_v4();
+        mgr.import_nodes_to_active(
+            &format!("vless://{u2}@127.0.0.1:18444?security=none#Uncommitted-Node"),
+            true,
+            true,
+        )
+        .unwrap();
+        let (new_meta, _) = mgr
+            .create_profile(CreateProfileSpec {
+                name: "Transient Profile".into(),
+                yaml: None,
+                uris: Some(format!(
+                    "vless://{u2}@127.0.0.1:18445?security=none#Transient-Node"
+                )),
+                subscription_url: None,
+                auto_update_interval_secs: None,
+                activate: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mgr.active_profile_id(), new_meta.id);
+        assert!(mgr.profile_yaml_path(&new_meta.id).exists());
+
+        // Roll back to checkpoint
+        mgr.restore_checkpoint(cp);
+
+        assert_eq!(mgr.active_profile_id(), initial_active_id);
+        assert!(!mgr.profile_yaml_path(&new_meta.id).exists());
+        assert_eq!(
+            fs::read_to_string(mgr.profile_yaml_path(&initial_active_id)).unwrap(),
+            initial_yaml
+        );
+
+        // Reopen from disk to prove `profiles_index.json` was also rolled back atomically
+        drop(mgr);
+        let reopened = ProfileManager::open_or_init(&dir).unwrap();
+        assert_eq!(reopened.active_profile_id(), initial_active_id);
+        assert_eq!(reopened.snapshot().profiles.len(), 1);
+        let (reopened_cfg, _) = reopened.load_active_config().unwrap();
+        assert_eq!(reopened_cfg.proxies.len(), 1);
+        assert_eq!(reopened_cfg.proxies[0].name(), "Initial-Node");
 
         let _ = fs::remove_dir_all(&dir);
     }

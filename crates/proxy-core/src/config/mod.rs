@@ -120,6 +120,10 @@ pub struct ClashConfig {
     #[serde(default)]
     pub secret: Option<String>,
 
+    /// Non-serialized runtime marker set when `secret` was auto-generated via `ensure_ephemeral_secret()`.
+    #[serde(skip)]
+    pub is_ephemeral_secret: bool,
+
     #[serde(default = "default_unified_delay", alias = "unified_delay")]
     pub unified_delay: bool,
 
@@ -187,6 +191,7 @@ impl Default for ClashConfig {
             log_level: default_log_level(),
             external_controller: default_external_controller(),
             secret: None,
+            is_ephemeral_secret: false,
             unified_delay: default_unified_delay(),
             geodata_mode: false,
             mmdb_path: None,
@@ -494,8 +499,23 @@ impl ClashConfig {
                 ))
             }
         })?;
+        cfg.normalize_secret();
         cfg.sync_root_hosts_into_dns();
         Ok(cfg)
+    }
+
+    pub fn normalize_secret(&mut self) {
+        if let Some(ref mut s) = self.secret {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                self.secret = None;
+                self.is_ephemeral_secret = false;
+            } else if trimmed.len() != s.len() {
+                *s = trimmed.to_string();
+            }
+        } else {
+            self.is_ephemeral_secret = false;
+        }
     }
 
     pub fn sync_root_hosts_into_dns(&mut self) {
@@ -608,6 +628,7 @@ impl ClashConfig {
             }
         })?;
 
+        cfg.normalize_secret();
         cfg.sync_root_hosts_into_dns();
         sanitize_subscription_groups_and_rules(&mut cfg, &skipped_names);
 
@@ -630,6 +651,19 @@ impl ClashConfig {
             .map_err(|e| ProxyError::Config(format!("YAML serialize error: {e}")))
     }
 
+    /// Serialize to YAML for on-disk profile persistence, omitting `secret` when it was
+    /// auto-generated as a session-only ephemeral secret (`is_ephemeral_secret == true`).
+    pub fn to_disk_yaml_string(&self) -> Result<String> {
+        if self.is_ephemeral_secret {
+            let mut disk_copy = self.clone();
+            disk_copy.secret = None;
+            disk_copy.is_ephemeral_secret = false;
+            disk_copy.to_yaml_string()
+        } else {
+            self.to_yaml_string()
+        }
+    }
+
     /// Ensures `self.secret` contains a non-empty controller secret, generating a
     /// 256-bit OS CSPRNG hex secret if `self.secret` is `None` or whitespace-only.
     pub fn ensure_ephemeral_secret(&mut self) -> String {
@@ -645,6 +679,7 @@ impl ClashConfig {
         }
         let secret = crate::api::generate_ephemeral_secret();
         self.secret = Some(secret.clone());
+        self.is_ephemeral_secret = true;
         secret
     }
 
@@ -784,6 +819,7 @@ rules:
     pub fn restore_redacted_from(&mut self, prev: &ClashConfig) {
         if self.secret.as_deref() == Some(REDACTED_SECRET) {
             self.secret = prev.secret.clone();
+            self.is_ephemeral_secret = prev.is_ephemeral_secret;
         }
         for entry in &mut self.authentication {
             if let Some((user, pass)) = entry.split_once(':')
@@ -1624,6 +1660,14 @@ fn normalize_clash_yaml_root_mapping(map: &mut YamlMap, lenient_subscription: bo
             coerce_yaml_string(v);
         }
     }
+    if let Some(YamlValue::String(sec)) = map.get_mut("secret") {
+        let trimmed = sec.trim().to_string();
+        if trimmed.is_empty() {
+            map.remove("secret");
+        } else {
+            *sec = trimmed;
+        }
+    }
     if lenient_subscription
         && let Some(mval) = map.get("mode")
         && mval.as_str().is_none_or(|s| {
@@ -2144,7 +2188,9 @@ pub(crate) fn decode_http_chunked_body(mut input: &[u8], max_bytes: usize) -> Re
     let mut out = Vec::new();
     loop {
         let Some(crlf) = input.windows(2).position(|w| w == b"\r\n") else {
-            return Err(ProxyError::Config("truncated HTTP chunk header".into()));
+            return Err(ProxyError::Config(
+                "truncated HTTP chunk header (missing terminal 0-size chunk)".into(),
+            ));
         };
         let len_str = std::str::from_utf8(&input[..crlf])
             .map_err(|_| ProxyError::Config("invalid HTTP chunk size header".into()))?
@@ -2152,6 +2198,11 @@ pub(crate) fn decode_http_chunked_body(mut input: &[u8], max_bytes: usize) -> Re
             .next()
             .unwrap_or("")
             .trim();
+        if len_str.is_empty() || !len_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ProxyError::Config(
+                "invalid chunked transfer hex length".into(),
+            ));
+        }
         let chunk_len = usize::from_str_radix(len_str, 16)
             .map_err(|_| ProxyError::Config("invalid chunked transfer hex length".into()))?;
         let after_hdr = crlf
@@ -4234,5 +4285,47 @@ rules:
         assert!(dns_engine.should_bypass_fake_ip("stun1.l.google.com"));
         assert!(dns_engine.should_bypass_fake_ip("0.cn.pool.ntp.org"));
         assert!(dns_engine.should_bypass_fake_ip("captive.apple.com"));
+    }
+
+    #[test]
+    fn whitespace_secret_normalizes_to_none_and_ephemeral_secret_omitted_from_disk_yaml() {
+        let ws_yaml = "mixed-port: 7890\nsecret: \"   \\t  \"\nrules:\n  - MATCH,DIRECT\n";
+        let mut cfg = ClashConfig::from_yaml_str(ws_yaml).expect("parse whitespace secret");
+        assert!(cfg.secret.is_none());
+        assert!(!cfg.is_ephemeral_secret);
+
+        let padded_yaml =
+            "mixed-port: 7890\nsecret: \"  my-token-123  \"\nrules:\n  - MATCH,DIRECT\n";
+        let mut explicit_cfg =
+            ClashConfig::from_yaml_str(padded_yaml).expect("parse padded secret");
+        assert_eq!(explicit_cfg.secret.as_deref(), Some("my-token-123"));
+        assert!(!explicit_cfg.is_ephemeral_secret);
+        assert_eq!(explicit_cfg.ensure_ephemeral_secret(), "my-token-123");
+        assert!(!explicit_cfg.is_ephemeral_secret);
+        assert!(
+            explicit_cfg
+                .to_disk_yaml_string()
+                .unwrap()
+                .contains("my-token-123")
+        );
+
+        let generated = cfg.ensure_ephemeral_secret();
+        assert_eq!(generated.len(), 64);
+        assert!(cfg.is_ephemeral_secret);
+        assert_eq!(cfg.secret.as_deref(), Some(generated.as_str()));
+
+        let disk_yaml = cfg.to_disk_yaml_string().expect("disk yaml");
+        assert!(
+            !disk_yaml.contains(&generated),
+            "ephemeral secret must never be written into disk profile YAML"
+        );
+        let reloaded_disk = ClashConfig::from_yaml_str(&disk_yaml).expect("reload disk yaml");
+        assert!(reloaded_disk.secret.is_none());
+
+        let redacted_yaml = cfg.redacted().to_yaml_string().unwrap();
+        let mut roundtrip = ClashConfig::from_yaml_str(&redacted_yaml).unwrap();
+        roundtrip.restore_redacted_from(&cfg);
+        assert_eq!(roundtrip.secret.as_deref(), Some(generated.as_str()));
+        assert!(roundtrip.is_ephemeral_secret);
     }
 }

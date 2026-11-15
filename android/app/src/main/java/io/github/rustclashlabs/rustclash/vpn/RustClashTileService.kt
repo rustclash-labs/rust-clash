@@ -62,36 +62,62 @@ class RustClashTileService : TileService() {
             syncTileUi()
             return
         }
-        if (currentState == VpnLifecycleState.PREPARING || currentState == VpnLifecycleState.STOPPING) {
+        if (currentState == VpnLifecycleState.STOPPING) {
             syncTileUi()
             return
+        }
+        if (currentState == VpnLifecycleState.PREPARING) {
+            val consentNeeded = runCatching { VpnService.prepare(this) != null }.getOrDefault(true)
+            if (consentNeeded) {
+                // Reconcile orphaned PREPARING state and open MainActivity so the user can complete consent.
+                RustClashVpnService.stateTracker.onStopped()
+                syncTileUi()
+                val openIntent = Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                launchMainActivityAndCollapse(openIntent)
+                return
+            }
+            // VPN consent is already granted; clear stale PREPARING state and proceed to start.
+            RustClashVpnService.stateTracker.onStopped()
         }
         if (clickJob?.isActive == true) {
             return
         }
 
         val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
-        val demoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
         val appContext = applicationContext
         val stateDirPath = filesDir.absolutePath
 
         clickJob = tileScope.launch {
-            val shouldOpenAppForEmptyNodes = if (demoMode) {
-                false
-            } else {
-                withContext(Dispatchers.IO) {
-                    if (!NativeBridge.ensureLoaded()) {
-                        false
-                    } else {
-                        val snap = io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.parseNodeManagerSnapshot(
-                            NativeBridge.nativeGetNodeManagerSnapshot(stateDirPath),
-                        )
-                        snap.ok &&
-                            snap.nodes.isEmpty() &&
-                            snap.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
-                    }
+            val snapInfo = withContext(Dispatchers.IO) {
+                if (!NativeBridge.ensureLoaded()) {
+                    null
+                } else {
+                    io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers.parseNodeManagerSnapshot(
+                        NativeBridge.nativeGetNodeManagerSnapshot(stateDirPath),
+                    )
                 }
             }
+
+            // Re-validate lifecycle state & Demo Mode preference on Main.immediate after async IO returns
+            // so concurrent connect/disconnect or Demo Sandbox exits never act on stale pre-IO state!
+            val latestState = RustClashVpnService.stateTracker.state
+            if (latestState == VpnLifecycleState.RUNNING ||
+                latestState == VpnLifecycleState.STARTING ||
+                latestState == VpnLifecycleState.RECONNECTING ||
+                latestState == VpnLifecycleState.STOPPING
+            ) {
+                syncTileUi()
+                return@launch
+            }
+
+            val latestDemoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
+            val shouldOpenAppForEmptyNodes = !latestDemoMode &&
+                snapInfo != null &&
+                snapInfo.ok &&
+                snapInfo.nodes.isEmpty() &&
+                snapInfo.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
 
             if (shouldOpenAppForEmptyNodes) {
                 val openIntent = Intent(this@RustClashTileService, MainActivity::class.java).apply {
@@ -101,11 +127,12 @@ class RustClashTileService : TileService() {
                 return@launch
             }
 
-            val prepareIntent = VpnService.prepare(this@RustClashTileService)
+            val prepareIntent = runCatching { VpnService.prepare(this@RustClashTileService) }.getOrNull()
             if (prepareIntent == null) {
+                RustClashVpnService.stateTracker.onStartRequested()
                 val startIntent = Intent(appContext, RustClashVpnService::class.java).apply {
                     action = RustClashVpnService.ACTION_START_VPN
-                    putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)
+                    putExtra(RustClashVpnService.EXTRA_DEMO_MODE, latestDemoMode)
                 }
                 ContextCompat.startForegroundService(appContext, startIntent)
                 syncTileUi()

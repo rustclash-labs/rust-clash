@@ -740,6 +740,26 @@ async fn exchange_doh_over_stream(
     Ok((wire, false))
 }
 
+fn evict_h2_client_from_slot(slot: &H2Slot, target: &Arc<H2DohClient>) {
+    if let Ok(mut slot_guard) = slot.try_lock() {
+        if slot_guard.as_ref().is_some_and(|c| Arc::ptr_eq(c, target)) {
+            *slot_guard = None;
+        }
+    } else {
+        let slot_bg = Arc::clone(slot);
+        let target_bg = Arc::clone(target);
+        tokio::spawn(async move {
+            let mut slot_guard = slot_bg.lock().await;
+            if slot_guard
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(c, &target_bg))
+            {
+                *slot_guard = None;
+            }
+        });
+    }
+}
+
 /// Forward a DNS query over RFC 8484 DNS-over-HTTPS (`POST` `application/dns-message`) using
 /// `SocketProtector`, multiplexed HTTP/2 (`h2`) session pooling, and HTTP/1.1 keep-alive fallback.
 pub async fn forward_doh_dns(
@@ -750,6 +770,30 @@ pub async fn forward_doh_dns(
     skip_cert_verify: bool,
     extra_ca_der: &[CertificateDer<'static>],
     query: &[u8],
+) -> Result<Vec<u8>> {
+    forward_doh_dns_with_timeout(
+        ns,
+        sni,
+        host_header,
+        path_and_query,
+        skip_cert_verify,
+        extra_ca_der,
+        query,
+        DNS_IO_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_doh_dns_with_timeout(
+    ns: SocketAddr,
+    sni: &str,
+    host_header: &str,
+    path_and_query: &str,
+    skip_cert_verify: bool,
+    extra_ca_der: &[CertificateDer<'static>],
+    query: &[u8],
+    io_timeout: Duration,
 ) -> Result<Vec<u8>> {
     if query.len() < 12 {
         return Err(ProxyError::Dns("invalid DoH query length".into()));
@@ -774,7 +818,7 @@ pub async fn forward_doh_dns(
     // 1. Fast path for HTTP/1.1 keep-alive servers already in `TLS_DNS_POOL`
     if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
         && let Ok(Ok((resp, reusable))) = tokio::time::timeout(
-            DNS_IO_TIMEOUT,
+            io_timeout,
             exchange_doh_over_stream(&mut pooled, host_header, path_and_query, &doh_wire, orig_id),
         )
         .await
@@ -792,13 +836,15 @@ pub async fn forward_doh_dns(
     let server_name = crate::crypto::tls::parse_server_name(sni)?;
 
     let h2_slot = get_h2_slot(&pool_key);
+    let mut used_h2_client: Option<Arc<H2DohClient>> = None;
 
-    let first_attempt = tokio::time::timeout(DNS_IO_TIMEOUT, async {
+    let first_attempt = match tokio::time::timeout(io_timeout, async {
         let mut slot_guard = h2_slot.lock().await;
         if let Some(existing) = slot_guard.as_ref()
             && existing.is_reusable()
         {
             let client = Arc::clone(existing);
+            used_h2_client = Some(Arc::clone(&client));
             drop(slot_guard);
             return client
                 .exchange(host_header, path_and_query, &doh_wire)
@@ -839,6 +885,7 @@ pub async fn forward_doh_dns(
         if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
             let client = H2DohClient::spawn(tls);
             *slot_guard = Some(Arc::clone(&client));
+            used_h2_client = Some(Arc::clone(&client));
             drop(slot_guard);
             client
                 .exchange(host_header, path_and_query, &doh_wire)
@@ -868,14 +915,35 @@ pub async fn forward_doh_dns(
         }
     })
     .await
-    .map_err(|_| ProxyError::Timeout)?;
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            if let Some(dead_client) = used_h2_client.take() {
+                dead_client.mark_closed_on_timeout();
+                evict_h2_client_from_slot(&h2_slot, &dead_client);
+            }
+            return Err(ProxyError::Timeout);
+        }
+    };
 
     match first_attempt {
         H2DohOutcome::Body(body) => finalize_doh_body(body, expected_query.as_ref(), orig_id),
-        H2DohOutcome::Fatal(err) => Err(err),
+        H2DohOutcome::Fatal(err) => {
+            if let Some(prev) = used_h2_client.as_ref()
+                && !prev.is_reusable()
+            {
+                evict_h2_client_from_slot(&h2_slot, prev);
+            }
+            Err(err)
+        }
         H2DohOutcome::RetryOnFreshConn => {
-            // Reused stream (>1) hit server close / GOAWAY / REFUSED_STREAM: retry once on Stream 1!
-            tokio::time::timeout(DNS_IO_TIMEOUT, async {
+            if let Some(prev) = used_h2_client.as_ref()
+                && !prev.is_reusable()
+            {
+                evict_h2_client_from_slot(&h2_slot, prev);
+            }
+            // Unprocessed stream hit server close / GOAWAY / REFUSED_STREAM: retry once on a fresh connection!
+            tokio::time::timeout(io_timeout, async {
                 let tcp = protected_tcp_connect_addr(ns).await?;
                 let mut tls = connector.connect(server_name, tcp).await?;
                 if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
@@ -1222,7 +1290,14 @@ fn encode_doh_h2_request_frames(
 
 impl H2DohClient {
     fn spawn(tls: TlsStream<TcpStream>) -> Arc<Self> {
-        let (mut rd, mut wr) = tokio::io::split(tls);
+        Self::spawn_io(tls)
+    }
+
+    fn spawn_io<S>(io: S) -> Arc<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut rd, mut wr) = tokio::io::split(io);
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<BytesMut>();
         let pending: Arc<DashMap<u32, H2StreamAcc>> = Arc::new(DashMap::new());
         let closed = Arc::new(AtomicBool::new(false));
@@ -1264,19 +1339,18 @@ impl H2DohClient {
         let write_tx_rd = write_tx.clone();
 
         let reader_jh = tokio::spawn(async move {
+            const H2_ERR_REFUSED_STREAM: u32 = 0x7;
             let mut dyn_table: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             let mut goaway_seen = false;
+            let mut goaway_last_sid: Option<u32> = None;
+            let mut completed_any_stream = false;
             let fail_err = loop {
                 let read_res = tokio::time::timeout(DNS_TLS_IDLE_TTL, read_h2_frame(&mut rd)).await;
                 let (ftype, flags, stream_id, payload) = match read_res {
                     Ok(Ok(f)) => f,
                     Ok(Err(e)) => break e,
-                    Err(_) => {
-                        if pending_rd.is_empty() {
-                            break ProxyError::Timeout;
-                        }
-                        continue;
-                    }
+                    // 45s with zero HTTP/2 frames (even if streams are pending) proves the connection is dead/blackholed.
+                    Err(_) => break ProxyError::Timeout,
                 };
 
                 match ftype {
@@ -1314,7 +1388,11 @@ impl H2DohClient {
                             0
                         };
                         if let Some((sid, acc)) = pending_rd.remove(&stream_id) {
-                            let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                            let can_retry = !acc.seen_final_status
+                                && (sid > 1
+                                    || code == H2_ERR_REFUSED_STREAM
+                                    || completed_any_stream);
+                            let _ = acc.tx.send(if can_retry {
                                 H2DohOutcome::RetryOnFreshConn
                             } else {
                                 H2DohOutcome::Fatal(ProxyError::Dns(format!(
@@ -1335,13 +1413,16 @@ impl H2DohClient {
                         } else {
                             0
                         };
+                        goaway_last_sid = Some(last_sid);
                         let keys: Vec<u32> = pending_rd
                             .iter()
                             .filter_map(|e| (*e.key() > last_sid).then_some(*e.key()))
                             .collect();
                         for sid in keys {
                             if let Some((_, acc)) = pending_rd.remove(&sid) {
-                                let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                                // RFC 9113 §6.8: any stream with stream_id > last_stream_id (even sid == 1 when last_sid == 0)
+                                // was NOT processed by the server and is safe to retry on a fresh connection.
+                                let _ = acc.tx.send(if !acc.seen_final_status {
                                     H2DohOutcome::RetryOnFreshConn
                                 } else {
                                     H2DohOutcome::Fatal(ProxyError::Dns(format!(
@@ -1446,6 +1527,9 @@ impl H2DohClient {
                         if let Some(outcome) = finish
                             && let Some((_, acc)) = pending_rd.remove(&stream_id)
                         {
+                            if matches!(outcome, H2DohOutcome::Body(_)) {
+                                completed_any_stream = true;
+                            }
                             let _ = acc.tx.send(outcome);
                         }
                         if goaway_seen && pending_rd.is_empty() {
@@ -1502,6 +1586,9 @@ impl H2DohClient {
                         if let Some(outcome) = finish
                             && let Some((_, acc)) = pending_rd.remove(&stream_id)
                         {
+                            if matches!(outcome, H2DohOutcome::Body(_)) {
+                                completed_any_stream = true;
+                            }
                             let _ = acc.tx.send(outcome);
                         }
                         if goaway_seen && pending_rd.is_empty() {
@@ -1517,7 +1604,11 @@ impl H2DohClient {
             let keys: Vec<u32> = pending_rd.iter().map(|e| *e.key()).collect();
             for sid in keys {
                 if let Some((_, acc)) = pending_rd.remove(&sid) {
-                    let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                    let can_retry = !acc.seen_final_status
+                        && (sid > 1
+                            || completed_any_stream
+                            || goaway_last_sid.is_some_and(|last| sid > last));
+                    let _ = acc.tx.send(if can_retry {
                         H2DohOutcome::RetryOnFreshConn
                     } else {
                         let msg = fail_err.to_string();
@@ -1564,9 +1655,12 @@ impl H2DohClient {
     ) -> H2DohOutcome {
         let mut req_buf = BytesMut::with_capacity(224 + doh_wire.len());
         let (sid, rx, mut guard) = {
-            // Hold non-blocking lock across stream ID assignment + write_tx enqueue so
-            // HTTP/2 HEADERS frames are strictly emitted in ascending stream ID order (RFC 9113 §5.1.1).
+            // Hold non-blocking lock across stream ID assignment + pending registration + write_tx enqueue
+            // so HTTP/2 HEADERS frames are strictly emitted in ascending stream ID order (RFC 9113 §5.1.1).
             let _open_guard = self.stream_open_lock.lock();
+            if self.closed.load(Ordering::Acquire) {
+                return H2DohOutcome::RetryOnFreshConn;
+            }
             let sid = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
             if sid > H2_MAX_STREAMS_PER_CONN * 2 + 1 {
                 self.closed.store(true, Ordering::Release);
@@ -1624,6 +1718,22 @@ impl H2DohClient {
                         "DoH HTTP/2 response channel dropped".into(),
                     ))
                 }
+            }
+        }
+    }
+
+    fn mark_closed_on_timeout(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.reader_abort.abort();
+        self.writer_abort.abort();
+        let keys: Vec<u32> = self.pending.iter().map(|e| *e.key()).collect();
+        for sid in keys {
+            if let Some((_, acc)) = self.pending.remove(&sid) {
+                let _ = acc.tx.send(if sid > 1 && !acc.seen_final_status {
+                    H2DohOutcome::RetryOnFreshConn
+                } else {
+                    H2DohOutcome::Fatal(ProxyError::Timeout)
+                });
             }
         }
     }
@@ -2168,5 +2278,351 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(decoded, vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x01]);
+    }
+
+    async fn mock_write_h2_doh_response<S: AsyncWrite + Unpin>(
+        io: &mut S,
+        stream_id: u32,
+        req_payload: &[u8],
+        ip: std::net::Ipv4Addr,
+    ) {
+        let qp = crate::dns::wire::DnsQueryPacket::parse(req_payload).unwrap();
+        let dns_resp = qp.build_response(
+            req_payload,
+            0,
+            60,
+            &[crate::dns::wire::DnsAnswerData::A(ip)],
+        );
+        let mut out = BytesMut::with_capacity(32 + dns_resp.len());
+        // Indexed `:status: 200` -> 0x88
+        put_h2_frame_header(
+            &mut out,
+            1,
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS,
+            stream_id,
+        );
+        out.put_u8(0x88);
+        put_h2_frame_header(
+            &mut out,
+            dns_resp.len(),
+            H2_FRAME_DATA,
+            H2_FLAG_END_STREAM,
+            stream_id,
+        );
+        out.put_slice(&dns_resp);
+        io.write_all(&out).await.unwrap();
+        io.flush().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_doh_concurrent_exchange_emits_strictly_monotonic_stream_ids() {
+        const CONCURRENCY: usize = 32;
+        let (client_io, mut server_io) = tokio::io::duplex(256 * 1024);
+        let client = H2DohClient::spawn_io(client_io);
+
+        let srv_jh = tokio::spawn(async move {
+            let mut preface = [0u8; H2_CLIENT_PREFACE.len()];
+            server_io.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, H2_CLIENT_PREFACE);
+
+            let mut srv_settings = BytesMut::with_capacity(9);
+            put_h2_frame_header(&mut srv_settings, 0, H2_FRAME_SETTINGS, 0, 0);
+            server_io.write_all(&srv_settings).await.unwrap();
+            server_io.flush().await.unwrap();
+
+            let mut seen_header_sids = Vec::with_capacity(CONCURRENCY);
+            let mut answered = 0usize;
+            while answered < CONCURRENCY {
+                let (ftype, flags, sid, payload) = read_h2_frame(&mut server_io).await.unwrap();
+                match ftype {
+                    H2_FRAME_HEADERS if sid > 0 => {
+                        if let Some(&prev) = seen_header_sids.last() {
+                            assert!(
+                                sid > prev,
+                                "out-of-order HTTP/2 HEADERS stream_id: {sid} after {prev}"
+                            );
+                        }
+                        seen_header_sids.push(sid);
+                    }
+                    H2_FRAME_DATA if sid > 0 && (flags & H2_FLAG_END_STREAM) != 0 => {
+                        mock_write_h2_doh_response(
+                            &mut server_io,
+                            sid,
+                            &payload,
+                            std::net::Ipv4Addr::new(93, 184, 216, 34),
+                        )
+                        .await;
+                        answered += 1;
+                    }
+                    _ => {}
+                }
+            }
+            seen_header_sids
+        });
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+        let mut handles = Vec::with_capacity(CONCURRENCY);
+        for i in 0..CONCURRENCY {
+            let c = Arc::clone(&client);
+            let b = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let q = crate::dns::wire::build_dns_query(
+                    0,
+                    &format!("h{i}.example.com"),
+                    crate::dns::wire::QTYPE_A,
+                );
+                b.wait().await;
+                match c.exchange("localhost", "/dns-query", &q).await {
+                    H2DohOutcome::Body(body) => assert!(body.len() >= 12),
+                    other => panic!(
+                        "unexpected H2DohOutcome variant: {}",
+                        matches!(other, H2DohOutcome::RetryOnFreshConn)
+                    ),
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        let seen_sids = srv_jh.await.unwrap();
+        let expected: Vec<u32> = (0..CONCURRENCY as u32).map(|i| i * 2 + 1).collect();
+        assert_eq!(seen_sids, expected);
+    }
+
+    #[tokio::test]
+    async fn h2_doh_goaway_zero_and_reader_teardown_retry_classification() {
+        let q =
+            crate::dns::wire::build_dns_query(0, "retry.example.com", crate::dns::wire::QTYPE_A);
+
+        // 1. GOAWAY(last_stream_id = 0) before Stream 1 response MUST classify Stream 1 as RetryOnFreshConn
+        {
+            let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+            let client = H2DohClient::spawn_io(client_io);
+            let srv = tokio::spawn(async move {
+                let mut preface = [0u8; H2_CLIENT_PREFACE.len()];
+                server_io.read_exact(&mut preface).await.unwrap();
+                loop {
+                    let (ftype, flags, sid, _) = read_h2_frame(&mut server_io).await.unwrap();
+                    if ftype == H2_FRAME_DATA && sid == 1 && (flags & H2_FLAG_END_STREAM) != 0 {
+                        let mut goaway = BytesMut::with_capacity(17);
+                        put_h2_frame_header(&mut goaway, 8, H2_FRAME_GOAWAY, 0, 0);
+                        goaway.put_u32(0); // last_stream_id = 0 -> Stream 1 was NOT processed
+                        goaway.put_u32(0); // NO_ERROR
+                        server_io.write_all(&goaway).await.unwrap();
+                        server_io.flush().await.unwrap();
+                        break;
+                    }
+                }
+            });
+            assert!(matches!(
+                client.exchange("localhost", "/dns-query", &q).await,
+                H2DohOutcome::RetryOnFreshConn
+            ));
+            srv.await.unwrap();
+        }
+
+        // 2. Brand-new connection immediate EOF with zero completed streams on Stream 1 -> Fatal (no dead-server retry loop)
+        {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            drop(server_io);
+            let client = H2DohClient::spawn_io(client_io);
+            assert!(matches!(
+                client.exchange("localhost", "/dns-query", &q).await,
+                H2DohOutcome::Fatal(_)
+            ));
+        }
+
+        // 3. Reused connection (after Stream 1 succeeded) hitting abrupt EOF on Stream 3 -> RetryOnFreshConn
+        {
+            let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+            let client = H2DohClient::spawn_io(client_io);
+            let srv = tokio::spawn(async move {
+                let mut preface = [0u8; H2_CLIENT_PREFACE.len()];
+                server_io.read_exact(&mut preface).await.unwrap();
+                loop {
+                    let (ftype, flags, sid, payload) = read_h2_frame(&mut server_io).await.unwrap();
+                    if ftype == H2_FRAME_DATA && sid == 1 && (flags & H2_FLAG_END_STREAM) != 0 {
+                        mock_write_h2_doh_response(
+                            &mut server_io,
+                            1,
+                            &payload,
+                            std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        )
+                        .await;
+                    } else if ftype == H2_FRAME_HEADERS && sid == 3 {
+                        // Simulate abrupt TCP reset/EOF before Stream 3 gets any response
+                        break;
+                    }
+                }
+            });
+            assert!(matches!(
+                client.exchange("localhost", "/dns-query", &q).await,
+                H2DohOutcome::Body(_)
+            ));
+            assert!(matches!(
+                client.exchange("localhost", "/dns-query", &q).await,
+                H2DohOutcome::RetryOnFreshConn
+            ));
+            srv.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn doh_timeout_immediately_evicts_blackholed_h2_client_from_pool() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (server_cfg, cert_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &["localhost".to_string()],
+            &[b"h2".to_vec()],
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ns = listener.local_addr().unwrap();
+        let accepted_conns = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = Arc::clone(&accepted_conns);
+
+        let srv_jh = tokio::spawn(async move {
+            // Connection #1: answers Stream 1, then blackholes Stream 3 forever
+            let (tcp1, _) = listener.accept().await.unwrap();
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            let mut tls1 = acceptor.accept(tcp1).await.unwrap();
+            let h1 = tokio::spawn(async move {
+                let mut preface = [0u8; H2_CLIENT_PREFACE.len()];
+                tls1.read_exact(&mut preface).await.unwrap();
+                let mut srv_settings = BytesMut::with_capacity(9);
+                put_h2_frame_header(&mut srv_settings, 0, H2_FRAME_SETTINGS, 0, 0);
+                tls1.write_all(&srv_settings).await.unwrap();
+                tls1.flush().await.unwrap();
+                loop {
+                    let Ok((ftype, flags, sid, payload)) = read_h2_frame(&mut tls1).await else {
+                        break;
+                    };
+                    if ftype == H2_FRAME_DATA && sid == 1 && (flags & H2_FLAG_END_STREAM) != 0 {
+                        mock_write_h2_doh_response(
+                            &mut tls1,
+                            1,
+                            &payload,
+                            std::net::Ipv4Addr::new(198, 51, 100, 1),
+                        )
+                        .await;
+                    } else if ftype == H2_FRAME_DATA
+                        && sid == 3
+                        && (flags & H2_FLAG_END_STREAM) != 0
+                    {
+                        // Blackhole: keep TCP/TLS socket open without ever replying
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        break;
+                    }
+                }
+            });
+
+            // Connection #2: healthy replacement connection after pool eviction
+            let (tcp2, _) = listener.accept().await.unwrap();
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            let mut tls2 = acceptor.accept(tcp2).await.unwrap();
+            let mut preface = [0u8; H2_CLIENT_PREFACE.len()];
+            tls2.read_exact(&mut preface).await.unwrap();
+            let mut srv_settings = BytesMut::with_capacity(9);
+            put_h2_frame_header(&mut srv_settings, 0, H2_FRAME_SETTINGS, 0, 0);
+            tls2.write_all(&srv_settings).await.unwrap();
+            tls2.flush().await.unwrap();
+            loop {
+                let Ok((ftype, flags, sid, payload)) = read_h2_frame(&mut tls2).await else {
+                    break;
+                };
+                if ftype == H2_FRAME_DATA && sid == 1 && (flags & H2_FLAG_END_STREAM) != 0 {
+                    mock_write_h2_doh_response(
+                        &mut tls2,
+                        1,
+                        &payload,
+                        std::net::Ipv4Addr::new(198, 51, 100, 2),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            h1.abort();
+        });
+
+        let extra_ca = [cert_der];
+        let q1 =
+            crate::dns::wire::build_dns_query(0x1111, "one.example", crate::dns::wire::QTYPE_A);
+        let r1 = forward_doh_dns_with_timeout(
+            ns,
+            "localhost",
+            "localhost",
+            "/dns-query",
+            false,
+            &extra_ca,
+            &q1,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!([r1[0], r1[1]], [0x11, 0x11]);
+        assert_eq!(accepted_conns.load(Ordering::SeqCst), 1);
+
+        let pool_key = TlsDnsPoolKey {
+            ns,
+            sni: "localhost".to_string(),
+            skip_cert_verify: false,
+            is_doh: true,
+            extra_ca_hash: hash_extra_ca(&extra_ca),
+            protector_epoch: current_protector_epoch(),
+        };
+        let slot = get_h2_slot(&pool_key);
+        let pooled_conn1 = slot.lock().await.clone().expect("conn1 must be pooled");
+        assert!(pooled_conn1.is_reusable());
+
+        // Query 2 hits blackhole on Connection #1 and times out after 120ms
+        let q2 =
+            crate::dns::wire::build_dns_query(0x2222, "two.example", crate::dns::wire::QTYPE_A);
+        let err = forward_doh_dns_with_timeout(
+            ns,
+            "localhost",
+            "localhost",
+            "/dns-query",
+            false,
+            &extra_ca,
+            &q2,
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ProxyError::Timeout));
+
+        // Blackholed client MUST be marked closed AND evicted from H2_DNS_POOL immediately!
+        assert!(!pooled_conn1.is_reusable());
+        assert!(slot.lock().await.is_none());
+
+        // Query 3 immediately dials fresh Connection #2 instead of stalling on blackholed Connection #1
+        let q3 =
+            crate::dns::wire::build_dns_query(0x3333, "three.example", crate::dns::wire::QTYPE_A);
+        let r3 = forward_doh_dns_with_timeout(
+            ns,
+            "localhost",
+            "localhost",
+            "/dns-query",
+            false,
+            &extra_ca,
+            &q3,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!([r3[0], r3[1]], [0x33, 0x33]);
+        assert_eq!(accepted_conns.load(Ordering::SeqCst), 2);
+        let meta = crate::dns::wire::extract_dns_response_meta(&r3).unwrap();
+        assert_eq!(
+            meta.answers,
+            vec![crate::dns::wire::DnsAnswerData::A(std::net::Ipv4Addr::new(
+                198, 51, 100, 2
+            ))]
+        );
+
+        srv_jh.await.unwrap();
     }
 }

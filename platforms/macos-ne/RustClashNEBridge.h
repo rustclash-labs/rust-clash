@@ -25,6 +25,16 @@ RcNeEngineHandle *rc_ne_start_engine(
     char **out_error
 );
 
+/// Start the pure-Rust `rust-clash` engine inside `NEPacketTunnelProvider` with explicit IPv6 sync
+/// (`cfg.tun.ipv6 = enable_ipv6` and `cfg.dns.ipv6 = enable_ipv6`).
+/// Returns NULL on error and populates `*out_error` (caller frees with `rc_ne_free_string`).
+RcNeEngineHandle *rc_ne_start_engine_v2(
+    const char *yaml_config,
+    uint16_t mtu,
+    bool enable_ipv6,
+    char **out_error
+);
+
 /// Push a single raw L3 IPv4/IPv6 packet read from `NEPacketTunnelFlow` into `smoltcp`.
 /// Returns `true` if queued, `false` on backpressure or after `rc_ne_stop_engine`.
 bool rc_ne_push_inbound_packet(
@@ -37,7 +47,8 @@ bool rc_ne_push_inbound_packet(
 /// - `timeout_ms < 0`: blocks until a packet arrives or `rc_ne_stop_engine` wakes the waiter.
 /// - `timeout_ms == 0`: non-blocking poll.
 /// - `timeout_ms > 0`: blocks up to `timeout_ms` ms.
-/// Returns byte length (`> 0`), `0` on timeout/empty, or `-1` when stopped/invalid.
+/// Returns byte length (`> 0`), `0` on timeout/empty, `-1` when stopped/invalid, or `-2` when an
+/// oversized packet exceeded `buf_cap` and was dropped.
 ssize_t rc_ne_wait_outbound_packet(
     RcNeEngineHandle *handle,
     uint8_t *out_buf,

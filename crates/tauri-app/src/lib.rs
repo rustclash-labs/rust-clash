@@ -19,7 +19,7 @@ use proxy_core::{
     platform::{
         autostart::{AutostartManager, AutostartStatus},
         recovery::{SingleInstanceGuard, default_state_dir, recover_stale_network_state},
-        sysproxy::{SysProxyStatus, query_sysproxy_status},
+        sysproxy::{SysProxyStatus, disable_system_proxy, query_sysproxy_status},
         tun::preflight_system_tun,
     },
     profile::ProfileManager,
@@ -38,6 +38,68 @@ const IPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Normalizes wildcard listener addresses (`0.0.0.0:port` and `[::]:port`) to `127.0.0.1:port`
+/// so local clients and WebView `fetch` / `WebSocket` calls receive a dialable loopback address.
+pub fn normalize_local_connect_addr(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], addr.port()))
+    } else {
+        addr
+    }
+}
+
+/// Formats a bound `SocketAddr` into a dialable `http://...` base URL, normalizing wildcard
+/// addresses (`0.0.0.0` / `[::]`) to `127.0.0.1` and bracket-wrapping explicit IPv6 addresses.
+pub fn format_http_base_url(addr: SocketAddr) -> String {
+    match normalize_local_connect_addr(addr) {
+        SocketAddr::V4(v4) => format!("http://{v4}"),
+        SocketAddr::V6(v6) => format!("http://[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+/// Derives the local connectable proxy host for OS System Proxy settings from `allow-lan` and
+/// `bind-address` so non-`127.0.0.1` binds (e.g. `::1` or a specific local interface IP) work.
+pub fn resolve_sysproxy_connect_host(cfg: &ClashConfig) -> String {
+    if cfg.allow_lan {
+        return "127.0.0.1".to_string();
+    }
+    match cfg.bind_address.trim() {
+        "" | "*" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        "::1" | "[::1]" => "::1".to_string(),
+        other => other
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(other)
+            .to_string(),
+    }
+}
+
+/// Waits for `SIGINT` (`Ctrl+C`) or, on Unix platforms, `SIGTERM` (`systemctl stop` / `kill <pid>`)
+/// so daemon, headless, and helper processes tear down TUN routes, DNS, and OS System Proxy cleanly.
+pub async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed registering SIGTERM handler ({err}); falling back to Ctrl-C only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 const fn default_close_to_tray() -> bool {
@@ -677,7 +739,7 @@ impl DesktopAppState {
             version: version().to_string(),
             mixed_listen: self.engine.mixed_addr().to_string(),
             dns_listen: self.engine.dns_addr().map(|a| a.to_string()),
-            api_base_url: format!("http://{}", self.api_addr),
+            api_base_url: format_http_base_url(self.api_addr),
             api_secret: cfg.secret.filter(|s| !s.is_empty()),
             mode: cfg.mode.as_str().to_string(),
             effective_outbound: eff.effective_outbound,
@@ -703,6 +765,10 @@ impl DesktopAppState {
             srv.stop();
         }
         let _ = self._shutdown_tx.send(true);
+        let state_dir = self.engine.state_dir();
+        if query_sysproxy_status(&state_dir).enabled {
+            let _ = disable_system_proxy(&state_dir);
+        }
         self.engine.shutdown();
         let _ = self.instance_guard.lock().take();
     }
@@ -751,9 +817,7 @@ pub fn run_desktop_app(rt: &tokio::runtime::Runtime, use_demo: bool) -> anyhow::
         );
         println!("  Mixed Inbound : {}", status.mixed_listen);
         println!("  Web Console   : {}", status.api_base_url);
-        rt.block_on(async {
-            let _ = tokio::signal::ctrl_c().await;
-        });
+        rt.block_on(wait_for_shutdown_signal());
         state.shutdown();
         Ok(())
     }
@@ -846,21 +910,55 @@ pub async fn run_elevated_tun_helper(config_path: &std::path::Path) -> anyhow::R
                 .unwrap_or("insufficient privileges")
         );
     }
+
+    let state_dir = default_state_dir();
+    let instance_guard = SingleInstanceGuard::acquire(&state_dir).map_err(|e| {
+        if e.kind() == io::ErrorKind::AddrInUse {
+            anyhow::anyhow!(
+                "Another RustClash instance is currently running (state directory '{}'). Please close the running non-elevated RustClash instance before starting --elevated-tun-helper.",
+                state_dir.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "failed to acquire RustClash single-instance lock in '{}': {e}",
+                state_dir.display()
+            )
+        }
+    })?;
+    let _ = recover_stale_network_state(&state_dir);
+
+    let generated_ephemeral = cfg.secret.as_deref().is_none_or(|s| s.trim().is_empty());
     cfg.ensure_ephemeral_secret();
     cfg.tun.enable = true;
     cfg.tun.auto_route = true;
     let engine = ProxyEngine::start_with_path(cfg, Some(canon)).await?;
+    if let Ok(profile_mgr) = ProfileManager::open_or_init(&state_dir) {
+        engine.attach_profile_manager(profile_mgr);
+    }
     let ctrl_listen = engine.config_snapshot().external_controller;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (_api_addr, _api_task) =
+    let (api_addr, _api_task) =
         match spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx.clone()).await {
             Ok(bound) => bound,
             Err(_) => spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx).await?,
         };
-    let _ = tokio::signal::ctrl_c().await;
+    let api_base_url = format_http_base_url(api_addr);
+    tracing::info!(
+        mixed_listen = %engine.mixed_addr(),
+        api_base_url = %api_base_url,
+        ephemeral_secret = generated_ephemeral,
+        "RustClash elevated TUN helper listening (Bearer secret active; redacted from logs)"
+    );
+
+    wait_for_shutdown_signal().await;
+    tracing::info!("Shutting down RustClash elevated TUN helper...");
     let _ = shutdown_tx.send(true);
+    if query_sysproxy_status(&state_dir).enabled {
+        let _ = disable_system_proxy(&state_dir);
+    }
     engine.shutdown();
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    drop(instance_guard);
     Ok(())
 }
 
@@ -870,7 +968,7 @@ mod desktop_ipc {
     use proxy_core::{
         config::RunMode,
         outbound::vless::encryption::{config::XorMode, generate_vless_encryption_pair},
-        platform::sysproxy::{disable_system_proxy, enable_system_proxy},
+        platform::sysproxy::enable_system_proxy,
     };
     use tauri::{
         Emitter, Manager, RunEvent, State, WindowEvent,
@@ -972,7 +1070,8 @@ mod desktop_ipc {
         let state_dir = state.engine.state_dir();
         if enable {
             let port = state.engine.mixed_addr().port();
-            enable_system_proxy("127.0.0.1", port, &[], &state_dir)
+            let host = resolve_sysproxy_connect_host(&state.engine.config_snapshot());
+            enable_system_proxy(&host, port, &[], &state_dir)
                 .map_err(|e| redact_sensitive_text(&e.to_string()))
         } else {
             disable_system_proxy(&state_dir).map_err(|e| redact_sensitive_text(&e.to_string()))
@@ -1080,7 +1179,8 @@ mod desktop_ipc {
                         disable_system_proxy(&dir)
                     } else {
                         let port = state.engine.mixed_addr().port();
-                        enable_system_proxy("127.0.0.1", port, &[], &dir)
+                        let host = resolve_sysproxy_connect_host(&state.engine.config_snapshot());
+                        enable_system_proxy(&host, port, &[], &dir)
                     };
                     if let Err(err) = result {
                         report_tray_error(
@@ -1150,6 +1250,32 @@ mod desktop_ipc {
                     });
                 });
 
+                #[cfg(unix)]
+                {
+                    let sigterm_state = setup_state.clone();
+                    let sigterm_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        match tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::terminate(),
+                        ) {
+                            Ok(mut sigterm) => {
+                                if sigterm.recv().await.is_some() {
+                                    tracing::info!(
+                                        "Received SIGTERM in Desktop GUI; tearing down TUN, DNS, and OS System Proxy before exit"
+                                    );
+                                    sigterm_state.shutdown();
+                                    sigterm_handle.exit(0);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed registering Desktop GUI SIGTERM listener: {err}"
+                                );
+                            }
+                        }
+                    });
+                }
+
                 match setup_system_tray(app.handle(), setup_state) {
                     Ok(()) => {
                         tray_flag_setup.store(true, Ordering::Release);
@@ -1214,6 +1340,7 @@ pub use desktop_ipc::run_tauri_window;
 mod tests {
     use std::{
         fs,
+        net::SocketAddr,
         path::PathBuf,
         sync::{
             Arc,
@@ -1222,12 +1349,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use proxy_core::platform::recovery::SingleInstanceGuard;
+    use proxy_core::{config::ClashConfig, platform::recovery::SingleInstanceGuard};
 
     use super::{
         DESKTOP_IPC_FILENAME, DESKTOP_PREFS_FILENAME, DesktopAppState, DesktopPrefs,
         DesktopWakeupServer, InstanceAcquireOutcome, acquire_or_signal_instance,
-        parse_elevated_tun_helper_args, try_signal_running_instance,
+        format_http_base_url, parse_elevated_tun_helper_args, resolve_sysproxy_connect_host,
+        try_signal_running_instance,
     };
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -1245,6 +1373,53 @@ mod tests {
     fn normal_gui_args_return_none() {
         assert!(parse_elevated_tun_helper_args(["--demo"]).is_none());
         assert!(parse_elevated_tun_helper_args(Vec::<String>::new()).is_none());
+    }
+
+    #[test]
+    fn wildcard_and_ipv6_controller_addrs_normalize_to_dialable_urls() {
+        let v4_wild: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+        assert_eq!(format_http_base_url(v4_wild), "http://127.0.0.1:9090");
+
+        let v6_wild: SocketAddr = "[::]:9090".parse().unwrap();
+        assert_eq!(format_http_base_url(v6_wild), "http://127.0.0.1:9090");
+
+        let v6_loopback: SocketAddr = "[::1]:9090".parse().unwrap();
+        assert_eq!(format_http_base_url(v6_loopback), "http://[::1]:9090");
+
+        let v4_lan: SocketAddr = "192.168.1.50:9095".parse().unwrap();
+        assert_eq!(format_http_base_url(v4_lan), "http://192.168.1.50:9095");
+    }
+
+    #[test]
+    fn sysproxy_connect_host_respects_allow_lan_and_bind_address() {
+        let mut cfg = ClashConfig {
+            allow_lan: false,
+            bind_address: "127.0.0.1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "127.0.0.1");
+
+        cfg.bind_address = "*".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "127.0.0.1");
+
+        cfg.bind_address = "0.0.0.0".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "127.0.0.1");
+
+        cfg.bind_address = "[::]".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "127.0.0.1");
+
+        cfg.bind_address = "::1".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "::1");
+
+        cfg.bind_address = "[::1]".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "::1");
+
+        cfg.bind_address = "127.0.0.2".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "127.0.0.2");
+
+        cfg.allow_lan = true;
+        cfg.bind_address = "192.168.1.25".to_string();
+        assert_eq!(resolve_sysproxy_connect_host(&cfg), "127.0.0.1");
     }
 
     #[test]

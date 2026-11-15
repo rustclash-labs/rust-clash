@@ -41,6 +41,8 @@ import org.json.JSONObject
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 internal fun isGlobalUnicastIpv6Address(addr: InetAddress?): Boolean {
     val v6 = addr as? Inet6Address ?: return false
@@ -77,6 +79,9 @@ class RustClashVpnService : VpnService() {
     private var screenStateReceiver: BroadcastReceiver? = null
     private val underlyingNetworkTracker = UnderlyingNetworkTracker()
     private val livePhysicalNetworks = ConcurrentHashMap<Long, Network>()
+    private val instanceSessionToken = AtomicLong(0L)
+    private val sliceCapturedForToken = AtomicLong(0L)
+    private val revokeHandled = AtomicBoolean(false)
 
     @Volatile
     private var isScreenInteractive: Boolean = true
@@ -86,6 +91,12 @@ class RustClashVpnService : VpnService() {
 
     @Volatile
     private var serviceDestroyedOrRevoked: Boolean = false
+
+    @Volatile
+    private var latestStartVpnStartId: Int = 0
+
+    @Volatile
+    private var latestStopVpnStartId: Int = 0
 
     private val openPendingIntent: PendingIntent by lazy {
         val openIntent = Intent(this, MainActivity::class.java).apply {
@@ -131,6 +142,10 @@ class RustClashVpnService : VpnService() {
         private const val NOTIFICATION_CHANNEL_ID = "rust_clash_vpn_channel"
         private const val NOTIFICATION_ID = 19818
 
+        private val nativeLifecycleLock = Any()
+        private val nextSessionToken = AtomicLong(0L)
+        private val activeNativeSessionToken = AtomicLong(0L)
+
         val stateTracker = VpnStateTracker()
 
         @Volatile
@@ -164,6 +179,39 @@ class RustClashVpnService : VpnService() {
     @Suppress("unused")
     fun protectSocket(fd: Int): Boolean = runCatching { protect(fd) }.getOrDefault(false)
 
+    private fun isStartSupersededOrCancelled(startCommandId: Int): Boolean =
+        !serviceScope.isActive ||
+            serviceDestroyedOrRevoked ||
+            latestStopVpnStartId > startCommandId ||
+            latestStartVpnStartId > startCommandId
+
+    private fun isCurrentOrIdleGlobalSession(token: Long): Boolean {
+        val active = activeNativeSessionToken.get()
+        return active == 0L || (token != 0L && active == token)
+    }
+
+    private fun captureStoppingSliceOnce(
+        context: Context,
+        stateDir: String,
+        token: Long,
+        revokedBySystem: Boolean,
+        trigger: String,
+    ) {
+        if (token == 0L) return
+        if (activeNativeSessionToken.get() != token) return
+        if (!sliceCapturedForToken.compareAndSet(0L, token)) return
+        if (DebugLogManager.isEnabled(context)) {
+            DebugLogManager.onVpnSessionStopping(revokedBySystem)
+            runCatching {
+                DebugLogManager.captureSlice(
+                    context = context,
+                    stateDir = stateDir,
+                    trigger = trigger,
+                )
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         DebugLogManager.installCrashBreadcrumbHook(applicationContext)
@@ -175,18 +223,19 @@ class RustClashVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_VPN -> {
-                serviceDestroyedOrRevoked = true
+                latestStopVpnStartId = startId
                 stateTracker.onStopRequested()
                 RustClashTileService.requestTileSync(this)
+                val stopCmdId = startId
                 serviceScope.launch {
                     sessionMutex.withLock {
-                        stopVpnSessionInternal(revokedBySystem = false)
+                        stopVpnSessionInternal(revokedBySystem = false, stopStartId = stopCmdId)
                     }
                 }
                 return START_NOT_STICKY
             }
             ACTION_START_VPN, SERVICE_INTERFACE, null -> {
-                serviceDestroyedOrRevoked = false
+                latestStartVpnStartId = startId
                 val prefs = getSharedPreferences(PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
                 val demoMode = intent?.getBooleanExtra(
                     EXTRA_DEMO_MODE,
@@ -199,9 +248,10 @@ class RustClashVpnService : VpnService() {
                 promoteForeground("RustClash 正在连接…", "正在初始化 TUN 隧道与出站套接字保护")
                 RustClashTileService.requestTileSync(this)
 
+                val startCmdId = startId
                 serviceScope.launch {
                     sessionMutex.withLock {
-                        startVpnSessionInternal(demoMode)
+                        startVpnSessionInternal(demoMode, startCommandId = startCmdId)
                     }
                 }
                 return START_STICKY
@@ -233,7 +283,7 @@ class RustClashVpnService : VpnService() {
         )
     }
 
-    private fun startVpnSessionInternal(demoMode: Boolean) {
+    private fun startVpnSessionInternal(demoMode: Boolean, startCommandId: Int) {
         // Clean up any prior ticker/network/screen observer on duplicate start before re-establishing
         telemetryJob?.cancel()
         telemetryJob = null
@@ -245,15 +295,29 @@ class RustClashVpnService : VpnService() {
         underlyingNetworkTracker.setSingleBestMatchingMode(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
         livePhysicalNetworks.clear()
 
-        if (!serviceScope.isActive || serviceDestroyedOrRevoked) {
+        // Ensure any previous session owned by this Service instance is cleanly stopped before re-starting.
+        val priorToken = instanceSessionToken.getAndSet(0L)
+        if (priorToken != 0L) {
+            engineRunningNative = false
+            synchronized(nativeLifecycleLock) {
+                if (NativeBridge.isNativeLoaded && activeNativeSessionToken.compareAndSet(priorToken, 0L)) {
+                    runCatching { NativeBridge.nativeStopVpn() }
+                }
+            }
+        }
+        sliceCapturedForToken.set(0L)
+
+        if (isStartSupersededOrCancelled(startCommandId)) {
             return
         }
 
         if (!NativeBridge.ensureLoaded()) {
-            stateTracker.onError("当前设备架构未能加载 Rust 核心库 (libproxy_ffi.so)")
-            RustClashTileService.requestTileSync(this)
-            stopForegroundCompat()
-            stopSelf()
+            if (latestStartVpnStartId <= startCommandId) {
+                stateTracker.onError("当前设备架构未能加载 Rust 核心库 (libproxy_ffi.so)")
+                RustClashTileService.requestTileSync(this)
+                stopForegroundCompat()
+                stopSelfResult(startCommandId)
+            }
             return
         }
 
@@ -289,8 +353,9 @@ class RustClashVpnService : VpnService() {
         // RAII guard on the Java side up to the exact point `detachFd()` transfers ownership into
         // `NativeBridge.nativeStartVpnWithStateDir` (which wraps `tun_fd` in Rust `OwnedFd` on line 1).
         var pendingPfd: ParcelFileDescriptor? = null
+        val myToken = nextSessionToken.incrementAndGet()
         try {
-            if (!serviceScope.isActive || serviceDestroyedOrRevoked) {
+            if (isStartSupersededOrCancelled(startCommandId)) {
                 return
             }
 
@@ -320,30 +385,36 @@ class RustClashVpnService : VpnService() {
             val detachedFd = established.detachFd()
             pendingPfd = null
 
-            val startJsonStr = NativeBridge.nativeStartVpnWithStateDir(
-                vpnService = this,
-                tunFd = detachedFd,
-                stateDir = filesDir.absolutePath,
-                yamlConfig = storedYaml,
-                demoMode = sessionCfg.demoMode,
-                enableIpv6 = sessionCfg.enableIpv6,
-            )
-
-            // Guard against `onRevoke()` / `onDestroy()` / `ACTION_STOP_VPN` arriving while
-            // `nativeStartVpnWithStateDir` was executing: tear down immediately without registering
-            // observers or marking the dead/revoked service as RUNNING!
-            if (!serviceScope.isActive || serviceDestroyedOrRevoked) {
-                runCatching { NativeBridge.nativeStopVpn() }
-                engineRunningNative = false
-                activeOutboundLabel = ""
-                latestStatusJson = "{\"running\":false}"
-                if (stateTracker.state != VpnLifecycleState.REVOKED) {
-                    stateTracker.onStopped()
+            val startJsonStr = synchronized(nativeLifecycleLock) {
+                if (isStartSupersededOrCancelled(startCommandId)) {
+                    runCatching { ParcelFileDescriptor.adoptFd(detachedFd).close() }
+                    return
                 }
-                RustClashTileService.requestTileSync(this)
-                stopForegroundCompat()
-                stopSelf()
-                return
+                val rawJson = try {
+                    NativeBridge.nativeStartVpnWithStateDir(
+                        vpnService = this,
+                        tunFd = detachedFd,
+                        stateDir = filesDir.absolutePath,
+                        yamlConfig = storedYaml,
+                        demoMode = sessionCfg.demoMode,
+                        enableIpv6 = sessionCfg.enableIpv6,
+                    )
+                } catch (jniErr: Throwable) {
+                    activeNativeSessionToken.set(0L)
+                    if (NativeBridge.isNativeLoaded) {
+                        runCatching { NativeBridge.nativeStopVpn() }
+                    }
+                    throw jniErr
+                }
+                val startedOk = runCatching {
+                    JSONObject(rawJson).optBoolean("ok", false)
+                }.getOrDefault(false)
+                if (startedOk) {
+                    activeNativeSessionToken.set(myToken)
+                    instanceSessionToken.set(myToken)
+                    engineRunningNative = true
+                }
+                rawJson
             }
 
             val resp = JSONObject(startJsonStr)
@@ -353,7 +424,30 @@ class RustClashVpnService : VpnService() {
                 )
                 throw IllegalStateException(err)
             }
-            engineRunningNative = true
+
+            // Guard against `onRevoke()` / `onDestroy()` / newer `ACTION_STOP_VPN` arriving while
+            // `nativeStartVpnWithStateDir` was executing: tear down `myToken` immediately without
+            // registering observers or marking a dead/revoked/stopped session as RUNNING!
+            if (isStartSupersededOrCancelled(startCommandId)) {
+                val tok = instanceSessionToken.getAndSet(0L)
+                engineRunningNative = false
+                synchronized(nativeLifecycleLock) {
+                    if (tok != 0L && NativeBridge.isNativeLoaded && activeNativeSessionToken.compareAndSet(tok, 0L)) {
+                        runCatching { NativeBridge.nativeStopVpn() }
+                    }
+                }
+                if (serviceDestroyedOrRevoked && isCurrentOrIdleGlobalSession(tok)) {
+                    activeOutboundLabel = ""
+                    latestStatusJson = "{\"running\":false}"
+                    if (stateTracker.state != VpnLifecycleState.REVOKED) {
+                        stateTracker.onStopped()
+                    }
+                    RustClashTileService.requestTileSync(this)
+                    stopForegroundCompat()
+                    stopSelf()
+                }
+                return
+            }
 
             if (storedYaml.isNotEmpty()) {
                 // Clear legacy Keystore blob once migrated into persistent ProfileManager
@@ -396,19 +490,23 @@ class RustClashVpnService : VpnService() {
             unregisterNetworkHandoffObserver()
             unregisterScreenStateObserver()
             livePhysicalNetworks.clear()
+            val tok = instanceSessionToken.getAndSet(0L)
             engineRunningNative = false
             val errMsg = NodeImportSupport.redactSecretsForUi(t.message ?: t.javaClass.simpleName)
             DebugLogManager.onVpnSessionError(errMsg)
-            if (NativeBridge.isNativeLoaded) {
-                // Idempotent: ensures any partially-initialized or post-JNI-exception native state & FD are closed.
-                runCatching { NativeBridge.nativeStopVpn() }
+            synchronized(nativeLifecycleLock) {
+                if (tok != 0L && NativeBridge.isNativeLoaded && activeNativeSessionToken.compareAndSet(tok, 0L)) {
+                    runCatching { NativeBridge.nativeStopVpn() }
+                }
             }
-            activeOutboundLabel = ""
-            latestStatusJson = "{\"running\":false}"
-            stateTracker.onError(errMsg)
-            RustClashTileService.requestTileSync(this)
-            stopForegroundCompat()
-            stopSelf()
+            if (isCurrentOrIdleGlobalSession(tok) && latestStartVpnStartId <= startCommandId) {
+                activeOutboundLabel = ""
+                latestStatusJson = "{\"running\":false}"
+                stateTracker.onError(errMsg)
+                RustClashTileService.requestTileSync(this)
+                stopForegroundCompat()
+                stopSelfResult(startCommandId)
+            }
         } finally {
             runCatching { pendingPfd?.close() }
         }
@@ -708,6 +806,10 @@ class RustClashVpnService : VpnService() {
                     delay(5_000L)
                     continue
                 }
+                val myToken = instanceSessionToken.get()
+                if (myToken == 0L || activeNativeSessionToken.get() != myToken) {
+                    break
+                }
                 val raw = NativeBridge.nativeGetStatusJson()
                 latestStatusJson = raw
                 runCatching {
@@ -741,12 +843,16 @@ class RustClashVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        if (!revokeHandled.compareAndSet(false, true)) {
+            super.onRevoke()
+            return
+        }
         serviceDestroyedOrRevoked = true
         stateTracker.onSystemRevoked()
         RustClashTileService.requestTileSync(this)
         serviceScope.launch {
             sessionMutex.withLock {
-                stopVpnSessionInternal(revokedBySystem = true)
+                stopVpnSessionInternal(revokedBySystem = true, stopStartId = null)
             }
         }
         super.onRevoke()
@@ -762,30 +868,32 @@ class RustClashVpnService : VpnService() {
         unregisterScreenStateObserver()
         underlyingNetworkTracker.reset()
         livePhysicalNetworks.clear()
-        val wasRunning = engineRunningNative
+        val tokenToStop = instanceSessionToken.getAndSet(0L)
         engineRunningNative = false
-        activeOutboundLabel = ""
-        latestStatusJson = "{\"running\":false}"
-        if (stateTracker.state != VpnLifecycleState.REVOKED) {
-            stateTracker.onStopped()
+        if (isCurrentOrIdleGlobalSession(tokenToStop)) {
+            activeOutboundLabel = ""
+            latestStatusJson = "{\"running\":false}"
+            if (stateTracker.state != VpnLifecycleState.REVOKED) {
+                stateTracker.onStopped()
+            }
+            RustClashTileService.requestTileSync(this)
         }
-        RustClashTileService.requestTileSync(this)
-        if (wasRunning || NativeBridge.isNativeLoaded) {
+        if (tokenToStop != 0L) {
             val appCtx = applicationContext
             val statePath = filesDir.absolutePath
+            val isRevoked = revokeHandled.get()
             Thread {
-                if (wasRunning && DebugLogManager.isEnabled(appCtx)) {
-                    DebugLogManager.onVpnSessionStopping(revokedBySystem = false)
-                    runCatching {
-                        DebugLogManager.captureSlice(
-                            context = appCtx,
-                            stateDir = statePath,
-                            trigger = "service-destroy",
-                        )
+                captureStoppingSliceOnce(
+                    context = appCtx,
+                    stateDir = statePath,
+                    token = tokenToStop,
+                    revokedBySystem = isRevoked,
+                    trigger = if (isRevoked) "revoked" else "service-destroy",
+                )
+                synchronized(nativeLifecycleLock) {
+                    if (NativeBridge.isNativeLoaded && activeNativeSessionToken.compareAndSet(tokenToStop, 0L)) {
+                        runCatching { NativeBridge.nativeStopVpn() }
                     }
-                }
-                if (NativeBridge.isNativeLoaded) {
-                    runCatching { NativeBridge.nativeStopVpn() }
                 }
             }.start()
         }
@@ -793,11 +901,13 @@ class RustClashVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun stopVpnSessionInternal(revokedBySystem: Boolean) {
-        serviceDestroyedOrRevoked = true
-        if (revokedBySystem) {
+    private fun stopVpnSessionInternal(revokedBySystem: Boolean, stopStartId: Int? = null) {
+        val isRevoked = revokedBySystem || revokeHandled.get()
+        val supersededByNewerStart = !isRevoked && stopStartId != null && latestStartVpnStartId > stopStartId
+        if (isRevoked) {
+            serviceDestroyedOrRevoked = true
             stateTracker.onSystemRevoked()
-        } else {
+        } else if (!supersededByNewerStart) {
             stateTracker.onStopRequested()
         }
         telemetryJob?.cancel()
@@ -808,27 +918,41 @@ class RustClashVpnService : VpnService() {
         unregisterScreenStateObserver()
         underlyingNetworkTracker.reset()
         livePhysicalNetworks.clear()
-        // Capture disconnect diagnostic slice BEFORE stopping native runtime so session stats are preserved!
-        if (engineRunningNative && DebugLogManager.isEnabled(this)) {
-            DebugLogManager.onVpnSessionStopping(revokedBySystem)
-            runCatching {
-                DebugLogManager.captureSlice(
-                    context = this,
-                    stateDir = filesDir.absolutePath,
-                    trigger = if (revokedBySystem) "revoked" else "disconnect",
-                )
+
+        val tokenToStop = instanceSessionToken.getAndSet(0L)
+        engineRunningNative = false
+        if (tokenToStop != 0L) {
+            // Capture disconnect diagnostic slice BEFORE stopping native runtime so session stats are preserved!
+            captureStoppingSliceOnce(
+                context = this,
+                stateDir = filesDir.absolutePath,
+                token = tokenToStop,
+                revokedBySystem = isRevoked,
+                trigger = if (isRevoked) "revoked" else "disconnect",
+            )
+            synchronized(nativeLifecycleLock) {
+                if (NativeBridge.isNativeLoaded && activeNativeSessionToken.compareAndSet(tokenToStop, 0L)) {
+                    runCatching { NativeBridge.nativeStopVpn() }
+                }
             }
         }
-        engineRunningNative = false
-        if (NativeBridge.isNativeLoaded) {
-            runCatching { NativeBridge.nativeStopVpn() }
+
+        if (supersededByNewerStart) {
+            return
         }
-        activeOutboundLabel = ""
-        latestStatusJson = "{\"running\":false}"
-        stateTracker.onStopped()
-        RustClashTileService.requestTileSync(this)
+
+        if (isCurrentOrIdleGlobalSession(tokenToStop)) {
+            activeOutboundLabel = ""
+            latestStatusJson = "{\"running\":false}"
+            stateTracker.onStopped()
+            RustClashTileService.requestTileSync(this)
+        }
         stopForegroundCompat()
-        stopSelf()
+        if (stopStartId != null) {
+            stopSelfResult(stopStartId)
+        } else {
+            stopSelf()
+        }
     }
 
     private fun promoteForeground(title: String, body: String) {

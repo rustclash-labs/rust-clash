@@ -1,12 +1,92 @@
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
 
 use crate::platform::recovery::{
     RecoveryOutcome, WindowsDnsFamilySnapshot, WindowsDnsInterfaceBackup, WindowsRecoveryRecord,
 };
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhysicalEgressInfo {
+    pub v4_if_index: u32,
+    pub v4_luid: u64,
+    pub v4_gateway: Option<IpAddr>,
+    pub v6_if_index: u32,
+    pub v6_luid: u64,
+    pub v6_gateway: Option<IpAddr>,
+}
+
+/// Normalized snapshot of a `MIB_IPFORWARD_ROW2` + `MIB_IF_ROW2` + `MIB_IPINTERFACE_ROW` entry
+/// used to select the active physical IPv4 and IPv6 default egress without trusting `/32` bypass routes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardRouteCandidate {
+    pub is_ipv6: bool,
+    pub prefix_length: u8,
+    pub loopback: bool,
+    pub if_index: u32,
+    pub luid: u64,
+    pub oper_up: bool,
+    pub ip_connected: bool,
+    pub route_metric: u32,
+    pub interface_metric: u32,
+    pub next_hop: Option<IpAddr>,
+}
+
+/// Select the lowest-metric `IfOperStatusUp` physical `/0` default route separately for IPv4 and IPv6,
+/// ignoring `/32` / `/128` static bypass routes, `/1` Wintun split routes, loopback, and `excluded_tun_luid`.
+pub fn select_physical_default_egress(
+    candidates: &[ForwardRouteCandidate],
+    excluded_tun_luid: u64,
+) -> PhysicalEgressInfo {
+    let mut info = PhysicalEgressInfo::default();
+    let mut best_v4_metric: Option<u32> = None;
+    let mut best_v6_metric: Option<u32> = None;
+
+    for c in candidates {
+        if c.prefix_length != 0
+            || c.loopback
+            || c.if_index <= 1
+            || c.luid == 0
+            || c.luid == excluded_tun_luid
+            || !c.oper_up
+            || !c.ip_connected
+        {
+            continue;
+        }
+        let effective_metric = c.route_metric.saturating_add(c.interface_metric);
+        if c.is_ipv6 {
+            if best_v6_metric.is_none_or(|m| effective_metric < m) {
+                best_v6_metric = Some(effective_metric);
+                info.v6_if_index = c.if_index;
+                info.v6_luid = c.luid;
+                info.v6_gateway = c.next_hop;
+            }
+        } else if best_v4_metric.is_none_or(|m| effective_metric < m) {
+            best_v4_metric = Some(effective_metric);
+            info.v4_if_index = c.if_index;
+            info.v4_luid = c.luid;
+            info.v4_gateway = c.next_hop;
+        }
+    }
+
+    info
+}
+
+/// Merge updated physical interface indices for `WindowsUnicastIfProtector`, never overwriting a
+/// previously valid non-zero index with `0` (which would turn `IPV6_UNICAST_IF` / `IP_UNICAST_IF`
+/// into a no-op and loop outbound sockets into Wintun).
+pub fn merge_non_zero_protector_indices(
+    prev_v4: u32,
+    prev_v6: u32,
+    latest_v4: u32,
+    latest_v6: u32,
+) -> (u32, u32) {
+    let next_v4 = if latest_v4 != 0 { latest_v4 } else { prev_v4 };
+    let next_v6 = if latest_v6 != 0 { latest_v6 } else { prev_v6 };
+    (next_v4, next_v6)
+}
 
 /// Official Wintun v0.14.1 (`https://www.wintun.net/builds/wintun-0.14.1.zip`) archive & signed DLL SHA-256 digests.
 pub const WINTUN_0_14_1_ZIP_SHA256: &str =
@@ -239,7 +319,7 @@ mod win_impl {
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         os::windows::ffi::OsStrExt,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -262,14 +342,14 @@ mod win_impl {
                     CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
                     DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_DOMAIN, DNS_SETTING_IPV6,
                     DNS_SETTING_NAMESERVER, DNS_SETTING_SEARCHLIST, DeleteIpForwardEntry2,
-                    FreeInterfaceDnsSettings, FreeMibTable, GetBestRoute2, GetInterfaceDnsSettings,
+                    FreeInterfaceDnsSettings, FreeMibTable, GetIfEntry2, GetInterfaceDnsSettings,
                     GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
-                    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-                    MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW, MibAddInstance,
-                    MibDeleteInstance, MibParameterNotification, NotifyIpInterfaceChange,
-                    SetInterfaceDnsSettings, SetIpInterfaceEntry,
+                    InitializeUnicastIpAddressEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+                    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+                    MibAddInstance, MibDeleteInstance, MibParameterNotification,
+                    NotifyIpInterfaceChange, SetInterfaceDnsSettings, SetIpInterfaceEntry,
                 },
-                Ndis::NET_LUID_LH,
+                Ndis::{IfOperStatusUp, NET_LUID_LH},
             },
             Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_INET},
             Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
@@ -288,9 +368,11 @@ mod win_impl {
     };
 
     use super::{
-        WINDOWS_SPLIT_IPV4_PREFIXES, WINDOWS_SPLIT_IPV6_PREFIXES, WindowsDnsOps,
-        apply_windows_adapter_dns_transactional, format_braced_guid, parse_braced_guid,
+        ForwardRouteCandidate, PhysicalEgressInfo, WINDOWS_SPLIT_IPV4_PREFIXES,
+        WINDOWS_SPLIT_IPV6_PREFIXES, WindowsDnsOps, apply_windows_adapter_dns_transactional,
+        format_braced_guid, merge_non_zero_protector_indices, parse_braced_guid,
         resolve_secure_wintun_dll_path, restore_windows_adapter_dns_with_ops,
+        select_physical_default_egress,
     };
     use crate::{
         inbound::tun::VirtualTunHandle,
@@ -516,34 +598,26 @@ mod win_impl {
         }
     }
 
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    pub struct PhysicalEgressInfo {
-        pub v4_if_index: u32,
-        pub v4_luid: u64,
-        pub v4_gateway: Option<IpAddr>,
-        pub v6_if_index: u32,
-        pub v6_luid: u64,
-        pub v6_gateway: Option<IpAddr>,
-    }
-
-    /// Scan `GetIpForwardTable2` for the lowest-metric connected physical `/0` default route
-    /// excluding `excluded_tun_luid` when Wintun's `/1` split routes shadow `GetBestRoute2`.
-    fn fallback_default_route_egress(
-        family: u16,
-        excluded_tun_luid: u64,
-    ) -> Option<(u32, u64, Option<IpAddr>)> {
+    /// Detect the active physical egress `InterfaceIndex`, `InterfaceLuid`, and next-hop gateway
+    /// directly from `GetIpForwardTable2(AF_UNSPEC)` `/0` default routes whose adapter is
+    /// `IfOperStatusUp` (`GetIfEntry2`) and IP-connected (`GetIpInterfaceEntry`).
+    ///
+    /// Never probes `GetBestRoute2` toward `1.1.1.1` / `2606:4700:4700::1111`, because our own
+    /// `/32` / `/128` static bypass routes on a still-associated Wi-Fi NIC would beat a newly
+    /// plugged-in Ethernet NIC's `0.0.0.0/0` default route via longest-prefix match!
+    pub fn detect_windows_physical_egress(excluded_tun_luid: u64) -> PhysicalEgressInfo {
         // SAFETY: `GetIpForwardTable2` allocates `table` which is freed via `FreeMibTable` before return.
         unsafe {
             let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
-            let status = GetIpForwardTable2(family, &raw mut table);
+            let status = GetIpForwardTable2(AF_UNSPEC, &raw mut table);
             if status != 0 || table.is_null() {
-                return None;
+                return PhysicalEgressInfo::default();
             }
             let num_entries = (*table).NumEntries as usize;
             let rows_ptr = std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
             let rows = std::slice::from_raw_parts(rows_ptr, num_entries);
 
-            let mut best: Option<(u32, u32, u64, Option<IpAddr>)> = None;
+            let mut candidates = Vec::new();
             for row in rows {
                 if row.DestinationPrefix.PrefixLength != 0
                     || row.Loopback != 0
@@ -555,101 +629,49 @@ mod win_impl {
                 if luid_val == 0 || luid_val == excluded_tun_luid {
                     continue;
                 }
-                let mut if_row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
-                if_row.Family = family;
-                if_row.InterfaceLuid = row.InterfaceLuid;
-                let if_metric = if GetIpInterfaceEntry(&raw mut if_row) == 0 {
-                    if if_row.Connected == 0 {
-                        continue;
-                    }
-                    if_row.Metric
+                let family = row.DestinationPrefix.Prefix.si_family;
+                let is_ipv6 = if family == AF_INET {
+                    false
+                } else if family == AF_INET6 {
+                    true
                 } else {
-                    0
+                    continue;
                 };
-                let effective_metric = row.Metric.saturating_add(if_metric);
-                let gw = ip_from_sockaddr_inet(&row.NextHop);
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_metric, _, _, _)| effective_metric < *best_metric)
-                {
-                    best = Some((effective_metric, row.InterfaceIndex, luid_val, gw));
+
+                let mut if_entry: MIB_IF_ROW2 = std::mem::zeroed();
+                if_entry.InterfaceLuid = row.InterfaceLuid;
+                let oper_up =
+                    GetIfEntry2(&raw mut if_entry) == 0 && if_entry.OperStatus == IfOperStatusUp;
+                if !oper_up {
+                    continue;
                 }
+
+                let mut ip_if: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+                ip_if.Family = family;
+                ip_if.InterfaceLuid = row.InterfaceLuid;
+                let (ip_connected, if_metric) = if GetIpInterfaceEntry(&raw mut ip_if) == 0 {
+                    (ip_if.Connected != 0, ip_if.Metric)
+                } else {
+                    (true, 0)
+                };
+
+                candidates.push(ForwardRouteCandidate {
+                    is_ipv6,
+                    prefix_length: row.DestinationPrefix.PrefixLength,
+                    loopback: row.Loopback != 0,
+                    if_index: row.InterfaceIndex,
+                    luid: luid_val,
+                    oper_up,
+                    ip_connected,
+                    route_metric: row.Metric,
+                    interface_metric: if_metric,
+                    next_hop: ip_from_sockaddr_inet(&row.NextHop),
+                });
             }
 
             FreeMibTable(table.cast::<c_void>());
-            best.map(|(_, idx, luid_val, gw)| (idx, luid_val, gw))
+            select_physical_default_egress(&candidates, excluded_tun_luid)
         }
-    }
-
-    /// Detect the active physical egress `InterfaceIndex`, `InterfaceLuid`, and next-hop gateway
-    /// via `GetBestRoute2`, falling back to `GetIpForwardTable2` `/0` default-route inspection
-    /// when Wintun's `/1` split routes are active!
-    pub fn detect_windows_physical_egress(excluded_tun_luid: u64) -> PhysicalEgressInfo {
-        let mut info = PhysicalEgressInfo::default();
-
-        // Probe IPv4 route toward `1.1.1.1`
-        let dst_v4 = sockaddr_inet_from_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-        // SAFETY: Zeroed `MIB_IPFORWARD_ROW2` and `SOCKADDR_INET` out-params match `GetBestRoute2` contract.
-        unsafe {
-            let mut best_row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
-            let mut best_src: SOCKADDR_INET = std::mem::zeroed();
-            let status = GetBestRoute2(
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                &raw const dst_v4,
-                0,
-                &raw mut best_row,
-                &raw mut best_src,
-            );
-            if status == 0 && best_row.InterfaceLuid.Value != excluded_tun_luid {
-                info.v4_if_index = best_row.InterfaceIndex;
-                info.v4_luid = best_row.InterfaceLuid.Value;
-                info.v4_gateway = ip_from_sockaddr_inet(&best_row.NextHop);
-            }
-        }
-        if info.v4_if_index == 0
-            && let Some((idx, luid_val, gw)) =
-                fallback_default_route_egress(AF_INET, excluded_tun_luid)
-        {
-            info.v4_if_index = idx;
-            info.v4_luid = luid_val;
-            info.v4_gateway = gw;
-        }
-
-        // Probe IPv6 route toward `2606:4700:4700::1111`
-        let dst_v6 = sockaddr_inet_from_ip(IpAddr::V6(
-            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap(),
-        ));
-        // SAFETY: Same `GetBestRoute2` contract for IPv6.
-        unsafe {
-            let mut best_row6: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
-            let mut best_src6: SOCKADDR_INET = std::mem::zeroed();
-            let status6 = GetBestRoute2(
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                &raw const dst_v6,
-                0,
-                &raw mut best_row6,
-                &raw mut best_src6,
-            );
-            if status6 == 0 && best_row6.InterfaceLuid.Value != excluded_tun_luid {
-                info.v6_if_index = best_row6.InterfaceIndex;
-                info.v6_luid = best_row6.InterfaceLuid.Value;
-                info.v6_gateway = ip_from_sockaddr_inet(&best_row6.NextHop);
-            }
-        }
-        if info.v6_if_index == 0
-            && let Some((idx, luid_val, gw)) =
-                fallback_default_route_egress(AF_INET6, excluded_tun_luid)
-        {
-            info.v6_if_index = idx;
-            info.v6_luid = luid_val;
-            info.v6_gateway = gw;
-        }
-
-        info
     }
 
     pub fn preflight_windows_tun(explicit_dll: Option<&Path>) -> TunHealthSnapshot {
@@ -672,6 +694,20 @@ mod win_impl {
             None
         };
 
+        let (default_egress_iface, default_egress_gateway) = if egress.v4_if_index != 0 {
+            (
+                Some(format!("ifIndex:{}", egress.v4_if_index)),
+                egress.v4_gateway.map(|g| g.to_string()),
+            )
+        } else if egress.v6_if_index != 0 {
+            (
+                Some(format!("ifIndex:{}", egress.v6_if_index)),
+                egress.v6_gateway.map(|g| g.to_string()),
+            )
+        } else {
+            (None, None)
+        };
+
         TunHealthSnapshot {
             platform: "windows".to_string(),
             backend: "windows-wintun".to_string(),
@@ -683,9 +719,8 @@ mod win_impl {
             auto_route_applied: false,
             strict_route_applied: false,
             route_table_id: None,
-            default_egress_iface: (egress.v4_if_index != 0)
-                .then(|| format!("ifIndex:{}", egress.v4_if_index)),
-            default_egress_gateway: egress.v4_gateway.map(|g| g.to_string()),
+            default_egress_iface,
+            default_egress_gateway,
             socket_protector: global_socket_protector().description(),
             privilege_ok: driver_loaded && elevated,
             privilege_hint: hint,
@@ -932,8 +967,55 @@ mod win_impl {
         restore_windows_adapter_dns_with_ops(&mut dns_backend, rec, outcome);
     }
 
+    fn install_physical_bypass_routes(
+        egress: &PhysicalEgressInfo,
+        bypass_ips: &[IpAddr],
+        fake_ip_net: ipnet::Ipv4Net,
+        tun_ipv6_cidr: ipnet::Ipv6Net,
+    ) -> Vec<WindowsRouteRecord> {
+        let mut routes = Vec::new();
+        for ip in bypass_ips {
+            match ip {
+                IpAddr::V4(v4)
+                    if !v4.is_loopback()
+                        && !v4.is_unspecified()
+                        && !fake_ip_net.contains(v4)
+                        && egress.v4_luid != 0 =>
+                {
+                    let nh = egress
+                        .v4_gateway
+                        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                    if let Ok(r_byp) = add_iphlpapi_route(egress.v4_luid, *ip, 32, nh, 1) {
+                        routes.push(r_byp);
+                    }
+                }
+                IpAddr::V6(v6)
+                    if !v6.is_loopback()
+                        && !v6.is_unspecified()
+                        && !tun_ipv6_cidr.contains(v6)
+                        && egress.v6_luid != 0 =>
+                {
+                    let nh6 = egress
+                        .v6_gateway
+                        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+                    if let Ok(r_byp6) = add_iphlpapi_route(egress.v6_luid, *ip, 128, nh6, 1) {
+                        routes.push(r_byp6);
+                    }
+                }
+                _ => {}
+            }
+        }
+        routes
+    }
+
     struct NetChangeCallbackCtx {
         adapter_luid: u64,
+        auto_route: bool,
+        bypass_ips: Vec<IpAddr>,
+        fake_ip_net: ipnet::Ipv4Net,
+        tun_ipv6_cidr: ipnet::Ipv6Net,
+        state_dir: PathBuf,
+        recovery_record: Arc<Mutex<WindowsRecoveryRecord>>,
         protector: Arc<WindowsUnicastIfProtector>,
         egress_state: Arc<Mutex<PhysicalEgressInfo>>,
         transitions: Arc<AtomicU64>,
@@ -961,18 +1043,84 @@ mod win_impl {
         if latest.v4_if_index == 0 && latest.v6_if_index == 0 {
             return;
         }
-        let mut guard = ctx.egress_state.lock();
-        if *guard != latest {
-            *guard = latest.clone();
-            drop(guard);
-            ctx.protector
-                .update_indices(latest.v4_if_index, latest.v6_if_index);
-            ctx.transitions.fetch_add(1, Ordering::Relaxed);
-            if let Some(hook) = &ctx.net_hook {
-                hook();
-            } else if let Some(dns) = &ctx.dns {
-                dns.flush_cache();
+
+        let (effective, routes_handoff_needed) = {
+            let mut guard = ctx.egress_state.lock();
+            let prev = guard.clone();
+            let (eff_v4_idx, eff_v6_idx) = merge_non_zero_protector_indices(
+                prev.v4_if_index,
+                prev.v6_if_index,
+                latest.v4_if_index,
+                latest.v6_if_index,
+            );
+            let effective = PhysicalEgressInfo {
+                v4_if_index: eff_v4_idx,
+                v4_luid: if latest.v4_if_index != 0 {
+                    latest.v4_luid
+                } else {
+                    prev.v4_luid
+                },
+                v4_gateway: if latest.v4_if_index != 0 {
+                    latest.v4_gateway
+                } else {
+                    prev.v4_gateway
+                },
+                v6_if_index: eff_v6_idx,
+                v6_luid: if latest.v6_if_index != 0 {
+                    latest.v6_luid
+                } else {
+                    prev.v6_luid
+                },
+                v6_gateway: if latest.v6_if_index != 0 {
+                    latest.v6_gateway
+                } else {
+                    prev.v6_gateway
+                },
+            };
+            if prev == effective {
+                return;
             }
+            let handoff = (prev.v4_luid, prev.v4_gateway)
+                != (effective.v4_luid, effective.v4_gateway)
+                || (prev.v6_luid, prev.v6_gateway) != (effective.v6_luid, effective.v6_gateway);
+            *guard = effective.clone();
+            (effective, handoff)
+        };
+
+        // Never overwrite a valid non-zero interface index with `0` (which would turn
+        // `WindowsUnicastIfProtector` into a no-op and loop outbound sockets into Wintun!).
+        ctx.protector
+            .update_indices(effective.v4_if_index, effective.v6_if_index);
+
+        if ctx.auto_route && !ctx.bypass_ips.is_empty() && routes_handoff_needed {
+            let rec_snap = {
+                let mut rec_guard = ctx.recovery_record.lock();
+                let mut kept_wintun_routes = Vec::with_capacity(rec_guard.owned_routes.len());
+                for r in rec_guard.owned_routes.drain(..) {
+                    if r.interface_luid == ctx.adapter_luid {
+                        kept_wintun_routes.push(r);
+                    } else {
+                        let _ = delete_iphlpapi_route(&r);
+                    }
+                }
+                let new_bypass = install_physical_bypass_routes(
+                    &effective,
+                    &ctx.bypass_ips,
+                    ctx.fake_ip_net,
+                    ctx.tun_ipv6_cidr,
+                );
+                kept_wintun_routes.extend(new_bypass);
+                rec_guard.owned_routes = kept_wintun_routes;
+                rec_guard.clone()
+            };
+            let _ = update_current_journal(&ctx.state_dir, |j| j.windows_tun = Some(rec_snap));
+        }
+
+        ctx.transitions.fetch_add(1, Ordering::Relaxed);
+        if let Some(hook) = &ctx.net_hook {
+            hook();
+        } else if let Some(dns) = &ctx.dns {
+            dns.flush_cache();
         }
     }
 
@@ -997,7 +1145,7 @@ mod win_impl {
         stop_event: RawSendPtr<c_void>,
         notify_handle: RawSendPtr<c_void>,
         notify_ctx: Option<Box<NetChangeCallbackCtx>>,
-        recovery_record: WindowsRecoveryRecord,
+        recovery_record: Arc<Mutex<WindowsRecoveryRecord>>,
         stop_flag: Arc<AtomicBool>,
         stop_watch_tx: tokio::sync::watch::Sender<bool>,
         stopped: bool,
@@ -1133,21 +1281,14 @@ mod win_impl {
                 )?;
                 rec.owned_routes.push(r_fake);
 
-                // Explicit `/32` bypass routes on the physical interface for proxy servers & bootstrap DNS
-                if initial_egress.v4_luid != 0
-                    && let Some(phys_gw) = initial_egress.v4_gateway
-                {
-                    for ip in &spec.bypass_ips {
-                        if let IpAddr::V4(v4) = ip
-                            && !v4.is_loopback()
-                            && !spec.fake_ip_net.contains(v4)
-                            && let Ok(r_byp) =
-                                add_iphlpapi_route(initial_egress.v4_luid, *ip, 32, phys_gw, 1)
-                        {
-                            rec.owned_routes.push(r_byp);
-                        }
-                    }
-                }
+                // Explicit `/32` (IPv4) and `/128` (IPv6) bypass routes on the physical interface
+                // for proxy servers & bootstrap DNS!
+                rec.owned_routes.extend(install_physical_bypass_routes(
+                    &initial_egress,
+                    &spec.bypass_ips,
+                    spec.fake_ip_net,
+                    spec.tun_ipv6_cidr,
+                ));
 
                 if spec.enable_ipv6 {
                     let zero_v6 = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
@@ -1223,6 +1364,7 @@ mod win_impl {
                 return Err(err);
             }
 
+            let recovery_record = Arc::new(Mutex::new(rec));
             let stop_flag = Arc::new(AtomicBool::new(false));
             let (stop_watch_tx, mut stop_watch_rx) = tokio::sync::watch::channel(false);
             let rx_packets = Arc::new(AtomicU64::new(0));
@@ -1233,6 +1375,12 @@ mod win_impl {
             // Register `NotifyIpInterfaceChange` for instant Wi-Fi/Ethernet/sleep/wake recovery!
             let mut notify_ctx = Box::new(NetChangeCallbackCtx {
                 adapter_luid: unsafe { luid.Value },
+                auto_route: spec.auto_route,
+                bypass_ips: spec.bypass_ips.clone(),
+                fake_ip_net: spec.fake_ip_net,
+                tun_ipv6_cidr: spec.tun_ipv6_cidr,
+                state_dir: spec.state_dir.clone(),
+                recovery_record: Arc::clone(&recovery_record),
                 protector: Arc::clone(&protector),
                 egress_state: Arc::clone(&egress_state),
                 transitions: Arc::clone(&network_transitions),
@@ -1270,29 +1418,56 @@ mod win_impl {
                     unsafe {
                         let read_event = (api_rx.get_read_wait_event)(sess_p);
                         let handles = [read_event, stop_p];
-                        while !stop_rx.load(Ordering::Acquire) {
-                            let mut pkt_size: u32 = 0;
-                            let pkt_ptr = (api_rx.receive_packet)(sess_p, &raw mut pkt_size);
-                            if !pkt_ptr.is_null() {
-                                let slice =
+                        let stop_handles = [stop_p];
+                        'outer: while !stop_rx.load(Ordering::Acquire) {
+                            loop {
+                                if stop_rx.load(Ordering::Acquire) {
+                                    break 'outer;
+                                }
+                                let mut pkt_size: u32 = 0;
+                                let pkt_ptr = (api_rx.receive_packet)(sess_p, &raw mut pkt_size);
+                                if pkt_ptr.is_null() {
+                                    break;
+                                }
+                                let mut slice =
                                     std::slice::from_raw_parts(pkt_ptr, pkt_size as usize).to_vec();
                                 (api_rx.release_receive_packet)(sess_p, pkt_ptr);
                                 rx_cnt.fetch_add(1, Ordering::Relaxed);
-                                if ingress_tx.blocking_send(slice).is_err() {
+                                loop {
+                                    if stop_rx.load(Ordering::Acquire) {
+                                        break 'outer;
+                                    }
+                                    match ingress_tx.try_send(slice) {
+                                        Ok(()) => break,
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                            returned,
+                                        )) => {
+                                            slice = returned;
+                                            let wait_rc = WaitForMultipleObjects(
+                                                1,
+                                                stop_handles.as_ptr(),
+                                                0,
+                                                2,
+                                            );
+                                            if wait_rc == 0 {
+                                                break 'outer;
+                                            }
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                            let err = GetLastError();
+                            // `ERROR_NO_MORE_ITEMS == 259` means ring buffer is currently empty; wait on kernel event!
+                            if err == 259 {
+                                let wait_rc = WaitForMultipleObjects(2, handles.as_ptr(), 0, 250);
+                                if wait_rc == 1 {
                                     break;
                                 }
                             } else {
-                                let err = GetLastError();
-                                // `ERROR_NO_MORE_ITEMS == 259` means ring buffer is currently empty; wait on kernel event!
-                                if err == 259 {
-                                    let wait_rc =
-                                        WaitForMultipleObjects(2, handles.as_ptr(), 0, 250);
-                                    if wait_rc == 1 {
-                                        break;
-                                    }
-                                } else {
-                                    std::thread::sleep(Duration::from_millis(5));
-                                }
+                                std::thread::sleep(Duration::from_millis(5));
                             }
                         }
                     }
@@ -1309,7 +1484,8 @@ mod win_impl {
                     }
                     drop(notify_ctx);
                     let mut outcome = RecoveryOutcome::default();
-                    recover_windows_tun_record(&rec, &mut outcome);
+                    let rec_final = recovery_record.lock().clone();
+                    recover_windows_tun_record(&rec_final, &mut outcome);
                     // SAFETY: No worker thread spawned; safe to end session, close adapter, and close event.
                     unsafe {
                         (api.end_session)(session);
@@ -1373,7 +1549,8 @@ mod win_impl {
                     drop(notify_ctx);
                     let _ = rx_thread.join();
                     let mut outcome = RecoveryOutcome::default();
-                    recover_windows_tun_record(&rec, &mut outcome);
+                    let rec_final = recovery_record.lock().clone();
+                    recover_windows_tun_record(&rec_final, &mut outcome);
                     unsafe {
                         (api.end_session)(session);
                         (api.close_adapter)(adapter);
@@ -1394,7 +1571,7 @@ mod win_impl {
                 stop_event: RawSendPtr(stop_event),
                 notify_handle: RawSendPtr(notify_handle),
                 notify_ctx: Some(notify_ctx),
-                recovery_record: rec,
+                recovery_record,
                 stop_flag,
                 stop_watch_tx,
                 stopped: false,
@@ -1412,6 +1589,19 @@ mod win_impl {
     impl SystemTunSession for WindowsWintunSession {
         fn health(&self) -> TunHealthSnapshot {
             let eg = self.egress_state.lock().clone();
+            let (default_egress_iface, default_egress_gateway) = if eg.v4_if_index != 0 {
+                (
+                    Some(format!("ifIndex:{}", eg.v4_if_index)),
+                    eg.v4_gateway.map(|g| g.to_string()),
+                )
+            } else if eg.v6_if_index != 0 {
+                (
+                    Some(format!("ifIndex:{}", eg.v6_if_index)),
+                    eg.v6_gateway.map(|g| g.to_string()),
+                )
+            } else {
+                (None, None)
+            };
             TunHealthSnapshot {
                 platform: "windows".to_string(),
                 backend: format!(
@@ -1430,9 +1620,8 @@ mod win_impl {
                 auto_route_applied: self.spec.auto_route,
                 strict_route_applied: self.spec.auto_route && self.spec.strict_route,
                 route_table_id: None,
-                default_egress_iface: (eg.v4_if_index != 0)
-                    .then(|| format!("ifIndex:{}", eg.v4_if_index)),
-                default_egress_gateway: eg.v4_gateway.map(|g| g.to_string()),
+                default_egress_iface,
+                default_egress_gateway,
                 socket_protector: global_socket_protector().description(),
                 privilege_ok: true,
                 privilege_hint: None,
@@ -1478,7 +1667,8 @@ mod win_impl {
 
             // 3. Roll back routes & DNS overrides, end Wintun session, close adapter & event, clear journal
             let mut outcome = RecoveryOutcome::default();
-            recover_windows_tun_record(&self.recovery_record, &mut outcome);
+            let rec_final = self.recovery_record.lock().clone();
+            recover_windows_tun_record(&rec_final, &mut outcome);
             for warn_msg in &outcome.warnings {
                 tracing::warn!("Windows Wintun teardown recovery warning: {}", warn_msg);
             }
@@ -1513,8 +1703,8 @@ mod win_impl {
 
 #[cfg(windows)]
 pub use win_impl::{
-    PhysicalEgressInfo, WindowsWintunSession, detect_windows_physical_egress,
-    is_windows_process_elevated, preflight_windows_tun, recover_windows_tun_record,
+    WindowsWintunSession, detect_windows_physical_egress, is_windows_process_elevated,
+    preflight_windows_tun, recover_windows_tun_record,
 };
 
 #[cfg(test)]
@@ -1851,5 +2041,130 @@ mod tests {
         );
         assert_eq!(outcome.warnings.len(), 1);
         assert!(outcome.warnings[0].contains("RestoreInterfaceDnsSettings(IPv4='1.1.1.1')"));
+    }
+
+    #[test]
+    fn select_physical_default_egress_ignores_bypass_and_split_routes_and_picks_lowest_metric_up_nic()
+     {
+        let tun_luid = 9001u64;
+        let wifi_luid = 1001u64;
+        let eth_luid = 1002u64;
+        let down_luid = 1003u64;
+
+        let candidates = vec![
+            // Our own 1.1.1.1/32 bypass route still sitting on associated Wi-Fi (metric 1, /32)
+            ForwardRouteCandidate {
+                is_ipv6: false,
+                prefix_length: 32,
+                loopback: false,
+                if_index: 11,
+                luid: wifi_luid,
+                oper_up: true,
+                ip_connected: true,
+                route_metric: 1,
+                interface_metric: 1,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            },
+            // Wintun 0.0.0.0/1 split route AND hypothetical /0 route on excluded Wintun LUID
+            ForwardRouteCandidate {
+                is_ipv6: false,
+                prefix_length: 1,
+                loopback: false,
+                if_index: 42,
+                luid: tun_luid,
+                oper_up: true,
+                ip_connected: true,
+                route_metric: 1,
+                interface_metric: 1,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            },
+            ForwardRouteCandidate {
+                is_ipv6: false,
+                prefix_length: 0,
+                loopback: false,
+                if_index: 42,
+                luid: tun_luid,
+                oper_up: true,
+                ip_connected: true,
+                route_metric: 0,
+                interface_metric: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            },
+            // Disconnected / down adapter with low metric must be skipped
+            ForwardRouteCandidate {
+                is_ipv6: false,
+                prefix_length: 0,
+                loopback: false,
+                if_index: 9,
+                luid: down_luid,
+                oper_up: false,
+                ip_connected: true,
+                route_metric: 1,
+                interface_metric: 5,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            },
+            // Associated Wi-Fi 0.0.0.0/0 default route (higher combined metric: 0 + 50 = 50)
+            ForwardRouteCandidate {
+                is_ipv6: false,
+                prefix_length: 0,
+                loopback: false,
+                if_index: 11,
+                luid: wifi_luid,
+                oper_up: true,
+                ip_connected: true,
+                route_metric: 0,
+                interface_metric: 50,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            },
+            // Newly plugged-in Ethernet 0.0.0.0/0 default route (lower combined metric: 0 + 25 = 25)
+            ForwardRouteCandidate {
+                is_ipv6: false,
+                prefix_length: 0,
+                loopback: false,
+                if_index: 15,
+                luid: eth_luid,
+                oper_up: true,
+                ip_connected: true,
+                route_metric: 0,
+                interface_metric: 25,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 10, 0, 1))),
+            },
+            // IPv6 ::/0 default route on Wi-Fi (Ethernet lacks IPv6 RA yet)
+            ForwardRouteCandidate {
+                is_ipv6: true,
+                prefix_length: 0,
+                loopback: false,
+                if_index: 11,
+                luid: wifi_luid,
+                oper_up: true,
+                ip_connected: true,
+                route_metric: 256,
+                interface_metric: 50,
+                next_hop: Some("fe80::1".parse().unwrap()),
+            },
+        ];
+
+        let selected = select_physical_default_egress(&candidates, tun_luid);
+        assert_eq!(selected.v4_if_index, 15);
+        assert_eq!(selected.v4_luid, eth_luid);
+        assert_eq!(
+            selected.v4_gateway,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 10, 0, 1)))
+        );
+        assert_eq!(selected.v6_if_index, 11);
+        assert_eq!(selected.v6_luid, wifi_luid);
+        assert_eq!(selected.v6_gateway, Some("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn merge_non_zero_protector_indices_never_zeros_active_family() {
+        // Initial dual-stack indices (11, 11), then v6-only update or temporary v4 route drop -> keep v4=11!
+        assert_eq!(merge_non_zero_protector_indices(11, 11, 0, 15), (11, 15));
+        // v4 switches to Ethernet (15) while v6 temporarily reports 0 -> keep v6=11 rather than 0!
+        assert_eq!(merge_non_zero_protector_indices(11, 11, 15, 0), (15, 11));
+        // Both families switch to 15 -> (15, 15).
+        assert_eq!(merge_non_zero_protector_indices(11, 11, 15, 15), (15, 15));
+        // Initially IPv4-only (11, 0), then IPv6 comes online (11, 11) -> (11, 11).
+        assert_eq!(merge_non_zero_protector_indices(11, 0, 11, 11), (11, 11));
     }
 }

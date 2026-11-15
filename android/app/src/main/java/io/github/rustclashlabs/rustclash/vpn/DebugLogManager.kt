@@ -358,7 +358,8 @@ object DebugLogManager {
 
     /**
      * Captures a diagnostic slice covering `[windowStartMs, now]`, writes it to `filesDir/debug_logs`,
-     * advances the rolling window, and enforces retention limits (`<= 12` files, `<= 8 MB`).
+     * and only advances the rolling window & rule-hit baselines after `outFile` is durably written,
+     * ensuring an I/O failure never loses the diagnostic window (`<= 12` files, `<= 8 MB`).
      */
     fun captureSlice(
         context: Context,
@@ -368,7 +369,7 @@ object DebugLogManager {
         val batteryEnd = readBatterySnapshot(context)
         val systemMeta = collectSystemMetadata(context, batteryEnd)
 
-        val (windowSnap, prevRuleHitsSnap) = synchronized(lock) {
+        val (windowSnap, prevRuleHitsSnap, capturedSessionStartMs) = synchronized(lock) {
             val now = System.currentTimeMillis()
             flushScreenDurationLocked(now)
             val snap = WindowTelemetryState(
@@ -380,12 +381,7 @@ object DebugLogManager {
                 startBatteryPct = windowStartBatteryPct,
                 events = timelineEvents.filter { it.timestampMs >= windowStartMs },
             )
-            windowStartMs = now
-            screenOnAccumMs = 0L
-            screenOffAccumMs = 0L
-            lastScreenTransitionMs = now
-            windowStartBatteryPct = batteryEnd.levelPct
-            snap to lastCumulativeRuleHits
+            Triple(snap, lastCumulativeRuleHits, sessionStartMs)
         }
 
         val nativeJsonStr = if (NativeBridge.ensureLoaded()) {
@@ -400,11 +396,7 @@ object DebugLogManager {
             "{\"ok\":false,\"vpnRunning\":false,\"error\":\"native library not loaded\"}"
         }
 
-        extractCumulativeRuleHits(nativeJsonStr)?.let { latestHits ->
-            synchronized(lock) {
-                lastCumulativeRuleHits = latestHits
-            }
-        }
+        val latestRuleHits = extractCumulativeRuleHits(nativeJsonStr)
 
         val dir = File(context.filesDir, DEBUG_DIR_NAME).apply { mkdirs() }
         val crashBreadcrumb = File(dir, CRASH_BREADCRUMB_FILE)
@@ -432,6 +424,22 @@ object DebugLogManager {
             if (!tmpFile.renameTo(outFile)) {
                 outFile.writeText(formatted, Charsets.UTF_8)
                 runCatching { tmpFile.delete() }
+            }
+            if (!outFile.isFile) {
+                error("slice target file missing after write")
+            }
+            synchronized(lock) {
+                if (sessionStartMs == capturedSessionStartMs && windowStartMs <= windowSnap.capturedAtMs) {
+                    val commitNow = System.currentTimeMillis()
+                    flushScreenDurationLocked(commitNow)
+                    screenOnAccumMs = (screenOnAccumMs - windowSnap.screenOnMs).coerceAtLeast(0L)
+                    screenOffAccumMs = (screenOffAccumMs - windowSnap.screenOffMs).coerceAtLeast(0L)
+                    windowStartMs = windowSnap.capturedAtMs
+                    windowStartBatteryPct = batteryEnd.levelPct
+                    if (latestRuleHits != null) {
+                        lastCumulativeRuleHits = latestRuleHits
+                    }
+                }
             }
             enforceRetentionPolicy(dir, MAX_SLICE_FILES, MAX_TOTAL_SLICE_BYTES)
             outFile
