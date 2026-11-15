@@ -502,19 +502,29 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         );
       }
     }
+    const existingEarlyHeader = existingWs?.["early-data-header-name"];
+    const hadExistingEarlyMax = (existingWs?.["max-early-data"] ?? 0) > 0;
+    const earlyDataOpts =
+      earlyNum > 0
+        ? {
+            "max-early-data": earlyNum,
+            ...(existingEarlyHeader
+              ? { "early-data-header-name": existingEarlyHeader }
+              : !hadExistingEarlyMax
+                ? { "early-data-header-name": "Sec-WebSocket-Protocol" }
+                : {}),
+          }
+        : trimmedEarly.length === 0 &&
+            !hadExistingEarlyMax &&
+            existingEarlyHeader
+          ? { "early-data-header-name": existingEarlyHeader }
+          : {};
     return {
       network: "ws",
       wsOpts: {
         path: wsPath.trim() || "/",
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
-        ...(earlyNum > 0
-          ? {
-              "max-early-data": earlyNum,
-              "early-data-header-name":
-                existingWs?.["early-data-header-name"] ??
-                "Sec-WebSocket-Protocol",
-            }
-          : {}),
+        ...earlyDataOpts,
       },
     };
   };
@@ -1600,7 +1610,18 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           onChange={(e) => setVlessServername(e.target.value)}
                         />
                       </div>
-                      <div className="form-field full">
+                      <div className="form-field">
+                        <label className="form-label">
+                          ALPN ({tr("逗号分隔，可选", "comma-separated, optional")})
+                        </label>
+                        <input
+                          className="input mono"
+                          placeholder="h2, http/1.1"
+                          value={vlessAlpn}
+                          onChange={(e) => setVlessAlpn(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
                         <label className="form-label">
                           {tr("VLESS 加密参数 (可选 PQ)", "Encryption (none or mlkem768x25519plus...)")}
                         </label>
@@ -1641,6 +1662,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           onChange={(e) => setTrojanSni(e.target.value)}
                         />
                       </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          ALPN ({tr("逗号分隔", "comma-separated")})
+                        </label>
+                        <input
+                          className="input mono"
+                          placeholder="h2, http/1.1"
+                          value={trojanAlpn}
+                          onChange={(e) => setTrojanAlpn(e.target.value)}
+                        />
+                      </div>
                     </>
                   )}
 
@@ -1669,6 +1701,17 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           placeholder="edge.example.com"
                           value={anytlsSni}
                           onChange={(e) => setAnytlsSni(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field full">
+                        <label className="form-label">
+                          ALPN ({tr("逗号分隔", "comma-separated")})
+                        </label>
+                        <input
+                          className="input mono"
+                          placeholder="h2, http/1.1"
+                          value={anytlsAlpn}
+                          onChange={(e) => setAnytlsAlpn(e.target.value)}
                         />
                       </div>
                     </>

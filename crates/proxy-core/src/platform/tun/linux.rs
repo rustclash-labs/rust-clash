@@ -77,6 +77,96 @@ pub fn parse_rt_tables_ids(contents: &str) -> std::collections::HashSet<u32> {
     out
 }
 
+pub const RESOLVECTL_CANDIDATE_PATHS: &[&str] = &[
+    "/usr/bin/resolvectl",
+    "/bin/resolvectl",
+    "/usr/local/bin/resolvectl",
+    "/run/current-system/sw/bin/resolvectl",
+];
+
+/// Locate `resolvectl` across standard FHS / NixOS locations and `PATH`.
+pub fn resolve_resolvectl_binary_with_paths(
+    candidates: &[&str],
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    for candidate in candidates {
+        let p = std::path::Path::new(candidate);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Some(paths) = path_env {
+        for dir in std::env::split_paths(paths) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let p = dir.join("resolvectl");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_resolvectl_binary() -> Option<std::path::PathBuf> {
+    resolve_resolvectl_binary_with_paths(
+        RESOLVECTL_CANDIDATE_PATHS,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// Parse `nameserver <ip>` entries from `/etc/resolv.conf` read-only.
+pub fn parse_resolv_conf_nameservers(contents: &str) -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let before_comment = line.split(['#', ';']).next().unwrap_or("").trim();
+        if before_comment.is_empty() {
+            continue;
+        }
+        let mut parts = before_comment.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        if let Some(raw_ip) = parts.next() {
+            let clean_ip = raw_ip.split('%').next().unwrap_or(raw_ip);
+            if let Ok(ip) = clean_ip.parse::<std::net::IpAddr>() {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// Return `true` when `/etc/resolv.conf` has at least one nameserver and EVERY configured
+/// nameserver matches a Linux TUN bypass policy rule (`pref 8990` explicit bypass or `pref 9000`
+/// loopback / link-local / RFC1918 / CGNAT), meaning unmarked system DNS queries would bypass TUN.
+pub fn all_nameservers_bypass_tun(
+    nameservers: &[std::net::IpAddr],
+    bypass_ips: &[std::net::IpAddr],
+    strict_route: bool,
+) -> bool {
+    if nameservers.is_empty() {
+        return false;
+    }
+    nameservers.iter().all(|ns| {
+        if bypass_ips.contains(ns) {
+            return true;
+        }
+        match ns {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+                v4.is_loopback()
+                    || v4.is_link_local()
+                    || (!strict_route && (v4.is_private() || is_cgnat))
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        }
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn has_cap_net_admin() -> bool {
     // SAFETY: `geteuid` has no preconditions.
@@ -565,16 +655,67 @@ impl LinuxSystemTunSession {
                 }
             }
 
-            // 7. Best-effort per-link DNS registration with `systemd-resolved` (`198.18.0.2`, domain `~.`)
+            // 7. Per-link DNS registration with `systemd-resolved` (`spec.dns_ipv4()`, domain `~.`)
             //    Automatically purged by `systemd-resolved` when the TUN kernel interface closes.
-            if Path::new("/usr/bin/resolvectl").exists() {
-                let dns_peer = spec.dns_ipv4().to_string();
-                let _ = std::process::Command::new("/usr/bin/resolvectl")
+            let dns_peer = spec.dns_ipv4().to_string();
+            let mut resolved_registered = false;
+            let mut resolved_err_detail: Option<String> = None;
+            if let Some(resolvectl_bin) = resolve_resolvectl_binary() {
+                let dns_res = std::process::Command::new(&resolvectl_bin)
                     .args(["dns", &actual_name, &dns_peer])
                     .output();
-                let _ = std::process::Command::new("/usr/bin/resolvectl")
+                let dom_res = std::process::Command::new(&resolvectl_bin)
                     .args(["domain", &actual_name, "~."])
                     .output();
+                match (dns_res, dom_res) {
+                    (Ok(d_out), Ok(m_out)) if d_out.status.success() && m_out.status.success() => {
+                        resolved_registered = true;
+                    }
+                    (dns_r, dom_r) => {
+                        let fmt_out = |res: io::Result<std::process::Output>| match res {
+                            Ok(o) if o.status.success() => "ok".to_string(),
+                            Ok(o) => {
+                                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                                if stderr.is_empty() {
+                                    format!("exit {}", o.status)
+                                } else {
+                                    format!("{} ({stderr})", o.status)
+                                }
+                            }
+                            Err(e) => e.to_string(),
+                        };
+                        resolved_err_detail = Some(format!(
+                            "`{}` failed (dns: {}, domain: {})",
+                            resolvectl_bin.display(),
+                            fmt_out(dns_r),
+                            fmt_out(dom_r),
+                        ));
+                    }
+                }
+            }
+            if !resolved_registered {
+                let resolv_nameservers = fs::read_to_string("/etc/resolv.conf")
+                    .map(|s| parse_resolv_conf_nameservers(&s))
+                    .unwrap_or_default();
+                let bypass_note = if all_nameservers_bypass_tun(
+                    &resolv_nameservers,
+                    &spec.bypass_ips,
+                    spec.strict_route,
+                ) {
+                    format!(
+                        "; `/etc/resolv.conf` nameservers ({resolv_nameservers:?}) match TUN bypass rules, so system DNS queries may bypass `{actual_name}` unless system DNS points to `{dns_peer}` (or `dns.listen`)"
+                    )
+                } else {
+                    String::new()
+                };
+                match resolved_err_detail {
+                    Some(detail) => tracing::warn!(
+                        "Linux TUN: `systemd-resolved` is not active or rejected per-link DNS on `{actual_name}` ({detail}){bypass_note}"
+                    ),
+                    None => tracing::warn!(
+                        "Linux TUN: `resolvectl` was not found in `/usr/bin`, `/bin`, `/run/current-system/sw/bin`, or `PATH` (`systemd-resolved` is not active){bypass_note}"
+                    ),
+                }
             }
 
             let rec_final = rec.clone();
@@ -642,15 +783,34 @@ impl LinuxSystemTunSession {
                         continue;
                     }
                     loop {
+                        if stop_rx.load(Ordering::Acquire) {
+                            return;
+                        }
                         match f.read(&mut buf) {
                             Ok(0) => return,
                             Ok(n) => {
                                 rx_cnt.fetch_add(1, Ordering::Relaxed);
-                                if ingress_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                    return;
+                                let mut pkt = buf[..n].to_vec();
+                                loop {
+                                    if stop_rx.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    match ingress_tx.try_send(pkt) {
+                                        Ok(()) => break,
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                            returned,
+                                        )) => {
+                                            pkt = returned;
+                                            std::thread::sleep(Duration::from_millis(2));
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                             Err(_) => return,
                         }
                     }
@@ -810,6 +970,9 @@ impl SystemTunSession for LinuxSystemTunSession {
         self.stopped = true;
         self.stop_flag.store(true, Ordering::Release);
         let _ = self.stop_watch_tx.send(true);
+        if let Some(h) = self.watch_thread.take() {
+            let _ = h.join();
+        }
         rollback_linux_record(&self.recovery_record);
         clear_global_socket_protector();
         if let Err(err) = update_current_journal(&self.spec.state_dir, |j| j.linux_tun = None) {
@@ -820,9 +983,6 @@ impl SystemTunSession for LinuxSystemTunSession {
             let _ = h.join();
         }
         if let Some(h) = self.tx_thread.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.watch_thread.take() {
             let _ = h.join();
         }
     }
@@ -897,5 +1057,65 @@ mod tests {
         assert!(ids.contains(&254));
         assert!(ids.contains(&20220));
         assert!(!ids.contains(&20221));
+    }
+
+    #[test]
+    fn resolves_resolvectl_from_nixos_or_path_and_detects_bypassed_resolv_conf() {
+        let base = std::env::temp_dir().join(format!("rc-linux-dns-test-{}", uuid::Uuid::new_v4()));
+        let nixos_sw = base.join("nixos-sw").join("bin");
+        let custom_path_dir = base.join("custom-bin");
+        std::fs::create_dir_all(&nixos_sw).unwrap();
+        std::fs::create_dir_all(&custom_path_dir).unwrap();
+
+        let nixos_bin = nixos_sw.join("resolvectl");
+        let path_bin = custom_path_dir.join("resolvectl");
+        std::fs::write(&nixos_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&path_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let missing = base.join("missing").join("resolvectl");
+        let missing_s = missing.to_string_lossy().into_owned();
+        let nixos_s = nixos_bin.to_string_lossy().into_owned();
+
+        // Candidate list hit (e.g. `/run/current-system/sw/bin/resolvectl` on NixOS)
+        let found_cand =
+            resolve_resolvectl_binary_with_paths(&[&missing_s, &nixos_s], None).unwrap();
+        assert_eq!(found_cand, nixos_bin);
+
+        // `PATH` fallback hit when standard candidate paths do not exist
+        let joined_path = std::env::join_paths([&custom_path_dir]).unwrap();
+        let found_path =
+            resolve_resolvectl_binary_with_paths(&[&missing_s], Some(&joined_path)).unwrap();
+        assert_eq!(found_path, path_bin);
+
+        // Absent everywhere -> `None`
+        assert!(resolve_resolvectl_binary_with_paths(&[&missing_s], None).is_none());
+
+        // `/etc/resolv.conf` parsing and TUN bypass detection
+        let resolv = "\
+            # Generated by NetworkManager\n\
+            search lan\n\
+            nameserver 192.168.1.1 # router\n\
+            nameserver 1.1.1.1\n\
+            nameserver fe80::1%wlan0\n";
+        let ns = parse_resolv_conf_nameservers(resolv);
+        assert_eq!(
+            ns,
+            vec![
+                "192.168.1.1".parse::<std::net::IpAddr>().unwrap(),
+                "1.1.1.1".parse::<std::net::IpAddr>().unwrap(),
+                "fe80::1".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+
+        let bypass_ips = vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()];
+        // `192.168.1.1` (RFC1918), `1.1.1.1` (`pref 8990` bypass_ips), `fe80::1` (link-local) all bypass when !strict_route
+        assert!(all_nameservers_bypass_tun(&ns, &bypass_ips, false));
+        // Under `strict_route`, RFC1918 `192.168.1.1` is captured into TUN (`!all_nameservers_bypass_tun`)
+        assert!(!all_nameservers_bypass_tun(&ns, &bypass_ips, true));
+        // With `8.8.8.8` (not in `bypass_ips`), DNS will enter TUN and be hijacked by Fake-IP DNS
+        let ns_public = parse_resolv_conf_nameservers("nameserver 8.8.8.8\n");
+        assert!(!all_nameservers_bypass_tun(&ns_public, &bypass_ips, false));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -11,8 +11,8 @@ use std::{
 use proxy_core::dns::wire::{QTYPE_A, build_dns_query, extract_ip_answers};
 use proxy_ffi::ne_c_api::{
     rc_ne_flush_dns, rc_ne_free_string, rc_ne_get_status_json, rc_ne_notify_network_change,
-    rc_ne_pop_outbound_packet, rc_ne_push_inbound_packet, rc_ne_start_engine, rc_ne_stop_engine,
-    rc_ne_wait_outbound_packet,
+    rc_ne_pop_outbound_packet, rc_ne_push_inbound_packet, rc_ne_start_engine,
+    rc_ne_start_engine_v2, rc_ne_stop_engine, rc_ne_wait_outbound_packet,
 };
 
 #[cfg(unix)]
@@ -60,8 +60,8 @@ fn macos_ne_c_abi_lifecycle_and_l3_packet_pump_e2e() {
     let c_yaml = CString::new(yaml).unwrap();
     let mut err_ptr: *mut std::ffi::c_char = ptr::null_mut();
 
-    let handle = unsafe { rc_ne_start_engine(c_yaml.as_ptr(), 1500, &raw mut err_ptr) };
-    assert!(!handle.is_null(), "rc_ne_start_engine should succeed");
+    let handle = unsafe { rc_ne_start_engine_v2(c_yaml.as_ptr(), 1500, true, &raw mut err_ptr) };
+    assert!(!handle.is_null(), "rc_ne_start_engine_v2 should succeed");
     assert!(err_ptr.is_null());
 
     // Push a raw IPv4 UDP DNS query to 198.18.0.1:53 through C ABI and wait via event-driven Condvar!
@@ -69,16 +69,28 @@ fn macos_ne_c_abi_lifecycle_and_l3_packet_pump_e2e() {
     let raw_l3 = build_raw_ipv4_udp_packet([198, 18, 0, 9], [198, 18, 0, 1], 53000, 53, &dns_q);
     assert!(unsafe { rc_ne_push_inbound_packet(handle, raw_l3.as_ptr(), raw_l3.len()) });
 
-    // Undersized buffer MUST return `-2` WITHOUT dropping the queued outbound packet!
+    // Undersized buffer MUST return `-2` and pop/drop that single oversized frame so fixed-capacity
+    // NE pumps (`PacketTunnelProvider.swift`) never wedge in an infinite spin loop!
     let mut tiny_buf = [0u8; 16];
     let too_small =
         unsafe { rc_ne_wait_outbound_packet(handle, tiny_buf.as_mut_ptr(), tiny_buf.len(), 2000) };
     assert_eq!(
         too_small, -2,
-        "rc_ne_wait_outbound_packet must return -2 instead of dropping oversized packet"
+        "rc_ne_wait_outbound_packet must return -2 and drop the oversized head packet"
     );
 
     let mut out_buf = vec![0u8; 4096];
+    assert_eq!(
+        unsafe { rc_ne_pop_outbound_packet(handle, out_buf.as_mut_ptr(), out_buf.len()) },
+        0,
+        "dropped oversized packet must not remain wedged at queue head"
+    );
+
+    // Subsequent normal packet flows cleanly without any head-of-line wedge!
+    let dns_q2 = build_dns_query(0x5152, "ne-tunnel.example.com", QTYPE_A);
+    let raw_l3_2 = build_raw_ipv4_udp_packet([198, 18, 0, 9], [198, 18, 0, 1], 53001, 53, &dns_q2);
+    assert!(unsafe { rc_ne_push_inbound_packet(handle, raw_l3_2.as_ptr(), raw_l3_2.len()) });
+
     let got_len =
         unsafe { rc_ne_wait_outbound_packet(handle, out_buf.as_mut_ptr(), out_buf.len(), 2000) };
     assert!(

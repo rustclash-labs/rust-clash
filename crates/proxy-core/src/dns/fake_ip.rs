@@ -568,6 +568,7 @@ pub struct FakeIpDnsEngine {
     upstream_max_ms: AtomicU64,
     dirty_revision: AtomicU64,
     persisted_revision: AtomicU64,
+    save_lock: Mutex<()>,
     assignment_notify: Arc<Notify>,
 }
 
@@ -825,6 +826,7 @@ impl FakeIpDnsEngine {
             upstream_max_ms: AtomicU64::new(0),
             dirty_revision: AtomicU64::new(0),
             persisted_revision: AtomicU64::new(0),
+            save_lock: Mutex::new(()),
             assignment_notify: Arc::new(Notify::new()),
         })
     }
@@ -2218,9 +2220,10 @@ impl FakeIpDnsEngine {
         self.pool.lock().ip_to_domain.len()
     }
 
-    /// Persist up to `2048` MRU Fake-IP <-> domain mappings atomically via a unique sibling `.json.tmp.<pid>.<seq>` file.
+    /// Persist up to `2048` MRU Fake-IP <-> domain mappings atomically via a unique sibling `.tmp.<pid>.<seq>` file.
     pub fn save_to_path(&self, path: &std::path::Path) -> std::io::Result<usize> {
         static SAVE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let _save_guard = self.save_lock.lock();
         let (rev, mut entries) = {
             let guard = self.pool.lock();
             (
@@ -2243,7 +2246,9 @@ impl FakeIpDnsEngine {
         };
         let encoded = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
         let seq = SAVE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(format!(".tmp.{}.{seq}", std::process::id()));
+        let tmp_path = std::path::PathBuf::from(tmp_os);
         #[cfg(unix)]
         {
             use std::io::Write;
@@ -2261,7 +2266,10 @@ impl FakeIpDnsEngine {
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(&tmp_path, &encoded)?;
+            if let Err(err) = std::fs::write(&tmp_path, &encoded) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
         }
         if let Err(err) = std::fs::rename(&tmp_path, path) {
             let _ = std::fs::remove_file(&tmp_path);
@@ -3672,5 +3680,94 @@ mod tests {
         assert!(hits.load(Ordering::Relaxed) > first_hits);
 
         srv_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_save_to_path_never_corrupts_state_or_leaks_temp_files() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustclash_fakeip_save_race_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let cache_path = test_dir.join("fake_ip_state.json");
+
+        let engine = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+
+        // Phase 1: Interleave concurrent Fake-IP allocations with 12 concurrent blocking save_to_path callers
+        let mut alloc_handles = Vec::new();
+        for i in 0..120usize {
+            let eng = Arc::clone(&engine);
+            alloc_handles.push(tokio::spawn(async move {
+                let q = build_dns_query(i as u16, &format!("host-{i}.concurrent.example"), QTYPE_A);
+                eng.handle_dns_packet(&q).await.unwrap();
+            }));
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let mut save_handles = Vec::new();
+        for _ in 0..12 {
+            let eng = Arc::clone(&engine);
+            let p = cache_path.clone();
+            let b = Arc::clone(&barrier);
+            save_handles.push(tokio::task::spawn_blocking(move || {
+                b.wait();
+                for _ in 0..20 {
+                    eng.save_to_path(&p).unwrap();
+                }
+            }));
+        }
+
+        for h in alloc_handles {
+            h.await.unwrap();
+        }
+        for h in save_handles {
+            h.await.unwrap();
+        }
+
+        // Phase 2: All 120 entries are now in the pool; hammer save_to_path concurrently from two engines sharing the path
+        let engine2 = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+        engine2.import_entries_from(&engine);
+        let barrier2 = Arc::new(std::sync::Barrier::new(8));
+        let mut save_handles2 = Vec::new();
+        for idx in 0..8 {
+            let eng = if idx % 2 == 0 {
+                Arc::clone(&engine)
+            } else {
+                Arc::clone(&engine2)
+            };
+            let p = cache_path.clone();
+            let b = Arc::clone(&barrier2);
+            save_handles2.push(tokio::task::spawn_blocking(move || {
+                b.wait();
+                for _ in 0..15 {
+                    assert_eq!(eng.save_to_path(&p).unwrap(), 120);
+                }
+            }));
+        }
+        for h in save_handles2 {
+            h.await.unwrap();
+        }
+
+        let restored = FakeIpDnsEngine::new(&DnsConfig::default()).unwrap();
+        assert_eq!(restored.load_from_path(&cache_path), 120);
+
+        // Phase 3: Rename failure (target path is an existing directory) MUST clean up its unique .tmp file
+        let dir_target = test_dir.join("cannot_overwrite_dir.json");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        assert!(engine.save_to_path(&dir_target).is_err());
+
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&test_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "leftover temp files found: {leftover_tmps:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

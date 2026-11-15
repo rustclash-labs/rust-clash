@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, net::IpAddr};
 
 /// Darwin `utun` 4-byte protocol family header constants (`<sys/socket.h>` on macOS/iOS).
 pub const DARWIN_AF_INET: u32 = 2;
@@ -50,7 +50,7 @@ pub fn decode_darwin_utun_packet(utun_frame: &[u8]) -> io::Result<&[u8]> {
     }
 }
 
-/// Parse `route -n get default` output on macOS to extract `(interface, gateway)`.
+/// Parse `route -n get default` (or `route -n get -inet6 default`) output on macOS to extract `(interface, gateway)`.
 pub fn parse_macos_route_get_default(output: &str) -> (Option<String>, Option<String>) {
     let mut iface = None;
     let mut gw = None;
@@ -69,6 +69,106 @@ pub fn parse_macos_route_get_default(output: &str) -> (Option<String>, Option<St
         }
     }
     (iface, gw)
+}
+
+/// Ensure link-local IPv6 gateways (`fe80:...`) include a BSD interface scope zone (`%en0`)
+/// so `/sbin/route -n add -inet6 -host <dst> <gw>` succeeds on Darwin.
+pub fn normalize_macos_ipv6_gateway(gw: &str, iface: Option<&str>) -> String {
+    let trimmed = gw.trim();
+    if trimmed.len() >= 5
+        && trimmed[..5].eq_ignore_ascii_case("fe80:")
+        && !trimmed.contains('%')
+        && let Some(if_name) = iface.map(str::trim).filter(|s| !s.is_empty())
+    {
+        return format!("{trimmed}%{if_name}");
+    }
+    trimmed.to_string()
+}
+
+/// Resolve primary `(interface, gateway)` from macOS IPv4 `route -n get default` output,
+/// falling back to `route -n get -inet6 default` on IPv6-only / NAT64 networks and ignoring `utun*`.
+pub fn resolve_macos_default_egress_outputs(
+    v4_route_out: Option<&str>,
+    v6_route_out: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(out4) = v4_route_out {
+        let (if4, gw4) = parse_macos_route_get_default(out4);
+        if let Some(iface) = if4.filter(|s| !s.starts_with("utun")) {
+            return (Some(iface), gw4);
+        }
+    }
+    if let Some(out6) = v6_route_out {
+        let (if6, gw6) = parse_macos_route_get_default(out6);
+        if let Some(iface) = if6.filter(|s| !s.starts_with("utun")) {
+            let norm_gw = gw6.map(|g| normalize_macos_ipv6_gateway(&g, Some(&iface)));
+            return (Some(iface), norm_gw);
+        }
+    }
+    (None, None)
+}
+
+/// Build `(add_args, delete_args)` pairs for `/sbin/route` covering both IPv4 `/32` (`-host`)
+/// and IPv6 `/128` (`-inet6 -host`) physical bypass routes.
+pub fn build_macos_bypass_route_commands(
+    bypass_ips: &[IpAddr],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+    v4_gw: Option<&str>,
+    v6_gw: Option<&str>,
+) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut cmds = Vec::new();
+    for ip in bypass_ips {
+        match ip {
+            IpAddr::V4(v4)
+                if !v4.is_loopback() && !v4.is_unspecified() && !fake_ip_net.contains(v4) =>
+            {
+                if let Some(gw) = v4_gw.filter(|s| !s.is_empty()) {
+                    let host_s = v4.to_string();
+                    let add_args = vec![
+                        "-n".to_string(),
+                        "add".to_string(),
+                        "-host".to_string(),
+                        host_s.clone(),
+                        gw.to_string(),
+                    ];
+                    let del_args = vec![
+                        "-n".to_string(),
+                        "delete".to_string(),
+                        "-host".to_string(),
+                        host_s,
+                        gw.to_string(),
+                    ];
+                    cmds.push((add_args, del_args));
+                }
+            }
+            IpAddr::V6(v6)
+                if !v6.is_loopback() && !v6.is_unspecified() && !tun_ipv6_cidr.contains(v6) =>
+            {
+                if let Some(gw6) = v6_gw.filter(|s| !s.is_empty()) {
+                    let host_s = v6.to_string();
+                    let add_args = vec![
+                        "-n".to_string(),
+                        "add".to_string(),
+                        "-inet6".to_string(),
+                        "-host".to_string(),
+                        host_s.clone(),
+                        gw6.to_string(),
+                    ];
+                    let del_args = vec![
+                        "-n".to_string(),
+                        "delete".to_string(),
+                        "-inet6".to_string(),
+                        "-host".to_string(),
+                        host_s,
+                        gw6.to_string(),
+                    ];
+                    cmds.push((add_args, del_args));
+                }
+            }
+            _ => {}
+        }
+    }
+    cmds
 }
 
 /// Parse `networksetup -listnetworkserviceorder` output to map BSD device `en0` -> macOS Service `"Wi-Fi"`.
@@ -99,8 +199,9 @@ mod darwin_impl {
     use std::{
         ffi::CString,
         io,
-        net::{IpAddr, Ipv4Addr},
+        net::Ipv4Addr,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        path::Path,
         process::Command,
         sync::{
             Arc,
@@ -113,8 +214,9 @@ mod darwin_impl {
     use parking_lot::Mutex;
 
     use super::{
-        decode_darwin_utun_packet, encode_darwin_utun_packet, map_bsd_device_to_network_service,
-        parse_macos_route_get_default,
+        build_macos_bypass_route_commands, decode_darwin_utun_packet, encode_darwin_utun_packet,
+        map_bsd_device_to_network_service, normalize_macos_ipv6_gateway,
+        parse_macos_route_get_default, resolve_macos_default_egress_outputs,
     };
     use crate::{
         inbound::tun::VirtualTunHandle,
@@ -153,6 +255,15 @@ mod darwin_impl {
         sc_reserved: [u32; 5],
     }
 
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct MacOsDualStackEgress {
+        primary_if: Option<String>,
+        primary_gw: Option<String>,
+        primary_idx: u32,
+        v4_gw: Option<String>,
+        v6_gw: Option<String>,
+    }
+
     fn run_cmd(program: &str, args: &[&str]) -> io::Result<String> {
         let out = Command::new(program).args(args).output()?;
         if out.status.success() {
@@ -175,11 +286,57 @@ mod darwin_impl {
         unsafe { libc::if_nametoindex(cstr.as_ptr()) }
     }
 
-    pub fn detect_macos_default_egress() -> (Option<String>, Option<String>, u32) {
-        let Ok(out) = run_cmd("/sbin/route", &["-n", "get", "default"]) else {
-            return (None, None, 0);
+    fn detect_macos_dual_stack_egress() -> MacOsDualStackEgress {
+        let out4 = run_cmd("/sbin/route", &["-n", "get", "default"]).ok();
+        let out6 = run_cmd("/sbin/route", &["-n", "get", "-inet6", "default"]).ok();
+
+        let (v4_if_raw, v4_gw_raw) = out4
+            .as_deref()
+            .map(parse_macos_route_get_default)
+            .unwrap_or((None, None));
+        let v4_gw = if v4_if_raw.as_deref().is_some_and(|s| !s.starts_with("utun")) {
+            v4_gw_raw
+        } else {
+            None
         };
-        let (iface, gw) = parse_macos_route_get_default(&out);
+
+        let (v6_if_raw, v6_gw_raw) = out6
+            .as_deref()
+            .map(parse_macos_route_get_default)
+            .unwrap_or((None, None));
+        let v6_gw = if let Some(ref if6) = v6_if_raw
+            && !if6.starts_with("utun")
+        {
+            v6_gw_raw.map(|g| normalize_macos_ipv6_gateway(&g, Some(if6)))
+        } else {
+            None
+        };
+
+        let (primary_if, primary_gw) =
+            resolve_macos_default_egress_outputs(out4.as_deref(), out6.as_deref());
+        let primary_idx = primary_if.as_deref().map(lookup_if_index).unwrap_or(0);
+
+        MacOsDualStackEgress {
+            primary_if,
+            primary_gw,
+            primary_idx,
+            v4_gw,
+            v6_gw,
+        }
+    }
+
+    pub fn detect_macos_default_egress() -> (Option<String>, Option<String>, u32) {
+        let out4 = run_cmd("/sbin/route", &["-n", "get", "default"]).ok();
+        if let Some(ref s4) = out4 {
+            let (iface, gw) = parse_macos_route_get_default(s4);
+            if let Some(if_name) = iface.filter(|s| !s.starts_with("utun")) {
+                let idx = lookup_if_index(&if_name);
+                return (Some(if_name), gw, idx);
+            }
+        }
+        // Fallback for IPv6-only / NAT64 networks where `route -n get default` has no interface!
+        let out6 = run_cmd("/sbin/route", &["-n", "get", "-inet6", "default"]).ok();
+        let (iface, gw) = resolve_macos_default_egress_outputs(None, out6.as_deref());
         let idx = iface.as_deref().map(lookup_if_index).unwrap_or(0);
         (iface, gw, idx)
     }
@@ -309,12 +466,8 @@ mod darwin_impl {
         Ok((fd, assigned))
     }
 
-    fn rollback_macos_record(rec: &MacOsRecoveryRecord) {
-        for args in rec.owned_route_del_args.iter().rev() {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let _ = run_cmd("/sbin/route", &refs);
-        }
-        for dns in &rec.dns_backups {
+    fn restore_macos_dns_backups(dns_backups: &[MacOsDnsBackup]) {
+        for dns in dns_backups {
             let mut args = vec!["-setdnsservers", dns.service_name.as_str()];
             if dns.previous_servers.is_empty() {
                 args.push("Empty");
@@ -327,17 +480,80 @@ mod darwin_impl {
         }
     }
 
+    fn bind_macos_service_dns_for_iface(
+        bsd_if: Option<&str>,
+        dns_str: &str,
+        rec: &mut MacOsRecoveryRecord,
+        state_dir: &Path,
+    ) {
+        if let Some(if_name) = bsd_if
+            && let Ok(order_out) = run_cmd("/usr/sbin/networksetup", &["-listnetworkserviceorder"])
+            && let Some(svc) = map_bsd_device_to_network_service(&order_out, if_name)
+            && let Ok(prev_dns_out) = run_cmd("/usr/sbin/networksetup", &["-getdnsservers", &svc])
+        {
+            let prev_servers: Vec<String> = prev_dns_out
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.contains("There aren't any DNS Servers"))
+                .map(ToOwned::to_owned)
+                .collect();
+            rec.dns_backups.push(MacOsDnsBackup {
+                service_name: svc.clone(),
+                previous_servers: prev_servers,
+            });
+            let rec_snap = rec.clone();
+            let _ = update_current_journal(state_dir, |j| j.macos_tun = Some(rec_snap));
+            let _ = run_cmd("/usr/sbin/networksetup", &["-setdnsservers", &svc, dns_str]);
+        } else {
+            let rec_snap = rec.clone();
+            let _ = update_current_journal(state_dir, |j| j.macos_tun = Some(rec_snap));
+        }
+    }
+
+    fn install_macos_bypass_routes(
+        spec: &TunLaunchSpec,
+        egress: &MacOsDualStackEgress,
+        rec: &mut MacOsRecoveryRecord,
+    ) {
+        let cmds = build_macos_bypass_route_commands(
+            &spec.bypass_ips,
+            spec.fake_ip_net,
+            spec.tun_ipv6_cidr,
+            egress.v4_gw.as_deref(),
+            egress.v6_gw.as_deref(),
+        );
+        for (add_args, del_args) in cmds {
+            let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
+            if run_cmd("/sbin/route", &add_refs).is_ok() {
+                rec.owned_route_del_args.push(del_args);
+            }
+        }
+    }
+
+    fn is_utun_split_route_del_arg(args: &[String], utun_name: &str) -> bool {
+        args.windows(2)
+            .any(|w| w[0] == "-interface" && w[1] == utun_name)
+    }
+
+    fn rollback_macos_record(rec: &MacOsRecoveryRecord) {
+        for args in rec.owned_route_del_args.iter().rev() {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = run_cmd("/sbin/route", &refs);
+        }
+        restore_macos_dns_backups(&rec.dns_backups);
+    }
+
     pub struct MacOsUtunSession {
         spec: TunLaunchSpec,
         utun_name: String,
-        recovery_record: MacOsRecoveryRecord,
+        recovery_record: Arc<Mutex<MacOsRecoveryRecord>>,
         stop_flag: Arc<AtomicBool>,
         stop_watch_tx: tokio::sync::watch::Sender<bool>,
         stopped: bool,
         rx_packets: Arc<AtomicU64>,
         tx_packets: Arc<AtomicU64>,
         network_transitions: Arc<AtomicU64>,
-        egress_snapshot: Arc<Mutex<(Option<String>, Option<String>)>>,
+        egress_snapshot: Arc<Mutex<MacOsDualStackEgress>>,
         rx_thread: Option<JoinHandle<()>>,
         tx_thread: Option<JoinHandle<()>>,
         watch_thread: Option<JoinHandle<()>>,
@@ -345,10 +561,10 @@ mod darwin_impl {
 
     impl MacOsUtunSession {
         pub fn start(spec: TunLaunchSpec, handle: VirtualTunHandle) -> io::Result<Self> {
-            let (egress_if, egress_gw, egress_idx) = detect_macos_default_egress();
+            let initial_egress = detect_macos_dual_stack_egress();
             let (utun_fd, utun_name) = open_darwin_utun_socket(&spec.device_name)?;
 
-            let protector = Arc::new(MacOsBoundIfProtector::new(egress_idx));
+            let protector = Arc::new(MacOsBoundIfProtector::new(initial_egress.primary_idx));
             set_global_socket_protector(Arc::clone(&protector) as _);
 
             let mut rec = MacOsRecoveryRecord {
@@ -356,6 +572,8 @@ mod darwin_impl {
                 owned_route_del_args: Vec::new(),
                 dns_backups: Vec::new(),
             };
+
+            let dns_str_for_watch = spec.dns_ipv4().to_string();
 
             let setup_res = (|| -> io::Result<()> {
                 let gw_v4: Ipv4Addr = spec.gateway_ipv4();
@@ -404,27 +622,8 @@ mod darwin_impl {
                     ]);
                 }
 
-                if let Some(ref phys_gw) = egress_gw {
-                    for ip in &spec.bypass_ips {
-                        if let IpAddr::V4(v4) = ip
-                            && !v4.is_loopback()
-                            && !spec.fake_ip_net.contains(v4)
-                        {
-                            let host_s = v4.to_string();
-                            if run_cmd("/sbin/route", &["-n", "add", "-host", &host_s, phys_gw])
-                                .is_ok()
-                            {
-                                rec.owned_route_del_args.push(vec![
-                                    "-n".into(),
-                                    "delete".into(),
-                                    "-host".into(),
-                                    host_s,
-                                    phys_gw.clone(),
-                                ]);
-                            }
-                        }
-                    }
-                }
+                // Install both IPv4 `/32` (`-host`) and IPv6 `/128` (`-inet6 -host`) physical bypass routes!
+                install_macos_bypass_routes(&spec, &initial_egress, &mut rec);
 
                 if spec.enable_ipv6 {
                     for net6 in ["::/1", "8000::/1"] {
@@ -447,35 +646,12 @@ mod darwin_impl {
                 }
 
                 // Snapshot & point primary macOS network service DNS at `198.18.0.2` (hijacked in-band by `smoltcp`!)
-                if let Some(ref bsd_if) = egress_if
-                    && let Ok(order_out) =
-                        run_cmd("/usr/sbin/networksetup", &["-listnetworkserviceorder"])
-                    && let Some(svc) = map_bsd_device_to_network_service(&order_out, bsd_if)
-                    && let Ok(prev_dns_out) =
-                        run_cmd("/usr/sbin/networksetup", &["-getdnsservers", &svc])
-                {
-                    let prev_servers: Vec<String> = prev_dns_out
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty() && !l.contains("There aren't any DNS Servers"))
-                        .map(ToOwned::to_owned)
-                        .collect();
-                    rec.dns_backups.push(MacOsDnsBackup {
-                        service_name: svc.clone(),
-                        previous_servers: prev_servers,
-                    });
-                    let rec_snap = rec.clone();
-                    let _ =
-                        update_current_journal(&spec.state_dir, |j| j.macos_tun = Some(rec_snap));
-                    let _ = run_cmd(
-                        "/usr/sbin/networksetup",
-                        &["-setdnsservers", &svc, &dns_str],
-                    );
-                } else {
-                    let rec_snap = rec.clone();
-                    let _ =
-                        update_current_journal(&spec.state_dir, |j| j.macos_tun = Some(rec_snap));
-                }
+                bind_macos_service_dns_for_iface(
+                    initial_egress.primary_if.as_deref(),
+                    &dns_str,
+                    &mut rec,
+                    &spec.state_dir,
+                );
 
                 Ok(())
             })();
@@ -508,12 +684,13 @@ mod darwin_impl {
                 }
             }
 
+            let recovery_record = Arc::new(Mutex::new(rec));
             let stop_flag = Arc::new(AtomicBool::new(false));
             let (stop_watch_tx, mut stop_watch_rx) = tokio::sync::watch::channel(false);
             let rx_packets = Arc::new(AtomicU64::new(0));
             let tx_packets = Arc::new(AtomicU64::new(0));
             let network_transitions = Arc::new(AtomicU64::new(0));
-            let egress_snapshot = Arc::new(Mutex::new((egress_if, egress_gw)));
+            let egress_snapshot = Arc::new(Mutex::new(initial_egress));
 
             let VirtualTunHandle {
                 ingress_tx,
@@ -537,6 +714,9 @@ mod darwin_impl {
                             continue;
                         }
                         loop {
+                            if stop_rx.load(Ordering::Acquire) {
+                                return;
+                            }
                             // SAFETY: `read` into `buf` bounded by `buf.len()`.
                             let n = unsafe {
                                 libc::read(
@@ -557,8 +737,23 @@ mod darwin_impl {
                             }
                             if let Ok(l3) = decode_darwin_utun_packet(&buf[..n as usize]) {
                                 rx_cnt.fetch_add(1, Ordering::Relaxed);
-                                if ingress_tx.blocking_send(l3.to_vec()).is_err() {
-                                    return;
+                                let mut pkt = l3.to_vec();
+                                loop {
+                                    if stop_rx.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    match ingress_tx.try_send(pkt) {
+                                        Ok(()) => break,
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                            returned,
+                                        )) => {
+                                            pkt = returned;
+                                            std::thread::sleep(Duration::from_millis(2));
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -568,7 +763,7 @@ mod darwin_impl {
                 Err(err) => {
                     stop_flag.store(true, Ordering::Release);
                     let _ = stop_watch_tx.send(true);
-                    rollback_macos_record(&rec);
+                    rollback_macos_record(&recovery_record.lock());
                     clear_global_socket_protector();
                     let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
                     return Err(err);
@@ -610,7 +805,7 @@ mod darwin_impl {
                     stop_flag.store(true, Ordering::Release);
                     let _ = stop_watch_tx.send(true);
                     let _ = rx_thread.join();
-                    rollback_macos_record(&rec);
+                    rollback_macos_record(&recovery_record.lock());
                     clear_global_socket_protector();
                     let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
                     return Err(err);
@@ -620,6 +815,9 @@ mod darwin_impl {
             let stop_watch = Arc::clone(&stop_flag);
             let egress_watch = Arc::clone(&egress_snapshot);
             let transitions_watch = Arc::clone(&network_transitions);
+            let rec_watch = Arc::clone(&recovery_record);
+            let spec_watch = spec.clone();
+            let utun_name_watch = utun_name.clone();
             let dns_watch = spec.dns_engine.clone();
             let net_hook_watch = spec.network_change_hook.clone();
             let watch_thread = match std::thread::Builder::new()
@@ -632,21 +830,76 @@ mod darwin_impl {
                             }
                             std::thread::sleep(Duration::from_millis(200));
                         }
-                        let (new_if, new_gw, new_idx) = detect_macos_default_egress();
-                        if new_if.as_deref().is_some_and(|s| s.starts_with("utun")) {
+                        if stop_watch.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let latest = detect_macos_dual_stack_egress();
+                        if latest
+                            .primary_if
+                            .as_deref()
+                            .is_some_and(|s| s.starts_with("utun"))
+                            || latest.primary_idx == 0
+                        {
                             continue;
                         }
-                        let mut guard = egress_watch.lock();
-                        if *guard != (new_if.clone(), new_gw.clone()) && new_idx > 0 {
-                            *guard = (new_if, new_gw);
-                            drop(guard);
-                            protector.set_if_index(new_idx);
-                            transitions_watch.fetch_add(1, Ordering::Relaxed);
-                            if let Some(hook) = &net_hook_watch {
-                                hook();
-                            } else if let Some(dns) = &dns_watch {
-                                dns.flush_cache();
+
+                        let (if_changed, gw_changed) = {
+                            let mut guard = egress_watch.lock();
+                            if *guard == latest {
+                                continue;
                             }
+                            let if_chg = guard.primary_if != latest.primary_if;
+                            let gw_chg =
+                                (guard.v4_gw != latest.v4_gw) || (guard.v6_gw != latest.v6_gw);
+                            *guard = latest.clone();
+                            (if_chg, gw_chg)
+                        };
+
+                        protector.set_if_index(latest.primary_idx);
+
+                        if spec_watch.auto_route && (if_changed || gw_changed) {
+                            let mut rec_guard = rec_watch.lock();
+                            if gw_changed && !spec_watch.bypass_ips.is_empty() {
+                                let mut split_routes =
+                                    Vec::with_capacity(rec_guard.owned_route_del_args.len());
+                                let mut old_bypass = Vec::new();
+                                for args in rec_guard.owned_route_del_args.drain(..) {
+                                    if is_utun_split_route_del_arg(&args, &utun_name_watch) {
+                                        split_routes.push(args);
+                                    } else {
+                                        old_bypass.push(args);
+                                    }
+                                }
+                                for args in old_bypass.iter().rev() {
+                                    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                                    let _ = run_cmd("/sbin/route", &refs);
+                                }
+                                rec_guard.owned_route_del_args = split_routes;
+                                install_macos_bypass_routes(&spec_watch, &latest, &mut rec_guard);
+                            }
+
+                            if if_changed {
+                                let prev_dns = std::mem::take(&mut rec_guard.dns_backups);
+                                restore_macos_dns_backups(&prev_dns);
+                                bind_macos_service_dns_for_iface(
+                                    latest.primary_if.as_deref(),
+                                    &dns_str_for_watch,
+                                    &mut rec_guard,
+                                    &spec_watch.state_dir,
+                                );
+                            } else {
+                                let rec_snap = rec_guard.clone();
+                                let _ = update_current_journal(&spec_watch.state_dir, |j| {
+                                    j.macos_tun = Some(rec_snap)
+                                });
+                            }
+                        }
+
+                        transitions_watch.fetch_add(1, Ordering::Relaxed);
+                        if let Some(hook) = &net_hook_watch {
+                            hook();
+                        } else if let Some(dns) = &dns_watch {
+                            dns.flush_cache();
                         }
                     }
                 }) {
@@ -656,7 +909,7 @@ mod darwin_impl {
                     let _ = stop_watch_tx.send(true);
                     let _ = rx_thread.join();
                     let _ = tx_thread.join();
-                    rollback_macos_record(&rec);
+                    rollback_macos_record(&recovery_record.lock());
                     clear_global_socket_protector();
                     let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
                     return Err(err);
@@ -666,7 +919,7 @@ mod darwin_impl {
             Ok(Self {
                 spec,
                 utun_name,
-                recovery_record: rec,
+                recovery_record,
                 stop_flag,
                 stop_watch_tx,
                 stopped: false,
@@ -683,7 +936,7 @@ mod darwin_impl {
 
     impl SystemTunSession for MacOsUtunSession {
         fn health(&self) -> TunHealthSnapshot {
-            let (egress_if, egress_gw) = self.egress_snapshot.lock().clone();
+            let eg = self.egress_snapshot.lock().clone();
             TunHealthSnapshot {
                 platform: "macos".to_string(),
                 backend: "macos-utun".to_string(),
@@ -698,8 +951,8 @@ mod darwin_impl {
                 auto_route_applied: self.spec.auto_route,
                 strict_route_applied: self.spec.auto_route && self.spec.strict_route,
                 route_table_id: None,
-                default_egress_iface: egress_if,
-                default_egress_gateway: egress_gw,
+                default_egress_iface: eg.primary_if,
+                default_egress_gateway: eg.primary_gw,
                 socket_protector: global_socket_protector().description(),
                 privilege_ok: true,
                 privilege_hint: None,
@@ -718,19 +971,21 @@ mod darwin_impl {
             self.stopped = true;
             self.stop_flag.store(true, Ordering::Release);
             let _ = self.stop_watch_tx.send(true);
-            rollback_macos_record(&self.recovery_record);
-            clear_global_socket_protector();
-            let _ = update_current_journal(&self.spec.state_dir, |j| j.macos_tun = None);
 
+            if let Some(h) = self.watch_thread.take() {
+                let _ = h.join();
+            }
             if let Some(h) = self.rx_thread.take() {
                 let _ = h.join();
             }
             if let Some(h) = self.tx_thread.take() {
                 let _ = h.join();
             }
-            if let Some(h) = self.watch_thread.take() {
-                let _ = h.join();
-            }
+
+            let rec_final = self.recovery_record.lock().clone();
+            rollback_macos_record(&rec_final);
+            clear_global_socket_protector();
+            let _ = update_current_journal(&self.spec.state_dir, |j| j.macos_tun = None);
         }
     }
 
@@ -831,6 +1086,68 @@ mod tests {
         assert_eq!(
             map_bsd_device_to_network_service(ns_out, "en0").as_deref(),
             Some("Wi-Fi")
+        );
+    }
+
+    #[test]
+    fn ipv6_only_macos_default_egress_fallback_and_bypass_route_commands() {
+        // IPv4 default missing -> falls back to `-inet6 default` and scopes link-local `fe80::` gateway
+        let v6_out = "   route to: ::\ndestination: ::\n    gateway: fe80::1\n  interface: en0\n";
+        let (iface, gw) = resolve_macos_default_egress_outputs(None, Some(v6_out));
+        assert_eq!(iface.as_deref(), Some("en0"));
+        assert_eq!(gw.as_deref(), Some("fe80::1%en0"));
+
+        // Already-scoped `fe80::1%en0` is preserved verbatim
+        assert_eq!(
+            normalize_macos_ipv6_gateway("fe80::1%en0", Some("en0")),
+            "fe80::1%en0"
+        );
+
+        let bypass_ips: Vec<IpAddr> = vec![
+            "1.1.1.1".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+            "198.18.0.2".parse().unwrap(), // inside fake_ip_net -> skipped
+            "::1".parse().unwrap(),        // loopback -> skipped
+        ];
+        let fake_v4: ipnet::Ipv4Net = "198.18.0.0/15".parse().unwrap();
+        let tun_v6: ipnet::Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
+        let cmds = build_macos_bypass_route_commands(
+            &bypass_ips,
+            fake_v4,
+            tun_v6,
+            Some("192.168.1.1"),
+            Some("fe80::1%en0"),
+        );
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[0].0,
+            vec!["-n", "add", "-host", "1.1.1.1", "192.168.1.1"]
+        );
+        assert_eq!(
+            cmds[0].1,
+            vec!["-n", "delete", "-host", "1.1.1.1", "192.168.1.1"]
+        );
+        assert_eq!(
+            cmds[1].0,
+            vec![
+                "-n",
+                "add",
+                "-inet6",
+                "-host",
+                "2606:4700:4700::1111",
+                "fe80::1%en0"
+            ]
+        );
+        assert_eq!(
+            cmds[1].1,
+            vec![
+                "-n",
+                "delete",
+                "-inet6",
+                "-host",
+                "2606:4700:4700::1111",
+                "fe80::1%en0"
+            ]
         );
     }
 }

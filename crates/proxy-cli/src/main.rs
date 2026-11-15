@@ -355,11 +355,12 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let (api_addr, _api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
+            let api_base_url = format_api_base_url(api_addr);
 
             let active_secret = engine.config_snapshot().secret;
             if generated_ephemeral && let Some(sec) = active_secret.as_deref() {
                 tracing::info!(
-                    "Generated ephemeral 256-bit controller secret; authenticated Web UI: http://{api_addr}/#secret={sec}"
+                    "Generated ephemeral 256-bit controller secret; authenticated Web UI: {api_base_url}/#secret={sec}"
                 );
             }
 
@@ -374,16 +375,14 @@ async fn main() -> Result<()> {
                 engine.tun_mode().as_str()
             );
             if generated_ephemeral && let Some(sec) = active_secret.as_deref() {
-                println!("  Web Console & Control API     : http://{api_addr}/#secret={sec}");
+                println!("  Web Console & Control API     : {api_base_url}/#secret={sec}");
                 println!("  Ephemeral Bearer Secret       : {sec}");
             } else {
-                println!("  Web Console & Control API     : http://{api_addr}");
+                println!("  Web Console & Control API     : {api_base_url}");
             }
             println!("================================================================");
 
-            tokio::signal::ctrl_c()
-                .await
-                .context("failed waiting for Ctrl-C signal")?;
+            wait_for_shutdown_signal().await?;
             tracing::info!("Shutting down rust-clash...");
             let _ = shutdown_tx.send(true);
             engine.shutdown();
@@ -392,9 +391,15 @@ async fn main() -> Result<()> {
 
         Commands::ElevatedTunHelper { config } => {
             let state_dir = proxy_core::platform::recovery::default_state_dir();
-            let _instance_guard =
+            let instance_guard =
                 proxy_core::platform::recovery::SingleInstanceGuard::acquire(&state_dir)
-                    .context("another rust-clash instance is already holding the TUN lock")?;
+                    .with_context(|| {
+                        format!(
+                            "another rust-clash instance is already running in '{}'; please close the running non-elevated instance before starting elevated-tun-helper",
+                            state_dir.display()
+                        )
+                    })?;
+            let _ = proxy_core::platform::recovery::recover_stale_network_state(&state_dir);
             let canon = std::fs::canonicalize(&config)
                 .with_context(|| format!("invalid config path '{}'", config.display()))?;
             let mut cfg = ClashConfig::from_file(&canon)?;
@@ -417,21 +422,26 @@ async fn main() -> Result<()> {
             cfg.tun.enable = true;
             cfg.tun.auto_route = true;
             let engine = ProxyEngine::start_with_path(cfg, Some(canon)).await?;
+            if let Ok(profile_mgr) = proxy_core::profile::ProfileManager::open_or_init(&state_dir) {
+                engine.attach_profile_manager(profile_mgr);
+            }
             let ctrl_listen = engine.config_snapshot().external_controller;
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let (api_addr, _api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
-            if generated_ephemeral && let Some(sec) = engine.config_snapshot().secret.as_deref() {
-                tracing::info!(
-                    "Generated ephemeral 256-bit controller secret for elevated TUN helper; Web UI: http://{api_addr}/#secret={sec}"
-                );
-            }
-            tokio::signal::ctrl_c()
-                .await
-                .context("failed waiting for Ctrl-C signal")?;
+            let api_base_url = format_api_base_url(api_addr);
+            tracing::info!(
+                mixed_listen = %engine.mixed_addr(),
+                api_base_url = %api_base_url,
+                ephemeral_secret = generated_ephemeral,
+                "Elevated TUN helper listening (Bearer secret active; redacted from logs)"
+            );
+            wait_for_shutdown_signal().await?;
+            tracing::info!("Shutting down rust-clash elevated TUN helper...");
             let _ = shutdown_tx.send(true);
             engine.shutdown();
             tokio::time::sleep(Duration::from_millis(80)).await;
+            drop(instance_guard);
         }
 
         Commands::TunCheck { wintun_path } => {
@@ -606,7 +616,7 @@ async fn main() -> Result<()> {
                     println!("AnyTLS v2 server (self-signed SNI={sni}) listening on {bound}");
                 }
             }
-            tokio::signal::ctrl_c().await?;
+            wait_for_shutdown_signal().await?;
             let _ = shutdown_tx.send(true);
         }
 
@@ -1102,4 +1112,48 @@ rules:
         Uuid::new_v4(),
         vless_enc
     )
+}
+
+fn format_api_base_url(addr: std::net::SocketAddr) -> String {
+    let normalized = if addr.ip().is_unspecified() {
+        std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
+    } else {
+        addr
+    };
+    match normalized {
+        std::net::SocketAddr::V4(v4) => format!("http://{v4}"),
+        std::net::SocketAddr::V6(v6) => format!("http://[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        res.context("failed waiting for Ctrl-C signal")?;
+                    }
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed registering SIGTERM handler ({err}); falling back to Ctrl-C only"
+                );
+                tokio::signal::ctrl_c()
+                    .await
+                    .context("failed waiting for Ctrl-C signal")?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed waiting for Ctrl-C signal")?;
+        Ok(())
+    }
 }

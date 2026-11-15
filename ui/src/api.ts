@@ -385,6 +385,59 @@ function effectiveSecret(settings: ControllerSettings): string {
   );
 }
 
+export async function probeControllerSettings(
+  settings: ControllerSettings,
+): Promise<VersionInfo> {
+  const cleanBase = settings.baseUrl.replace(/\/+$/, "");
+  const base = await resolveRuntimeBaseUrl(cleanBase);
+  const url = `${base}/version`;
+  const headers = new Headers();
+  const secret =
+    settings.secret.trim() || (!cleanBase ? discoveredDesktopSecret || "" : "");
+  if (secret) {
+    headers.set("Authorization", `Bearer ${secret}`);
+  }
+  let resp: Response;
+  try {
+    resp = await fetch(url, { headers });
+  } catch (err) {
+    const detail = err instanceof Error && err.message ? ` (${err.message})` : "";
+    throw new Error(
+      `Cannot reach RustClash controller API at ${base || "local origin"}${detail}.`,
+    );
+  }
+  if (!resp.ok) {
+    let errText = `${resp.status} ${resp.statusText}`.trim();
+    try {
+      const rawBody = await resp.text();
+      if (rawBody.trim().length > 0) {
+        try {
+          const parsed = JSON.parse(rawBody) as {
+            message?: string;
+            error?: string;
+          };
+          const msg = parsed.message || parsed.error;
+          if (msg && msg.trim().length > 0) {
+            errText = msg.trim();
+          }
+        } catch {
+          // keep HTTP status text
+        }
+      }
+    } catch {
+      // ignore body read error
+    }
+    throw new ApiHttpError(resp.status, errText);
+  }
+  const data = (await resp.json()) as VersionInfo;
+  if (!data || typeof data.version !== "string") {
+    throw new Error(
+      "Endpoint did not return a valid RustClash controller /version response.",
+    );
+  }
+  return data;
+}
+
 async function apiFetch<T>(
   path: string,
   init?: RequestInit,

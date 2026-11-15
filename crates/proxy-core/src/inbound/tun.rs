@@ -76,7 +76,7 @@ impl RxToken for VecRxToken {
 }
 
 struct ChannelTxToken {
-    tx: mpsc::Sender<Vec<u8>>,
+    permit: mpsc::OwnedPermit<Vec<u8>>,
 }
 
 impl TxToken for ChannelTxToken {
@@ -86,7 +86,7 @@ impl TxToken for ChannelTxToken {
     {
         let mut pkt = vec![0u8; len];
         let res = f(&mut pkt);
-        let _ = self.tx.try_send(pkt);
+        let _ = self.permit.send(pkt);
         res
     }
 }
@@ -99,25 +99,21 @@ impl Device for VirtualIpDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.tx_sender.capacity() == 0 {
+        if self.rx_queue.is_empty() {
             return None;
         }
+        let Ok(permit) = self.tx_sender.clone().try_reserve_owned() else {
+            return None;
+        };
         let pkt = self.rx_queue.pop_front()?;
-        Some((
-            VecRxToken(pkt),
-            ChannelTxToken {
-                tx: self.tx_sender.clone(),
-            },
-        ))
+        Some((VecRxToken(pkt), ChannelTxToken { permit }))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        if self.tx_sender.capacity() == 0 {
+        let Ok(permit) = self.tx_sender.clone().try_reserve_owned() else {
             return None;
-        }
-        Some(ChannelTxToken {
-            tx: self.tx_sender.clone(),
-        })
+        };
+        Some(ChannelTxToken { permit })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -148,7 +144,7 @@ struct BridgeFlow {
 }
 
 impl BridgeFlow {
-    fn is_timed_out(&self, now: Instant, now_wall_ms: u64) -> bool {
+    fn is_timed_out(&self, now: Instant, now_wall_ms: u64, send_queue_bytes: usize) -> bool {
         let syn_timed_out = !self.established
             && (now.duration_since(self.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT
                 || now_wall_ms.saturating_sub(self.created_wall_ms)
@@ -156,13 +152,19 @@ impl BridgeFlow {
         let idle_timed_out = now.duration_since(self.last_active) > TCP_IDLE_TIMEOUT
             || now_wall_ms.saturating_sub(self.last_active_wall_ms)
                 > TCP_IDLE_TIMEOUT.as_millis() as u64;
-        let fin_timed_out = (self
+        let fin_age_exceeded = self
             .fin_started_at
             .is_some_and(|t| now.duration_since(t) > TCP_HALF_CLOSE_TIMEOUT)
             || self.fin_started_wall_ms.is_some_and(|w| {
                 now_wall_ms.saturating_sub(w) > TCP_HALF_CLOSE_TIMEOUT.as_millis() as u64
-            }))
-            && self.pending_tx.is_empty();
+            });
+        let fin_idle_exceeded = now.duration_since(self.last_active) > TCP_HALF_CLOSE_TIMEOUT
+            || now_wall_ms.saturating_sub(self.last_active_wall_ms)
+                > TCP_HALF_CLOSE_TIMEOUT.as_millis() as u64;
+        let fin_timed_out = fin_age_exceeded
+            && fin_idle_exceeded
+            && self.pending_tx.is_empty()
+            && send_queue_bytes == 0;
         syn_timed_out || idle_timed_out || fin_timed_out
     }
 }
@@ -206,7 +208,20 @@ pub fn spawn_userspace_tun(
     mtu: usize,
     router: Arc<RwLock<Arc<Router>>>,
     hub: Arc<TelemetryHub>,
+    shutdown: watch::Receiver<bool>,
+) -> (VirtualTunHandle, JoinHandle<()>) {
+    spawn_userspace_tun_with_ipv6(mtu, router, hub, shutdown, Arc::new(AtomicBool::new(true)))
+}
+
+/// Spawn the `smoltcp` userspace `any_ip` transparent TUN stack with a live `ipv6_enabled` gate.
+/// When `!ipv6_enabled.load(Ordering::Relaxed)`, inbound IPv6 packets are dropped immediately
+/// before DNS hijack, UDP NAT, or `smoltcp` `rx_queue` queueing.
+pub fn spawn_userspace_tun_with_ipv6(
+    mtu: usize,
+    router: Arc<RwLock<Arc<Router>>>,
+    hub: Arc<TelemetryHub>,
     mut shutdown: watch::Receiver<bool>,
+    ipv6_enabled: Arc<AtomicBool>,
 ) -> (VirtualTunHandle, JoinHandle<()>) {
     let (ingress_tx, mut ingress_rx) = mpsc::channel::<Vec<u8>>(TUN_PACKET_QUEUE_CAPACITY);
     let (egress_tx, egress_rx) = mpsc::channel::<Vec<u8>>(TUN_PACKET_QUEUE_CAPACITY);
@@ -237,6 +252,7 @@ pub fn spawn_userspace_tun(
         let mut sockets = SocketSet::new(vec![]);
         let mut flows: HashMap<FourTuple, BridgeFlow> = HashMap::new();
         let udp_sem = Arc::new(Semaphore::new(MAX_TUN_UDP_INFLIGHT));
+        let shutting_down = Arc::new(AtomicBool::new(false));
         let wake_notify = Arc::new(Notify::new());
         let _tun_reap_waker: Arc<dyn SessionResetter> = Arc::new(TunIdleWakeResetter {
             wake_notify: Arc::clone(&wake_notify),
@@ -259,11 +275,44 @@ pub fn spawn_userspace_tun(
         );
 
         let mut next_delay: Option<Duration> = None;
+        let mut consecutive_zero_delays: u32 = 0;
 
         loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
             if next_delay == Some(Duration::ZERO) {
-                tokio::task::yield_now().await;
+                if device.tx_sender.is_closed() {
+                    break;
+                }
+                if device.tx_sender.capacity() == 0 {
+                    consecutive_zero_delays = 0;
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        res = device.tx_sender.reserve() => {
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    }
+                } else {
+                    consecutive_zero_delays = consecutive_zero_delays.saturating_add(1);
+                    tokio::task::yield_now().await;
+                    if consecutive_zero_delays >= 32 {
+                        consecutive_zero_delays = 0;
+                        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                            break;
+                        }
+                    }
+                }
             } else {
+                consecutive_zero_delays = 0;
                 tokio::select! {
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -276,6 +325,8 @@ pub fn spawn_userspace_tun(
                         };
                         handle_ingress_packet(
                             pkt,
+                            &ipv6_enabled,
+                            &shutting_down,
                             &mut device,
                             &mut sockets,
                             &mut flows,
@@ -293,6 +344,8 @@ pub fn spawn_userspace_tun(
                             match ingress_rx.try_recv() {
                                 Ok(more) => handle_ingress_packet(
                                     more,
+                                    &ipv6_enabled,
+                                    &shutting_down,
                                     &mut device,
                                     &mut sockets,
                                     &mut flows,
@@ -439,7 +492,7 @@ pub fn spawn_userspace_tun(
 
                 // Enforce SYN handshake timeout, half-close linger timeout, and idle timeout
                 // using both monotonic `Instant` and wall-clock epoch ms (for Android deep sleep).
-                if flow.is_timed_out(now, now_wall) {
+                if flow.is_timed_out(now, now_wall, sock.send_queue()) {
                     flow.task_abort.abort();
                     sock.abort();
                     finished_keys.push(*tuple);
@@ -505,21 +558,33 @@ pub fn spawn_userspace_tun(
                             .max(Duration::from_millis(1)),
                     );
                     if let Some(fin_t) = flow.fin_started_at {
-                        let mut rem_fin =
-                            TCP_HALF_CLOSE_TIMEOUT.saturating_sub(check_now.duration_since(fin_t));
-                        if let Some(fin_w) = flow.fin_started_wall_ms {
-                            let rem_fin_wall = TCP_HALF_CLOSE_TIMEOUT.saturating_sub(
-                                Duration::from_millis(check_now_wall.saturating_sub(fin_w)),
-                            );
-                            rem_fin = rem_fin.min(rem_fin_wall);
+                        let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
+                        if flow.pending_tx.is_empty() && sock.send_queue() == 0 {
+                            let mut rem_fin_age = TCP_HALF_CLOSE_TIMEOUT
+                                .saturating_sub(check_now.duration_since(fin_t));
+                            if let Some(fin_w) = flow.fin_started_wall_ms {
+                                let rem_fin_wall = TCP_HALF_CLOSE_TIMEOUT.saturating_sub(
+                                    Duration::from_millis(check_now_wall.saturating_sub(fin_w)),
+                                );
+                                rem_fin_age = rem_fin_age.min(rem_fin_wall);
+                            }
+                            let rem_fin_idle_mono = TCP_HALF_CLOSE_TIMEOUT
+                                .saturating_sub(check_now.duration_since(flow.last_active));
+                            let rem_fin_idle_wall =
+                                TCP_HALF_CLOSE_TIMEOUT.saturating_sub(Duration::from_millis(
+                                    check_now_wall.saturating_sub(flow.last_active_wall_ms),
+                                ));
+                            let rem_fin = rem_fin_age.max(rem_fin_idle_mono.min(rem_fin_idle_wall));
+                            next_delay =
+                                fold_min_delay(next_delay, rem_fin.max(Duration::from_millis(1)));
                         }
-                        next_delay =
-                            fold_min_delay(next_delay, rem_fin.max(Duration::from_millis(1)));
                     }
                 }
             }
         }
 
+        shutting_down.store(true, Ordering::Release);
+        udp_sem.close();
         for (_, flow) in flows.drain() {
             flow.task_abort.abort();
             sockets.remove(flow.handle);
@@ -539,6 +604,8 @@ pub fn spawn_userspace_tun(
 #[allow(clippy::too_many_arguments)]
 fn handle_ingress_packet(
     pkt: Vec<u8>,
+    ipv6_enabled: &Arc<AtomicBool>,
+    shutting_down: &Arc<AtomicBool>,
     device: &mut VirtualIpDevice,
     sockets: &mut SocketSet<'static>,
     flows: &mut HashMap<FourTuple, BridgeFlow>,
@@ -575,6 +642,7 @@ fn handle_ingress_packet(
                             SocketAddr::new(IpAddr::V4(src_v4), src_port),
                             SocketAddr::new(IpAddr::V4(dst_v4), dst_port),
                             payload,
+                            shutting_down,
                             egress_tx,
                             udp_sem,
                             udp_nat,
@@ -607,6 +675,9 @@ fn handle_ingress_packet(
             }
         }
         6 => {
+            if !ipv6_enabled.load(Ordering::Relaxed) {
+                return;
+            }
             let Ok(ip6) = Ipv6Packet::new_checked(&pkt) else {
                 return;
             };
@@ -637,6 +708,7 @@ fn handle_ingress_packet(
                             src_addr,
                             SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
                             payload,
+                            shutting_down,
                             egress_tx,
                             udp_sem,
                             udp_nat,
@@ -717,15 +789,20 @@ fn should_fast_reject_unreachable_direct_ipv6(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_tun_udp_handler(
     src: SocketAddr,
     dst: SocketAddr,
     payload: Vec<u8>,
+    shutting_down: &Arc<AtomicBool>,
     egress_tx: &mpsc::Sender<Vec<u8>>,
     udp_sem: &Arc<Semaphore>,
     udp_nat: &Arc<UdpNatManager>,
     router: &Arc<RwLock<Arc<Router>>>,
 ) {
+    if shutting_down.load(Ordering::Acquire) {
+        return;
+    }
     let payload = if dst.port() != 53 {
         let epoch = router.read().epoch();
         match udp_nat.try_send_fast(src, dst, epoch, payload) {
@@ -742,6 +819,7 @@ fn spawn_tun_udp_handler(
     let current_router = Arc::clone(&router.read());
     let egress = egress_tx.clone();
     let nat = Arc::clone(udp_nat);
+    let shutting_down_task = Arc::clone(shutting_down);
 
     tokio::spawn(async move {
         let _permit = permit;
@@ -766,6 +844,9 @@ fn spawn_tun_udp_handler(
                 &raw_target,
             )
             .await;
+        if shutting_down_task.load(Ordering::Acquire) {
+            return;
+        }
         nat.send_datagram_with_epoch(
             src,
             raw_target,
@@ -779,6 +860,9 @@ fn spawn_tun_udp_handler(
             route_epoch,
         )
         .await;
+        if shutting_down_task.load(Ordering::Acquire) {
+            let _ = nat.reset_all_sessions();
+        }
     });
 }
 
@@ -1331,23 +1415,74 @@ mod tests {
         };
 
         // Fresh established flow is not timed out.
-        assert!(!flow.is_timed_out(mono_now, base_wall + 5_000));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 5_000, 0));
 
         // Monotonic clock froze at `mono_now`, but wall clock advanced 309s (> 120s TCP_IDLE_TIMEOUT).
-        assert!(flow.is_timed_out(mono_now, base_wall + 309_000));
+        assert!(flow.is_timed_out(mono_now, base_wall + 309_000, 0));
 
-        // Half-closed flow with empty pending_tx times out after 10s wall-clock advance even if monotonic froze.
+        // Half-closed flow with empty pending_tx & send_queue times out after 10s idle wall-clock advance even if monotonic froze.
         flow.fin_started_at = Some(mono_now);
         flow.fin_started_wall_ms = Some(base_wall);
-        assert!(!flow.is_timed_out(mono_now, base_wall + 9_000));
-        assert!(flow.is_timed_out(mono_now, base_wall + 11_000));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 9_000, 0));
+        assert!(flow.is_timed_out(mono_now, base_wall + 11_000, 0));
 
         // Unestablished SYN flow times out after 15s wall-clock advance even if monotonic froze.
         flow.established = false;
         flow.fin_started_at = None;
         flow.fin_started_wall_ms = None;
-        assert!(!flow.is_timed_out(mono_now, base_wall + 14_000));
-        assert!(flow.is_timed_out(mono_now, base_wall + 16_000));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 14_000, 0));
+        assert!(flow.is_timed_out(mono_now, base_wall + 16_000, 0));
+    }
+
+    #[tokio::test]
+    async fn active_half_closed_bridge_flow_is_not_timed_out_until_idle_and_drained() {
+        let mut sockets = SocketSet::new(vec![]);
+        let sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        let handle = sockets.add(sock);
+        let (_tx, rx) = mpsc::channel(1);
+        let (_bridge_closed_tx, bridge_closed_rx) = watch::channel(());
+        let noop_task = tokio::spawn(async {});
+
+        let mono_now = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+        let mut flow = BridgeFlow {
+            handle,
+            established: true,
+            created_at: mono_now,
+            created_wall_ms: base_wall,
+            last_active: mono_now + Duration::from_secs(20),
+            last_active_wall_ms: base_wall + 20_000,
+            fin_started_at: Some(mono_now),
+            fin_started_wall_ms: Some(base_wall),
+            pending_tx: BytesMut::new(),
+            from_remote_rx: rx,
+            to_remote_tx: None,
+            _bridge_closed_rx: bridge_closed_rx,
+            remote_eof: false,
+            remote_failed: Arc::new(AtomicBool::new(false)),
+            task_abort: noop_task.abort_handle(),
+        };
+
+        // 25s after FIN started (> 10s), but stream transferred bytes 5s ago (< 10s): MUST NOT time out!
+        let t_25s = mono_now + Duration::from_secs(25);
+        let wall_25s = base_wall + 25_000;
+        assert!(!flow.is_timed_out(t_25s, wall_25s, 0));
+
+        // 35s after FIN started and 15s since last_active (> 10s), but smoltcp send_queue still holds un-ACKed bytes: MUST NOT time out!
+        let t_35s = mono_now + Duration::from_secs(35);
+        let wall_35s = base_wall + 35_000;
+        assert!(!flow.is_timed_out(t_35s, wall_35s, 512));
+
+        // Pending outbound buffer non-empty also prevents premature half-close timeout.
+        flow.pending_tx.extend_from_slice(b"chunk");
+        assert!(!flow.is_timed_out(t_35s, wall_35s, 0));
+
+        // Once idle > 10s AND both pending_tx and smoltcp send_queue are drained, half-close timeout fires.
+        flow.pending_tx.clear();
+        assert!(flow.is_timed_out(t_35s, wall_35s, 0));
     }
 
     struct MockProxyOutbound;
@@ -1718,5 +1853,154 @@ mod tests {
         assert!(!answers.is_empty());
 
         let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn congested_egress_channel_obeys_shutdown_without_spinning() {
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Direct,
+                HashMap::new(),
+                &[],
+                &rules,
+                dns,
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (vtun, tun_task) = spawn_userspace_tun(1500, router_slot, hub, shutdown_rx);
+
+        // Flood unsolicited TCP ACK segments without reading `vtun.egress_rx` so `smoltcp` fills
+        // `egress_tx` with RST replies (`capacity() == 0`) while residual packets remain queued in
+        // `device.rx_queue` (`next_delay == Some(Duration::ZERO)`).
+        let dst = (Ipv4Addr::new(198, 18, 0, 99), 8080u16);
+        for i in 0..(TUN_PACKET_QUEUE_CAPACITY + 64) {
+            let src_port = 20_000u16.wrapping_add((i % 30_000) as u16);
+            let pkt = build_ipv4_tcp_packet(
+                (Ipv4Addr::new(198, 18, 0, 10), src_port),
+                dst,
+                smoltcp::wire::TcpControl::None,
+                100,
+                Some(200),
+                &[],
+            );
+            if i < TUN_PACKET_QUEUE_CAPACITY {
+                vtun.ingress_tx.send(pkt).await.unwrap();
+                if i % 256 == 255 {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                let _ = vtun.ingress_tx.try_send(pkt);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(vtun.egress_rx.len(), TUN_PACKET_QUEUE_CAPACITY);
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_millis(500), tun_task)
+            .await
+            .expect("TUN task must exit promptly on shutdown even when egress_tx is full")
+            .expect("TUN task panicked");
+    }
+
+    #[tokio::test]
+    async fn spawn_userspace_tun_with_ipv6_live_gate_and_udp_nat_shutdown_cleanup() {
+        let udp_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = udp_sink.local_addr().unwrap().port();
+
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Direct,
+                HashMap::new(),
+                &[],
+                &rules,
+                dns,
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let ipv6_enabled = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, tun_task) = spawn_userspace_tun_with_ipv6(
+            1500,
+            router_slot,
+            Arc::clone(&hub),
+            shutdown_rx,
+            Arc::clone(&ipv6_enabled),
+        );
+
+        let client_v6: Ipv6Addr = "fd00::2".parse().unwrap();
+        let dns_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let dns_query =
+            crate::dns::wire::build_dns_query(0x5151, "example.org", crate::dns::wire::QTYPE_A);
+        let dns_pkt = build_ipv6_udp_packet(client_v6, 53010, dns_v6, 53, &dns_query)
+            .expect("valid IPv6 DNS UDP packet");
+
+        // 1. With `ipv6_enabled == false`, inbound IPv6 packets are dropped before DNS hijack / NAT / smoltcp.
+        vtun.ingress_tx.send(dns_pkt.clone()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), vtun.egress_rx.recv())
+                .await
+                .is_err(),
+            "IPv6 DNS packet must be dropped while ipv6_enabled is false"
+        );
+
+        // 2. Live-enabling `ipv6_enabled` immediately restores IPv6 packet processing.
+        ipv6_enabled.store(true, Ordering::Relaxed);
+        vtun.ingress_tx.send(dns_pkt).await.unwrap();
+        let dns_reply = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected hijacked IPv6 :53 DNS reply once ipv6_enabled is true")
+            .expect("egress packet");
+        let ip6_dns = Ipv6Packet::new_checked(&dns_reply).unwrap();
+        assert_eq!(ip6_dns.src_addr(), dns_v6);
+        assert_eq!(ip6_dns.dst_addr(), client_v6);
+
+        // 3. Establish an active UDP NAT session and verify TUN shutdown cleans up `udp_nat` sessions.
+        let udp_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(198, 18, 0, 10),
+            53011,
+            Ipv4Addr::LOCALHOST,
+            udp_port,
+            b"ping-cleanup",
+        )
+        .expect("valid IPv4 UDP packet");
+        vtun.ingress_tx.send(udp_pkt).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp_sink.recv_from(&mut buf))
+            .await
+            .expect("UDP sink should receive forwarded datagram")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping-cleanup");
+        assert_eq!(hub.active_connection_count(), 1);
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), tun_task)
+            .await
+            .expect("TUN task should exit on shutdown")
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while hub.active_connection_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(
+            "TUN shutdown must reset all UdpNatManager sessions so active_connection_count == 0",
+        );
     }
 }

@@ -757,7 +757,7 @@ impl AnyTlsClientSession {
 
     /// Fail all multiplexed streams and abort the underlying TLS reader/writer tasks immediately
     /// so background tasks and OS sockets are released without waiting for TCP read timeouts.
-    pub fn abort_session(&self, reason: &str) -> bool {
+    pub fn abort_with_reason(&self, reason: &str) -> bool {
         let was_healthy = self.mark_unhealthy_inner(reason);
         let (wr_abort, rd_abort) = {
             let mut guard = self.io_aborts.lock();
@@ -772,10 +772,15 @@ impl AnyTlsClientSession {
         was_healthy
     }
 
+    /// Alias for [`Self::abort_with_reason`].
+    pub fn abort_session(&self, reason: &str) -> bool {
+        self.abort_with_reason(reason)
+    }
+
     /// Immediately fail all multiplexed streams and abort the underlying TLS reader/writer tasks
     /// so the stale OS socket closes without waiting for kernel TCP retransmission timeouts.
     pub fn abort_for_network_change(&self) -> bool {
-        self.abort_session("network interface changed")
+        self.abort_with_reason("network interface changed")
     }
 
     fn on_stream_dropped(self: &Arc<Self>, stream_id: u32) {
@@ -807,7 +812,7 @@ impl AnyTlsClientSession {
                 }
             }
             // Session invalidated or pool dropped after last stream closed: release background tasks.
-            self.abort_session("AnyTLS session retired");
+            self.abort_with_reason("AnyTLS session retired");
         }
     }
 }
@@ -997,7 +1002,7 @@ impl AnyTlsSessionPool {
     }
 
     pub fn set_low_power_mode(&self, enabled: bool) {
-        let prev = self.low_power_mode.swap(enabled, Ordering::AcqRel);
+        let prev = self.low_power_mode.swap(enabled, Ordering::SeqCst);
         if prev != enabled {
             self.low_power_wake.notify_waiters();
         }
@@ -1028,38 +1033,50 @@ impl AnyTlsSessionPool {
             let mut ticker = tokio::time::interval(check_interval.max(Duration::from_secs(5)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                while low_power_mode.load(Ordering::Acquire) {
-                    if shutdown.load(Ordering::Acquire) || weak_idle.strong_count() == 0 {
+                while low_power_mode.load(Ordering::SeqCst) {
+                    if shutdown.load(Ordering::SeqCst) || weak_idle.strong_count() == 0 {
                         return;
                     }
                     let notified = low_power_wake.notified();
-                    if !low_power_mode.load(Ordering::Acquire)
-                        || shutdown.load(Ordering::Acquire)
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !low_power_mode.load(Ordering::SeqCst)
+                        || shutdown.load(Ordering::SeqCst)
                         || weak_idle.strong_count() == 0
                     {
                         break;
                     }
                     notified.await;
                 }
-                if shutdown.load(Ordering::Acquire) || weak_idle.strong_count() == 0 {
+                if shutdown.load(Ordering::SeqCst) || weak_idle.strong_count() == 0 {
                     break;
+                }
+
+                let wake_notified = low_power_wake.notified();
+                tokio::pin!(wake_notified);
+                wake_notified.as_mut().enable();
+                if shutdown.load(Ordering::SeqCst) || weak_idle.strong_count() == 0 {
+                    break;
+                }
+                if low_power_mode.load(Ordering::SeqCst) {
+                    continue;
                 }
 
                 tokio::select! {
                     _ = ticker.tick() => {}
-                    _ = low_power_wake.notified() => {
-                        if shutdown.load(Ordering::Acquire) || weak_idle.strong_count() == 0 {
+                    _ = &mut wake_notified => {
+                        if shutdown.load(Ordering::SeqCst) || weak_idle.strong_count() == 0 {
                             break;
                         }
-                        if low_power_mode.load(Ordering::Acquire) {
+                        if low_power_mode.load(Ordering::SeqCst) {
                             continue;
                         }
                     }
                 }
-                if shutdown.load(Ordering::Acquire) {
+                if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                if low_power_mode.load(Ordering::Acquire) {
+                if low_power_mode.load(Ordering::SeqCst) {
                     continue;
                 }
                 let Some(idle_arc) = weak_idle.upgrade() else {
@@ -1100,7 +1117,7 @@ impl AnyTlsSessionPool {
                     });
                 }
                 for (sess, reason) in to_abort {
-                    sess.abort_session(reason);
+                    sess.abort_with_reason(reason);
                 }
             }
         });
@@ -1133,7 +1150,7 @@ impl AnyTlsSessionPool {
             }
         };
         for sess in stale {
-            sess.abort_session("stale idle session");
+            sess.abort_with_reason("stale idle session");
         }
         chosen
     }
@@ -1162,7 +1179,7 @@ impl AnyTlsSessionPool {
                 return;
             }
         }
-        sess.abort_session("unused idle session retired");
+        sess.abort_with_reason("unused idle session retired");
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -1222,7 +1239,7 @@ impl AnyTlsSessionPool {
             guard.len()
         };
         for sess in stale {
-            sess.abort_session("stale idle session");
+            sess.abort_with_reason("stale idle session");
         }
         len
     }
@@ -1251,19 +1268,208 @@ impl AnyTlsSessionPool {
 
 impl Drop for AnyTlsSessionPool {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::SeqCst);
         self.epoch.fetch_add(1, Ordering::SeqCst);
         self.low_power_wake.notify_waiters();
         let drained_idle: Vec<IdleSessionEntry> = std::mem::take(&mut *self.idle.lock());
         for entry in drained_idle {
-            entry.session.abort_session("AnyTLS session pool dropped");
+            entry
+                .session
+                .abort_with_reason("AnyTLS session pool dropped");
         }
         let drained_live: Vec<Arc<AnyTlsClientSession>> = std::mem::take(&mut *self.live.lock())
             .into_iter()
             .filter_map(|w| w.upgrade())
             .collect();
         for sess in drained_live {
-            sess.abort_session("AnyTLS session pool dropped");
+            sess.abort_with_reason("AnyTLS session pool dropped");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TaskDropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for TaskDropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn spawn_synthetic_session(
+        seq: u64,
+        session_epoch: u64,
+        healthy: bool,
+        pool_ctx: SessionPoolContext,
+    ) -> (
+        Arc<AnyTlsClientSession>,
+        oneshot::Receiver<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let (tx, mut rx) = mpsc::channel(SESSION_OUTBOUND_QUEUE_CAP);
+        let session = Arc::new(AnyTlsClientSession {
+            seq,
+            session_epoch,
+            pool_epoch: pool_ctx.pool_epoch,
+            next_stream_id: AtomicU32::new(1),
+            active_streams: AtomicU32::new(0),
+            healthy: AtomicBool::new(healthy),
+            negotiated_v2: AtomicBool::new(true),
+            v2_notify: Notify::new(),
+            tx,
+            streams: Arc::new(DashMap::new()),
+            synack_waiters: Arc::new(DashMap::new()),
+            preconnect_pong: Mutex::new(None),
+            pool_return: pool_ctx.idle,
+            io_aborts: Mutex::new((None, None)),
+        });
+        pool_ctx.live.lock().push(Arc::downgrade(&session));
+
+        let (wr_done_tx, wr_done_rx) = oneshot::channel();
+        let session_wr = Arc::clone(&session);
+        let wr_join = tokio::spawn(async move {
+            let _guard = TaskDropSignal(Some(wr_done_tx));
+            let _hold_session = session_wr;
+            while rx.recv().await.is_some() {}
+        });
+
+        // Mirror `spawn_io_tasks`: `rd_join` holds both `Arc<AnyTlsClientSession>` and a clone
+        // of `tx`, creating an `Arc` + channel cycle that ONLY breaks when `io_aborts` are aborted.
+        let (rd_done_tx, rd_done_rx) = oneshot::channel();
+        let session_rd = Arc::clone(&session);
+        let tx_pong = session.tx.clone();
+        let rd_join = tokio::spawn(async move {
+            let _guard = TaskDropSignal(Some(rd_done_tx));
+            let _hold_session = session_rd;
+            let _hold_pong = tx_pong;
+            std::future::pending::<()>().await;
+        });
+
+        *session.io_aborts.lock() = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+        (session, wr_done_rx, rd_done_rx)
+    }
+
+    #[tokio::test]
+    async fn reaper_aborts_expired_and_stale_idle_sessions_and_wakes_from_low_power() {
+        let pool = AnyTlsSessionPool::new(Duration::from_secs(5), Duration::ZERO, 0);
+        // Park reaper in `low_power_mode` BEFORE its first immediate `interval` tick runs.
+        pool.set_low_power_mode(true);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let ctx = pool.pool_context();
+        let cur_epoch = ctx.session_epoch;
+
+        let (stale_sess, stale_wr, stale_rd) =
+            spawn_synthetic_session(1, cur_epoch.wrapping_sub(1), true, ctx.clone());
+        let (unhealthy_sess, unhealthy_wr, unhealthy_rd) =
+            spawn_synthetic_session(2, cur_epoch, false, ctx.clone());
+        let (expired_sess, expired_wr, expired_rd) =
+            spawn_synthetic_session(3, cur_epoch, true, ctx);
+
+        let weak_stale = Arc::downgrade(&stale_sess);
+        let weak_unhealthy = Arc::downgrade(&unhealthy_sess);
+        let weak_expired = Arc::downgrade(&expired_sess);
+
+        {
+            let mut guard = pool.idle.lock();
+            let past = Instant::now();
+            guard.push(IdleSessionEntry {
+                session: stale_sess,
+                idle_since: past,
+            });
+            guard.push(IdleSessionEntry {
+                session: unhealthy_sess,
+                idle_since: past,
+            });
+            guard.push(IdleSessionEntry {
+                session: expired_sess,
+                idle_since: past,
+            });
+        }
+
+        // Rapidly toggle low-power mode ending at `false` so the reaper wakes, consumes its
+        // initial tick, and aborts IO tasks for all stale/unhealthy/expired sessions.
+        for _ in 0..16 {
+            pool.set_low_power_mode(false);
+            pool.set_low_power_mode(true);
+        }
+        pool.set_low_power_mode(false);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = stale_wr.await;
+            let _ = stale_rd.await;
+            let _ = unhealthy_wr.await;
+            let _ = unhealthy_rd.await;
+            let _ = expired_wr.await;
+            let _ = expired_rd.await;
+        })
+        .await
+        .expect("reaper must wake from low-power mode and abort evicted session IO tasks");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(weak_stale.strong_count(), 0);
+        assert_eq!(weak_unhealthy.strong_count(), 0);
+        assert_eq!(weak_expired.strong_count(), 0);
+        assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_drop_and_network_change_abort_idle_session_io_tasks() {
+        let pool = AnyTlsSessionPool::new(Duration::from_secs(60), Duration::from_secs(300), 2);
+        let ctx = pool.pool_context();
+
+        // 1. Direct `abort_for_network_change` delegates to `abort_with_reason` and breaks IO cycle.
+        let (net_sess, net_wr, net_rd) =
+            spawn_synthetic_session(10, ctx.session_epoch, true, ctx.clone());
+        let weak_net = Arc::downgrade(&net_sess);
+        assert!(net_sess.abort_for_network_change());
+        assert!(!net_sess.abort_for_network_change());
+        drop(net_sess);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = net_wr.await;
+            let _ = net_rd.await;
+        })
+        .await
+        .expect("abort_for_network_change must abort reader and writer tasks");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(weak_net.strong_count(), 0);
+
+        // 2. `Drop for AnyTlsSessionPool` aborts remaining idle sessions even while parked in low-power mode.
+        pool.set_low_power_mode(true);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let (idle_sess, idle_wr, idle_rd) =
+            spawn_synthetic_session(11, ctx.session_epoch, true, ctx);
+        let weak_idle = Arc::downgrade(&idle_sess);
+        pool.idle.lock().push(IdleSessionEntry {
+            session: idle_sess,
+            idle_since: Instant::now(),
+        });
+
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = idle_wr.await;
+            let _ = idle_rd.await;
+        })
+        .await
+        .expect("dropping AnyTlsSessionPool must abort remaining idle session IO tasks");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(weak_idle.strong_count(), 0);
     }
 }

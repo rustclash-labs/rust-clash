@@ -89,13 +89,16 @@ import io.github.rustclashlabs.rustclash.ui.screens.RulesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.SettingsScreen
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashTheme
+import io.github.rustclashlabs.rustclash.vpn.NativeBridge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.RustClashVpnService
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 
 class MainActivity : AppCompatActivity() {
@@ -103,10 +106,53 @@ class MainActivity : AppCompatActivity() {
     private var pendingCameraQrFile: File? = null
     private var pendingExportYamlContent: String? = null
     private var pendingExportDebugFile: File? = null
+    private var vpnConsentInFlight: Boolean = false
+
+    companion object {
+        private const val KEY_VPN_CONSENT_IN_FLIGHT = "vpn_consent_in_flight"
+    }
+
+    private fun exitDemoModeIfActive() {
+        val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        if (viewModel.uiState.value.demoMode || prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)) {
+            viewModel.setDemoMode(false)
+        }
+    }
+
+    private fun reconcileDemoModeAfterAsyncMutation() {
+        val current = viewModel.uiState.value
+        val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        val demoPref = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
+        if (!current.demoMode && !demoPref) return
+        if (current.vpnState != VpnLifecycleState.RUNNING) {
+            if (NativeBridge.ensureLoaded()) {
+                viewModel.setDemoMode(false)
+            }
+            return
+        }
+        lifecycleScope.launch {
+            for (waitMs in longArrayOf(80L, 200L, 500L)) {
+                delay(waitMs)
+                val st = viewModel.uiState.value
+                if (!st.demoMode || st.vpnState != VpnLifecycleState.RUNNING) break
+                if (!NativeBridge.isNativeLoaded) break
+                val demoStillActive = withContext(Dispatchers.IO) {
+                    runCatching {
+                        JSONObject(NativeBridge.nativeGetStatusJson()).optBoolean("demoActive", true)
+                    }.getOrDefault(true)
+                }
+                if (!demoStillActive) {
+                    viewModel.setDemoMode(false)
+                    break
+                }
+            }
+        }
+    }
 
     private val vpnPrepareLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        vpnConsentInFlight = false
         if (result.resultCode == RESULT_OK) {
             launchVpnForegroundService()
         } else {
@@ -174,7 +220,12 @@ class MainActivity : AppCompatActivity() {
                     }.getOrNull()
                 }
                 if (!text.isNullOrBlank()) {
-                    viewModel.importUnifiedPayload(text, deduplicate = true, autoSelect = true)
+                    viewModel.importUnifiedPayload(
+                        rawPayload = text,
+                        deduplicate = true,
+                        autoSelect = true,
+                        onSuccess = ::exitDemoModeIfActive,
+                    )
                 } else {
                     viewModel.emitUiMessage("所选 YAML 配置文件为空或无法读取")
                 }
@@ -235,6 +286,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        vpnConsentInFlight = savedInstanceState?.getBoolean(KEY_VPN_CONSENT_IN_FLIGHT, false) ?: false
         requestNotificationPermissionIfNeeded()
         handleIncomingShareOrDeepLinkIntent(intent)
 
@@ -245,6 +297,34 @@ class MainActivity : AppCompatActivity() {
             LaunchedEffect(viewModel) {
                 viewModel.messages.collectLatest { msg ->
                     snackbarHostState.showSnackbar(msg)
+                }
+            }
+
+            // Reconcile UI + SharedPreferences `demoMode` whenever a live engine mutation exits Demo Sandbox.
+            LaunchedEffect(
+                state.vpnState,
+                state.demoMode,
+                state.nodes,
+                state.activeProfileId,
+                state.routingPreset,
+            ) {
+                if (state.vpnState == VpnLifecycleState.RUNNING &&
+                    state.demoMode &&
+                    NativeBridge.isNativeLoaded
+                ) {
+                    val liveDemoActive = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val obj = JSONObject(NativeBridge.nativeGetStatusJson())
+                            if (obj.optBoolean("running", false)) {
+                                obj.optBoolean("demoActive", true)
+                            } else {
+                                true
+                            }
+                        }.getOrDefault(true)
+                    }
+                    if (!liveDemoActive) {
+                        viewModel.setDemoMode(false)
+                    }
                 }
             }
 
@@ -282,8 +362,17 @@ class MainActivity : AppCompatActivity() {
                         }
                     },
                     onOpenBatteryOptimizationSettings = ::openBatteryOptimizationSettings,
+                    onExitDemoModeSync = ::exitDemoModeIfActive,
+                    onReconcileAsyncMutationDemoExit = ::reconcileDemoModeAfterAsyncMutation,
                 )
             }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (isChangingConfigurations && vpnConsentInFlight) {
+            outState.putBoolean(KEY_VPN_CONSENT_IN_FLIGHT, true)
         }
     }
 
@@ -295,6 +384,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (!vpnConsentInFlight && RustClashVpnService.stateTracker.state == VpnLifecycleState.PREPARING) {
+            RustClashVpnService.stateTracker.onStopped()
+            viewModel.syncServiceStateImmediate()
+        }
         viewModel.refreshAll()
         viewModel.startForegroundTicker()
     }
@@ -402,25 +495,31 @@ class MainActivity : AppCompatActivity() {
             viewModel.syncServiceStateImmediate()
             return
         }
-        if (currentState == VpnLifecycleState.PREPARING || currentState == VpnLifecycleState.STOPPING) {
+        if (currentState == VpnLifecycleState.STOPPING ||
+            (currentState == VpnLifecycleState.PREPARING && vpnConsentInFlight)
+        ) {
             return
         }
 
         RustClashVpnService.stateTracker.onPrepareRequested()
         viewModel.syncServiceStateImmediate()
         val prepareIntent = runCatching { VpnService.prepare(this) }.getOrElse { err ->
+            vpnConsentInFlight = false
             RustClashVpnService.stateTracker.onError("无法请求系统 VPN 授权：${err.message ?: "系统限制"}")
             viewModel.syncServiceStateImmediate()
             return
         }
         if (prepareIntent != null) {
+            vpnConsentInFlight = true
             runCatching {
                 vpnPrepareLauncher.launch(prepareIntent)
             }.onFailure { err ->
+                vpnConsentInFlight = false
                 RustClashVpnService.stateTracker.onError("无法拉起系统 VPN 授权弹窗：${err.message ?: "系统限制"}")
                 viewModel.syncServiceStateImmediate()
             }
         } else {
+            vpnConsentInFlight = false
             launchVpnForegroundService()
         }
     }
@@ -428,6 +527,8 @@ class MainActivity : AppCompatActivity() {
     private fun launchVpnForegroundService() {
         val prefs = getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
         val demoMode = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
+        RustClashVpnService.stateTracker.onStartRequested()
+        viewModel.syncServiceStateImmediate()
         val startIntent = Intent(this, RustClashVpnService::class.java).apply {
             action = RustClashVpnService.ACTION_START_VPN
             putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)
@@ -463,7 +564,12 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (!decodedText.isNullOrBlank()) {
-                viewModel.importUnifiedPayload(decodedText, deduplicate = true, autoSelect = true)
+                viewModel.importUnifiedPayload(
+                    rawPayload = decodedText,
+                    deduplicate = true,
+                    autoSelect = true,
+                    onSuccess = ::exitDemoModeIfActive,
+                )
             } else {
                 viewModel.emitUiMessage("未识别到有效的二维码，请对准清晰的节点或订阅二维码重试")
             }
@@ -526,6 +632,8 @@ internal fun RustClashAppScaffold(
     onShareDebugReport: () -> Unit = {},
     onSaveDebugReportToFile: () -> Unit = {},
     onOpenBatteryOptimizationSettings: () -> Unit = {},
+    onExitDemoModeSync: () -> Unit = {},
+    onReconcileAsyncMutationDemoExit: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var currentDestination by rememberSaveable { mutableStateOf(MainDestination.HOME) }
@@ -540,6 +648,18 @@ internal fun RustClashAppScaffold(
     var editingNode by remember { mutableStateOf<ProxyNodeItem?>(null) }
     var showCustomRulesDialog by remember { mutableStateOf(false) }
     var showYamlEditorDialog by remember { mutableStateOf(false) }
+    var awaitingExternalImportDemoExit by remember { mutableStateOf(false) }
+
+    LaunchedEffect(state.pendingExternalImportPayload, state.isImporting, state.modalError) {
+        if (awaitingExternalImportDemoExit && !state.isImporting) {
+            if (state.pendingExternalImportPayload == null && state.modalError == null) {
+                awaitingExternalImportDemoExit = false
+                onExitDemoModeSync()
+            } else if (state.modalError != null) {
+                awaitingExternalImportDemoExit = false
+            }
+        }
+    }
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -648,7 +768,12 @@ internal fun RustClashAppScaffold(
                     onImportClipboardDirect = {
                         val clip = onReadClipboard()
                         if (!clip.isNullOrBlank()) {
-                            viewModel.importUnifiedPayload(clip, deduplicate = true, autoSelect = true)
+                            viewModel.importUnifiedPayload(
+                                rawPayload = clip,
+                                deduplicate = true,
+                                autoSelect = true,
+                                onSuccess = onExitDemoModeSync,
+                            )
                         } else {
                             viewModel.clearModalError()
                             showImportSheet = true
@@ -666,8 +791,14 @@ internal fun RustClashAppScaffold(
                         editingNode = item
                         showNodeEditor = true
                     },
-                    onDeleteNode = viewModel::deleteNode,
-                    onDeduplicateNodes = viewModel::deduplicateNodes,
+                    onDeleteNode = { nodeName ->
+                        viewModel.deleteNode(nodeName)
+                        onReconcileAsyncMutationDemoExit()
+                    },
+                    onDeduplicateNodes = {
+                        viewModel.deduplicateNodes()
+                        onReconcileAsyncMutationDemoExit()
+                    },
                 )
 
                 MainDestination.RULES -> RulesScreen(
@@ -695,7 +826,10 @@ internal fun RustClashAppScaffold(
                         viewModel.clearModalError()
                         showImportSheet = true
                     },
-                    onActivateProfile = viewModel::activateProfile,
+                    onActivateProfile = { profileId ->
+                        viewModel.activateProfile(profileId)
+                        onReconcileAsyncMutationDemoExit()
+                    },
                     onRefreshProfile = viewModel::refreshProfileSubscription,
                     onDeleteProfile = viewModel::deleteProfile,
                     onRenameProfile = viewModel::renameProfile,
@@ -766,6 +900,7 @@ internal fun RustClashAppScaffold(
                     autoSelect = autoSel,
                     subscriptionAutoUpdateSecs = subSecs,
                     onSuccess = {
+                        onExitDemoModeSync()
                         viewModel.clearModalError()
                         showImportSheet = false
                     },
@@ -792,6 +927,7 @@ internal fun RustClashAppScaffold(
                     nodeJson = nodeJson,
                     autoSelect = autoSelect,
                     onSuccess = {
+                        onExitDemoModeSync()
                         viewModel.clearModalError()
                         showNodeEditor = false
                     },
@@ -816,6 +952,7 @@ internal fun RustClashAppScaffold(
                 viewModel.saveCustomRules(
                     rulesText = text,
                     onSuccess = {
+                        onExitDemoModeSync()
                         viewModel.clearModalError()
                         showCustomRulesDialog = false
                     },
@@ -840,6 +977,7 @@ internal fun RustClashAppScaffold(
                 viewModel.saveActiveYaml(
                     yamlText = yaml,
                     onSuccess = {
+                        onExitDemoModeSync()
                         viewModel.clearModalError()
                         showYamlEditorDialog = false
                     },
@@ -854,8 +992,12 @@ internal fun RustClashAppScaffold(
             rawPayload = pendingExternalPayload,
             isImporting = state.isImporting,
             errorMessage = state.modalError,
-            onDismiss = viewModel::dismissPendingExternalImport,
+            onDismiss = {
+                awaitingExternalImportDemoExit = false
+                viewModel.dismissPendingExternalImport()
+            },
             onConfirm = { switchImmediately, enableAutoUpdate ->
+                awaitingExternalImportDemoExit = true
                 viewModel.confirmPendingExternalImport(
                     autoSelect = switchImmediately,
                     enableSubscriptionAutoUpdate = enableAutoUpdate,

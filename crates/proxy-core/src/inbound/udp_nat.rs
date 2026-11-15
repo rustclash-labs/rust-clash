@@ -2,15 +2,15 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     addr::{HostName, TargetAddr},
@@ -159,6 +159,33 @@ struct NatSessionEntry {
 /// Parameters: `(client_src, effective_return_target, payload)`.
 pub type UdpReplySink = Arc<dyn Fn(SocketAddr, TargetAddr, Vec<u8>) + Send + Sync>;
 
+fn cleanup_weak_session_maps(
+    sessions_weak: &Weak<DashMap<NatSessionKey, NatSessionEntry>>,
+    fast_routes_weak: &Weak<DashMap<(SocketAddr, SocketAddr), CachedUdpRoute>>,
+    key: &NatSessionKey,
+    conn_entry: &Arc<ActiveConnection>,
+) {
+    if let Some(sessions_map) = sessions_weak.upgrade()
+        && sessions_map
+            .remove_if(key, |_, v| Arc::ptr_eq(&v.conn_entry, conn_entry))
+            .is_some()
+        && let Some(fast_routes_map) = fast_routes_weak.upgrade()
+    {
+        fast_routes_map.retain(|rk, rv| {
+            !(rk.0 == key.client_src
+                && rv.outbound_name == key.outbound_name
+                && rv.fake_ip_scope == key.fake_ip_scope)
+        });
+    }
+}
+
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    let _ = rx.changed().await;
+}
+
 /// Stateful multi-datagram UDP NAT manager shared by TUN and SOCKS5 `UDP ASSOCIATE`.
 /// Maintains persistent `OutboundUdpSession`s per `(client_src, outbound)` (and per Fake-IP on proxy
 /// outbounds) so QUIC/HTTP3, gaming, and STUN/WebRTC flows preserve NAT port bindings and return addresses.
@@ -167,10 +194,18 @@ pub struct UdpNatManager {
     max_sessions: usize,
     idle_timeout: Duration,
     boot: Instant,
+    closed: AtomicBool,
+    shutdown_tx: watch::Sender<bool>,
     sessions: Arc<DashMap<NatSessionKey, NatSessionEntry>>,
     fast_routes: Arc<DashMap<(SocketAddr, SocketAddr), CachedUdpRoute>>,
     hub: Arc<TelemetryHub>,
     reply_sink: UdpReplySink,
+}
+
+impl Drop for UdpNatManager {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
 }
 
 impl SessionResetter for UdpNatManager {
@@ -206,18 +241,20 @@ impl UdpNatManager {
         hub: Arc<TelemetryHub>,
         reply_sink: UdpReplySink,
     ) -> Arc<Self> {
+        let (shutdown_tx, _) = watch::channel(false);
         let mgr = Arc::new(Self {
             inbound_label,
             max_sessions: max_sessions.max(16),
             idle_timeout,
             boot: Instant::now(),
+            closed: AtomicBool::new(false),
+            shutdown_tx,
             sessions: Arc::new(DashMap::new()),
             fast_routes: Arc::new(DashMap::new()),
             hub: Arc::clone(&hub),
             reply_sink,
         });
-        let weak: std::sync::Weak<dyn SessionResetter> =
-            Arc::downgrade(&mgr) as std::sync::Weak<dyn SessionResetter>;
+        let weak: Weak<dyn SessionResetter> = Arc::downgrade(&mgr) as Weak<dyn SessionResetter>;
         hub.register_session_resetter(weak);
         mgr
     }
@@ -236,6 +273,18 @@ impl UdpNatManager {
 
     pub fn active_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Permanently shut down this `UdpNatManager`, rejecting any late-arriving datagrams and
+    /// immediately terminating all active per-session tasks, sockets, and `TelemetryHub` entries.
+    pub fn shutdown(&self) -> usize {
+        self.closed.store(true, Ordering::Release);
+        let _ = self.shutdown_tx.send(true);
+        self.reset_all_sessions()
     }
 
     /// Synchronously evict and close every cached UDP NAT session (e.g. on Wi-Fi <-> Cellular handoff).
@@ -339,7 +388,7 @@ impl UdpNatManager {
         router_epoch: u64,
         payload: Vec<u8>,
     ) -> Result<(), Vec<u8>> {
-        if router_epoch == 0 {
+        if self.closed.load(Ordering::Acquire) || router_epoch == 0 {
             return Err(payload);
         }
         let cached = match self.fast_routes.get(&(client_src, raw_dst)) {
@@ -450,6 +499,9 @@ impl UdpNatManager {
         payload: Vec<u8>,
         router_epoch: u64,
     ) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         if !outbound.udp_supported() {
             let reason = match outbound.exit_category() {
                 "REJECT" => "blocked by REJECT rule",
@@ -677,6 +729,19 @@ impl UdpNatManager {
                 }
             };
 
+        if self.closed.load(Ordering::Acquire) {
+            if self
+                .sessions
+                .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
+                .is_some()
+            {
+                self.fast_routes.clear();
+            }
+            conn_entry.request_close();
+            self.hub.unregister_connection(&conn_entry.id);
+            return;
+        }
+
         self.cache_fast_route(
             client_src,
             &raw_dst,
@@ -689,8 +754,9 @@ impl UdpNatManager {
 
         let inbound_label = self.inbound_label;
         let hub_clone = Arc::clone(&self.hub);
-        let sessions_map = Arc::clone(&self.sessions);
-        let fast_routes_map = Arc::clone(&self.fast_routes);
+        let sessions_weak = Arc::downgrade(&self.sessions);
+        let fast_routes_weak = Arc::downgrade(&self.fast_routes);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let sink = Arc::clone(&self.reply_sink);
         let boot = self.boot;
 
@@ -699,16 +765,13 @@ impl UdpNatManager {
             let session = tokio::select! {
                 biased;
                 _ = conn_entry.closed() => {
-                    if sessions_map
-                        .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
-                        .is_some()
-                    {
-                        fast_routes_map.retain(|rk, rv| {
-                            !(rk.0 == key.client_src
-                                && rv.outbound_name == key.outbound_name
-                                && rv.fake_ip_scope == key.fake_ip_scope)
-                        });
-                    }
+                    cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
+                    hub_clone.unregister_connection(&conn_entry.id);
+                    return;
+                }
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    conn_entry.request_close();
+                    cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
                     hub_clone.unregister_connection(&conn_entry.id);
                     return;
                 }
@@ -724,16 +787,7 @@ impl UdpNatManager {
                                 target,
                                 err
                             );
-                            if sessions_map
-                                .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
-                                .is_some()
-                            {
-                                fast_routes_map.retain(|rk, rv| {
-                                    !(rk.0 == key.client_src
-                                        && rv.outbound_name == key.outbound_name
-                                        && rv.fake_ip_scope == key.fake_ip_scope)
-                                });
-                            }
+                            cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
                             hub_clone.record_connection_failed(&conn_entry.id, &err.to_string());
                             return;
                         }
@@ -753,6 +807,7 @@ impl UdpNatManager {
             let first_outcome = tokio::select! {
                 biased;
                 _ = conn_entry.closed() => FirstPacketOutcome::ClosedOrIdle,
+                _ = wait_for_shutdown(&mut shutdown_rx) => FirstPacketOutcome::ClosedOrIdle,
                 res = tokio::time::timeout(session_timeout, async {
                     let mut last_transient_err: Option<std::io::Error> = None;
                     loop {
@@ -810,30 +865,13 @@ impl UdpNatManager {
                         target,
                         err
                     );
-                    if sessions_map
-                        .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
-                        .is_some()
-                    {
-                        fast_routes_map.retain(|rk, rv| {
-                            !(rk.0 == key.client_src
-                                && rv.outbound_name == key.outbound_name
-                                && rv.fake_ip_scope == key.fake_ip_scope)
-                        });
-                    }
+                    cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
                     hub_clone.record_connection_failed(&conn_entry.id, &err.to_string());
                     return;
                 }
                 FirstPacketOutcome::ClosedOrIdle => {
-                    if sessions_map
-                        .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
-                        .is_some()
-                    {
-                        fast_routes_map.retain(|rk, rv| {
-                            !(rk.0 == key.client_src
-                                && rv.outbound_name == key.outbound_name
-                                && rv.fake_ip_scope == key.fake_ip_scope)
-                        });
-                    }
+                    conn_entry.request_close();
+                    cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
                     hub_clone.unregister_connection(&conn_entry.id);
                     return;
                 }
@@ -870,8 +908,12 @@ impl UdpNatManager {
             let reader_last = Arc::clone(&last_active_ms);
             let reader_last_wall = Arc::clone(&last_active_wall_ms);
             let reader_timeout = Arc::clone(&idle_timeout_ms);
+            let shutdown_rx_reader = shutdown_rx.clone();
             let reader = async move {
                 loop {
+                    if conn_dl.is_closed() || *shutdown_rx_reader.borrow() {
+                        break;
+                    }
                     let timeout_ms = reader_timeout.load(Ordering::Relaxed);
                     let now_mono = boot.elapsed().as_millis() as u64;
                     let now_wall = TelemetryHub::now_ms();
@@ -889,6 +931,9 @@ impl UdpNatManager {
                     .await
                     {
                         Ok(Ok((resp, remote_src))) => {
+                            if conn_dl.is_closed() || *shutdown_rx_reader.borrow() {
+                                break;
+                            }
                             reader_last.store(boot.elapsed().as_millis() as u64, Ordering::Relaxed);
                             reader_last_wall.store(TelemetryHub::now_ms(), Ordering::Relaxed);
                             hub_dl.record_download(&conn_dl, resp.len());
@@ -913,21 +958,15 @@ impl UdpNatManager {
             };
 
             tokio::select! {
+                biased;
+                _ = conn_entry.closed() => {}
+                _ = wait_for_shutdown(&mut shutdown_rx) => {}
                 _ = writer => {}
                 _ = reader => {}
-                _ = conn_entry.closed() => {}
             }
 
-            if sessions_map
-                .remove_if(&key, |_, v| Arc::ptr_eq(&v.conn_entry, &conn_entry))
-                .is_some()
-            {
-                fast_routes_map.retain(|rk, rv| {
-                    !(rk.0 == key.client_src
-                        && rv.outbound_name == key.outbound_name
-                        && rv.fake_ip_scope == key.fake_ip_scope)
-                });
-            }
+            conn_entry.request_close();
+            cleanup_weak_session_maps(&sessions_weak, &fast_routes_weak, &key, &conn_entry);
             hub_clone.unregister_connection(&conn_entry.id);
         });
     }
@@ -1731,5 +1770,142 @@ mod tests {
         );
         assert_eq!(mgr.active_session_count(), 1);
         mgr.reset_all_sessions();
+    }
+
+    struct FloodingUdpSession {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for FloodingUdpSession {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundUdpSession for FloodingUdpSession {
+        async fn send_to(&self, _payload: &[u8], _target: &TargetAddr) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn recv_from(&self) -> std::io::Result<(Vec<u8>, TargetAddr)> {
+            tokio::task::yield_now().await;
+            Ok((vec![0xAB; 32], "93.184.216.34:443".parse().unwrap()))
+        }
+    }
+
+    struct FloodingUdpOutbound {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for FloodingUdpOutbound {
+        fn name(&self) -> &str {
+            "flood-node"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(&self, _target: &TargetAddr) -> std::io::Result<BoxedStream> {
+            Err(std::io::Error::other("unused"))
+        }
+
+        async fn open_udp_session(&self) -> std::io::Result<Box<dyn OutboundUdpSession>> {
+            Ok(Box::new(FloodingUdpSession {
+                dropped: Arc::clone(&self.dropped),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_and_shutdown_break_self_retaining_cycle_during_udp_flood() {
+        let hub = Arc::new(TelemetryHub::new());
+        let rx_packets = Arc::new(AtomicUsize::new(0));
+        let rx_clone = Arc::clone(&rx_packets);
+        let session_dropped = Arc::new(AtomicBool::new(false));
+        let outbound: DynOutbound = Arc::new(FloodingUdpOutbound {
+            dropped: Arc::clone(&session_dropped),
+        });
+
+        let mgr = UdpNatManager::new(
+            "test-flood",
+            64,
+            Arc::clone(&hub),
+            Arc::new(move |_, _, _| {
+                rx_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let sessions_weak = Arc::downgrade(&mgr.sessions);
+        let src: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let dst: TargetAddr = "93.184.216.34:443".parse().unwrap();
+
+        mgr.send_datagram(
+            src,
+            dst.clone(),
+            None,
+            dst.clone(),
+            "MATCH",
+            "",
+            vec!["flood-node".into()],
+            Arc::clone(&outbound),
+            vec![1, 2, 3],
+        )
+        .await;
+
+        // Wait until the flooded reader loop is actively delivering packets
+        for _ in 0..200 {
+            if rx_packets.load(Ordering::Relaxed) >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(rx_packets.load(Ordering::Relaxed) >= 5);
+        assert_eq!(hub.active_connection_count(), 1);
+
+        // Dropping the sole Arc<UdpNatManager> (without calling reset_all_sessions manually)
+        // MUST immediately exit the flooded session task, close TelemetryHub, and free the session map!
+        drop(mgr);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !session_dropped.load(Ordering::Acquire)
+                || hub.active_connection_count() != 0
+                || sessions_weak.strong_count() != 0
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("flooded UDP session and DashMap must be freed within milliseconds on Drop");
+
+        // Also verify explicit shutdown() gates late send_datagram_with_epoch calls against zombie sessions
+        let mgr2 = UdpNatManager::new(
+            "test-shutdown-gate",
+            64,
+            Arc::clone(&hub),
+            Arc::new(|_, _, _| {}),
+        );
+        mgr2.shutdown();
+        assert!(mgr2.is_closed());
+        mgr2.send_datagram_with_epoch(
+            src,
+            dst.clone(),
+            None,
+            dst,
+            "MATCH",
+            "",
+            vec!["flood-node".into()],
+            outbound,
+            vec![9, 9],
+            1,
+        )
+        .await;
+        assert_eq!(mgr2.active_session_count(), 0);
+        assert_eq!(hub.active_connection_count(), 0);
     }
 }

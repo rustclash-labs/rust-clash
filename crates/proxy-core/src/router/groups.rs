@@ -87,6 +87,19 @@ impl DelayStore {
             .filter(|(_, d)| *d > 0)
     }
 
+    pub fn is_known_failed(&self, name: &str) -> bool {
+        self.records
+            .get(name)
+            .and_then(|q| q.back().map(|item| item.delay == 0))
+            .unwrap_or(false)
+    }
+
+    pub fn clear(&self, name: &str) {
+        if self.records.remove(name).is_some() {
+            self.revision.fetch_add(1, Ordering::Release);
+        }
+    }
+
     pub fn seed_if_absent(&self, name: &str, delay_ms: u64) {
         if delay_ms == 0 {
             return;
@@ -252,7 +265,7 @@ impl ProxyGroup {
 
     /// Idempotently update `selected` for `URLTest` (with `tolerance_ms` hysteresis), `Fallback`,
     /// and `LoadBalance` from `map` without mutating `DelayStore`, returning the group's resulting
-    /// effective probe latency (`Some(ms)`) or `None` if all members failed / group is `Select`.
+    /// effective probe latency (`Some(ms)`) or `None` if all members failed / selected member failed.
     pub fn update_selection_from_probes(&self, map: &HashMap<String, Option<u64>>) -> Option<u64> {
         match self.group_type {
             ProxyGroupType::UrlTest => {
@@ -270,8 +283,10 @@ impl ProxyGroup {
                     };
                     if should_switch {
                         *self.selected.write() = best_name.clone();
+                        Some(best_ms)
+                    } else {
+                        current_ms.or(Some(best_ms))
                     }
-                    Some(best_ms)
                 } else {
                     None
                 }
@@ -302,15 +317,12 @@ impl ProxyGroup {
 
     /// Apply member latency probe results (preserving `self.members` config order) to update
     /// `selected` for `URLTest` (with `tolerance_ms` hysteresis), `Fallback`, and `LoadBalance`,
-    /// and record the group's resulting latency (or failure when all members fail) in `delays`.
+    /// and record the group's resulting latency (or failure when all candidate/selected members fail)
+    /// in `delays` so dead groups never retain stale pre-outage delays.
     pub fn apply_probe_results(&self, map: &HashMap<String, Option<u64>>, delays: &DelayStore) {
-        if self.group_type == ProxyGroupType::Select {
-            return;
-        }
         match self.update_selection_from_probes(map) {
             Some(ms) => delays.record(&self.name, ms),
-            None if !self.members.is_empty() => delays.record_failure(&self.name),
-            None => {}
+            None => delays.record_failure(&self.name),
         }
     }
 
@@ -328,6 +340,7 @@ impl ProxyGroup {
     }
 
     /// Run bounded concurrent latency benchmark with explicit `unified_delay` selection.
+    /// Non-concrete members (nested `ProxyGroup`s) resolve their current delay from `delays`.
     pub async fn evaluate_health_with_mode(
         &self,
         outbounds: &HashMap<String, DynOutbound>,
@@ -344,7 +357,8 @@ impl ProxyGroup {
             let sem_clone = Arc::clone(&sem);
             async move {
                 let Some(outbound) = outbound_opt else {
-                    return (member, None);
+                    let sub_delay = delays.latest_delay(&member);
+                    return (member, sub_delay);
                 };
                 let _permit = sem_clone.acquire().await.ok();
                 match outbound
@@ -447,7 +461,40 @@ mod tests {
 
         // Failed probe should not be overwritten by offline cache seed.
         store.record_failure("node-c");
+        assert!(store.is_known_failed("node-c"));
         store.seed_if_absent("node-c", 99);
         assert_eq!(store.latest_delay("node-c"), None);
+        store.clear("node-c");
+        assert!(!store.is_known_failed("node-c"));
+    }
+
+    #[test]
+    fn apply_probe_results_clears_stale_group_delay_and_preserves_hysteresis_rtt() {
+        let store = DelayStore::default();
+        let grp = ProxyGroup::from_config(&ProxyGroupConfig {
+            name: "HK-Auto".to_string(),
+            group_type: ProxyGroupType::UrlTest,
+            proxies: vec!["hk-1".to_string(), "hk-2".to_string()],
+            url: "http://www.gstatic.com/generate_204".to_string(),
+            interval: 60,
+            tolerance: 30,
+            strategy: None,
+        });
+
+        // Initial healthy probe: hk-1=60ms, hk-2=45ms -> within 30ms tolerance so hk-1 stays selected (60ms)
+        let mut initial = HashMap::new();
+        initial.insert("hk-1".to_string(), Some(60));
+        initial.insert("hk-2".to_string(), Some(45));
+        grp.apply_probe_results(&initial, &store);
+        assert_eq!(grp.current(), "hk-1");
+        assert_eq!(store.latest_delay("HK-Auto"), Some(60));
+
+        // Total outage: both hk-1 and hk-2 fail -> HK-Auto MUST record failure and clear stale 60ms delay
+        let mut outage = HashMap::new();
+        outage.insert("hk-1".to_string(), None);
+        outage.insert("hk-2".to_string(), None);
+        grp.apply_probe_results(&outage, &store);
+        assert_eq!(store.latest_delay("HK-Auto"), None);
+        assert!(store.is_known_failed("HK-Auto"));
     }
 }

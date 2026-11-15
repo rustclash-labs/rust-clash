@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -308,6 +308,23 @@ fn format_tls_version(v: Option<ProtocolVersion>) -> Option<String> {
     }
 }
 
+fn format_probe_host_header(host_str: &str, port: u16, is_https: bool) -> String {
+    let clean = host_str
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let host_part = if clean.parse::<Ipv6Addr>().is_ok() {
+        format!("[{clean}]")
+    } else {
+        clean.to_string()
+    };
+    if (is_https && port == 443) || (!is_https && port == 80) {
+        host_part
+    } else {
+        format!("{host_part}:{port}")
+    }
+}
+
 fn parse_probe_url(raw_url: &str) -> Result<(bool, String, u16, String, String)> {
     let parsed = Url::parse(raw_url.trim())
         .map_err(|e| ProxyError::Config(format!("invalid probe URL: {e}")))?;
@@ -351,11 +368,7 @@ fn parse_probe_url(raw_url: &str) -> Result<(bool, String, u16, String, String)>
             }
         }
     };
-    let host_header = if parsed.port().is_some() {
-        format!("{raw_host}:{port}")
-    } else {
-        raw_host.to_string()
-    };
+    let host_header = format_probe_host_header(&clean_host, port, is_https);
     let sanitized_url = format!(
         "{}://{}{}",
         parsed.scheme(),
@@ -889,16 +902,7 @@ pub async fn probe_target_waterfall(
             }
         };
 
-        let bracketed_host = if host_str.contains(':') {
-            format!("[{host_str}]")
-        } else {
-            host_str.clone()
-        };
-        let host_hdr = if (is_https && port == 443) || (!is_https && port == 80) {
-            bracketed_host
-        } else {
-            format!("{bracketed_host}:{port}")
-        };
+        let host_hdr = format_probe_host_header(&host_str, port, is_https);
         let req_bytes = format!(
             "GET {path_and_query} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rust-clash/{}\r\nAccept: application/json, text/plain, */*\r\nConnection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
@@ -1321,16 +1325,7 @@ fn normalize_site_check_input_with_wire_url(
 
     let (is_https, host_str, port, path_and_query, sanitized_url) =
         parse_probe_url(&candidate_url)?;
-    let bracketed_host = if host_str.contains(':') {
-        format!("[{host_str}]")
-    } else {
-        host_str.clone()
-    };
-    let wire_authority = if (is_https && port == 443) || (!is_https && port == 80) {
-        bracketed_host
-    } else {
-        format!("{bracketed_host}:{port}")
-    };
+    let wire_authority = format_probe_host_header(&host_str, port, is_https);
     let wire_url = format!(
         "{}://{wire_authority}{path_and_query}",
         if is_https { "https" } else { "http" }
@@ -2750,5 +2745,202 @@ mod tests {
             geo_rep.suggested_action_kind.as_deref(),
             Some("switch_node")
         );
+    }
+
+    #[test]
+    fn format_probe_host_header_handles_ipv6_ipv4_and_domains() {
+        assert_eq!(format_probe_host_header("::1", 80, false), "[::1]");
+        assert_eq!(format_probe_host_header("::1", 443, false), "[::1]:443");
+        assert_eq!(format_probe_host_header("::1", 18080, false), "[::1]:18080");
+        assert_eq!(format_probe_host_header("::1", 443, true), "[::1]");
+        assert_eq!(format_probe_host_header("::1", 80, true), "[::1]:80");
+        assert_eq!(
+            format_probe_host_header("2001:4860:4860::8888", 8443, true),
+            "[2001:4860:4860::8888]:8443"
+        );
+        assert_eq!(
+            format_probe_host_header("127.0.0.1", 80, false),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            format_probe_host_header("127.0.0.1", 8080, false),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            format_probe_host_header("api.openai.com", 443, true),
+            "api.openai.com"
+        );
+        assert_eq!(
+            format_probe_host_header("api.openai.com", 8443, true),
+            "api.openai.com:8443"
+        );
+
+        let (norm_v6, target_v6) = normalize_site_check_input("::1").unwrap();
+        assert_eq!(norm_v6, "https://[::1]/");
+        assert_eq!(
+            target_v6,
+            TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 443)
+        );
+
+        let (norm_v6_port, target_v6_port) = normalize_site_check_input("[::1]:8443").unwrap();
+        assert_eq!(norm_v6_port, "https://[::1]:8443/");
+        assert_eq!(
+            target_v6_port,
+            TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 8443)
+        );
+    }
+
+    #[tokio::test]
+    async fn waterfall_probe_formats_ipv6_host_header_and_unbracketed_sni() {
+        struct MockIpv6OriginOutbound {
+            targets: Arc<parking_lot::Mutex<Vec<TargetAddr>>>,
+            requests: Arc<parking_lot::Mutex<Vec<String>>>,
+            acceptor: TlsAcceptor,
+            tls_ports: [u16; 2],
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for MockIpv6OriginOutbound {
+            fn name(&self) -> &str {
+                "Mock-IPv6-Proxy"
+            }
+
+            fn protocol(&self) -> &'static str {
+                "Mock"
+            }
+
+            async fn connect_tcp(
+                &self,
+                target: &TargetAddr,
+            ) -> io::Result<crate::outbound::BoxedStream> {
+                self.targets.lock().push(target.clone());
+                let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+                let requests = Arc::clone(&self.requests);
+                let use_tls = self.tls_ports.contains(&target.port);
+                let acceptor = self.acceptor.clone();
+
+                tokio::spawn(async move {
+                    if use_tls {
+                        let Ok(mut tls) = acceptor.accept(server_io).await else {
+                            return;
+                        };
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        loop {
+                            match tls.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        requests
+                            .lock()
+                            .push(String::from_utf8_lossy(&buf).into_owned());
+                        let _ = tls
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        let _ = tls.shutdown().await;
+                    } else {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        loop {
+                            match server_io.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        requests
+                            .lock()
+                            .push(String::from_utf8_lossy(&buf).into_owned());
+                        let _ = server_io
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        let _ = server_io.shutdown().await;
+                    }
+                });
+                Ok(Box::new(client_io))
+            }
+        }
+
+        let (srv_tls, ca_der) =
+            generate_self_signed_server_config(&["::1".to_string()], &[b"http/1.1".to_vec()])
+                .unwrap();
+        let targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mock_outbound = MockIpv6OriginOutbound {
+            targets: Arc::clone(&targets),
+            requests: Arc::clone(&requests),
+            acceptor: TlsAcceptor::from(srv_tls),
+            tls_ports: [443, 8443],
+        };
+
+        let cfg = ClashConfig::default();
+        let dns = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+        let mut outbounds: HashMap<String, Arc<dyn crate::outbound::OutboundHandler>> =
+            HashMap::new();
+        outbounds.insert("Mock-IPv6-Proxy".to_string(), Arc::new(mock_outbound));
+        let router = Router::new(RunMode::Rule, outbounds, &[], &cfg.rules, dns).unwrap();
+        let ca_slice = [ca_der];
+        let opts = ProbeOptions {
+            extra_ca_der: &ca_slice,
+            check_udp: false,
+            udp_dns_target: None,
+            timeout: Duration::from_secs(2),
+            allow_private_targets: true,
+            allowed_private_addrs: &[],
+        };
+
+        let cases = [
+            ("http://[::1]/v1", 80u16, "Host: [::1]\r\n", false),
+            (
+                "http://[::1]:18080/v1",
+                18080u16,
+                "Host: [::1]:18080\r\n",
+                false,
+            ),
+            ("https://[::1]/v1", 443u16, "Host: [::1]\r\n", true),
+            (
+                "https://[::1]:8443/v1",
+                8443u16,
+                "Host: [::1]:8443\r\n",
+                true,
+            ),
+        ];
+
+        for (idx, (url, expected_port, expected_host_line, expect_tls)) in
+            cases.into_iter().enumerate()
+        {
+            let rep = probe_target_waterfall(&router, &cfg, "Mock-IPv6-Proxy", url, opts)
+                .await
+                .unwrap();
+            assert_eq!(rep.verdict, ProbeVerdict::Reachable);
+            assert_eq!(rep.target_host, "::1");
+            assert_eq!(rep.target_port, expected_port);
+            if expect_tls {
+                assert_eq!(rep.tls_version.as_deref(), Some("TLSv1.3"));
+            }
+            assert_eq!(
+                targets.lock()[idx],
+                TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), expected_port)
+            );
+            let req = &requests.lock()[idx];
+            assert!(
+                req.contains(expected_host_line),
+                "expected `{expected_host_line:?}` in HTTP request for {url}, got: {req:?}"
+            );
+        }
     }
 }

@@ -129,15 +129,49 @@ pub struct WindowsRecoveryRecord {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxGnomeProtoBackup {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxKdeProxyBackup {
+    /// `6` for `kwriteconfig6`, `5` for `kwriteconfig5`.
+    #[serde(default)]
+    pub tool_generation: u8,
+    #[serde(default)]
+    pub proxy_type: Option<String>,
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+    #[serde(default)]
+    pub https_proxy: Option<String>,
+    #[serde(default)]
+    pub socks_proxy: Option<String>,
+    #[serde(default)]
+    pub no_proxy_for: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SysProxyRecoveryRecord {
     pub platform: String,
     pub windows_proxy_enable: Option<u32>,
     pub windows_proxy_server: Option<String>,
     pub windows_proxy_override: Option<String>,
+    #[serde(default)]
     pub macos_services: Vec<MacOsProxyServiceBackup>,
     pub linux_gnome_mode: Option<String>,
     #[serde(default)]
     pub linux_gnome_ignore_hosts: Option<String>,
+    #[serde(default)]
+    pub linux_gnome_http: Option<LinuxGnomeProtoBackup>,
+    #[serde(default)]
+    pub linux_gnome_https: Option<LinuxGnomeProtoBackup>,
+    #[serde(default)]
+    pub linux_gnome_socks: Option<LinuxGnomeProtoBackup>,
+    #[serde(default)]
+    pub linux_kde: Option<LinuxKdeProxyBackup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,30 +201,66 @@ pub struct RecoveryJournal {
     pub macos_tun: Option<MacOsRecoveryRecord>,
     pub windows_tun: Option<WindowsRecoveryRecord>,
     pub sysproxy: Option<SysProxyRecoveryRecord>,
+    /// Optional explicit owner PID for the TUN section when `sysproxy` and `tun` are managed by
+    /// different concurrent `rust-clash` processes. Defaults to `self.pid` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tun_owner_pid: Option<u32>,
+    /// Optional explicit owner PID for the `sysproxy` section when `sysproxy` and `tun` are
+    /// managed by different concurrent `rust-clash` processes. Defaults to `self.pid` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sysproxy_owner_pid: Option<u32>,
 }
 
 impl RecoveryJournal {
     pub fn new_for_current_process() -> Self {
+        Self::new_for_pid(std::process::id())
+    }
+
+    pub fn new_for_pid(pid: u32) -> Self {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         Self {
-            pid: std::process::id(),
+            pid,
             started_at_unix_ms: now_ms,
             platform: std::env::consts::OS.to_string(),
             linux_tun: None,
             macos_tun: None,
             windows_tun: None,
             sysproxy: None,
+            tun_owner_pid: None,
+            sysproxy_owner_pid: None,
         }
     }
 
+    pub fn has_tun(&self) -> bool {
+        self.linux_tun.is_some() || self.macos_tun.is_some() || self.windows_tun.is_some()
+    }
+
+    pub fn effective_tun_pid(&self) -> u32 {
+        self.tun_owner_pid.unwrap_or(self.pid)
+    }
+
+    pub fn effective_sysproxy_pid(&self) -> u32 {
+        self.sysproxy_owner_pid.unwrap_or(self.pid)
+    }
+
+    pub fn normalize_owner_pids(
+        &mut self,
+        tun_pid: Option<u32>,
+        sysproxy_pid: Option<u32>,
+        fallback_pid: u32,
+    ) {
+        let effective_tun = tun_pid.filter(|_| self.has_tun());
+        let effective_sp = sysproxy_pid.filter(|_| self.sysproxy.is_some());
+        self.pid = effective_tun.or(effective_sp).unwrap_or(fallback_pid);
+        self.tun_owner_pid = effective_tun.filter(|&p| p != self.pid);
+        self.sysproxy_owner_pid = effective_sp.filter(|&p| p != self.pid);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.linux_tun.is_none()
-            && self.macos_tun.is_none()
-            && self.windows_tun.is_none()
-            && self.sysproxy.is_none()
+        !self.has_tun() && self.sysproxy.is_none()
     }
 
     pub fn path_in(state_dir: &Path) -> PathBuf {
@@ -215,15 +285,20 @@ impl RecoveryJournal {
         Ok(Some(parsed))
     }
 
-    /// Persist atomically via `<dir>/network_recovery.json.tmp.<pid>` + `rename`.
+    /// Persist atomically via `<dir>/network_recovery.json.tmp.<pid>.<nonce>` + `rename`.
     /// If the journal has no owned resources left, removes the journal file instead.
     pub fn save_atomic(&self, state_dir: &Path) -> io::Result<()> {
+        use rand::RngCore;
         if self.is_empty() {
             return Self::remove_from(state_dir);
         }
         fs::create_dir_all(state_dir)?;
         let final_path = Self::path_in(state_dir);
-        let tmp_path = state_dir.join(format!("{JOURNAL_FILENAME}.tmp.{}", std::process::id()));
+        let nonce = rand::rng().next_u64();
+        let tmp_path = state_dir.join(format!(
+            "{JOURNAL_FILENAME}.tmp.{}.{nonce:016x}",
+            std::process::id()
+        ));
         let serialized = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         {
             let mut f = OpenOptions::new()
@@ -239,7 +314,10 @@ impl RecoveryJournal {
             f.write_all(&serialized)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp_path, &final_path)?;
+        if let Err(err) = fs::rename(&tmp_path, &final_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -253,16 +331,143 @@ impl RecoveryJournal {
     }
 }
 
-/// Update (or clear if empty) a section of the current process's `RecoveryJournal` in `state_dir`.
+static JOURNAL_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+const JOURNAL_LOCK_FILENAME: &str = "network_recovery.journal.lock";
+
+fn acquire_journal_file_lock(state_dir: &Path) -> Option<File> {
+    let _ = fs::create_dir_all(state_dir);
+    let lock_path = state_dir.join(JOURNAL_LOCK_FILENAME);
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0x7);
+    }
+    let file = opts.open(lock_path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: Blocking `flock(LOCK_EX)` on valid open `file` fd serializes cross-process journal updates.
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx},
+            System::IO::OVERLAPPED,
+        };
+        // SAFETY: Blocking `LockFileEx` with zeroed `OVERLAPPED` serializes cross-process journal updates;
+        // the lock is automatically released when `file` is dropped.
+        unsafe {
+            let mut overlapped: OVERLAPPED = std::mem::zeroed();
+            let _ = LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            );
+        }
+    }
+    Some(file)
+}
+
+/// Update (or clear if empty) a section of the current process's `RecoveryJournal` in `state_dir`,
+/// preserving any `tun` or `sysproxy` recovery entries owned by other processes.
 pub fn update_current_journal<F>(state_dir: &Path, mutate: F) -> io::Result<()>
 where
     F: FnOnce(&mut RecoveryJournal),
 {
-    let mut journal = match RecoveryJournal::load_from(state_dir) {
-        Ok(Some(existing)) if existing.pid == std::process::id() => existing,
-        _ => RecoveryJournal::new_for_current_process(),
-    };
+    update_journal_for_pid_with_liveness(state_dir, std::process::id(), is_pid_alive, mutate)
+}
+
+pub fn update_journal_for_pid_with_liveness<F, L>(
+    state_dir: &Path,
+    caller_pid: u32,
+    is_alive: L,
+    mutate: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&mut RecoveryJournal),
+    L: Fn(u32) -> bool,
+{
+    let _mem_guard = JOURNAL_MUTEX.lock();
+    let _file_guard = acquire_journal_file_lock(state_dir);
+
+    let existing = RecoveryJournal::load_from(state_dir).ok().flatten();
+    let mut journal = RecoveryJournal::new_for_pid(caller_pid);
+
+    if let Some(ref ex) = existing {
+        if ex.pid == caller_pid {
+            journal.started_at_unix_ms = ex.started_at_unix_ms;
+        }
+        if ex.has_tun() && ex.effective_tun_pid() == caller_pid {
+            journal.linux_tun = ex.linux_tun.clone();
+            journal.macos_tun = ex.macos_tun.clone();
+            journal.windows_tun = ex.windows_tun.clone();
+        }
+        if ex.sysproxy.is_some() && ex.effective_sysproxy_pid() == caller_pid {
+            journal.sysproxy = ex.sysproxy.clone();
+        }
+    }
+
     mutate(&mut journal);
+
+    let final_tun_pid = if journal.has_tun() {
+        Some(caller_pid)
+    } else if let Some(ref ex) = existing
+        && ex.has_tun()
+    {
+        let ex_tun_pid = ex.effective_tun_pid();
+        if ex_tun_pid != caller_pid {
+            // Preserve foreign process's TUN record (especially when `is_alive(ex_tun_pid)` is true,
+            // and also if a foreign process crashed and awaits `recover_stale_network_state`).
+            let _ = is_alive(ex_tun_pid);
+            journal.linux_tun = ex.linux_tun.clone();
+            journal.macos_tun = ex.macos_tun.clone();
+            journal.windows_tun = ex.windows_tun.clone();
+            Some(ex_tun_pid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let final_sp_pid = if journal.sysproxy.is_some() {
+        Some(caller_pid)
+    } else if let Some(ref ex) = existing
+        && ex.sysproxy.is_some()
+    {
+        let ex_sp_pid = ex.effective_sysproxy_pid();
+        if ex_sp_pid != caller_pid && is_alive(ex_sp_pid) {
+            journal.sysproxy = ex.sysproxy.clone();
+            Some(ex_sp_pid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    journal.normalize_owner_pids(final_tun_pid, final_sp_pid, caller_pid);
+    journal.save_atomic(state_dir)
+}
+
+/// Clear a stale/unowned `sysproxy` entry after `disable_system_proxy` has restored OS settings,
+/// without touching any live or unrecovered `tun` entry in `network_recovery.json`.
+pub(crate) fn clear_sysproxy_journal_entry(state_dir: &Path) -> io::Result<()> {
+    let _mem_guard = JOURNAL_MUTEX.lock();
+    let _file_guard = acquire_journal_file_lock(state_dir);
+    let Some(mut journal) = RecoveryJournal::load_from(state_dir)? else {
+        return Ok(());
+    };
+    let tun_pid = journal.has_tun().then(|| journal.effective_tun_pid());
+    journal.sysproxy = None;
+    journal.normalize_owner_pids(tun_pid, None, std::process::id());
     journal.save_atomic(state_dir)
 }
 
@@ -453,6 +658,9 @@ where
     F: FnMut(&str, &[String]) -> io::Result<()>,
 {
     let mut outcome = RecoveryOutcome::default();
+    let _mem_guard = JOURNAL_MUTEX.lock();
+    let _file_guard = acquire_journal_file_lock(state_dir);
+
     let journal = match RecoveryJournal::load_from(state_dir) {
         Ok(Some(j)) => j,
         Ok(None) => return outcome,
@@ -462,124 +670,138 @@ where
         }
     };
 
-    if is_pid_alive(journal.pid) {
-        // Another live process owns this journal — never touch its active routes!
+    let tun_pid = journal.effective_tun_pid();
+    let sp_pid = journal.effective_sysproxy_pid();
+    let tun_stale = journal.has_tun() && !is_pid_alive(tun_pid);
+    let sp_stale = journal.sysproxy.is_some() && !is_pid_alive(sp_pid);
+    let empty_stale = journal.is_empty() && !is_pid_alive(journal.pid);
+
+    if !tun_stale && !sp_stale && !empty_stale {
+        // Every active section in this journal belongs to a live OS process — never touch its state!
         return outcome;
     }
 
     outcome.found_stale_journal = true;
-    outcome.stale_pid = Some(journal.pid);
+    outcome.stale_pid = if tun_stale {
+        Some(tun_pid)
+    } else if sp_stale {
+        Some(sp_pid)
+    } else {
+        Some(journal.pid)
+    };
 
-    if let Some(linux) = &journal.linux_tun {
-        for args in linux.owned_v4_rule_del_args.iter().rev() {
-            let desc = format!("ip {}", args.join(" "));
-            match run_cmd("ip", args) {
-                Ok(()) => outcome.actions_executed.push(desc),
-                Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+    if tun_stale {
+        if let Some(linux) = &journal.linux_tun {
+            for args in linux.owned_v4_rule_del_args.iter().rev() {
+                let desc = format!("ip {}", args.join(" "));
+                match run_cmd("ip", args) {
+                    Ok(()) => outcome.actions_executed.push(desc),
+                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                }
+            }
+            for args in linux.owned_v6_rule_del_args.iter().rev() {
+                let desc = format!("ip {}", args.join(" "));
+                match run_cmd("ip", args) {
+                    Ok(()) => outcome.actions_executed.push(desc),
+                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                }
+            }
+            for args in linux.owned_route_del_args.iter().rev() {
+                let desc = format!("ip {}", args.join(" "));
+                match run_cmd("ip", args) {
+                    Ok(()) => outcome.actions_executed.push(desc),
+                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                }
+            }
+            if !linux.device_name.is_empty() {
+                let del_link = vec![
+                    "link".to_string(),
+                    "delete".to_string(),
+                    "dev".to_string(),
+                    linux.device_name.clone(),
+                ];
+                if run_cmd("ip", &del_link).is_ok() {
+                    outcome
+                        .actions_executed
+                        .push(format!("ip link delete dev {}", linux.device_name));
+                }
             }
         }
-        for args in linux.owned_v6_rule_del_args.iter().rev() {
-            let desc = format!("ip {}", args.join(" "));
-            match run_cmd("ip", args) {
-                Ok(()) => outcome.actions_executed.push(desc),
-                Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-            }
-        }
-        for args in linux.owned_route_del_args.iter().rev() {
-            let desc = format!("ip {}", args.join(" "));
-            match run_cmd("ip", args) {
-                Ok(()) => outcome.actions_executed.push(desc),
-                Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-            }
-        }
-        if !linux.device_name.is_empty() {
-            let del_link = vec![
-                "link".to_string(),
-                "delete".to_string(),
-                "dev".to_string(),
-                linux.device_name.clone(),
-            ];
-            if run_cmd("ip", &del_link).is_ok() {
-                outcome
-                    .actions_executed
-                    .push(format!("ip link delete dev {}", linux.device_name));
-            }
-        }
-    }
 
-    if let Some(macos) = &journal.macos_tun {
-        for args in macos.owned_route_del_args.iter().rev() {
-            let desc = format!("route {}", args.join(" "));
-            match run_cmd("route", args) {
-                Ok(()) => outcome.actions_executed.push(desc),
-                Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+        if let Some(macos) = &journal.macos_tun {
+            for args in macos.owned_route_del_args.iter().rev() {
+                let desc = format!("route {}", args.join(" "));
+                match run_cmd("route", args) {
+                    Ok(()) => outcome.actions_executed.push(desc),
+                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                }
             }
-        }
-        for dns in &macos.dns_backups {
-            let mut args = vec!["-setdnsservers".to_string(), dns.service_name.clone()];
-            if dns.previous_servers.is_empty() {
-                args.push("Empty".to_string());
-            } else {
-                args.extend(dns.previous_servers.iter().cloned());
-            }
-            let desc = format!("networksetup {}", args.join(" "));
-            match run_cmd("networksetup", &args) {
-                Ok(()) => outcome.actions_executed.push(desc),
-                Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-            }
-        }
-    }
-
-    if let Some(win) = &journal.windows_tun {
-        #[cfg(windows)]
-        {
-            crate::platform::tun::windows::recover_windows_tun_record(win, &mut outcome);
-        }
-        #[cfg(not(windows))]
-        {
-            let target_guid = win
-                .dns_backup
-                .as_ref()
-                .map(|b| b.interface_guid.as_str())
-                .or(win.dns_interface_guid.as_deref());
-            if let Some(guid) = target_guid {
-                let v4_servers: Option<Vec<String>> = if let Some(b) = &win.dns_backup {
-                    Some(
-                        b.ipv4
-                            .name_server
-                            .split([',', ' '])
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .collect(),
-                    )
+            for dns in &macos.dns_backups {
+                let mut args = vec!["-setdnsservers".to_string(), dns.service_name.clone()];
+                if dns.previous_servers.is_empty() {
+                    args.push("Empty".to_string());
                 } else {
-                    win.previous_dns_servers.clone()
-                };
-                if let Some(servers) = v4_servers {
-                    let mut args = vec![
-                        "interface".to_string(),
-                        "ipv4".to_string(),
-                        "set".to_string(),
-                        "dnsservers".to_string(),
-                        format!("name={guid}"),
-                    ];
-                    if servers.is_empty() {
-                        args.push("source=dhcp".to_string());
+                    args.extend(dns.previous_servers.iter().cloned());
+                }
+                let desc = format!("networksetup {}", args.join(" "));
+                match run_cmd("networksetup", &args) {
+                    Ok(()) => outcome.actions_executed.push(desc),
+                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                }
+            }
+        }
+
+        if let Some(win) = &journal.windows_tun {
+            #[cfg(windows)]
+            {
+                crate::platform::tun::windows::recover_windows_tun_record(win, &mut outcome);
+            }
+            #[cfg(not(windows))]
+            {
+                let target_guid = win
+                    .dns_backup
+                    .as_ref()
+                    .map(|b| b.interface_guid.as_str())
+                    .or(win.dns_interface_guid.as_deref());
+                if let Some(guid) = target_guid {
+                    let v4_servers: Option<Vec<String>> = if let Some(b) = &win.dns_backup {
+                        Some(
+                            b.ipv4
+                                .name_server
+                                .split([',', ' '])
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect(),
+                        )
                     } else {
-                        args.push("source=static".to_string());
-                        args.push(format!("address={}", servers[0]));
-                    }
-                    let desc = format!("netsh {}", args.join(" "));
-                    match run_cmd("netsh", &args) {
-                        Ok(()) => outcome.actions_executed.push(desc),
-                        Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                        win.previous_dns_servers.clone()
+                    };
+                    if let Some(servers) = v4_servers {
+                        let mut args = vec![
+                            "interface".to_string(),
+                            "ipv4".to_string(),
+                            "set".to_string(),
+                            "dnsservers".to_string(),
+                            format!("name={guid}"),
+                        ];
+                        if servers.is_empty() {
+                            args.push("source=dhcp".to_string());
+                        } else {
+                            args.push("source=static".to_string());
+                            args.push(format!("address={}", servers[0]));
+                        }
+                        let desc = format!("netsh {}", args.join(" "));
+                        match run_cmd("netsh", &args) {
+                            Ok(()) => outcome.actions_executed.push(desc),
+                            Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                        }
                     }
                 }
             }
         }
     }
 
-    if let Some(sp) = &journal.sysproxy {
+    if sp_stale && let Some(sp) = &journal.sysproxy {
         struct AdapterRunner<'a, F>(&'a mut F);
         impl<F> crate::platform::sysproxy::SysProxyCommandBackend for AdapterRunner<'_, F>
         where
@@ -601,10 +823,29 @@ where
         let _ = fs::remove_file(state_dir.join("sysproxy_active.json"));
     }
 
-    if let Err(e) = RecoveryJournal::remove_from(state_dir) {
+    // Preserve any remaining section owned by a still-live process; if none remain, `save_atomic`
+    // removes `network_recovery.json` cleanly.
+    let mut survivor = journal;
+    let keep_tun_pid = if tun_stale {
+        survivor.linux_tun = None;
+        survivor.macos_tun = None;
+        survivor.windows_tun = None;
+        None
+    } else {
+        survivor.has_tun().then_some(tun_pid)
+    };
+    let keep_sp_pid = if sp_stale {
+        survivor.sysproxy = None;
+        None
+    } else {
+        survivor.sysproxy.is_some().then_some(sp_pid)
+    };
+    survivor.normalize_owner_pids(keep_tun_pid, keep_sp_pid, std::process::id());
+
+    if let Err(e) = survivor.save_atomic(state_dir) {
         outcome
             .warnings
-            .push(format!("failed removing recovery journal: {e}"));
+            .push(format!("failed updating/removing recovery journal: {e}"));
     }
 
     outcome
@@ -709,6 +950,124 @@ mod tests {
         drop(g1);
         let g3 = SingleInstanceGuard::acquire(&dir).expect("reacquire after drop");
         drop(g3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_live_pid_tun_and_sysproxy_entries_are_preserved_across_processes() {
+        let dir = std::env::temp_dir().join(format!(
+            "rc-recovery-multiproc-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let daemon_pid = std::process::id();
+        let demo_cli_pid = daemon_pid.wrapping_add(50_000);
+
+        // 1. Live TUN daemon (`daemon_pid` == current process, genuinely alive via OS `is_pid_alive`)
+        //    records its active TUN recovery entry.
+        let tun_rec = LinuxRecoveryRecord {
+            device_name: "ClashLive0".into(),
+            route_table_id: 20260,
+            fwmark: 0x1a5,
+            owned_v4_rule_del_args: vec![vec![
+                "-4".into(),
+                "rule".into(),
+                "del".into(),
+                "pref".into(),
+                "9020".into(),
+            ]],
+            owned_v6_rule_del_args: vec![],
+            owned_route_del_args: vec![],
+        };
+        update_current_journal(&dir, |j| {
+            j.linux_tun = Some(tun_rec.clone());
+        })
+        .unwrap();
+
+        // 2. A second concurrent process (`demo_cli_pid`) enables and then disables System Proxy.
+        //    Using real `is_pid_alive`, `daemon_pid` is alive so its `linux_tun` MUST NOT be clobbered!
+        let sp_rec = SysProxyRecoveryRecord {
+            platform: "linux".into(),
+            linux_gnome_mode: Some("none".into()),
+            ..Default::default()
+        };
+        update_journal_for_pid_with_liveness(&dir, demo_cli_pid, is_pid_alive, |j| {
+            assert!(
+                j.linux_tun.is_none(),
+                "foreign process view must not expose daemon's TUN for mutation"
+            );
+            j.sysproxy = Some(sp_rec.clone());
+        })
+        .unwrap();
+
+        let merged = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(merged.linux_tun.as_ref(), Some(&tun_rec));
+        assert_eq!(merged.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(merged.effective_tun_pid(), daemon_pid);
+        assert_eq!(merged.effective_sysproxy_pid(), demo_cli_pid);
+
+        // Foreign process disables its own System Proxy (`j.sysproxy = None`): live daemon's TUN remains!
+        update_journal_for_pid_with_liveness(&dir, demo_cli_pid, is_pid_alive, |j| {
+            j.sysproxy = None;
+        })
+        .unwrap();
+
+        let after_sp_off = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(after_sp_off.linux_tun.as_ref(), Some(&tun_rec));
+        assert!(after_sp_off.sysproxy.is_none());
+        assert_eq!(after_sp_off.effective_tun_pid(), daemon_pid);
+
+        // 3. Symmetrically, if `demo_cli_pid` is alive holding `sysproxy` while `daemon_pid` stops TUN,
+        //    `demo_cli_pid`'s live `sysproxy` entry is preserved!
+        let both_alive = |pid: u32| pid == daemon_pid || pid == demo_cli_pid;
+        update_journal_for_pid_with_liveness(&dir, demo_cli_pid, both_alive, |j| {
+            j.sysproxy = Some(sp_rec.clone());
+        })
+        .unwrap();
+        update_journal_for_pid_with_liveness(&dir, daemon_pid, both_alive, |j| {
+            j.linux_tun = None;
+        })
+        .unwrap();
+
+        let after_tun_off = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert!(after_tun_off.linux_tun.is_none());
+        assert_eq!(after_tun_off.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(after_tun_off.effective_sysproxy_pid(), demo_cli_pid);
+
+        // 4. Selective crash recovery: `daemon_pid` (alive) holds `linux_tun` while a dead PID
+        //    (`999_999_993`) crashed holding `sysproxy`. Only `sysproxy` is recovered; live TUN stays!
+        let dead_sp_pid = 999_999_993u32;
+        update_current_journal(&dir, |j| {
+            j.linux_tun = Some(tun_rec.clone());
+        })
+        .unwrap();
+        update_journal_for_pid_with_liveness(&dir, dead_sp_pid, is_pid_alive, |j| {
+            j.sysproxy = Some(sp_rec.clone());
+        })
+        .unwrap();
+
+        let mut cmds = Vec::new();
+        let partial = recover_stale_network_state_with_runner(&dir, &mut |prog, args| {
+            cmds.push(format!("{prog} {}", args.join(" ")));
+            Ok(())
+        });
+        assert!(partial.found_stale_journal);
+        assert_eq!(partial.stale_pid, Some(dead_sp_pid));
+        assert!(
+            cmds.iter().all(|c| !c.starts_with("ip ")),
+            "must NOT tear down live daemon's TUN routes: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c == "gsettings set org.gnome.system.proxy mode none")
+        );
+
+        let surviving = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(surviving.linux_tun.as_ref(), Some(&tun_rec));
+        assert!(surviving.sysproxy.is_none());
+        assert_eq!(surviving.effective_tun_pid(), daemon_pid);
 
         let _ = fs::remove_dir_all(&dir);
     }

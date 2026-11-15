@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ApiHttpError,
   clashApi,
   fetchExitIp,
   patchConfig,
@@ -113,6 +114,30 @@ function getBrowserHeapBytes(): number | null {
   return typeof mem?.usedJSHeapSize === "number" && mem.usedJSHeapSize > 0
     ? mem.usedJSHeapSize
     : null;
+}
+
+function isTunPrivilegeFailure(
+  err: unknown,
+  msg: string,
+  privilegeOk?: boolean,
+): boolean {
+  if (
+    err instanceof ApiHttpError &&
+    (err.status === 401 || err.status === 403)
+  ) {
+    return false;
+  }
+  if (/cannot reach rustclash controller|failed to fetch|networkerror/i.test(msg)) {
+    return false;
+  }
+  if (
+    /cap_net_admin|privilege|permission|operation not permitted|access is denied|administrator|root|elevat|wintun|utun|\/dev\/net\/tun|eacces|eperm/i.test(
+      msg,
+    )
+  ) {
+    return true;
+  }
+  return privilegeOk === false && err instanceof ApiHttpError;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -407,8 +432,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           if (sysproxyTurnedOn) {
             await setSysProxy(false).catch(() => {});
           }
+          const stepMsg =
+            stepErr instanceof Error ? stepErr.message : String(stepErr);
           const hint = config?.tun.health?.privilege_hint;
-          if (plan.targetTun && hint) {
+          if (
+            plan.targetTun &&
+            !tunEnabled &&
+            hint &&
+            isTunPrivilegeFailure(
+              stepErr,
+              stepMsg,
+              config?.tun.health?.privilege_ok,
+            )
+          ) {
             setTunPrivilegeHint(hint);
           }
           throw stepErr;
@@ -470,11 +506,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         void loadExitIp(true);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        setToast({ ok: false, text: msg });
         const hint = config.tun.health?.privilege_hint;
-        if (hint) {
+        if (
+          nextEnable &&
+          hint &&
+          isTunPrivilegeFailure(err, msg, config.tun.health?.privilege_ok)
+        ) {
           setTunPrivilegeHint(hint);
-        } else {
-          setToast({ ok: false, text: msg });
         }
         await onRefreshAll();
       } finally {

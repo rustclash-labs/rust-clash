@@ -116,7 +116,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             var errPtr: UnsafeMutablePointer<CChar>?
             let handle = yamlConfig.withCString { cYaml in
-                rc_ne_start_engine(cYaml, UInt16(clamping: mtu), &errPtr)
+                rc_ne_start_engine_v2(cYaml, UInt16(clamping: mtu), enableIpv6, &errPtr)
             }
 
             guard let validHandle = handle else {
@@ -125,7 +125,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     message = String(cString: errPtr)
                     rc_ne_free_string(errPtr)
                 } else {
-                    message = "rc_ne_start_engine failed"
+                    message = "rc_ne_start_engine_v2 failed"
                 }
                 let err = NSError(
                     domain: "io.github.rustclashlabs.rustclash.ne",
@@ -136,7 +136,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            // Check whether `stopTunnel` raced while `setTunnelNetworkSettings` / `rc_ne_start_engine` ran
+            // Check whether `stopTunnel` raced while `setTunnelNetworkSettings` / `rc_ne_start_engine_v2` ran
             self.stateLock.lock()
             if self.stopRequested {
                 self.stateLock.unlock()
@@ -154,7 +154,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             self.startInboundPump(expectedHandle: validHandle)
             self.startOutboundPump(handle: validHandle)
-            os_log(.info, log: self.log, "RustClash NEPacketTunnelProvider started (MTU=%d, idleWakeups=0Hz)", mtu)
+            os_log(
+                .info,
+                log: self.log,
+                "RustClash NEPacketTunnelProvider started (MTU=%d, ipv6=%{public}@, idleWakeups=0Hz)",
+                mtu,
+                enableIpv6 ? "true" : "false"
+            )
             completionHandler(nil)
         }
     }
@@ -225,7 +231,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         egressGroup.enter()
         egressQueue.async { [weak self] in
             defer { self?.egressGroup.leave() }
-            var scratch = [UInt8](repeating: 0, count: 65536)
+            // 65,600-byte scratch buffer safely accommodates max-length IPv6 frames
+            // (40-byte fixed IPv6 header + 65,535-byte payload = 65,575 bytes).
+            var scratch = [UInt8](repeating: 0, count: 65600)
 
             while true {
                 // Event-driven wait (`timeout_ms = -1`): blocks on Rust Condvar with 0 Hz idle wakeups!
@@ -233,11 +241,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     rc_ne_wait_outbound_packet(handle, buf.baseAddress, buf.count, -1)
                 }
                 if firstLen == -2 {
-                    if scratch.count < 65536 {
-                        scratch = [UInt8](repeating: 0, count: 65536)
-                        continue
+                    // Rust already popped and dropped the single oversized frame; log and continue pumping.
+                    if let self = self {
+                        os_log(
+                            .error,
+                            log: self.log,
+                            "Skipped oversized outbound L3 frame (> %d bytes) in NE pump",
+                            scratch.count
+                        )
                     }
-                    break
+                    continue
                 }
                 if firstLen < 0 {
                     // Engine stopped (`rc_ne_stop_engine` called)

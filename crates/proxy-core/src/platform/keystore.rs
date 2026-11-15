@@ -213,26 +213,44 @@ impl SecretVault {
         self.vault_dir.join(format!("item_{slug}.{ext}"))
     }
 
-    fn load_or_create_master_key(&self) -> io::Result<[u8; 32]> {
-        self.ensure_vault_dir()?;
-        let key_path = self.vault_dir.join(MASTER_KEY_FILE);
-        if key_path.exists() {
-            let raw = fs::read(&key_path)?;
+    fn read_existing_master_key(key_path: &Path) -> io::Result<[u8; 32]> {
+        for attempt in 0..10 {
+            let mut raw = fs::read(key_path)?;
             if raw.len() == 32 {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&raw);
+                raw.zeroize();
                 return Ok(key);
             }
+            let was_empty = raw.is_empty();
+            raw.zeroize();
+            if !was_empty || attempt == 9 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "corrupt vault master key '{}' (expected 32 bytes)",
+                key_path.display()
+            ),
+        ))
+    }
 
-        let mut key = [0u8; 32];
-        rand::rng().fill_bytes(&mut key);
-        let tmp_path = self
-            .vault_dir
-            .join(format!("{MASTER_KEY_FILE}.tmp.{}", std::process::id()));
-        {
+    fn publish_master_key_atomic(
+        vault_dir: &Path,
+        key_path: &Path,
+        mut candidate: [u8; 32],
+    ) -> io::Result<[u8; 32]> {
+        let nonce = rand::rng().next_u64();
+        let tmp_path = vault_dir.join(format!(
+            "{MASTER_KEY_FILE}.tmp.{}.{nonce:016x}",
+            std::process::id()
+        ));
+        let write_tmp = (|| -> io::Result<()> {
             let mut opts = OpenOptions::new();
-            opts.create(true).write(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -244,11 +262,79 @@ impl SecretVault {
                 use std::os::unix::fs::PermissionsExt;
                 f.set_permissions(fs::Permissions::from_mode(0o600))?;
             }
-            f.write_all(&key)?;
+            f.write_all(&candidate)?;
             f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_tmp {
+            let _ = fs::remove_file(&tmp_path);
+            candidate.zeroize();
+            return Err(err);
         }
-        fs::rename(&tmp_path, &key_path)?;
-        Ok(key)
+
+        let link_res = fs::hard_link(&tmp_path, key_path);
+        let _ = fs::remove_file(&tmp_path);
+
+        match link_res {
+            Ok(()) => Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                candidate.zeroize();
+                Self::read_existing_master_key(key_path)
+            }
+            Err(_) => {
+                let mut opts = OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                match opts.open(key_path) {
+                    Ok(mut f) => {
+                        let direct_res = (|| -> io::Result<()> {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                f.set_permissions(fs::Permissions::from_mode(0o600))?;
+                            }
+                            f.write_all(&candidate)?;
+                            f.sync_all()?;
+                            Ok(())
+                        })();
+                        if let Err(err) = direct_res {
+                            drop(f);
+                            let _ = fs::remove_file(key_path);
+                            candidate.zeroize();
+                            return Err(err);
+                        }
+                        Ok(candidate)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        candidate.zeroize();
+                        Self::read_existing_master_key(key_path)
+                    }
+                    Err(e) => {
+                        candidate.zeroize();
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_or_create_master_key(&self) -> io::Result<[u8; 32]> {
+        static MASTER_KEY_INIT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = MASTER_KEY_INIT_LOCK.lock();
+
+        self.ensure_vault_dir()?;
+        let key_path = self.vault_dir.join(MASTER_KEY_FILE);
+        if key_path.exists() {
+            return Self::read_existing_master_key(&key_path);
+        }
+
+        let mut candidate = [0u8; 32];
+        rand::rng().fill_bytes(&mut candidate);
+        Self::publish_master_key_atomic(&self.vault_dir, &key_path, candidate)
     }
 
     fn put_encrypted_file(&self, key_id: &str, plaintext: &[u8]) -> io::Result<()> {
@@ -273,7 +359,8 @@ impl SecretVault {
         buf.zeroize();
 
         let target = self.entry_path(key_id, "enc");
-        let tmp = target.with_extension(format!("enc.tmp.{}", std::process::id()));
+        let tmp_nonce = rand::rng().next_u64();
+        let tmp = target.with_extension(format!("enc.tmp.{}.{tmp_nonce:016x}", std::process::id()));
         {
             let mut opts = OpenOptions::new();
             opts.create(true).write(true).truncate(true);
@@ -291,7 +378,10 @@ impl SecretVault {
             f.write_all(&blob)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp, &target)?;
+        if let Err(err) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -378,9 +468,14 @@ impl SecretVault {
         };
 
         let target = self.entry_path(key_id, "dpapi");
-        let tmp = target.with_extension(format!("dpapi.tmp.{}", std::process::id()));
+        let tmp_nonce = rand::rng().next_u64();
+        let tmp =
+            target.with_extension(format!("dpapi.tmp.{}.{tmp_nonce:016x}", std::process::id()));
         fs::write(&tmp, &protected)?;
-        fs::rename(&tmp, &target)?;
+        if let Err(err) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -664,5 +759,75 @@ mod tests {
         os_vault.delete_secret("os-test-key").unwrap();
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_first_time_secret_vault_init_never_clobbers_master_key() {
+        use std::sync::{Arc, Barrier};
+
+        let dir =
+            std::env::temp_dir().join(format!("rc-vault-concurrent-test-{}", uuid::Uuid::new_v4()));
+        let worker_count = 16usize;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for idx in 0..worker_count {
+            let dir_c = dir.clone();
+            let bar_c = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let v = SecretVault::new_file_backed(&dir_c);
+                bar_c.wait();
+                v.put_secret(
+                    &format!("concurrent-sub-{idx}"),
+                    &format!("secret-token-value-{idx}"),
+                )
+                .expect("concurrent put_secret must succeed");
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // Every thread's ciphertext MUST authenticate cleanly under the single winning master key!
+        let reader = SecretVault::new_file_backed(&dir);
+        for idx in 0..worker_count {
+            let got = reader.get_secret(&format!("concurrent-sub-{idx}")).expect(
+                "ciphertext written during concurrent init must decrypt without tag mismatch",
+            );
+            assert_eq!(
+                got.as_deref(),
+                Some(format!("secret-token-value-{idx}").as_str())
+            );
+        }
+
+        // Simulate cross-process race (`AlreadyExists` on `hard_link` / `create_new(true)`):
+        // losing process must return the winning on-disk key without overwriting `vault.master.key`.
+        let mp_dir =
+            std::env::temp_dir().join(format!("rc-vault-multiproc-test-{}", uuid::Uuid::new_v4()));
+        let mp_vault = SecretVault::new_file_backed(&mp_dir);
+        mp_vault.ensure_vault_dir().unwrap();
+        let key_path = mp_vault.vault_dir.join(MASTER_KEY_FILE);
+        let winning_key = [0x42u8; 32];
+        let first =
+            SecretVault::publish_master_key_atomic(&mp_vault.vault_dir, &key_path, winning_key)
+                .unwrap();
+        assert_eq!(first, winning_key);
+
+        let losing_candidate = [0x99u8; 32];
+        let second = SecretVault::publish_master_key_atomic(
+            &mp_vault.vault_dir,
+            &key_path,
+            losing_candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            second, winning_key,
+            "losing concurrent process must adopt winning master key"
+        );
+        assert_eq!(fs::read(&key_path).unwrap(), winning_key);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&mp_dir);
     }
 }

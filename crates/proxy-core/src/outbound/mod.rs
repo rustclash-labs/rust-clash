@@ -34,6 +34,24 @@ pub type BoxedStream = Box<dyn AsyncStream>;
 
 pub(crate) const OUTBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
 
+#[inline]
+pub(crate) fn hash_write_prefix(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[inline]
+pub(crate) fn save_waker_slot(slot: &mut Option<std::task::Waker>, waker: &std::task::Waker) {
+    match slot {
+        Some(existing) if existing.will_wake(waker) => {}
+        _ => *slot = Some(waker.clone()),
+    }
+}
+
 pub(crate) async fn with_handshake_timeout<T, F>(label: &'static str, fut: F) -> io::Result<T>
 where
     F: std::future::Future<Output = io::Result<T>>,
@@ -144,13 +162,24 @@ pub trait OutboundHandler: std::any::Any + Send + Sync {
                 format!("invalid test URL: {e}"),
             )
         })?;
-        let host = parsed.host_str().ok_or_else(|| {
+        let raw_host = parsed.host_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "missing host in test URL")
         })?;
+        let clean_host = raw_host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(raw_host);
         let is_https = parsed.scheme() == "https";
         let port = parsed.port().unwrap_or(if is_https { 443 } else { 80 });
         let path = match parsed.query() {
-            Some(q) => format!("{}?{q}", parsed.path()),
+            Some(q) => format!(
+                "{}?{q}",
+                if parsed.path().is_empty() {
+                    "/"
+                } else {
+                    parsed.path()
+                }
+            ),
             None => {
                 let p = parsed.path();
                 if p.is_empty() {
@@ -160,27 +189,34 @@ pub trait OutboundHandler: std::any::Any + Send + Sync {
                 }
             }
         };
-        let target = TargetAddr::new_domain(host, port)?;
+        let target = TargetAddr::new_domain(clean_host, port)?;
+        let host_hdr = format_http_host_header(clean_host, port, is_https);
 
         let connect_started = Instant::now();
         tokio::time::timeout(timeout, async {
             let mut stream = self.connect_tcp(&target).await?;
             if is_https {
                 let tls_cfg = crate::crypto::tls::build_tls_client_config(false, &[], &[])?;
-                let sni = crate::crypto::tls::parse_server_name(host)?;
+                let sni = crate::crypto::tls::parse_server_name(clean_host)?;
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);
                 let mut tls_stream = connector.connect(sni, stream).await?;
                 measure_http_head_latency(
                     &mut tls_stream,
-                    host,
+                    &host_hdr,
                     &path,
                     unified_delay,
                     connect_started,
                 )
                 .await
             } else {
-                measure_http_head_latency(&mut stream, host, &path, unified_delay, connect_started)
-                    .await
+                measure_http_head_latency(
+                    &mut stream,
+                    &host_hdr,
+                    &path,
+                    unified_delay,
+                    connect_started,
+                )
+                .await
             }
         })
         .await
@@ -188,9 +224,23 @@ pub trait OutboundHandler: std::any::Any + Send + Sync {
     }
 }
 
+fn format_http_host_header(clean_host: &str, port: u16, is_https: bool) -> String {
+    let host_part = if clean_host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{clean_host}]")
+    } else {
+        clean_host.to_string()
+    };
+    let is_default_port = (is_https && port == 443) || (!is_https && port == 80);
+    if is_default_port {
+        host_part
+    } else {
+        format!("{host_part}:{port}")
+    }
+}
+
 async fn measure_http_head_latency<S>(
     stream: &mut S,
-    host: &str,
+    host_hdr: &str,
     path: &str,
     unified_delay: bool,
     connect_started: Instant,
@@ -198,11 +248,6 @@ async fn measure_http_head_latency<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let host_hdr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
     if !unified_delay {
         let req = format!(
             "HEAD {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rust-clash/{}\r\nConnection: close\r\n\r\n",
@@ -381,7 +426,7 @@ impl DirectUdpSession {
 
     async fn socket_for(&self, remote: SocketAddr) -> io::Result<&Arc<UdpSocket>> {
         if remote.is_ipv4() {
-            let created = self.sock_v4.get().is_none();
+            let did_init = std::sync::atomic::AtomicBool::new(false);
             let sock = self
                 .sock_v4
                 .get_or_try_init(|| async {
@@ -389,15 +434,16 @@ impl DirectUdpSession {
                     let s = protected_udp_bind(bind, Some(remote)).map_err(|e| {
                         io::Error::new(e.kind(), format!("{DIRECT_UDP_LOCAL_BIND_ERR_PREFIX} {e}"))
                     })?;
+                    did_init.store(true, std::sync::atomic::Ordering::Relaxed);
                     Ok::<Arc<UdpSocket>, io::Error>(Arc::new(s))
                 })
                 .await?;
-            if created {
+            if did_init.load(std::sync::atomic::Ordering::Relaxed) {
                 self.ready_notify.notify_waiters();
             }
             Ok(sock)
         } else {
-            let created = self.sock_v6.get().is_none();
+            let did_init = std::sync::atomic::AtomicBool::new(false);
             let sock = self
                 .sock_v6
                 .get_or_try_init(|| async {
@@ -415,10 +461,11 @@ impl DirectUdpSession {
                             )
                         }
                     })?;
+                    did_init.store(true, std::sync::atomic::Ordering::Relaxed);
                     Ok::<Arc<UdpSocket>, io::Error>(Arc::new(s))
                 })
                 .await?;
-            if created {
+            if did_init.load(std::sync::atomic::Ordering::Relaxed) {
                 self.ready_notify.notify_waiters();
             }
             Ok(sock)
@@ -859,3 +906,278 @@ impl OutboundHandler for ErrorOutbound {
 }
 
 pub type DynOutbound = Arc<dyn OutboundHandler>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_http_host_header_handles_ipv6_ipv4_and_ports() {
+        assert_eq!(format_http_host_header("::1", 80, false), "[::1]");
+        assert_eq!(format_http_host_header("::1", 8080, false), "[::1]:8080");
+        assert_eq!(
+            format_http_host_header("2001:db8::1", 443, true),
+            "[2001:db8::1]"
+        );
+        assert_eq!(
+            format_http_host_header("2001:db8::1", 8443, true),
+            "[2001:db8::1]:8443"
+        );
+        assert_eq!(format_http_host_header("127.0.0.1", 80, false), "127.0.0.1");
+        assert_eq!(
+            format_http_host_header("127.0.0.1", 8080, false),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            format_http_host_header("example.com", 443, true),
+            "example.com"
+        );
+        assert_eq!(
+            format_http_host_header("example.com", 80, true),
+            "example.com:80"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_udp_session_recv_from_never_loses_wakeup_on_lazy_init() {
+        let echo_v4 = UdpSocket::bind("127.0.0.1:0").await.expect("bind v4 echo");
+        let echo_v4_addr = echo_v4.local_addr().expect("v4 local_addr");
+        let echo_v4_task = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            while let Ok((n, peer)) = echo_v4.recv_from(&mut buf).await {
+                if &buf[..n] == b"stop" {
+                    break;
+                }
+                let _ = echo_v4.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        // Case 1: `recv_from` parks in `(None, None)` before `send_to` initializes `sock_v4`.
+        let direct = DirectOutbound::default();
+        let sess: Arc<Box<dyn OutboundUdpSession>> =
+            Arc::new(direct.open_udp_session().await.expect("open_udp_session"));
+        let sess_rx = Arc::clone(&sess);
+        let recv_handle = tokio::spawn(async move { sess_rx.recv_from().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        sess.send_to(b"hello-v4", &TargetAddr::from(echo_v4_addr))
+            .await
+            .expect("send_to v4");
+        let (payload, src) = tokio::time::timeout(Duration::from_secs(2), recv_handle)
+            .await
+            .expect("recv_from v4 should wake without timeout")
+            .expect("recv_handle join")
+            .expect("recv_from v4 ok");
+        assert_eq!(payload, b"hello-v4");
+        assert_eq!(src, TargetAddr::from(echo_v4_addr));
+
+        // Case 2: `recv_from` parks in `(Some(s4), None)` while `send_to` initializes `sock_v6`.
+        if let Ok(echo_v6) = UdpSocket::bind("[::1]:0").await {
+            let echo_v6_addr = echo_v6.local_addr().expect("v6 local_addr");
+            let echo_v6_task = tokio::spawn(async move {
+                let mut buf = [0u8; 256];
+                if let Ok((n, peer)) = echo_v6.recv_from(&mut buf).await {
+                    let _ = echo_v6.send_to(&buf[..n], peer).await;
+                }
+            });
+
+            let sess_rx_v6 = Arc::clone(&sess);
+            let recv_v6_handle = tokio::spawn(async move { sess_rx_v6.recv_from().await });
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            if sess
+                .send_to(b"hello-v6", &TargetAddr::from(echo_v6_addr))
+                .await
+                .is_ok()
+            {
+                let (v6_payload, v6_src) =
+                    tokio::time::timeout(Duration::from_secs(2), recv_v6_handle)
+                        .await
+                        .expect("recv_from should wake when sock_v6 initializes")
+                        .expect("recv_v6 join")
+                        .expect("recv_from v6 ok");
+                assert_eq!(v6_payload, b"hello-v6");
+                assert_eq!(v6_src, TargetAddr::from(echo_v6_addr));
+            } else {
+                recv_v6_handle.abort();
+            }
+            echo_v6_task.abort();
+        }
+
+        // Case 3: Repeated concurrent races between `recv_from` and first `send_to`.
+        for i in 0..24u8 {
+            let s: Arc<Box<dyn OutboundUdpSession>> =
+                Arc::new(direct.open_udp_session().await.expect("open_udp_session"));
+            let s_rx = Arc::clone(&s);
+            let msg = [b'r', i];
+            let dst = TargetAddr::from(echo_v4_addr);
+            let (rx_res, tx_res) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(s_rx.recv_from(), s.send_to(&msg, &dst))
+            })
+            .await
+            .expect("concurrent recv_from + send_to should not deadlock");
+            tx_res.expect("race send_to");
+            let (got, _) = rx_res.expect("race recv_from");
+            assert_eq!(got, msg);
+        }
+
+        let _ = sess.send_to(b"stop", &TargetAddr::from(echo_v4_addr)).await;
+        let _ = echo_v4_task.await;
+    }
+
+    struct MockCaptureOutbound {
+        targets: Arc<parking_lot::Mutex<Vec<TargetAddr>>>,
+        requests: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+        mode: MockCaptureMode,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockCaptureMode {
+        Http204KeepAlive,
+        TlsCloseOnClientHello,
+    }
+
+    #[async_trait]
+    impl OutboundHandler for MockCaptureOutbound {
+        fn name(&self) -> &str {
+            "mock-capture"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "Mock"
+        }
+
+        async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+            self.targets.lock().push(target.clone());
+            let (c_io, mut s_io) = tokio::io::duplex(16 * 1024);
+            let reqs = Arc::clone(&self.requests);
+            let mode = self.mode;
+            tokio::spawn(async move {
+                match mode {
+                    MockCaptureMode::Http204KeepAlive => {
+                        for _ in 0..2 {
+                            let mut buf = Vec::new();
+                            let mut chunk = [0u8; 512];
+                            loop {
+                                match s_io.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => {
+                                        buf.extend_from_slice(&chunk[..n]);
+                                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            reqs.lock().push(buf);
+                            if s_io
+                                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    MockCaptureMode::TlsCloseOnClientHello => {
+                        let mut buf = [0u8; 512];
+                        if let Ok(n) = s_io.read(&mut buf).await
+                            && n > 0
+                        {
+                            reqs.lock().push(buf[..n].to_vec());
+                        }
+                        // Drop `s_io` to trigger clean EOF after ClientHello (proving SNI parsed).
+                    }
+                }
+            });
+            Ok(Box::new(c_io))
+        }
+    }
+
+    #[tokio::test]
+    async fn latency_test_with_mode_formats_ipv6_host_and_strips_sni_brackets() {
+        let targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mock_http = MockCaptureOutbound {
+            targets: Arc::clone(&targets),
+            requests: Arc::clone(&requests),
+            mode: MockCaptureMode::Http204KeepAlive,
+        };
+
+        // Default HTTP port 80 -> `Host: [::1]` and `TargetAddr::Ip(::1, 80)`
+        let rtt_default = mock_http
+            .latency_test_with_mode("http://[::1]/generate_204", Duration::from_secs(2), false)
+            .await
+            .expect("http ipv6 default port latency");
+        assert!(rtt_default >= 1);
+
+        // Non-default HTTP port 18080 with `unified_delay = true` -> `Host: [::1]:18080` on both HEADs
+        let rtt_unified = mock_http
+            .latency_test_with_mode(
+                "http://[::1]:18080/generate_204?probe=1",
+                Duration::from_secs(2),
+                true,
+            )
+            .await
+            .expect("http ipv6 non-default port unified-delay latency");
+        assert!(rtt_unified >= 1);
+
+        {
+            let seen_targets = targets.lock();
+            assert_eq!(
+                seen_targets.as_slice(),
+                &[
+                    TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 80),
+                    TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 18080),
+                ]
+            );
+            let seen_reqs = requests.lock();
+            assert_eq!(seen_reqs.len(), 3);
+            let req0 = String::from_utf8_lossy(&seen_reqs[0]);
+            assert!(req0.starts_with("HEAD /generate_204 HTTP/1.1\r\nHost: [::1]\r\n"));
+            let req1 = String::from_utf8_lossy(&seen_reqs[1]);
+            assert!(
+                req1.starts_with("HEAD /generate_204?probe=1 HTTP/1.1\r\nHost: [::1]:18080\r\n")
+            );
+            let req2 = String::from_utf8_lossy(&seen_reqs[2]);
+            assert!(
+                req2.starts_with("HEAD /generate_204?probe=1 HTTP/1.1\r\nHost: [::1]:18080\r\n")
+            );
+        }
+
+        // HTTPS IPv6 URL -> strips `[` and `]` so `parse_server_name("::1")` succeeds and sends TLS ClientHello
+        let tls_targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tls_hellos = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mock_https = MockCaptureOutbound {
+            targets: Arc::clone(&tls_targets),
+            requests: Arc::clone(&tls_hellos),
+            mode: MockCaptureMode::TlsCloseOnClientHello,
+        };
+        let err = mock_https
+            .latency_test_with_mode(
+                "https://[::1]:8443/generate_204",
+                Duration::from_secs(2),
+                false,
+            )
+            .await
+            .expect_err("closed mock TLS server should fail handshake after ClientHello");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "HTTPS IPv6 probe must not fail with InvalidInput SNI error: {err}"
+        );
+        assert_eq!(
+            tls_targets.lock().as_slice(),
+            &[TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 8443)]
+        );
+        let hellos = tls_hellos.lock();
+        assert_eq!(
+            hellos.len(),
+            1,
+            "TLS ClientHello must have been transmitted"
+        );
+        assert_eq!(hellos[0][0], 0x16, "TLS Handshake record type");
+    }
+}

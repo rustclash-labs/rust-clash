@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
+  ApiHttpError,
   clashApi,
   exportDiagnosticsBundle,
   fetchDesktopPrefs,
@@ -7,6 +8,7 @@ import {
   isTauriDesktop,
   loadControllerSettings,
   patchConfig,
+  probeControllerSettings,
   runBenchmark,
   runDiagnosticsWaterfall,
   saveControllerSettings,
@@ -250,16 +252,137 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
 
   const handleSaveController = async (e: React.FormEvent) => {
     e.preventDefault();
-    saveControllerSettings({ baseUrl: ctrlUrl.trim(), secret: ctrlSecret });
-    onControllerUpdated();
-    await onRefreshCore();
-    setToast({
-      ok: true,
-      text: tr(
-        "控制接口连接设置已保存",
-        "Controller API settings saved",
-      ),
-    });
+    const trimmed = ctrlUrl.trim();
+    let normalizedUrl = "";
+
+    if (trimmed.length > 0) {
+      if (/\s/.test(trimmed)) {
+        setToast({
+          ok: false,
+          text: tr(
+            "API 地址格式无效：请填写有效的 http:// 或 https:// 地址（例如 http://127.0.0.1:9090）",
+            "Invalid Controller URL: enter a valid http:// or https:// URL (e.g. http://127.0.0.1:9090)",
+          ),
+        });
+        return;
+      }
+
+      const hasSlashScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+      if (
+        !hasSlashScheme &&
+        /^[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?:\/|$))/.test(trimmed)
+      ) {
+        setToast({
+          ok: false,
+          text: tr(
+            "API 地址仅支持 http:// 或 https:// 协议",
+            "Controller URL must use http:// or https://",
+          ),
+        });
+        return;
+      }
+
+      const candidate = hasSlashScheme ? trimmed : `http://${trimmed}`;
+      let parsed: URL;
+      try {
+        parsed = new URL(candidate);
+      } catch {
+        setToast({
+          ok: false,
+          text: tr(
+            "API 地址格式无效：请填写有效的 http:// 或 https:// 地址（例如 http://127.0.0.1:9090）",
+            "Invalid Controller URL: enter a valid http:// or https:// URL (e.g. http://127.0.0.1:9090)",
+          ),
+        });
+        return;
+      }
+
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        setToast({
+          ok: false,
+          text: tr(
+            "API 地址仅支持 http:// 或 https:// 协议",
+            "Controller URL must use http:// or https://",
+          ),
+        });
+        return;
+      }
+
+      if (
+        !parsed.hostname ||
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash
+      ) {
+        setToast({
+          ok: false,
+          text: tr(
+            "API 地址格式无效：请勿包含账号密码、查询参数或 # 片段",
+            "Invalid Controller URL: do not include credentials, query strings, or # fragments",
+          ),
+        });
+        return;
+      }
+
+      const cleanPath =
+        parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+      normalizedUrl = `${parsed.origin}${cleanPath}`;
+    }
+
+    setBusyKey("save-controller");
+    setToast(null);
+    try {
+      if (!normalizedUrl) {
+        // Always allow clearing a custom URL to return to local auto-discovery,
+        // then verify connectivity before reporting success.
+        saveControllerSettings({ baseUrl: "", secret: ctrlSecret });
+        setCtrlUrl("");
+        onControllerUpdated();
+        await probeControllerSettings({ baseUrl: "", secret: ctrlSecret });
+        await onRefreshCore();
+      } else {
+        await probeControllerSettings({
+          baseUrl: normalizedUrl,
+          secret: ctrlSecret,
+        });
+        saveControllerSettings({ baseUrl: normalizedUrl, secret: ctrlSecret });
+        setCtrlUrl(normalizedUrl);
+        onControllerUpdated();
+        await onRefreshCore();
+      }
+      setToast({
+        ok: true,
+        text: tr(
+          "控制接口连接设置已保存",
+          "Controller API settings saved",
+        ),
+      });
+    } catch (err) {
+      if (!normalizedUrl) {
+        await onRefreshCore();
+      }
+      if (err instanceof ApiHttpError && err.status === 401) {
+        setToast({
+          ok: false,
+          text: tr(
+            "无法通过认证（401 未授权）：请检查 Bearer Secret 是否正确",
+            "Controller authentication failed (401 Unauthorized) — check Bearer Secret",
+          ),
+        });
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        setToast({
+          ok: false,
+          text: tr(
+            `无法连接控制接口：${msg}`,
+            `Controller verification failed: ${msg}`,
+          ),
+        });
+      }
+    } finally {
+      setBusyKey(null);
+    }
   };
 
   // Site Connectivity Doctor actions
@@ -841,14 +964,14 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
               <button
                 type="button"
                 role="switch"
-                aria-checked={Boolean(config?.ipv6 || config?.tun.ipv6)}
+                aria-checked={Boolean(config?.ipv6 ?? config?.tun.ipv6)}
                 disabled={busyKey === "ipv6" || !config}
                 className={`pill-switch ${
-                  config?.ipv6 || config?.tun.ipv6 ? "checked" : ""
+                  Boolean(config?.ipv6 ?? config?.tun.ipv6) ? "checked" : ""
                 }`}
                 onClick={() =>
                   void runSettingAction("ipv6", async () => {
-                    const next = !Boolean(config?.ipv6 || config?.tun.ipv6);
+                    const next = !Boolean(config?.ipv6 ?? config?.tun.ipv6);
                     await patchConfig({ ipv6: next, tun: { ipv6: next } });
                   })
                 }
@@ -861,7 +984,8 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                   {tr("混合代理端口 (HTTP + SOCKS5)", "Mixed Proxy Port")}
                 </div>
                 <div className="setting-desc tabular">
-                  127.0.0.1:{config?.["mixed-port"] ?? 7890}
+                  {config?.["mixed-listen"] ||
+                    `127.0.0.1:${config?.["mixed-port"] ?? 7890}`}
                 </div>
               </div>
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -948,8 +1072,14 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                     onChange={(e) => setCtrlSecret(e.target.value)}
                   />
                 </div>
-                <button type="submit" className="btn btn-primary">
-                  {tr("保存并重连", "Save & Reconnect")}
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={busyKey === "save-controller"}
+                >
+                  {busyKey === "save-controller"
+                    ? tr("正在验证...", "Verifying...")
+                    : tr("保存并重连", "Save & Reconnect")}
                 </button>
               </form>
             )}

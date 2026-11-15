@@ -102,6 +102,7 @@ import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.ModalInlineErrorBanner
 import io.github.rustclashlabs.rustclash.ui.theme.ProtocolBadge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
+import org.json.JSONArray
 import org.json.JSONObject
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1119,6 +1120,11 @@ fun NodeEditorDialog(
         "http" to "HTTP",
     )
     val existingProto = existingNode?.type?.lowercase()?.let { if (it == "socks") "socks5" else it }
+    val existingRawObj = remember(existingNode) {
+        existingNode?.rawRedactedJson
+            ?.takeIf { it.isNotBlank() }
+            ?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }
+    }
     var selectedProto by remember(existingNode) {
         mutableStateOf(
             existingProto?.takeIf { p -> protocols.any { it.first == p } } ?: "ss",
@@ -1149,9 +1155,33 @@ fun NodeEditorDialog(
         mutableStateOf(if ((existingNode?.maxEarlyData ?: 0) > 0) existingNode!!.maxEarlyData.toString() else "0")
     }
     var sni by remember(existingNode) { mutableStateOf(existingNode?.sni ?: "") }
+    var alpnText by remember(existingNode) {
+        val initialAlpn = existingRawObj?.optJSONArray("alpn")?.let { arr ->
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val item = arr.optString(i, "").trim()
+                    if (item.isNotEmpty()) add(item)
+                }
+            }.joinToString(", ")
+        } ?: ""
+        mutableStateOf(initialAlpn)
+    }
     var tlsEnabled by remember(existingNode) {
         mutableStateOf(
-            existingNode?.tls ?: (selectedProto in setOf("vless", "trojan", "anytls")),
+            if (existingRawObj?.has("tls") == true) {
+                existingRawObj.optBoolean("tls", existingNode?.tls ?: true)
+            } else {
+                existingNode?.tls ?: (selectedProto in setOf("vless", "trojan", "anytls"))
+            },
+        )
+    }
+    var udpEnabled by remember(existingNode) {
+        mutableStateOf(
+            if (existingRawObj?.has("udp") == true) {
+                existingRawObj.optBoolean("udp", existingNode?.udp ?: (selectedProto != "http"))
+            } else {
+                existingNode?.udp ?: (selectedProto != "http")
+            },
         )
     }
     var skipCertVerify by remember(existingNode) { mutableStateOf(existingNode?.skipCertVerify ?: false) }
@@ -1209,8 +1239,14 @@ fun NodeEditorDialog(
                             enabled = !isSaving,
                             onClick = {
                                 if (selectedProto != protoKey) {
+                                    val prevProto = selectedProto
                                     selectedProto = protoKey
                                     clearErrors()
+                                    if (protoKey == "http") {
+                                        udpEnabled = false
+                                    } else if (!isEditing || prevProto == "http") {
+                                        udpEnabled = true
+                                    }
                                     when (protoKey) {
                                         "ss" -> {
                                             if (cipherOrEnc.isBlank() || cipherOrEnc == "none") {
@@ -1409,7 +1445,21 @@ fun NodeEditorDialog(
                     )
                 }
 
-                if (selectedProto in setOf("vless", "socks5", "http")) {
+                if (selectedProto in setOf("vless", "trojan", "anytls")) {
+                    OutlinedTextField(
+                        value = alpnText,
+                        onValueChange = {
+                            alpnText = it
+                            clearErrors()
+                        },
+                        enabled = !isSaving,
+                        label = { Text("ALPN (可选，逗号分隔如 h2, http/1.1)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
+                if (selectedProto in setOf("vless", "trojan", "socks5", "http")) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = tlsEnabled,
@@ -1433,6 +1483,23 @@ fun NodeEditorDialog(
                             },
                         )
                         Text("跳过证书校验 (仅测试环境)", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+                if (selectedProto != "http") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("启用 UDP 转发 (UDP Relay)", style = MaterialTheme.typography.bodySmall)
+                        Switch(
+                            checked = udpEnabled,
+                            enabled = !isSaving,
+                            onCheckedChange = {
+                                udpEnabled = it
+                                clearErrors()
+                            },
+                        )
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1488,28 +1555,71 @@ fun NodeEditorDialog(
                     }
                     validationError = null
 
-                    val json = JSONObject().apply {
+                    // When editing an existing node of the same protocol, clone its raw JSON object so
+                    // advanced fields (`flow`, AnyTLS session-pool intervals, HTTP `headers`, extra
+                    // `ws-opts.headers`, custom `early-data-header-name`) are never wiped on save!
+                    val baseJson = if (isEditing && !protoSwitchedOnEdit && existingRawObj != null) {
+                        JSONObject(existingRawObj.toString())
+                    } else {
+                        JSONObject()
+                    }
+                    val json = baseJson.apply {
                         put("type", selectedProto)
                         put("name", cleanName)
                         put("server", cleanHost)
                         put("port", port)
-                        put("udp", selectedProto != "http")
+                        if (selectedProto != "http") {
+                            put("udp", udpEnabled)
+                        } else {
+                            remove("udp")
+                        }
+                        val applyAlpn = {
+                            val parsedAlpn = alpnText
+                                .split(',')
+                                .map { it.trim() }
+                                .filter { it.isNotEmpty() }
+                            if (parsedAlpn.isNotEmpty()) {
+                                put("alpn", JSONArray(parsedAlpn))
+                            } else {
+                                remove("alpn")
+                            }
+                        }
                         val applyWsOpts = {
                             if (transportNet == "ws") {
                                 put("network", "ws")
-                                val wsObj = JSONObject()
+                                remove("transport")
+                                val prevWs = optJSONObject("ws-opts")
+                                val wsObj = if (prevWs != null) JSONObject(prevWs.toString()) else JSONObject()
                                 val cleanPath = wsPath.trim().ifEmpty { "/" }
                                 wsObj.put("path", if (cleanPath.startsWith("/")) cleanPath else "/$cleanPath")
+                                val prevHeaders = wsObj.optJSONObject("headers")
+                                val headersObj = if (prevHeaders != null) JSONObject(prevHeaders.toString()) else JSONObject()
                                 if (wsHost.trim().isNotEmpty()) {
-                                    wsObj.put("headers", JSONObject().put("Host", wsHost.trim()))
+                                    headersObj.remove("host")
+                                    headersObj.put("Host", wsHost.trim())
+                                } else {
+                                    headersObj.remove("Host")
+                                    headersObj.remove("host")
+                                }
+                                if (headersObj.length() > 0) {
+                                    wsObj.put("headers", headersObj)
+                                } else {
+                                    wsObj.remove("headers")
                                 }
                                 if (parsedEarlyData > 0) {
                                     wsObj.put("max-early-data", parsedEarlyData)
-                                    wsObj.put("early-data-header-name", "Sec-WebSocket-Protocol")
+                                    if (wsObj.optString("early-data-header-name", "").isBlank()) {
+                                        wsObj.put("early-data-header-name", "Sec-WebSocket-Protocol")
+                                    }
+                                } else {
+                                    wsObj.remove("max-early-data")
+                                    wsObj.remove("early-data-header-name")
                                 }
                                 put("ws-opts", wsObj)
                             } else {
                                 put("network", "tcp")
+                                remove("transport")
+                                remove("ws-opts")
                             }
                         }
                         when (selectedProto) {
@@ -1527,33 +1637,66 @@ fun NodeEditorDialog(
                                 }
                                 put("encryption", finalEnc)
                                 put("tls", tlsEnabled)
-                                if (sni.trim().isNotEmpty()) put("servername", sni.trim())
+                                if (sni.trim().isNotEmpty()) {
+                                    put("servername", sni.trim())
+                                    remove("sni")
+                                } else {
+                                    remove("servername")
+                                    remove("sni")
+                                }
                                 put("skip-cert-verify", skipCertVerify)
+                                applyAlpn()
                                 applyWsOpts()
                             }
                             "trojan" -> {
                                 put("password", cleanSec.ifEmpty { "***REDACTED***" })
-                                put("tls", true)
-                                if (sni.trim().isNotEmpty()) put("sni", sni.trim())
+                                put("tls", tlsEnabled)
+                                if (sni.trim().isNotEmpty()) {
+                                    put("sni", sni.trim())
+                                    remove("servername")
+                                } else {
+                                    remove("sni")
+                                    remove("servername")
+                                }
                                 put("skip-cert-verify", skipCertVerify)
+                                applyAlpn()
                                 applyWsOpts()
                             }
                             "anytls" -> {
                                 put("password", cleanSec.ifEmpty { "***REDACTED***" })
-                                if (sni.trim().isNotEmpty()) put("sni", sni.trim())
+                                if (sni.trim().isNotEmpty()) {
+                                    put("sni", sni.trim())
+                                    remove("servername")
+                                } else {
+                                    remove("sni")
+                                    remove("servername")
+                                }
                                 put("skip-cert-verify", skipCertVerify)
+                                applyAlpn()
                             }
                             "socks5", "http" -> {
                                 if (username.trim().isNotEmpty()) {
                                     put("username", username.trim())
+                                } else {
+                                    remove("username")
                                 }
+                                val hadSavedPassword = existingRawObj?.optString("password", "")?.isNotEmpty() == true ||
+                                    (existingRawObj == null && username.trim().isNotEmpty())
                                 if (cleanSec.isNotEmpty()) {
                                     put("password", cleanSec)
-                                } else if (isEditing && !protoSwitchedOnEdit && username.trim().isNotEmpty()) {
+                                } else if (isEditing && !protoSwitchedOnEdit && hadSavedPassword) {
                                     put("password", "***REDACTED***")
+                                } else {
+                                    remove("password")
                                 }
                                 put("tls", tlsEnabled)
-                                if (sni.trim().isNotEmpty()) put("sni", sni.trim())
+                                if (sni.trim().isNotEmpty()) {
+                                    put("sni", sni.trim())
+                                    remove("servername")
+                                } else {
+                                    remove("sni")
+                                    remove("servername")
+                                }
                                 put("skip-cert-verify", skipCertVerify)
                             }
                         }

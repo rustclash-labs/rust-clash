@@ -177,15 +177,22 @@ impl TrojanOutbound {
 pub struct TrojanClientStream<S> {
     inner: S,
     pending_req_hdr: BytesMut,
-    pending_user_written: usize,
+    hdr_flushed: bool,
+    pending_write: Option<(usize, u64)>,
+    read_waker: Option<std::task::Waker>,
+    write_waker: Option<std::task::Waker>,
 }
 
 impl<S> TrojanClientStream<S> {
     pub fn new(inner: S, req_hdr: BytesMut) -> Self {
+        let hdr_flushed = req_hdr.is_empty();
         Self {
             inner,
             pending_req_hdr: req_hdr,
-            pending_user_written: 0,
+            hdr_flushed,
+            pending_write: None,
+            read_waker: None,
+            write_waker: None,
         }
     }
 }
@@ -197,24 +204,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TrojanClientStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.pending_req_hdr.is_empty() && this.pending_user_written == 0 {
-            while !this.pending_req_hdr.is_empty() {
-                match Pin::new(&mut this.inner).poll_write(cx, &this.pending_req_hdr) {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "Trojan header write(0) before read",
-                        )));
+        if !this.hdr_flushed {
+            if this.pending_write.is_none() {
+                let had_pending = !this.pending_req_hdr.is_empty();
+                while !this.pending_req_hdr.is_empty() {
+                    match Pin::new(&mut this.inner).poll_write(cx, &this.pending_req_hdr) {
+                        Poll::Ready(Ok(0)) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "Trojan header write(0) before read",
+                            )));
+                        }
+                        Poll::Ready(Ok(n)) => this.pending_req_hdr.advance(n),
+                        Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
+                            this.pending_req_hdr.clear();
+                            this.hdr_flushed = true;
+                            break;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            crate::outbound::save_waker_slot(&mut this.read_waker, cx.waker());
+                            return Poll::Pending;
+                        }
                     }
-                    Poll::Ready(Ok(n)) => this.pending_req_hdr.advance(n),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
                 }
-            }
-            match Pin::new(&mut this.inner).poll_flush(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                if had_pending && let Some(w) = this.write_waker.take() {
+                    w.wake();
+                }
+                if !this.hdr_flushed {
+                    match Pin::new(&mut this.inner).poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            this.hdr_flushed = true;
+                        }
+                        Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
+                            this.hdr_flushed = true;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            crate::outbound::save_waker_slot(&mut this.read_waker, cx.waker());
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            } else {
+                crate::outbound::save_waker_slot(&mut this.read_waker, cx.waker());
             }
         }
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -232,10 +265,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrojanClientStream<S> {
         }
         let this = self.get_mut();
         if !this.pending_req_hdr.is_empty() {
-            if this.pending_user_written == 0 {
+            if this.pending_write.is_none() {
                 let take = buf.len().min(8000);
+                let sig = crate::outbound::hash_write_prefix(&buf[..take]);
                 this.pending_req_hdr.extend_from_slice(&buf[..take]);
-                this.pending_user_written = take;
+                this.pending_write = Some((take, sig));
             }
             while !this.pending_req_hdr.is_empty() {
                 match Pin::new(&mut this.inner).poll_write(cx, &this.pending_req_hdr) {
@@ -247,13 +281,20 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrojanClientStream<S> {
                     }
                     Poll::Ready(Ok(n)) => this.pending_req_hdr.advance(n),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        crate::outbound::save_waker_slot(&mut this.write_waker, cx.waker());
+                        return Poll::Pending;
+                    }
                 }
             }
+            if let Some(w) = this.read_waker.take() {
+                w.wake();
+            }
         }
-        if this.pending_user_written > 0 {
-            let done = this.pending_user_written;
-            this.pending_user_written = 0;
+        if let Some((done, sig)) = this.pending_write.take()
+            && buf.len() >= done
+            && crate::outbound::hash_write_prefix(&buf[..done]) == sig
+        {
             return Poll::Ready(Ok(done));
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
@@ -261,6 +302,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrojanClientStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let had_pending = !this.pending_req_hdr.is_empty();
         while !this.pending_req_hdr.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.pending_req_hdr) {
                 Poll::Ready(Ok(0)) => {
@@ -274,7 +316,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrojanClientStream<S> {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        Pin::new(&mut this.inner).poll_flush(cx)
+        if had_pending && let Some(w) = this.write_waker.take() {
+            w.wake();
+        }
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                this.hdr_flushed = true;
+                if let Some(w) = this.read_waker.take() {
+                    w.wake();
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -726,5 +780,244 @@ async fn handle_trojan_server_conn(
             io::ErrorKind::Unsupported,
             format!("unsupported Trojan command 0x{other:02x}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ThrottledStream<S> {
+        inner: S,
+        max_write: usize,
+        yield_next_write: bool,
+        yield_next_flush: bool,
+    }
+
+    impl<S> ThrottledStream<S> {
+        fn new(inner: S, max_write: usize) -> Self {
+            Self {
+                inner,
+                max_write: max_write.max(1),
+                yield_next_write: false,
+                yield_next_flush: true,
+            }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for ThrottledStream<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for ThrottledStream<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.yield_next_write {
+                this.yield_next_write = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            this.yield_next_write = true;
+            let cap = buf.len().min(this.max_write);
+            Pin::new(&mut this.inner).poll_write(cx, &buf[..cap])
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.yield_next_flush {
+                this.yield_next_flush = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            this.yield_next_flush = true;
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    fn sample_trojan_header() -> BytesMut {
+        let mut hdr = BytesMut::with_capacity(96);
+        hdr.put_slice(&trojan_password_hex("secret-pass"));
+        hdr.put_slice(b"\r\n");
+        hdr.put_u8(TROJAN_CMD_TCP);
+        TargetAddr::new_domain("smtp.example.com", 25)
+            .expect("target")
+            .encode_socks5(&mut hdr)
+            .expect("encode_socks5");
+        hdr.put_slice(b"\r\n");
+        hdr
+    }
+
+    fn poll_write_once<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        Pin::new(writer).poll_write(&mut cx, data)
+    }
+
+    #[tokio::test]
+    async fn trojan_stream_flushes_header_on_read_for_server_speaks_first() {
+        let req_hdr = sample_trojan_header();
+        let expected_hdr = req_hdr.to_vec();
+        let (c_io, mut s_io) = tokio::io::duplex(256);
+        let mut client = TrojanClientStream::new(ThrottledStream::new(c_io, 3), req_hdr);
+
+        let server_task = tokio::spawn(async move {
+            let mut got_hdr = vec![0u8; expected_hdr.len()];
+            s_io.read_exact(&mut got_hdr)
+                .await
+                .expect("server read hdr");
+            assert_eq!(got_hdr, expected_hdr);
+            s_io.write_all(b"220 smtp.example.com ESMTP\r\n")
+                .await
+                .expect("server write banner");
+            let mut ehlo = [0u8; 13];
+            s_io.read_exact(&mut ehlo).await.expect("server read ehlo");
+            assert_eq!(&ehlo, b"EHLO client\r\n");
+        });
+
+        let mut banner = [0u8; 28];
+        client
+            .read_exact(&mut banner)
+            .await
+            .expect("client read banner before any write");
+        assert_eq!(&banner, b"220 smtp.example.com ESMTP\r\n");
+        client
+            .write_all(b"EHLO client\r\n")
+            .await
+            .expect("client write after banner");
+        client.flush().await.expect("client flush");
+        server_task.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn trojan_stream_no_duplication_on_interleaved_pending_write_read_and_flush() {
+        // Part A: `poll_write` returns `Pending`, then `flush()` drains `pending_req_hdr`,
+        // then retrying the same `write_all(payload)` must NOT send `payload` a second time.
+        let req_hdr = sample_trojan_header();
+        let expected_hdr = req_hdr.to_vec();
+        let payload: Vec<u8> = (0..512).map(|i| (i * 7 + 3) as u8).collect();
+        let (c_io, mut s_io) = tokio::io::duplex(4096);
+        let mut client = TrojanClientStream::new(ThrottledStream::new(c_io, 2), req_hdr);
+
+        assert!(matches!(
+            poll_write_once(&mut client, &payload),
+            Poll::Pending
+        ));
+        client.flush().await.expect("interleaved flush");
+        client
+            .write_all(&payload)
+            .await
+            .expect("retried write_all after flush");
+        client.shutdown().await.expect("shutdown");
+
+        let mut wire = Vec::new();
+        s_io.read_to_end(&mut wire).await.expect("read wire");
+        let mut expected_wire = expected_hdr.clone();
+        expected_wire.extend_from_slice(&payload);
+        assert_eq!(
+            wire, expected_wire,
+            "payload must not be duplicated after flush"
+        );
+
+        // Part B: `copy_bidirectional` over 1-byte throttled stream (interleaving `poll_write` + `poll_read`).
+        let req_hdr2 = sample_trojan_header();
+        let expected_hdr2 = req_hdr2.to_vec();
+        let (c_io2, mut s_io2) = tokio::io::duplex(128);
+        let mut trojan_client = TrojanClientStream::new(ThrottledStream::new(c_io2, 1), req_hdr2);
+        let (mut app_side, mut proxy_in) = tokio::io::duplex(256);
+
+        let client_data: Vec<u8> = (0..2048).map(|i| (i ^ 0x5A) as u8).collect();
+        let server_data: Vec<u8> = (0..1536).map(|i| (i * 13 + 1) as u8).collect();
+        let server_data_expect = server_data.clone();
+        let expected_hdr2_len = expected_hdr2.len();
+
+        let relay_task = tokio::spawn(async move {
+            tokio::io::copy_bidirectional(&mut proxy_in, &mut trojan_client)
+                .await
+                .expect("copy_bidirectional")
+        });
+
+        let srv_task = tokio::spawn(async move {
+            let mut hdr_buf = vec![0u8; expected_hdr2_len];
+            s_io2.read_exact(&mut hdr_buf).await.expect("srv hdr");
+            assert_eq!(hdr_buf, expected_hdr2);
+            let (mut srd, mut swr) = tokio::io::split(s_io2);
+            let writer = async move {
+                swr.write_all(&server_data).await.expect("srv write");
+                swr.shutdown().await.expect("srv shutdown");
+            };
+            let reader = async move {
+                let mut got = Vec::new();
+                srd.read_to_end(&mut got).await.expect("srv read_to_end");
+                got
+            };
+            let (_, got_client) = tokio::join!(writer, reader);
+            got_client
+        });
+
+        let client_data_send = client_data.clone();
+        let (mut ard, mut awr) = tokio::io::split(&mut app_side);
+        let app_writer = async move {
+            awr.write_all(&client_data_send).await.expect("app write");
+            awr.shutdown().await.expect("app shutdown");
+        };
+        let app_reader = async move {
+            let mut got = Vec::new();
+            ard.read_to_end(&mut got).await.expect("app read");
+            got
+        };
+        let (_, got_server) = tokio::join!(app_writer, app_reader);
+        let got_client = srv_task.await.expect("srv join");
+        let _ = relay_task.await.expect("relay join");
+
+        assert_eq!(
+            got_client, client_data,
+            "client stream bytes must match without duplication"
+        );
+        assert_eq!(got_server, server_data_expect);
+    }
+
+    #[tokio::test]
+    async fn trojan_stream_cancelled_large_write_then_small_write_does_not_panic() {
+        let req_hdr = sample_trojan_header();
+        let expected_hdr = req_hdr.to_vec();
+        let (c_io, mut s_io) = tokio::io::duplex(8192);
+        let mut client = TrojanClientStream::new(ThrottledStream::new(c_io, 4), req_hdr);
+
+        let large_buf = vec![0xAAu8; 1024];
+        let small_buf = vec![0xBBu8; 12];
+        assert!(matches!(
+            poll_write_once(&mut client, &large_buf),
+            Poll::Pending
+        ));
+
+        // Caller drops/cancels `large_buf` future and writes a much smaller buffer (`12 < 1024`).
+        client
+            .write_all(&small_buf)
+            .await
+            .expect("cancelled large write followed by small write must not panic");
+        client.shutdown().await.expect("shutdown");
+
+        let mut wire = Vec::new();
+        s_io.read_to_end(&mut wire).await.expect("read wire");
+        let mut expected = expected_hdr;
+        expected.extend_from_slice(&large_buf);
+        expected.extend_from_slice(&small_buf);
+        assert_eq!(wire, expected);
     }
 }

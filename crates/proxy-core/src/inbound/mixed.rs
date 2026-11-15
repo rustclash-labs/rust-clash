@@ -10,10 +10,10 @@ use bytes::{BufMut, BytesMut};
 use ipnet::IpNet;
 use parking_lot::RwLock;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use url::Url;
 
@@ -533,7 +533,7 @@ struct UdpAssocCleanupGuard {
 impl Drop for UdpAssocCleanupGuard {
     fn drop(&mut self) {
         self.udp_task.abort();
-        let _ = self.udp_nat.reset_all_sessions();
+        let _ = self.udp_nat.shutdown();
     }
 }
 
@@ -714,7 +714,9 @@ async fn handle_socks5(
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     let mut locked_client_port: Option<u16> = initial_port_lock;
+                    let mut pkt_tasks = JoinSet::<()>::new();
                     while let Ok((n, client_udp_addr)) = udp_clone.recv_from(&mut buf).await {
+                        while pkt_tasks.try_join_next().is_some() {}
                         // Strictly enforce source IP association with the authenticated TCP peer!
                         if canonical_ip(client_udp_addr.ip()) != expected_client_ip {
                             continue;
@@ -769,7 +771,7 @@ async fn handle_socks5(
                         let router_for_pkt = Arc::clone(&router_clone);
                         let nat_inner = Arc::clone(&nat_clone);
                         let policy_for_pkt = Arc::clone(&policy_for_udp);
-                        tokio::spawn(async move {
+                        pkt_tasks.spawn(async move {
                             let _permit = permit;
                             let route_epoch = router_for_pkt.epoch();
                             let decision = router_for_pkt
@@ -1086,9 +1088,12 @@ async fn handle_http_proxy(
             };
 
         // Validate HTTP/1.1 framing headers before dialing so CL/TE smuggling or invalid
-        // Content-Length headers are rejected cleanly with 400 Bad Request.
-        let mut has_upgrade = false;
+        // Content-Length / Transfer-Encoding headers are rejected cleanly with 400 Bad Request.
+        let mut has_upgrade_header = false;
+        let mut conn_has_upgrade_token = false;
         let mut has_transfer_encoding = false;
+        let mut last_te_coding: Option<String> = None;
+        let mut invalid_transfer_encoding = false;
         let mut content_length: Option<u64> = None;
         let mut nominated_hop_headers: Vec<String> = Vec::new();
         for line in lines.clone() {
@@ -1098,9 +1103,27 @@ async fn handle_http_proxy(
             let k_trim = k.trim();
             let v_trim = v.trim();
             if k_trim.eq_ignore_ascii_case("upgrade") && !v_trim.is_empty() {
-                has_upgrade = true;
+                has_upgrade_header = true;
             } else if k_trim.eq_ignore_ascii_case("transfer-encoding") {
                 has_transfer_encoding = true;
+                let mut saw_any = false;
+                for coding in v_trim.split(',') {
+                    let tok = coding
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    if tok.is_empty() {
+                        invalid_transfer_encoding = true;
+                    } else {
+                        saw_any = true;
+                        last_te_coding = Some(tok);
+                    }
+                }
+                if !saw_any {
+                    invalid_transfer_encoding = true;
+                }
             } else if k_trim.eq_ignore_ascii_case("content-length") {
                 let Ok(parsed_len) = v_trim.parse::<u64>() else {
                     let _ = tcp
@@ -1127,9 +1150,16 @@ async fn handle_http_proxy(
                     ));
                 }
                 content_length = Some(parsed_len);
-            } else if k_trim.eq_ignore_ascii_case("connection")
-                || k_trim.eq_ignore_ascii_case("proxy-connection")
-            {
+            } else if k_trim.eq_ignore_ascii_case("connection") {
+                for token in v_trim.split(',') {
+                    let tok = token.trim().to_ascii_lowercase();
+                    if tok == "upgrade" {
+                        conn_has_upgrade_token = true;
+                    } else if !tok.is_empty() {
+                        nominated_hop_headers.push(tok);
+                    }
+                }
+            } else if k_trim.eq_ignore_ascii_case("proxy-connection") {
                 for token in v_trim.split(',') {
                     let tok = token.trim().to_ascii_lowercase();
                     if !tok.is_empty() && tok != "upgrade" {
@@ -1149,6 +1179,20 @@ async fn handle_http_proxy(
                 "rejecting request with both Transfer-Encoding and Content-Length",
             ));
         }
+        if has_transfer_encoding
+            && (invalid_transfer_encoding || last_te_coding.as_deref() != Some("chunked"))
+        {
+            let _ = tcp
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nX-Proxy-Error: unsupported-transfer-encoding\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plain HTTP Transfer-Encoding must terminate in chunked",
+            ));
+        }
+        let is_upgrade = has_upgrade_header && conn_has_upgrade_token;
 
         if let Err(err) = reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
         {
@@ -1232,17 +1276,18 @@ async fn handle_http_proxy(
                 if k_trim.eq_ignore_ascii_case("proxy-connection")
                     || k_trim.eq_ignore_ascii_case("proxy-authorization")
                     || k_trim.eq_ignore_ascii_case("proxy-authenticate")
+                    || k_trim.eq_ignore_ascii_case("connection")
+                    || k_trim.eq_ignore_ascii_case("keep-alive")
+                    || nominated_hop_headers
+                        .iter()
+                        .any(|h| k_trim.eq_ignore_ascii_case(h))
                 {
                     continue;
                 }
-                if !has_upgrade
-                    && (k_trim.eq_ignore_ascii_case("connection")
-                        || k_trim.eq_ignore_ascii_case("keep-alive")
+                if !is_upgrade
+                    && (k_trim.eq_ignore_ascii_case("upgrade")
                         || k_trim.eq_ignore_ascii_case("te")
-                        || k_trim.eq_ignore_ascii_case("trailer")
-                        || nominated_hop_headers
-                            .iter()
-                            .any(|h| k_trim.eq_ignore_ascii_case(h)))
+                        || k_trim.eq_ignore_ascii_case("trailer"))
                 {
                     continue;
                 }
@@ -1250,7 +1295,9 @@ async fn handle_http_proxy(
             rewritten.push_str(line);
             rewritten.push_str("\r\n");
         }
-        if !has_upgrade {
+        if is_upgrade {
+            rewritten.push_str("Connection: Upgrade\r\n");
+        } else {
             rewritten.push_str("Connection: close\r\n");
         }
         rewritten.push_str("\r\n");
@@ -1258,7 +1305,7 @@ async fn handle_http_proxy(
         let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
         tracked.write_all(rewritten.as_bytes()).await?;
 
-        if has_upgrade || has_transfer_encoding {
+        if is_upgrade {
             if !trailing_body.is_empty() {
                 tracked.write_all(trailing_body).await?;
             }
@@ -1269,6 +1316,11 @@ async fn handle_http_proxy(
                 }
                 _ = conn_entry.closed() => {}
             }
+        } else if has_transfer_encoding {
+            // Forward strictly the RFC 9112 §7.1 chunked body up to `0\r\n...\r\n` so pipelined
+            // subsequent HTTP requests never leak `Proxy-Authorization` or reach `host1`!
+            forward_chunked_request_body(tcp, &mut tracked, trailing_body, &conn_entry).await?;
+            relay_http_one_shot_response(tcp, &mut tracked, method, &conn_entry).await?;
         } else {
             // Forward strictly `Content-Length` body bytes (default 0) so pipelined subsequent
             // HTTP requests on the same client TCP socket never leak `Proxy-Authorization` upstream!
@@ -1281,6 +1333,8 @@ async fn handle_http_proxy(
             if remaining_body > 0 {
                 let mut body_reader = (&mut *tcp).take(remaining_body);
                 tokio::select! {
+                    biased;
+                    _ = conn_entry.closed() => return Ok(()),
                     res = tokio::io::copy(&mut body_reader, &mut tracked) => {
                         let copied = res?;
                         if copied < remaining_body {
@@ -1290,19 +1344,353 @@ async fn handle_http_proxy(
                             ));
                         }
                     }
-                    _ = conn_entry.closed() => return Ok(()),
                 }
             }
             tracked.flush().await?;
-            tokio::select! {
-                res = tokio::io::copy(&mut tracked, tcp) => {
-                    let _ = res?;
-                }
-                _ = conn_entry.closed() => {}
-            }
-            let _ = tcp.shutdown().await;
+            relay_http_one_shot_response(tcp, &mut tracked, method, &conn_entry).await?;
         }
         Ok(())
+    }
+}
+
+async fn read_into_chunk_buf(
+    tcp: &mut TcpStream,
+    buf: &mut BytesMut,
+    conn_entry: &ActiveConnection,
+) -> io::Result<bool> {
+    let mut scratch = [0u8; 4096];
+    let n = tokio::select! {
+        biased;
+        _ = conn_entry.closed() => return Ok(false),
+        res = tcp.read(&mut scratch) => res?,
+    };
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "client closed before terminating chunked request body",
+        ));
+    }
+    buf.extend_from_slice(&scratch[..n]);
+    Ok(true)
+}
+
+async fn forward_chunked_request_body<W>(
+    tcp: &mut TcpStream,
+    tracked: &mut W,
+    trailing_body: &[u8],
+    conn_entry: &ActiveConnection,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    const MAX_CHUNK_LINE_BYTES: usize = 4096;
+    const MAX_TRAILER_BYTES: usize = 16 * 1024;
+
+    let mut buf = BytesMut::from(trailing_body);
+    loop {
+        let crlf = loop {
+            if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+                break pos;
+            }
+            if buf.len() > MAX_CHUNK_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP chunk header line exceeds 4 KiB",
+                ));
+            }
+            if !read_into_chunk_buf(tcp, &mut buf, conn_entry).await? {
+                return Ok(());
+            }
+        };
+
+        let chunk_size = {
+            let line_str = std::str::from_utf8(&buf[..crlf]).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "non-ASCII HTTP chunk size line")
+            })?;
+            let size_hex = line_str.split(';').next().unwrap_or("").trim();
+            if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid hex size in HTTP chunked body",
+                ));
+            }
+            u64::from_str_radix(size_hex, 16).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "HTTP chunk size overflow")
+            })?
+        };
+
+        let header_line = buf.split_to(crlf + 2);
+        tracked.write_all(&header_line).await?;
+
+        if chunk_size == 0 {
+            let mut trailer_total = 0usize;
+            loop {
+                let tr_crlf = loop {
+                    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+                        break pos;
+                    }
+                    if buf.len() > MAX_CHUNK_LINE_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HTTP chunk trailer line exceeds 4 KiB",
+                        ));
+                    }
+                    if !read_into_chunk_buf(tcp, &mut buf, conn_entry).await? {
+                        return Ok(());
+                    }
+                };
+
+                if tr_crlf == 0 {
+                    let _ = buf.split_to(2);
+                    tracked.write_all(b"\r\n").await?;
+                    break;
+                }
+
+                trailer_total = trailer_total.saturating_add(tr_crlf + 2);
+                if trailer_total > MAX_TRAILER_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HTTP chunk trailers exceed 16 KiB",
+                    ));
+                }
+
+                let tr_line = buf.split_to(tr_crlf + 2);
+                let skip_proxy_trailer = std::str::from_utf8(&tr_line[..tr_crlf])
+                    .ok()
+                    .and_then(|s| s.split_once(':'))
+                    .is_some_and(|(k, _)| {
+                        let kt = k.trim();
+                        kt.eq_ignore_ascii_case("proxy-authorization")
+                            || kt.eq_ignore_ascii_case("proxy-authenticate")
+                            || kt.eq_ignore_ascii_case("proxy-connection")
+                    });
+                if !skip_proxy_trailer {
+                    tracked.write_all(&tr_line).await?;
+                }
+            }
+            break;
+        }
+
+        let from_buf = (buf.len() as u64).min(chunk_size) as usize;
+        if from_buf > 0 {
+            let buffered_data = buf.split_to(from_buf);
+            tracked.write_all(&buffered_data).await?;
+        }
+        let mut rem = chunk_size - from_buf as u64;
+        if rem > 0 {
+            let mut limited = (&mut *tcp).take(rem);
+            tokio::select! {
+                biased;
+                _ = conn_entry.closed() => return Ok(()),
+                res = tokio::io::copy(&mut limited, tracked) => {
+                    let copied = res?;
+                    rem -= copied;
+                }
+            }
+            if rem > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client closed during HTTP chunk payload",
+                ));
+            }
+        }
+
+        while buf.len() < 2 {
+            if !read_into_chunk_buf(tcp, &mut buf, conn_entry).await? {
+                return Ok(());
+            }
+        }
+        if &buf[..2] != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing CRLF after HTTP chunk payload",
+            ));
+        }
+        let _ = buf.split_to(2);
+        tracked.write_all(b"\r\n").await?;
+    }
+
+    tracked.flush().await
+}
+
+async fn relay_http_one_shot_response<S>(
+    tcp: &mut TcpStream,
+    upstream: &mut S,
+    req_method: &str,
+    conn_entry: &ActiveConnection,
+) -> io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = BytesMut::with_capacity(4096);
+    loop {
+        let hdr_end = loop {
+            if let Some(pos) = find_double_crlf(&buf) {
+                break Some(pos);
+            }
+            if buf.len() >= 32 * 1024 {
+                break None;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = tokio::select! {
+                biased;
+                _ = conn_entry.closed() => return Ok(()),
+                res = upstream.read(&mut chunk) => res?,
+            };
+            if n == 0 {
+                break None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+
+        let Some(hdr_end) = hdr_end else {
+            if !buf.is_empty() {
+                tcp.write_all(&buf).await?;
+                buf.clear();
+            }
+            tokio::select! {
+                biased;
+                _ = conn_entry.closed() => return Ok(()),
+                res = tokio::io::copy(upstream, tcp) => {
+                    let _ = res?;
+                }
+            }
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        };
+
+        let parsed_hdr = std::str::from_utf8(&buf[..hdr_end]).ok().map(|hdr_str| {
+            let mut hdr_lines = hdr_str.split("\r\n");
+            let status_line = hdr_lines.next().unwrap_or("");
+            let status_code = if status_line.starts_with("HTTP/1.") {
+                status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if (100..200).contains(&status_code) && status_code != 101 {
+                return (status_code, None, false, None, false);
+            }
+            let mut resp_has_te = false;
+            let mut resp_cl: Option<u64> = None;
+            let mut resp_cl_conflict = false;
+            let mut out_hdr = String::with_capacity(hdr_end + 32);
+            out_hdr.push_str(status_line);
+            out_hdr.push_str("\r\n");
+            for line in hdr_lines {
+                if let Some((k, v)) = line.split_once(':') {
+                    let k_trim = k.trim();
+                    let v_trim = v.trim();
+                    if k_trim.eq_ignore_ascii_case("connection")
+                        || k_trim.eq_ignore_ascii_case("keep-alive")
+                        || k_trim.eq_ignore_ascii_case("proxy-connection")
+                    {
+                        continue;
+                    }
+                    if k_trim.eq_ignore_ascii_case("transfer-encoding") {
+                        resp_has_te = true;
+                    } else if k_trim.eq_ignore_ascii_case("content-length") {
+                        match v_trim.parse::<u64>() {
+                            Ok(n) => {
+                                if let Some(prev) = resp_cl
+                                    && prev != n
+                                {
+                                    resp_cl_conflict = true;
+                                }
+                                resp_cl = Some(n);
+                            }
+                            Err(_) => resp_cl_conflict = true,
+                        }
+                    }
+                }
+                out_hdr.push_str(line);
+                out_hdr.push_str("\r\n");
+            }
+            out_hdr.push_str("Connection: close\r\n\r\n");
+            (
+                status_code,
+                Some(out_hdr),
+                resp_has_te,
+                resp_cl,
+                resp_cl_conflict,
+            )
+        });
+
+        let Some((status_code, maybe_out_hdr, resp_has_te, resp_cl, resp_cl_conflict)) = parsed_hdr
+        else {
+            tcp.write_all(&buf).await?;
+            buf.clear();
+            tokio::select! {
+                biased;
+                _ = conn_entry.closed() => return Ok(()),
+                res = tokio::io::copy(upstream, tcp) => {
+                    let _ = res?;
+                }
+            }
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        };
+
+        let Some(out_hdr) = maybe_out_hdr else {
+            // 1xx informational response (except 101): forward verbatim and continue to final headers
+            let block = buf.split_to(hdr_end + 4);
+            tcp.write_all(&block).await?;
+            tcp.flush().await?;
+            continue;
+        };
+
+        let _ = buf.split_to(hdr_end + 4);
+        tcp.write_all(out_hdr.as_bytes()).await?;
+
+        let bodyless_response =
+            req_method.eq_ignore_ascii_case("HEAD") || status_code == 204 || status_code == 304;
+        if bodyless_response {
+            tcp.flush().await?;
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        }
+
+        if !resp_has_te
+            && !resp_cl_conflict
+            && let Some(expected_len) = resp_cl
+        {
+            let from_buf = (buf.len() as u64).min(expected_len) as usize;
+            if from_buf > 0 {
+                tcp.write_all(&buf[..from_buf]).await?;
+            }
+            let rem = expected_len - from_buf as u64;
+            if rem > 0 {
+                let mut limited = upstream.take(rem);
+                tokio::select! {
+                    biased;
+                    _ = conn_entry.closed() => return Ok(()),
+                    res = tokio::io::copy(&mut limited, tcp) => {
+                        let _ = res?;
+                    }
+                }
+            }
+            tcp.flush().await?;
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        }
+
+        if !buf.is_empty() {
+            tcp.write_all(&buf).await?;
+            buf.clear();
+        }
+        tokio::select! {
+            biased;
+            _ = conn_entry.closed() => return Ok(()),
+            res = tokio::io::copy(upstream, tcp) => {
+                let _ = res?;
+            }
+        }
+        tcp.flush().await?;
+        let _ = tcp.shutdown().await;
+        return Ok(());
     }
 }
 
@@ -1386,5 +1774,463 @@ mod tests {
             .is_ok(),
             "loopback client must still reach non-daemon local test servers"
         );
+    }
+
+    struct LoopbackTestUdpSession {
+        sock: UdpSocket,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for LoopbackTestUdpSession {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundUdpSession for LoopbackTestUdpSession {
+        async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
+            let IpAddr::V4(v4) = target.host.as_ip().expect("IPv4 target in test") else {
+                unreachable!()
+            };
+            self.sock
+                .send_to(payload, SocketAddr::new(IpAddr::V4(v4), target.port))
+                .await?;
+            Ok(())
+        }
+
+        async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
+            let mut buf = vec![0u8; 2048];
+            let (n, peer) = self.sock.recv_from(&mut buf).await?;
+            buf.truncate(n);
+            Ok((buf, TargetAddr::from(peer)))
+        }
+    }
+
+    struct LoopbackTestOutbound {
+        host_map: std::collections::HashMap<String, SocketAddr>,
+        udp_dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for LoopbackTestOutbound {
+        fn name(&self) -> &str {
+            "test-exit"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+            let key = target.to_string();
+            let dst = self
+                .host_map
+                .get(&key)
+                .copied()
+                .or_else(|| {
+                    target
+                        .host
+                        .as_ip()
+                        .map(|ip| SocketAddr::new(ip, target.port))
+                })
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("unmapped {key}"))
+                })?;
+            let stream = TcpStream::connect(dst).await?;
+            Ok(Box::new(stream))
+        }
+
+        async fn open_udp_session(
+            &self,
+        ) -> io::Result<Box<dyn crate::outbound::OutboundUdpSession>> {
+            let sock = UdpSocket::bind("127.0.0.1:0").await?;
+            Ok(Box::new(LoopbackTestUdpSession {
+                sock,
+                dropped: Arc::clone(&self.udp_dropped),
+            }))
+        }
+    }
+
+    async fn spawn_capturing_http_origin(
+        tag: &'static str,
+    ) -> (
+        SocketAddr,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_srv = Arc::clone(&captured);
+
+        let jh = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let cap = Arc::clone(&captured_srv);
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let hdr_end = loop {
+                        let Ok(Ok(n)) =
+                            tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tmp)).await
+                        else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        raw.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = find_double_crlf(&raw) {
+                            break pos;
+                        }
+                    };
+
+                    let hdr_text = String::from_utf8_lossy(&raw[..hdr_end]).into_owned();
+                    let req_line = hdr_text.lines().next().unwrap_or("").to_string();
+                    let path = req_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+
+                    let mut cl = 0usize;
+                    let mut chunked = false;
+                    for line in hdr_text.lines().skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                cl = v.trim().parse::<usize>().unwrap_or(0);
+                            } else if k.trim().eq_ignore_ascii_case("transfer-encoding")
+                                && v.to_ascii_lowercase().contains("chunked")
+                            {
+                                chunked = true;
+                            }
+                        }
+                    }
+
+                    let body_start = hdr_end + 4;
+                    if chunked {
+                        while !raw[body_start..].windows(5).any(|w| w == b"0\r\n\r\n") {
+                            let Ok(Ok(n)) =
+                                tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tmp))
+                                    .await
+                            else {
+                                break;
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            raw.extend_from_slice(&tmp[..n]);
+                        }
+                    } else {
+                        while raw.len().saturating_sub(body_start) < cl {
+                            let Ok(Ok(n)) =
+                                tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tmp))
+                                    .await
+                            else {
+                                break;
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            raw.extend_from_slice(&tmp[..n]);
+                        }
+                    }
+
+                    // Probe briefly to catch any leaked pipelined bytes sent past Request #1's body!
+                    if let Ok(Ok(extra)) =
+                        tokio::time::timeout(Duration::from_millis(20), sock.read(&mut tmp)).await
+                        && extra > 0
+                    {
+                        raw.extend_from_slice(&tmp[..extra]);
+                    }
+
+                    let full_req = String::from_utf8_lossy(&raw).into_owned();
+                    let body_str = String::from_utf8_lossy(&raw[body_start..]).into_owned();
+                    cap.lock().await.push(full_req);
+
+                    let resp_body = format!("{tag}:{path}:body={body_str}");
+                    // Deliberately advertise `Connection: keep-alive` upstream to verify the proxy
+                    // rewrites the client-facing response to `Connection: close`.
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        (addr, captured, jh)
+    }
+
+    #[tokio::test]
+    async fn plain_http_proxy_isolates_keepalive_pipelining_strips_credentials_and_frames_post_bodies()
+     {
+        let (h1_addr, h1_reqs, h1_jh) = spawn_capturing_http_origin("host1").await;
+        let (h2_addr, h2_reqs, h2_jh) = spawn_capturing_http_origin("host2").await;
+
+        let mut host_map = std::collections::HashMap::new();
+        host_map.insert("host1.example:80".to_string(), h1_addr);
+        host_map.insert("host2.example:80".to_string(), h2_addr);
+
+        let mut outbounds: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        outbounds.insert(
+            "test-exit".to_string(),
+            Arc::new(LoopbackTestOutbound {
+                host_map,
+                udp_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+        );
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &["MATCH,test-exit".to_string()],
+                dns,
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let policy = Arc::new(RwLock::new(
+            MixedInboundPolicy::from_config(false, &["alice:s3cr3t".to_string()], &[]).unwrap(),
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mixed_addr, mixed_jh) = spawn_mixed_inbound_with_policy(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(router)),
+            policy,
+            hub,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        let auth_hdr = format!("Basic {}", STANDARD.encode("alice:s3cr3t"));
+
+        // (a) Pipelined GET Request #1 (host1) + GET Request #2 (host2) on the SAME client socket
+        {
+            let mut client = TcpStream::connect(mixed_addr).await.unwrap();
+            let pipelined = format!(
+                "GET http://host1.example/one HTTP/1.1\r\nHost: host1.example\r\nProxy-Authorization: {auth_hdr}\r\nConnection: keep-alive\r\n\r\n\
+                 GET http://host2.example/two HTTP/1.1\r\nHost: host2.example\r\nProxy-Authorization: {auth_hdr}\r\nConnection: keep-alive\r\n\r\n"
+            );
+            client.write_all(pipelined.as_bytes()).await.unwrap();
+
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).await.unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(resp.to_ascii_lowercase().contains("connection: close\r\n"));
+            assert!(resp.ends_with("host1:/one:body="));
+
+            let got_h1 = h1_reqs.lock().await.clone();
+            assert_eq!(got_h1.len(), 1);
+            let r1_lc = got_h1[0].to_ascii_lowercase();
+            assert!(got_h1[0].starts_with("GET /one HTTP/1.1\r\n"));
+            assert!(r1_lc.contains("connection: close\r\n"));
+            assert!(!r1_lc.contains("proxy-authorization"));
+            assert!(!got_h1[0].contains("s3cr3t"));
+            assert!(!got_h1[0].contains(&auth_hdr));
+            assert!(!got_h1[0].contains("/two"));
+            assert!(!r1_lc.contains("host2.example"));
+            assert!(h2_reqs.lock().await.is_empty());
+
+            // Sequential Request #2 on a fresh connection reaches host2 cleanly without credentials leaking
+            let mut client2 = TcpStream::connect(mixed_addr).await.unwrap();
+            let req2 = format!(
+                "GET http://host2.example/two HTTP/1.1\r\nHost: host2.example\r\nProxy-Authorization: {auth_hdr}\r\n\r\n"
+            );
+            client2.write_all(req2.as_bytes()).await.unwrap();
+            let mut resp2 = String::new();
+            client2.read_to_string(&mut resp2).await.unwrap();
+            assert!(resp2.ends_with("host2:/two:body="));
+            let got_h2 = h2_reqs.lock().await.clone();
+            assert_eq!(got_h2.len(), 1);
+            assert!(
+                !got_h2[0]
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization")
+            );
+        }
+
+        // (b1) POST with Content-Length + pipelined 2nd request on the same socket
+        {
+            let mut client = TcpStream::connect(mixed_addr).await.unwrap();
+            let post_cl = format!(
+                "POST http://host1.example/submit HTTP/1.1\r\nHost: host1.example\r\nProxy-Authorization: {auth_hdr}\r\nContent-Length: 11\r\n\r\nhello=world\
+                 GET http://host2.example/leaked HTTP/1.1\r\nHost: host2.example\r\nProxy-Authorization: {auth_hdr}\r\n\r\n"
+            );
+            client.write_all(post_cl.as_bytes()).await.unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).await.unwrap();
+            assert!(resp.ends_with("host1:/submit:body=hello=world"));
+
+            let got_h1 = h1_reqs.lock().await.clone();
+            assert_eq!(got_h1.len(), 2);
+            let post_req = &got_h1[1];
+            assert!(post_req.ends_with("\r\n\r\nhello=world"));
+            assert!(
+                !post_req
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization")
+            );
+            assert!(!post_req.contains("/leaked"));
+            assert_eq!(h2_reqs.lock().await.len(), 1);
+        }
+
+        // (b2) POST with Transfer-Encoding: chunked + pipelined 2nd request on the same socket
+        {
+            let mut client = TcpStream::connect(mixed_addr).await.unwrap();
+            let post_chunked = format!(
+                "POST http://host1.example/chunked HTTP/1.1\r\nHost: host1.example\r\nProxy-Authorization: {auth_hdr}\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 5\r\nhello\r\n6\r\n=world\r\n0\r\n\r\n\
+                 GET http://host2.example/chunk-leak HTTP/1.1\r\nHost: host2.example\r\nProxy-Authorization: {auth_hdr}\r\n\r\n"
+            );
+            client.write_all(post_chunked.as_bytes()).await.unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).await.unwrap();
+            assert!(resp.contains("host1:/chunked:body=5\r\nhello\r\n6\r\n=world\r\n0\r\n\r\n"));
+
+            let got_h1 = h1_reqs.lock().await.clone();
+            assert_eq!(got_h1.len(), 3);
+            let chunk_req = &got_h1[2];
+            assert!(
+                !chunk_req
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization")
+            );
+            assert!(!chunk_req.contains("/chunk-leak"));
+            assert_eq!(h2_reqs.lock().await.len(), 1);
+        }
+
+        let _ = shutdown_tx.send(true);
+        mixed_jh.abort();
+        h1_jh.abort();
+        h2_jh.abort();
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_control_close_immediately_stops_flooded_session_and_telemetry() {
+        let udp_origin = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let udp_origin_addr = udp_origin.local_addr().unwrap();
+        let stop_flood = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flood_srv = Arc::clone(&stop_flood);
+        let udp_origin_srv = Arc::clone(&udp_origin);
+
+        let flood_srv_jh = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let Ok((_, proxy_udp_peer)) = udp_origin_srv.recv_from(&mut buf).await else {
+                return;
+            };
+            while !stop_flood_srv.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = udp_origin_srv
+                    .send_to(b"active-udp-flood-frame", proxy_udp_peer)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        let udp_session_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut outbounds: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        outbounds.insert(
+            "test-exit".to_string(),
+            Arc::new(LoopbackTestOutbound {
+                host_map: std::collections::HashMap::new(),
+                udp_dropped: Arc::clone(&udp_session_dropped),
+            }),
+        );
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &["MATCH,test-exit".to_string()],
+                dns,
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let policy = Arc::new(RwLock::new(MixedInboundPolicy::default()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mixed_addr, mixed_jh) = spawn_mixed_inbound_with_policy(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(router)),
+            policy,
+            Arc::clone(&hub),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        // Open SOCKS5 TCP control connection and request UDP ASSOCIATE (0x03)
+        let mut socks_tcp = TcpStream::connect(mixed_addr).await.unwrap();
+        socks_tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greet_resp = [0u8; 2];
+        socks_tcp.read_exact(&mut greet_resp).await.unwrap();
+        assert_eq!(greet_resp, [0x05, 0x00]);
+
+        socks_tcp
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut assoc_hdr = [0u8; 3];
+        socks_tcp.read_exact(&mut assoc_hdr).await.unwrap();
+        assert_eq!(assoc_hdr, [0x05, 0x00, 0x00]);
+        let relay_target = TargetAddr::read_socks5(&mut socks_tcp).await.unwrap();
+        let relay_addr = SocketAddr::new(relay_target.host.as_ip().unwrap(), relay_target.port);
+
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut dgram = BytesMut::new();
+        dgram.put_slice(&[0x00, 0x00, 0x00]);
+        TargetAddr::from(udp_origin_addr)
+            .encode_socks5(&mut dgram)
+            .unwrap();
+        dgram.put_slice(b"trigger-flood");
+        client_udp.send_to(&dgram, relay_addr).await.unwrap();
+
+        // Wait for at least 5 flooded UDP packets to arrive back at the client
+        let mut rbuf = [0u8; 256];
+        for _ in 0..5 {
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut rbuf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(n > 10);
+        }
+        assert_eq!(hub.active_connection_count(), 1);
+
+        // Close the SOCKS5 TCP control stream while remote UDP packets are still actively flooding!
+        drop(socks_tcp);
+
+        tokio::time::timeout(Duration::from_millis(300), async {
+            while hub.active_connection_count() != 0
+                || !udp_session_dropped.load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("closing SOCKS5 TCP control stream must immediately tear down UDP sessions and TelemetryHub entries");
+
+        stop_flood.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = shutdown_tx.send(true);
+        mixed_jh.abort();
+        let _ = flood_srv_jh.await;
     }
 }

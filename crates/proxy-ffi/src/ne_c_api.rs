@@ -16,6 +16,9 @@ use proxy_core::{
 };
 
 const MAX_EGRESS_QUEUE_PACKETS: usize = 1024;
+/// Maximum raw L3 packet frame size supported over the NE FFI bridge:
+/// accommodates maximum-length IPv6 frames (40-byte fixed IPv6 header + 65,535-byte payload = 65,575 bytes).
+const MAX_NE_PACKET_BYTES: usize = 65580;
 
 /// Uninhabited opaque C handle matching `typedef struct RcNeEngineHandle RcNeEngineHandle;`
 /// in `platforms/macos-ne/RustClashNEBridge.h`.
@@ -67,7 +70,8 @@ impl EgressSyncQueue {
     /// - `Ok(Some(pkt))`: packet popped (`pkt.len() <= buf_cap`)
     /// - `Ok(None)`: empty (non-blocking) or timed out while still open
     /// - `Err(PopPacketError::Closed)`: queue closed / engine stopped
-    /// - `Err(PopPacketError::BufferTooSmall { required })`: front packet exceeds `buf_cap` (kept in queue)
+    /// - `Err(PopPacketError::BufferTooSmall { required })`: front packet exceeded `buf_cap`
+    ///   (popped and dropped with a warning so it can never wedge the head of the queue)
     fn pop_packet(
         &self,
         buf_cap: usize,
@@ -79,6 +83,14 @@ impl EgressSyncQueue {
             if let Some(front) = st.packets.front() {
                 let pkt_len = front.len();
                 if pkt_len > buf_cap || pkt_len > isize::MAX as usize {
+                    let _ = st.packets.pop_front();
+                    drop(st);
+                    self.space_notify.notify_one();
+                    tracing::warn!(
+                        pkt_len,
+                        buf_cap,
+                        "Dropping oversized egress L3 packet in NE packet pump"
+                    );
                     return Err(PopPacketError::BufferTooSmall { required: pkt_len });
                 }
                 let pkt = st.packets.pop_front().expect("front packet checked");
@@ -112,6 +124,7 @@ impl EgressSyncQueue {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum PopPacketError {
     Closed,
     #[allow(dead_code)]
@@ -200,14 +213,10 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Start an embedded `ProxyEngine` in virtual `smoltcp` L3 packet mode for Apple `NEPacketTunnelProvider`.
-///
-/// # Safety
-/// `yaml_config` must be a valid NUL-terminated UTF-8 C string. `out_error` may be null or a valid pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rc_ne_start_engine(
+unsafe fn start_ne_engine_internal(
     yaml_config: *const c_char,
     mtu: u16,
+    enable_ipv6_override: Option<bool>,
     out_error: *mut *mut c_char,
 ) -> *mut RcNeEngineHandle {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -242,9 +251,28 @@ pub unsafe extern "C" fn rc_ne_start_engine(
         cfg.authentication.clear();
         cfg.mixed_port = 0;
         cfg.dns.listen = "127.0.0.1:0".to_string();
+        let ctrl_trimmed = cfg.external_controller.trim();
+        if !ctrl_trimmed.is_empty() {
+            let is_loopback = ctrl_trimmed
+                .parse::<std::net::SocketAddr>()
+                .map(|sa| sa.ip().is_loopback())
+                .unwrap_or_else(|_| {
+                    ctrl_trimmed
+                        .strip_prefix("localhost:")
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .is_some()
+                });
+            if !is_loopback {
+                cfg.external_controller = "127.0.0.1:0".to_string();
+            }
+        }
         cfg.tun.enable = true;
         cfg.tun.auto_route = false;
         cfg.tun.mtu = usize::from(mtu.max(1280));
+        if let Some(enable_ipv6) = enable_ipv6_override {
+            cfg.tun.ipv6 = enable_ipv6;
+            cfg.dns.ipv6 = enable_ipv6;
+        }
 
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -286,7 +314,15 @@ pub unsafe extern "C" fn rc_ne_start_engine(
         let queue_for_pump = Arc::clone(&egress_queue);
         let pump_task = rt.spawn(async move {
             while let Some(pkt) = egress_rx.recv().await {
-                if pkt.is_empty() || pkt.len() > 65535 {
+                if pkt.is_empty() {
+                    continue;
+                }
+                if pkt.len() > MAX_NE_PACKET_BYTES {
+                    tracing::warn!(
+                        pkt_len = pkt.len(),
+                        max = MAX_NE_PACKET_BYTES,
+                        "Dropping oversized egress packet exceeding MAX_NE_PACKET_BYTES"
+                    );
                     continue;
                 }
                 loop {
@@ -336,12 +372,43 @@ pub unsafe extern "C" fn rc_ne_start_engine(
     }
 }
 
+/// Start an embedded `ProxyEngine` in virtual `smoltcp` L3 packet mode for Apple `NEPacketTunnelProvider`.
+///
+/// # Safety
+/// `yaml_config` must be a valid NUL-terminated UTF-8 C string. `out_error` may be null or a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rc_ne_start_engine(
+    yaml_config: *const c_char,
+    mtu: u16,
+    out_error: *mut *mut c_char,
+) -> *mut RcNeEngineHandle {
+    // SAFETY: Forwarded directly with identical C ABI preconditions.
+    unsafe { start_ne_engine_internal(yaml_config, mtu, None, out_error) }
+}
+
+/// Start an embedded `ProxyEngine` in virtual `smoltcp` L3 packet mode for Apple `NEPacketTunnelProvider`,
+/// explicitly synchronizing `cfg.tun.ipv6` and `cfg.dns.ipv6` with `enable_ipv6`.
+///
+/// # Safety
+/// `yaml_config` must be a valid NUL-terminated UTF-8 C string. `out_error` may be null or a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rc_ne_start_engine_v2(
+    yaml_config: *const c_char,
+    mtu: u16,
+    enable_ipv6: bool,
+    out_error: *mut *mut c_char,
+) -> *mut RcNeEngineHandle {
+    // SAFETY: Forwarded directly with identical C ABI preconditions.
+    unsafe { start_ne_engine_internal(yaml_config, mtu, Some(enable_ipv6), out_error) }
+}
+
 /// Push a raw L3 IPv4/IPv6 packet from `NEPacketTunnelFlow` into `smoltcp`.
 ///
 /// Safe against concurrent `rc_ne_stop_engine`: returns `false` if `handle` is NULL or already stopped.
 ///
 /// # Safety
-/// `packet_ptr` must reference at least `packet_len` readable bytes when non-null and `0 < packet_len <= 65535`.
+/// `packet_ptr` must reference at least `packet_len` readable bytes when non-null and
+/// `0 < packet_len <= MAX_NE_PACKET_BYTES` (`65580`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rc_ne_push_inbound_packet(
     handle: *mut RcNeEngineHandle,
@@ -349,7 +416,7 @@ pub unsafe extern "C" fn rc_ne_push_inbound_packet(
     packet_len: usize,
 ) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if packet_ptr.is_null() || packet_len == 0 || packet_len > 65535 {
+        if packet_ptr.is_null() || packet_len == 0 || packet_len > MAX_NE_PACKET_BYTES {
             return false;
         }
         let Some(ctx) = lookup_context(handle) else {
@@ -376,7 +443,7 @@ pub unsafe extern "C" fn rc_ne_push_inbound_packet(
 /// - `> 0`: byte length copied into `out_buf`
 /// - `0`: timeout elapsed (or queue empty when `timeout_ms == 0`)
 /// - `-1`: invalid/stopped `handle` or invalid buffer arguments
-/// - `-2`: `buf_cap` is smaller than the queued front packet (packet remains queued at front)
+/// - `-2`: `buf_cap` was smaller than the queued front packet (that single oversized packet was popped & dropped)
 ///
 /// # Safety
 /// `out_buf` must point to at least `buf_cap` writable bytes.
@@ -434,9 +501,15 @@ pub unsafe extern "C" fn rc_ne_pop_outbound_packet(
     buf_cap: usize,
 ) -> usize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: Same buffer contract as `rc_ne_wait_outbound_packet`.
-        let n = unsafe { rc_ne_wait_outbound_packet(handle, out_buf, buf_cap, 0) };
-        if n > 0 { n as usize } else { 0 }
+        loop {
+            // SAFETY: Same buffer contract as `rc_ne_wait_outbound_packet`.
+            let n = unsafe { rc_ne_wait_outbound_packet(handle, out_buf, buf_cap, 0) };
+            if n == -2 {
+                // Single oversized packet was popped/dropped; continue draining remaining batch items.
+                continue;
+            }
+            return if n > 0 { n as usize } else { 0 };
+        }
     }))
     .unwrap_or(0)
 }
@@ -533,4 +606,33 @@ pub unsafe extern "C" fn rc_ne_free_string(ptr: *mut c_char) {
             }
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn egress_queue_drops_oversized_packet_without_wedging_subsequent_frames() {
+        const { assert!(MAX_NE_PACKET_BYTES >= 65_575) };
+        let q = EgressSyncQueue::new();
+        {
+            let mut st = q.inner.lock();
+            st.packets.push_back(vec![0x60; 2_000]);
+            st.packets.push_back(vec![0x45; 64]);
+        }
+
+        let err = q.pop_packet(1_500, None, false);
+        assert!(matches!(
+            err,
+            Err(PopPacketError::BufferTooSmall { required: 2_000 })
+        ));
+
+        let next = q
+            .pop_packet(1_500, None, false)
+            .expect("queue stays healthy")
+            .expect("second packet preserved");
+        assert_eq!(next.len(), 64);
+        assert_eq!(next[0], 0x45);
+    }
 }

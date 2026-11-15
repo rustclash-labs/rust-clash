@@ -807,7 +807,8 @@ export const App: React.FC = () => {
                   >
                     <span>{tr("混合端口", "Mixed Port")}</span>
                     <strong className="tabular" style={{ color: "var(--text-primary)" }}>
-                      127.0.0.1:{config?.["mixed-port"] ?? 7890}
+                      {config?.["mixed-listen"] ||
+                        `127.0.0.1:${config?.["mixed-port"] ?? 7890}`}
                     </strong>
                   </div>
                   <div
