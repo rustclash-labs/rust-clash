@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, LazyLock, Weak,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -27,9 +27,11 @@ use crate::{
     platform::socket_protect::{
         current_protector_epoch, protected_tcp_connect_addr, protected_udp_bind,
     },
+    tracker::TelemetryHub,
 };
 
 const DNS_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const DNS_POOLED_IO_TIMEOUT: Duration = Duration::from_millis(1200);
 const DNS_TLS_IDLE_TTL: Duration = Duration::from_secs(45);
 const MAX_IDLE_TLS_CONNS_PER_KEY: usize = 4;
 
@@ -43,7 +45,7 @@ struct TlsDnsPoolKey {
     protector_epoch: u64,
 }
 
-type TlsDnsPoolEntry = (Instant, TlsStream<TcpStream>);
+type TlsDnsPoolEntry = (Instant, u64, TlsStream<TcpStream>);
 type TlsDnsPoolMap = HashMap<TlsDnsPoolKey, Vec<TlsDnsPoolEntry>>;
 type H2Slot = Arc<AsyncMutex<Option<Arc<H2DohClient>>>>;
 
@@ -52,6 +54,16 @@ static H2_DNS_POOL: LazyLock<Mutex<HashMap<TlsDnsPoolKey, H2Slot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static H2_LIVE_CLIENTS: LazyLock<Mutex<Vec<Weak<H2DohClient>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn is_tls_pool_entry_fresh(
+    stored_mono: Instant,
+    stored_wall_ms: u64,
+    now_mono: Instant,
+    now_wall_ms: u64,
+) -> bool {
+    now_mono.duration_since(stored_mono) < DNS_TLS_IDLE_TTL
+        && now_wall_ms.saturating_sub(stored_wall_ms) < DNS_TLS_IDLE_TTL.as_millis() as u64
+}
 
 fn get_h2_slot(key: &TlsDnsPoolKey) -> H2Slot {
     let mut guard = H2_DNS_POOL.lock();
@@ -82,10 +94,11 @@ fn hash_extra_ca(extra_ca_der: &[CertificateDer<'static>]) -> u64 {
 
 fn pop_idle_tls_stream(key: &TlsDnsPoolKey) -> Option<TlsStream<TcpStream>> {
     let now = Instant::now();
+    let now_wall_ms = TelemetryHub::now_ms();
     let mut guard = TLS_DNS_POOL.lock();
     let list = guard.get_mut(key)?;
-    while let Some((stored_at, stream)) = list.pop() {
-        if now.duration_since(stored_at) < DNS_TLS_IDLE_TTL {
+    while let Some((stored_at, stored_wall_ms, stream)) = list.pop() {
+        if is_tls_pool_entry_fresh(stored_at, stored_wall_ms, now, now_wall_ms) {
             return Some(stream);
         }
     }
@@ -94,17 +107,55 @@ fn pop_idle_tls_stream(key: &TlsDnsPoolKey) -> Option<TlsStream<TcpStream>> {
 
 fn push_idle_tls_stream(key: TlsDnsPoolKey, stream: TlsStream<TcpStream>) {
     let now = Instant::now();
+    let now_wall_ms = TelemetryHub::now_ms();
     let mut guard = TLS_DNS_POOL.lock();
     if guard.len() > 64 {
         guard.retain(|_, v| {
-            v.retain(|(ts, _)| now.duration_since(*ts) < DNS_TLS_IDLE_TTL);
+            v.retain(|(ts, ts_wall, _)| is_tls_pool_entry_fresh(*ts, *ts_wall, now, now_wall_ms));
             !v.is_empty()
         });
     }
     let entry = guard.entry(key).or_default();
-    entry.retain(|(ts, _)| now.duration_since(*ts) < DNS_TLS_IDLE_TTL);
+    entry.retain(|(ts, ts_wall, _)| is_tls_pool_entry_fresh(*ts, *ts_wall, now, now_wall_ms));
     if entry.len() < MAX_IDLE_TLS_CONNS_PER_KEY {
-        entry.push((now, stream));
+        entry.push((now, now_wall_ms, stream));
+    }
+}
+
+/// Proactively evict DoT and DoH (HTTP/1.1 & HTTP/2) pooled connections whose monotonic or
+/// wall-clock idle age exceeded `DNS_TLS_IDLE_TTL` (e.g., across Android Doze/suspend transitions).
+pub fn reap_expired_dns_upstream_pools() {
+    let now_mono = Instant::now();
+    let now_wall_ms = TelemetryHub::now_ms();
+    {
+        let mut tls_guard = TLS_DNS_POOL.lock();
+        tls_guard.retain(|_, list| {
+            list.retain(|(ts_mono, ts_wall, _)| {
+                is_tls_pool_entry_fresh(*ts_mono, *ts_wall, now_mono, now_wall_ms)
+            });
+            !list.is_empty()
+        });
+    }
+    {
+        let mut h2_guard = H2_DNS_POOL.lock();
+        h2_guard.retain(|_, slot| {
+            slot.try_lock()
+                .map(|mut g| {
+                    if g.as_ref().is_some_and(|c| !c.is_reusable_at(now_wall_ms)) {
+                        *g = None;
+                    }
+                    g.is_some()
+                })
+                .unwrap_or(true)
+        });
+    }
+    let live: Vec<Arc<H2DohClient>> = {
+        let mut guard = H2_LIVE_CLIENTS.lock();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for client in live {
+        let _ = client.is_reusable_at(now_wall_ms);
     }
 }
 
@@ -653,7 +704,7 @@ pub async fn forward_dot_dns(
 
     if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
         && let Ok(Ok(resp)) = tokio::time::timeout(
-            DNS_IO_TIMEOUT,
+            DNS_POOLED_IO_TIMEOUT,
             exchange_length_prefixed_dns(&mut pooled, query),
         )
         .await
@@ -831,10 +882,12 @@ async fn forward_doh_dns_with_timeout(
         protector_epoch: current_protector_epoch(),
     };
 
+    let pooled_probe_timeout = io_timeout.min(DNS_POOLED_IO_TIMEOUT);
+
     // 1. Fast path for HTTP/1.1 keep-alive servers already in `TLS_DNS_POOL`
     if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
         && let Ok(Ok((resp, reusable))) = tokio::time::timeout(
-            io_timeout,
+            pooled_probe_timeout,
             exchange_doh_over_stream(&mut pooled, host_header, path_and_query, &doh_wire, orig_id),
         )
         .await
@@ -862,6 +915,21 @@ async fn forward_doh_dns_with_timeout(
             let client = Arc::clone(existing);
             used_h2_client = Some(Arc::clone(&client));
             drop(slot_guard);
+            if io_timeout > DNS_POOLED_IO_TIMEOUT {
+                return match tokio::time::timeout(
+                    DNS_POOLED_IO_TIMEOUT,
+                    client.exchange(host_header, path_and_query, &doh_wire),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        client.mark_closed_on_timeout();
+                        evict_h2_client_from_slot(&h2_slot, &client);
+                        H2DohOutcome::RetryOnFreshConn
+                    }
+                };
+            }
             return client
                 .exchange(host_header, path_and_query, &doh_wire)
                 .await;
@@ -870,12 +938,15 @@ async fn forward_doh_dns_with_timeout(
 
         // Re-check HTTP/1.1 pool in case a sibling caller just populated it
         if let Some(mut pooled) = pop_idle_tls_stream(&pool_key)
-            && let Ok((resp, reusable)) = exchange_doh_over_stream(
-                &mut pooled,
-                host_header,
-                path_and_query,
-                &doh_wire,
-                orig_id,
+            && let Ok(Ok((resp, reusable))) = tokio::time::timeout(
+                pooled_probe_timeout,
+                exchange_doh_over_stream(
+                    &mut pooled,
+                    host_header,
+                    path_and_query,
+                    &doh_wire,
+                    orig_id,
+                ),
             )
             .await
         {
@@ -1259,6 +1330,7 @@ struct H2DohClient {
     pending: Arc<DashMap<u32, H2StreamAcc>>,
     next_stream_id: AtomicU32,
     max_concurrent: Arc<AtomicU32>,
+    last_rx_wall_ms: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     reader_abort: AbortHandle,
     writer_abort: AbortHandle,
@@ -1318,6 +1390,7 @@ impl H2DohClient {
         let pending: Arc<DashMap<u32, H2StreamAcc>> = Arc::new(DashMap::new());
         let closed = Arc::new(AtomicBool::new(false));
         let max_concurrent = Arc::new(AtomicU32::new(100));
+        let last_rx_wall_ms = Arc::new(AtomicU64::new(TelemetryHub::now_ms()));
 
         // Enqueue HTTP/2 client preface + SETTINGS (HEADER_TABLE_SIZE=0, ENABLE_PUSH=0) + 1 MiB connection WINDOW_UPDATE first
         let mut init_buf = BytesMut::with_capacity(64);
@@ -1352,6 +1425,7 @@ impl H2DohClient {
         let pending_rd = Arc::clone(&pending);
         let closed_rd = Arc::clone(&closed);
         let max_conc_rd = Arc::clone(&max_concurrent);
+        let last_rx_rd = Arc::clone(&last_rx_wall_ms);
         let write_tx_rd = write_tx.clone();
 
         let reader_jh = tokio::spawn(async move {
@@ -1363,7 +1437,10 @@ impl H2DohClient {
             let fail_err = loop {
                 let read_res = tokio::time::timeout(DNS_TLS_IDLE_TTL, read_h2_frame(&mut rd)).await;
                 let (ftype, flags, stream_id, payload) = match read_res {
-                    Ok(Ok(f)) => f,
+                    Ok(Ok(f)) => {
+                        last_rx_rd.store(TelemetryHub::now_ms(), Ordering::Release);
+                        f
+                    }
                     Ok(Err(e)) => break e,
                     // 45s with zero HTTP/2 frames (even if streams are pending) proves the connection is dead/blackholed.
                     Err(_) => break ProxyError::Timeout,
@@ -1474,6 +1551,7 @@ impl H2DohClient {
                             match tokio::time::timeout(DNS_IO_TIMEOUT, read_h2_frame(&mut rd)).await
                             {
                                 Ok(Ok((cont_type, cont_flags, cont_sid, cont_payload))) => {
+                                    last_rx_rd.store(TelemetryHub::now_ms(), Ordering::Release);
                                     if cont_type != H2_FRAME_CONTINUATION || cont_sid != stream_id {
                                         cont_err = Some(ProxyError::Dns(
                                             "expected HTTP/2 CONTINUATION frame".into(),
@@ -1643,6 +1721,7 @@ impl H2DohClient {
             pending,
             next_stream_id: AtomicU32::new(1),
             max_concurrent,
+            last_rx_wall_ms,
             closed,
             reader_abort,
             writer_abort,
@@ -1657,10 +1736,22 @@ impl H2DohClient {
         client
     }
 
-    fn is_reusable(&self) -> bool {
-        !self.closed.load(Ordering::Acquire)
-            && self.next_stream_id.load(Ordering::Relaxed) <= H2_MAX_STREAMS_PER_CONN * 2
+    fn is_reusable_at(&self, now_wall_ms: u64) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        if now_wall_ms.saturating_sub(self.last_rx_wall_ms.load(Ordering::Acquire))
+            >= DNS_TLS_IDLE_TTL.as_millis() as u64
+        {
+            self.abort();
+            return false;
+        }
+        self.next_stream_id.load(Ordering::Relaxed) <= H2_MAX_STREAMS_PER_CONN * 2
             && (self.pending.len() as u32) < self.max_concurrent.load(Ordering::Relaxed)
+    }
+
+    fn is_reusable(&self) -> bool {
+        self.is_reusable_at(TelemetryHub::now_ms())
     }
 
     async fn exchange(
@@ -2698,5 +2789,36 @@ mod tests {
         );
 
         srv_jh.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_and_h2_dns_pools_evict_wall_clock_expired_sessions_across_suspend() {
+        let mono_now = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+
+        // 1. `is_tls_pool_entry_fresh` checks both monotonic and wall-clock idle TTL (45s)
+        assert!(is_tls_pool_entry_fresh(
+            mono_now,
+            base_wall,
+            mono_now,
+            base_wall + 44_999
+        ));
+        // Monotonic froze at `mono_now`, but wall-clock advanced 45s across Android suspend -> expired!
+        assert!(!is_tls_pool_entry_fresh(
+            mono_now,
+            base_wall,
+            mono_now,
+            base_wall + 45_000
+        ));
+
+        // 2. `H2DohClient::is_reusable_at` aborts and rejects sessions whose wall-clock idle age >= 45s
+        let (client_io, _server_io) = tokio::io::duplex(16 * 1024);
+        let client = H2DohClient::spawn_io(client_io);
+        let spawned_wall = client.last_rx_wall_ms.load(Ordering::Acquire);
+        assert!(client.is_reusable_at(spawned_wall + 10_000));
+        assert!(!client.is_reusable_at(spawned_wall + 45_000));
+        // Once aborted by wall-clock expiry, `closed` stays true even if queried again.
+        assert!(client.closed.load(Ordering::Acquire));
+        assert!(!client.is_reusable_at(spawned_wall + 1_000));
     }
 }

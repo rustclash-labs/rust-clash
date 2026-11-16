@@ -2363,6 +2363,7 @@ impl ProxyEngine {
 
     pub fn set_low_power_mode(&self, enabled: bool) {
         let _ = self.hub.reap_idle_sessions();
+        crate::dns::upstream::reap_expired_dns_upstream_pools();
         if enabled {
             self.persist_fake_ip_cache();
         }
