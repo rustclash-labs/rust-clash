@@ -36,8 +36,34 @@ pub use keys::{GeneratedVlessPair, generate_vless_encryption_pair};
 #[derive(Clone)]
 struct CachedClientTicket {
     expire_at: Instant,
+    issued_wall_ms: u64,
+    ttl_ms: u64,
     pfs_key: Zeroizing<[u8; 64]>,
     ticket: [u8; 16],
+}
+
+impl CachedClientTicket {
+    fn new(ticket_secs: u16, pfs_key: Zeroizing<[u8; 64]>, ticket: [u8; 16]) -> Self {
+        // Subtract a 3s RTT/clock-skew safety margin on normal multi-minute tickets while
+        // keeping short test tickets (<= 10s) exact.
+        let eff_secs = if ticket_secs > 10 {
+            u64::from(ticket_secs) - 3
+        } else {
+            u64::from(ticket_secs)
+        };
+        let ttl = Duration::from_secs(eff_secs);
+        Self {
+            expire_at: Instant::now() + ttl,
+            issued_wall_ms: crate::tracker::TelemetryHub::now_ms(),
+            ttl_ms: ttl.as_millis() as u64,
+            pfs_key,
+            ticket,
+        }
+    }
+
+    fn is_fresh(&self, now_mono: Instant, now_wall_ms: u64) -> bool {
+        now_mono < self.expire_at && now_wall_ms.saturating_sub(self.issued_wall_ms) < self.ttl_ms
+    }
 }
 
 /// Client-side Xray `mlkem768x25519plus` Post-Quantum Hybrid Encryption Engine (1-RTT + 0-RTT).
@@ -68,10 +94,12 @@ impl ClientEncryption {
     }
 
     pub fn has_valid_0rtt_ticket(&self) -> bool {
+        let now_mono = Instant::now();
+        let now_wall = crate::tracker::TelemetryHub::now_ms();
         self.ticket_cache
             .lock()
             .as_ref()
-            .is_some_and(|t| Instant::now() < t.expire_at)
+            .is_some_and(|t| t.is_fresh(now_mono, now_wall))
     }
 
     /// Wrap a raw transport stream (`TcpStream`, etc.) in a `mlkem768x25519plus` encrypted session.
@@ -81,12 +109,17 @@ impl ClientEncryption {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         if self.enable_0rtt {
+            let now_mono = Instant::now();
+            let now_wall = crate::tracker::TelemetryHub::now_ms();
             let cached = {
-                let guard = self.ticket_cache.lock();
-                guard
+                let mut guard = self.ticket_cache.lock();
+                if guard
                     .as_ref()
-                    .filter(|c| Instant::now() < c.expire_at)
-                    .cloned()
+                    .is_some_and(|c| !c.is_fresh(now_mono, now_wall))
+                {
+                    *guard = None;
+                }
+                guard.clone()
             };
             if let Some(ticket_entry) = cached {
                 return self.build_0rtt_stream(io_stream, ticket_entry);
@@ -203,11 +236,8 @@ impl ClientEncryption {
         }
 
         if self.enable_0rtt && ticket_secs > 0 {
-            *self.ticket_cache.lock() = Some(CachedClientTicket {
-                expire_at: Instant::now() + Duration::from_secs(u64::from(ticket_secs)),
-                pfs_key,
-                ticket: ticket_arr,
-            });
+            *self.ticket_cache.lock() =
+                Some(CachedClientTicket::new(ticket_secs, pfs_key, ticket_arr));
         }
 
         let (out_ctr, in_ctr) = if self.mode == XorMode::Random {
@@ -260,8 +290,12 @@ impl ClientEncryption {
         };
 
         let cache_ref = Arc::clone(&self.ticket_cache);
+        let rejected_ticket = cached.ticket;
         let invalidation_hook = Arc::new(Mutex::new(Some(Box::new(move || {
-            *cache_ref.lock() = None;
+            let mut guard = cache_ref.lock();
+            if guard.as_ref().is_some_and(|t| t.ticket == rejected_ticket) {
+                *guard = None;
+            }
         }) as Box<dyn FnOnce() + Send>)));
 
         Ok(VlessEncryptedStream::new_0rtt_client(
@@ -279,8 +313,16 @@ impl ClientEncryption {
 
 struct ServerTicketSession {
     expire_at: Instant,
+    issued_wall_ms: u64,
+    ttl_ms: u64,
     pfs_key: Zeroizing<[u8; 64]>,
     seen_nfs_keys: HashSet<[u8; 32]>,
+}
+
+impl ServerTicketSession {
+    fn is_fresh(&self, now_mono: Instant, now_wall_ms: u64) -> bool {
+        now_mono < self.expire_at && now_wall_ms.saturating_sub(self.issued_wall_ms) < self.ttl_ms
+    }
 }
 
 /// Server-side Xray `mlkem768x25519plus` Post-Quantum Hybrid Decryption Engine (1-RTT + 0-RTT).
@@ -355,7 +397,8 @@ impl ServerEncryption {
             let maybe_pfs = {
                 let mut guard = self.sessions.lock();
                 let now = Instant::now();
-                guard.retain(|_, s| now < s.expire_at);
+                let now_wall = crate::tracker::TelemetryHub::now_ms();
+                guard.retain(|_, s| s.is_fresh(now, now_wall));
                 if let Some(sess) = guard.get_mut(&ticket_id) {
                     if !sess.seen_nfs_keys.insert(*nfs_key) {
                         return Err(io::Error::new(
@@ -477,11 +520,15 @@ impl ServerEncryption {
             seen.insert(*nfs_key);
             let mut guard = self.sessions.lock();
             let now = Instant::now();
-            guard.retain(|_, s| now < s.expire_at);
+            let now_wall = crate::tracker::TelemetryHub::now_ms();
+            let ttl = Duration::from_secs(u64::from(ticket_secs));
+            guard.retain(|_, s| s.is_fresh(now, now_wall));
             guard.insert(
                 ticket,
                 ServerTicketSession {
-                    expire_at: now + Duration::from_secs(u64::from(ticket_secs)),
+                    expire_at: now + ttl,
+                    issued_wall_ms: now_wall,
+                    ttl_ms: ttl.as_millis() as u64,
                     pfs_key,
                     seen_nfs_keys: seen,
                 },
@@ -592,5 +639,91 @@ fn detect_aes_hardware() -> bool {
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wall_clock_expired_0rtt_ticket_evicts_and_falls_back_to_1rtt_after_suspend() {
+        let pair = generate_vless_encryption_pair(XorMode::Random, true, true).unwrap();
+        let client = Arc::new(ClientEncryption::new(&pair.encryption).unwrap());
+        let server = Arc::new(ServerEncryption::new(&pair.decryption).unwrap());
+
+        // 1. Initial 1-RTT handshake populates a 0-RTT ticket.
+        let (c1, s1) = tokio::io::duplex(65536);
+        let srv_ref = Arc::clone(&server);
+        let srv_task = tokio::spawn(async move { srv_ref.accept(s1).await.unwrap() });
+        let mut c_stream = client.handshake(c1).await.unwrap();
+        let mut s_stream = srv_task.await.unwrap();
+        c_stream.write_all(b"ping").await.unwrap();
+        c_stream.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        assert!(client.has_valid_0rtt_ticket());
+
+        // 2. Simulate Android deep sleep: `expire_at` (`Instant`) is still far in the future,
+        //    while wall-clock elapsed past `ttl_ms` AND server evicted the expired session.
+        {
+            let mut guard = client.ticket_cache.lock();
+            let entry = guard.as_mut().expect("cached 0-RTT ticket");
+            entry.issued_wall_ms = entry.issued_wall_ms.saturating_sub(entry.ttl_ms + 5_000);
+        }
+        server.sessions.lock().clear();
+
+        assert!(
+            !client.has_valid_0rtt_ticket(),
+            "wall-clock-expired ticket must report invalid even when Instant has not advanced"
+        );
+
+        // 3. Subsequent `handshake` must cleanly perform a fresh 1-RTT PQ handshake (zero 0-RTT rejection).
+        let (c2, s2) = tokio::io::duplex(65536);
+        let srv_ref2 = Arc::clone(&server);
+        let srv_task2 = tokio::spawn(async move { srv_ref2.accept(s2).await.unwrap() });
+        let mut c_stream2 = client.handshake(c2).await.unwrap();
+        let mut s_stream2 = srv_task2.await.unwrap();
+        c_stream2.write_all(b"wake").await.unwrap();
+        c_stream2.flush().await.unwrap();
+        s_stream2.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"wake");
+        assert!(client.has_valid_0rtt_ticket());
+    }
+
+    #[tokio::test]
+    async fn stale_0rtt_invalidation_hook_does_not_clobber_newer_ticket() {
+        let pair = generate_vless_encryption_pair(XorMode::Random, true, true).unwrap();
+        let client = ClientEncryption::new(&pair.encryption).unwrap();
+
+        let old_ticket = [0xAAu8; 16];
+        let new_ticket = [0xBBu8; 16];
+        *client.ticket_cache.lock() = Some(CachedClientTicket::new(
+            60,
+            Zeroizing::new([0x11u8; 64]),
+            old_ticket,
+        ));
+
+        // Open a 0-RTT stream bound to `old_ticket` whose peer immediately closes (0-byte EOF).
+        let (c_io, s_io) = tokio::io::duplex(4096);
+        drop(s_io);
+        let mut stale_stream = client.handshake(c_io).await.unwrap();
+
+        // Meanwhile, a sibling 1-RTT handshake already replaced `ticket_cache` with `new_ticket`.
+        *client.ticket_cache.lock() = Some(CachedClientTicket::new(
+            60,
+            Zeroizing::new([0x22u8; 64]),
+            new_ticket,
+        ));
+
+        // Triggering EOF rejection on `stale_stream` must NOT wipe `new_ticket`!
+        let mut tmp = [0u8; 16];
+        let err = stale_stream.read(&mut tmp).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            client.ticket_cache.lock().as_ref().map(|t| t.ticket),
+            Some(new_ticket)
+        );
     }
 }

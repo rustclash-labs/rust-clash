@@ -49,6 +49,7 @@ const MAX_TUN_UDP_INFLIGHT: usize = 512;
 const MAX_TUN_UDP_SESSIONS: usize = 512;
 const TCP_SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTBOUND_CONNECT_HARD_REAP_GRACE: Duration = Duration::from_secs(2);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const TCP_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -131,6 +132,9 @@ impl Device for VirtualIpDevice {
 struct BridgeFlow {
     handle: SocketHandle,
     established: bool,
+    remote_connected: Arc<AtomicBool>,
+    dial_timeout_notify: Arc<Notify>,
+    dial_timeout_notified: bool,
     created_at: Instant,
     created_wall_ms: u64,
     last_active: Instant,
@@ -147,11 +151,23 @@ struct BridgeFlow {
 }
 
 impl BridgeFlow {
+    fn is_dial_timed_out(&self, now: Instant, now_wall_ms: u64) -> bool {
+        !self.remote_connected.load(Ordering::Acquire)
+            && (now.duration_since(self.created_at) > OUTBOUND_CONNECT_TIMEOUT
+                || now_wall_ms.saturating_sub(self.created_wall_ms)
+                    > OUTBOUND_CONNECT_TIMEOUT.as_millis() as u64)
+    }
+
     fn is_timed_out(&self, now: Instant, now_wall_ms: u64, send_queue_bytes: usize) -> bool {
         let syn_timed_out = !self.established
             && (now.duration_since(self.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT
                 || now_wall_ms.saturating_sub(self.created_wall_ms)
                     > TCP_SYN_HANDSHAKE_TIMEOUT.as_millis() as u64);
+        let hard_dial_limit = OUTBOUND_CONNECT_TIMEOUT + OUTBOUND_CONNECT_HARD_REAP_GRACE;
+        let dial_hard_timed_out = !self.remote_connected.load(Ordering::Acquire)
+            && (now.duration_since(self.created_at) > hard_dial_limit
+                || now_wall_ms.saturating_sub(self.created_wall_ms)
+                    > hard_dial_limit.as_millis() as u64);
         let idle_timed_out = now.duration_since(self.last_active) > TCP_IDLE_TIMEOUT
             || now_wall_ms.saturating_sub(self.last_active_wall_ms)
                 > TCP_IDLE_TIMEOUT.as_millis() as u64;
@@ -168,7 +184,7 @@ impl BridgeFlow {
             && fin_idle_exceeded
             && self.pending_tx.is_empty()
             && send_queue_bytes == 0;
-        syn_timed_out || idle_timed_out || fin_timed_out
+        syn_timed_out || dial_hard_timed_out || idle_timed_out || fin_timed_out
     }
 }
 
@@ -491,8 +507,16 @@ pub fn spawn_userspace_tun_with_ipv6(
                     }
                 }
 
-                // Enforce SYN handshake timeout, half-close linger timeout, and idle timeout
-                // using both monotonic `Instant` and wall-clock epoch ms (for Android deep sleep).
+                // Signal `flow_task` when outbound connect exceeds 15s (monotonic or wall-clock)
+                // so `ConnectionGuard::record_failed` records the exact dial timeout before RST.
+                if flow.is_dial_timed_out(now, now_wall) && !flow.dial_timeout_notified {
+                    flow.dial_timeout_notified = true;
+                    flow.dial_timeout_notify.notify_one();
+                }
+
+                // Enforce SYN handshake timeout, hard dial backstop, half-close linger timeout,
+                // and idle timeout using both monotonic `Instant` and wall-clock epoch ms
+                // (for Android deep sleep).
                 if flow.is_timed_out(now, now_wall, sock.send_queue()) {
                     flow.task_abort.abort();
                     sock.abort();
@@ -535,13 +559,19 @@ pub fn spawn_userspace_tun_with_ipv6(
                 let check_now = Instant::now();
                 let check_now_wall = TelemetryHub::now_ms();
                 for flow in flows.values() {
-                    if !flow.established {
-                        let rem_mono = TCP_SYN_HANDSHAKE_TIMEOUT
-                            .saturating_sub(check_now.duration_since(flow.created_at));
-                        let rem_wall =
-                            TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(Duration::from_millis(
-                                check_now_wall.saturating_sub(flow.created_wall_ms),
-                            ));
+                    if !flow.established || !flow.remote_connected.load(Ordering::Acquire) {
+                        let limit = if !flow.established {
+                            TCP_SYN_HANDSHAKE_TIMEOUT
+                        } else if !flow.dial_timeout_notified {
+                            OUTBOUND_CONNECT_TIMEOUT
+                        } else {
+                            OUTBOUND_CONNECT_TIMEOUT + OUTBOUND_CONNECT_HARD_REAP_GRACE
+                        };
+                        let rem_mono =
+                            limit.saturating_sub(check_now.duration_since(flow.created_at));
+                        let rem_wall = limit.saturating_sub(Duration::from_millis(
+                            check_now_wall.saturating_sub(flow.created_wall_ms),
+                        ));
                         next_delay = fold_min_delay(
                             next_delay,
                             rem_mono.min(rem_wall).max(Duration::from_millis(1)),
@@ -950,11 +980,17 @@ fn register_syn_flow(
     let (to_remote_tx, mut to_remote_rx) = mpsc::channel::<Vec<u8>>(TUN_FLOW_STREAM_CAPACITY);
     let (from_remote_tx, from_remote_rx) = mpsc::channel::<Vec<u8>>(TUN_FLOW_STREAM_CAPACITY);
     let (bridge_closed_tx, bridge_closed_rx) = watch::channel(());
+    let remote_connected = Arc::new(AtomicBool::new(false));
+    let remote_connected_task = Arc::clone(&remote_connected);
+    let dial_timeout_notify = Arc::new(Notify::new());
+    let dial_timeout_task = Arc::clone(&dial_timeout_notify);
     let remote_failed = Arc::new(AtomicBool::new(false));
     let remote_failed_task = Arc::clone(&remote_failed);
     let wake_task = Arc::clone(wake_notify);
     let now = Instant::now();
     let now_wall = TelemetryHub::now_ms();
+    let flow_created_at = now;
+    let flow_created_wall_ms = now_wall;
 
     let current_router = Arc::clone(&router.read());
     let hub_clone = Arc::clone(hub);
@@ -963,6 +999,7 @@ fn register_syn_flow(
         // Prevents Android/OS virtual VPN DNS (`198.18.0.2:53`) TCP fallback queries from hitting
         // `UNMAPPED-FAKE-IP` when UDP DNS responses are truncated (`TC=1`) or retried over TCP.
         if tuple.dst.port() == 53 && current_router.tun_dns_hijack() {
+            remote_connected_task.store(true, Ordering::Release);
             serve_tun_tcp_dns_flow(
                 Arc::clone(current_router.dns()),
                 to_remote_rx,
@@ -1001,14 +1038,21 @@ fn register_syn_flow(
             raw_target.clone()
         };
 
-        let decision = current_router
-            .route_async_with_context(
+        let decision = tokio::select! {
+            biased;
+            _ = bridge_closed_tx.closed() => return,
+            _ = dial_timeout_task.notified() => {
+                remote_failed_task.store(true, Ordering::Release);
+                wake_task.notify_one();
+                return;
+            }
+            d = current_router.route_async_with_context(
                 Some(tuple.src.ip()),
                 Some(tuple.src),
                 crate::platform::process::SocketTransport::Tcp,
                 &route_target,
-            )
-            .await;
+            ) => d,
+        };
         let conn_guard = hub_clone.register_connection_with_outbound_guard(
             "TUN(smoltcp)",
             "tcp",
@@ -1035,31 +1079,46 @@ fn register_syn_flow(
         );
 
         let dial_start = Instant::now();
-        let dial_res = tokio::select! {
-            biased;
-            _ = conn_entry.closed() => {
-                remote_failed_task.store(true, Ordering::Release);
-                wake_task.notify_one();
-                return;
-            }
-            _ = bridge_closed_tx.closed() => {
-                return;
-            }
-            res = tokio::time::timeout(
-                OUTBOUND_CONNECT_TIMEOUT,
-                decision.outbound.connect_tcp(&decision.target),
-            ) => {
-                match res {
-                    Ok(inner) => inner,
-                    Err(_) => Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "outbound dial+handshake to {} via '{}' timed out after {}s",
-                            decision.target,
-                            decision.outbound.name(),
-                            OUTBOUND_CONNECT_TIMEOUT.as_secs()
-                        ),
-                    )),
+        let elapsed_mono = flow_created_at.elapsed();
+        let elapsed_wall =
+            Duration::from_millis(TelemetryHub::now_ms().saturating_sub(flow_created_wall_ms));
+        let rem_connect_budget =
+            OUTBOUND_CONNECT_TIMEOUT.saturating_sub(elapsed_mono.max(elapsed_wall));
+        let make_timeout_err = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "outbound dial+handshake to {} via '{}' timed out after {}s",
+                    decision.target,
+                    decision.outbound.name(),
+                    OUTBOUND_CONNECT_TIMEOUT.as_secs()
+                ),
+            )
+        };
+        let dial_res = if rem_connect_budget.is_zero() {
+            Err(make_timeout_err())
+        } else {
+            tokio::select! {
+                biased;
+                _ = conn_entry.closed() => {
+                    remote_failed_task.store(true, Ordering::Release);
+                    wake_task.notify_one();
+                    return;
+                }
+                _ = bridge_closed_tx.closed() => {
+                    return;
+                }
+                _ = dial_timeout_task.notified() => {
+                    Err(make_timeout_err())
+                }
+                res = tokio::time::timeout(
+                    rem_connect_budget,
+                    decision.outbound.connect_tcp(&decision.target),
+                ) => {
+                    match res {
+                        Ok(inner) => inner,
+                        Err(_) => Err(make_timeout_err()),
+                    }
                 }
             }
         };
@@ -1079,6 +1138,7 @@ fn register_syn_flow(
                 return;
             }
         };
+        remote_connected_task.store(true, Ordering::Release);
         conn_guard.mark_established();
         let leaf_outbound = decision.outbound.name();
         if decision.outbound.exit_category() == "PROXY"
@@ -1187,6 +1247,9 @@ fn register_syn_flow(
         BridgeFlow {
             handle,
             established: false,
+            remote_connected,
+            dial_timeout_notify,
+            dial_timeout_notified: false,
             created_at: now,
             created_wall_ms: now_wall,
             last_active: now,
@@ -1528,6 +1591,9 @@ mod tests {
         let mut flow = BridgeFlow {
             handle,
             established: true,
+            remote_connected: Arc::new(AtomicBool::new(true)),
+            dial_timeout_notify: Arc::new(Notify::new()),
+            dial_timeout_notified: false,
             created_at: mono_now,
             created_wall_ms: base_wall,
             last_active: mono_now,
@@ -1564,6 +1630,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locally_established_unconnected_outbound_dial_times_out_on_wall_clock() {
+        let mut sockets = SocketSet::new(vec![]);
+        let sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        let handle = sockets.add(sock);
+        let (_tx, rx) = mpsc::channel(1);
+        let (_bridge_closed_tx, bridge_closed_rx) = watch::channel(());
+        let noop_task = tokio::spawn(async {});
+
+        let mono_now = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+        let remote_connected = Arc::new(AtomicBool::new(false));
+        let flow = BridgeFlow {
+            handle,
+            // smoltcp completed local 3-way handshake (<1ms), while outbound dial is still pending.
+            established: true,
+            remote_connected: Arc::clone(&remote_connected),
+            dial_timeout_notify: Arc::new(Notify::new()),
+            dial_timeout_notified: false,
+            created_at: mono_now,
+            created_wall_ms: base_wall,
+            // Even if client sent TLS ClientHello bytes at +14s, created_wall_ms governs dial budget!
+            last_active: mono_now,
+            last_active_wall_ms: base_wall + 14_000,
+            fin_started_at: None,
+            fin_started_wall_ms: None,
+            pending_tx: BytesMut::new(),
+            from_remote_rx: rx,
+            to_remote_tx: None,
+            _bridge_closed_rx: bridge_closed_rx,
+            remote_eof: false,
+            remote_failed: Arc::new(AtomicBool::new(false)),
+            task_abort: noop_task.abort_handle(),
+        };
+
+        // At 14s wall-clock (monotonic frozen), neither soft dial timeout nor hard reap fires.
+        assert!(!flow.is_dial_timed_out(mono_now, base_wall + 14_000));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 14_000, 0));
+
+        // At 15.5s wall-clock (monotonic frozen during Android Doze/suspend), soft dial timeout
+        // fires so `flow_task` records `outbound dial+handshake ... timed out after 15s`.
+        assert!(flow.is_dial_timed_out(mono_now, base_wall + 15_500));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 15_500, 0));
+
+        // At 18s wall-clock (> 15s + 2s grace), hard reap backstop also fires if still unconnected.
+        assert!(flow.is_timed_out(mono_now, base_wall + 18_000, 0));
+
+        // Once remote_connected flips true, neither dial timeout nor hard dial backstop triggers.
+        remote_connected.store(true, Ordering::Release);
+        assert!(!flow.is_dial_timed_out(mono_now, base_wall + 18_000));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 18_000, 0));
+    }
+
+    #[tokio::test]
     async fn active_half_closed_bridge_flow_is_not_timed_out_until_idle_and_drained() {
         let mut sockets = SocketSet::new(vec![]);
         let sock = tcp::Socket::new(
@@ -1580,6 +1702,9 @@ mod tests {
         let mut flow = BridgeFlow {
             handle,
             established: true,
+            remote_connected: Arc::new(AtomicBool::new(true)),
+            dial_timeout_notify: Arc::new(Notify::new()),
+            dial_timeout_notified: false,
             created_at: mono_now,
             created_wall_ms: base_wall,
             last_active: mono_now + Duration::from_secs(20),
