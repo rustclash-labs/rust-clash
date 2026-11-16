@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to `rust-clash` (maintained by **RustClash Labs** — [`rustclash.labs@proton.me`](mailto:rustclash.labs@proton.me))!
 
-> **Experimental & AI-Authored Codebase**: `rust-clash` is an experimental pure-Rust prototype written end-to-end by **Gemini 4 Argon** and **Gemini 4 Carbon** under human direction and review. Please read the security, privacy, verification, and licensing guidelines below before opening an issue or pull request.
+> **Experimental & AI-Authored Codebase**: `rust-clash` is an experimental pure-Rust prototype written end-to-end by **Gemini Argon** and **Gemini Carbon**, with **GPT** participating in code review. Please read the security, privacy, verification, and licensing guidelines below before opening an issue or pull request.
 
 ---
 
