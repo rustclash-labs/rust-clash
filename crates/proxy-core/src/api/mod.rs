@@ -1661,6 +1661,8 @@ fn summarize_node_redacted(node: &ProxyNodeConfig) -> serde_json::Value {
             server,
             port,
             tls,
+            flow,
+            reality_opts,
             udp,
             ..
         } => {
@@ -1674,11 +1676,76 @@ fn summarize_node_redacted(node: &ProxyNodeConfig) -> serde_json::Value {
                 "type": "vless",
                 "server": server,
                 "port": port,
+                "tls": *tls || reality_opts.is_some(),
+                "reality": reality_opts.is_some(),
+                "flow": flow,
+                "network": transport,
+                "udp": udp,
+            })
+        }
+        ProxyNodeConfig::Vmess {
+            name,
+            server,
+            port,
+            cipher,
+            tls,
+            udp,
+            ..
+        } => {
+            let transport = if node.effective_ws_opts().is_some() {
+                "ws"
+            } else {
+                "tcp"
+            };
+            serde_json::json!({
+                "name": name,
+                "type": "vmess",
+                "server": server,
+                "port": port,
+                "cipher": cipher,
                 "tls": tls,
                 "network": transport,
                 "udp": udp,
             })
         }
+        ProxyNodeConfig::Hysteria2 {
+            name,
+            server,
+            port,
+            ports,
+            obfs,
+            sni,
+            udp,
+            ..
+        } => serde_json::json!({
+            "name": name,
+            "type": "hysteria2",
+            "server": server,
+            "port": port,
+            "ports": ports,
+            "obfs": obfs,
+            "sni": sni,
+            "udp": udp,
+        }),
+        ProxyNodeConfig::Tuic {
+            name,
+            server,
+            port,
+            udp_relay_mode,
+            congestion_controller,
+            sni,
+            udp,
+            ..
+        } => serde_json::json!({
+            "name": name,
+            "type": "tuic",
+            "server": server,
+            "port": port,
+            "udp-relay-mode": udp_relay_mode,
+            "congestion-controller": congestion_controller,
+            "sni": sni,
+            "udp": udp,
+        }),
         ProxyNodeConfig::Anytls {
             name,
             server,
@@ -3587,11 +3654,49 @@ async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> i
                 }
             }
             ProxyNodeConfig::Vless {
-                uuid, encryption, ..
+                uuid,
+                encryption,
+                reality_opts,
+                ..
             } => {
                 known_secrets.push(uuid.to_string());
                 if !encryption.is_empty() && encryption != "none" && encryption != REDACTED_SECRET {
                     known_secrets.push(encryption.clone());
+                }
+                if let Some(ro) = reality_opts {
+                    if !ro.public_key.is_empty() && ro.public_key != REDACTED_SECRET {
+                        known_secrets.push(ro.public_key.clone());
+                    }
+                    if let Some(ref sid) = ro.short_id
+                        && !sid.is_empty()
+                        && sid != REDACTED_SECRET
+                    {
+                        known_secrets.push(sid.clone());
+                    }
+                }
+            }
+            ProxyNodeConfig::Vmess { uuid, .. } => {
+                known_secrets.push(uuid.to_string());
+            }
+            ProxyNodeConfig::Hysteria2 {
+                password,
+                obfs_password,
+                ..
+            } => {
+                if !password.is_empty() && password != REDACTED_SECRET {
+                    known_secrets.push(password.clone());
+                }
+                if let Some(opw) = obfs_password
+                    && !opw.is_empty()
+                    && opw != REDACTED_SECRET
+                {
+                    known_secrets.push(opw.clone());
+                }
+            }
+            ProxyNodeConfig::Tuic { uuid, password, .. } => {
+                known_secrets.push(uuid.to_string());
+                if !password.is_empty() && password != REDACTED_SECRET {
+                    known_secrets.push(password.clone());
                 }
             }
             ProxyNodeConfig::Socks5 { password, .. } => {

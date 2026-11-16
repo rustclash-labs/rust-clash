@@ -398,7 +398,7 @@ proxies:
       - http/1.1
     skip-cert-verify: true
     udp: true
-  - name: 'Unsupported-Reality-Node'
+  - name: 'Reality-Vision-Node'
     type: vless
     server: reality.private-edge.example.com
     port: 443
@@ -409,6 +409,12 @@ proxies:
     reality-opts:
       public-key: dGVzdC1wdWJsaWMta2V5LXRlc3QtcHVibGljLWtleS0
       short-id: 01020304
+  - name: 'Unsupported-WireGuard-Node'
+    type: wireguard
+    server: wg.private-edge.example.com
+    port: 51820
+    ip: 10.0.0.2
+    private-key: c2VjcmV0LXdnLXByaXZhdGUta2V5LXRlc3QtMTIzNDU2Nzg=
 proxy-groups:
   - name: '🚀 节点选择'
     type: select
@@ -437,7 +443,7 @@ rules:
         .await
         .expect("sanitized mixed subscription import must succeed");
 
-    assert_eq!(import_report.total_nodes, 1);
+    assert_eq!(import_report.total_nodes, 2);
     assert_eq!(import_report.skipped_unsupported.len(), 1);
 
     // Reload persisted YAML from disk to prove `to_yaml_string()` preserved `nameserver-policy`!

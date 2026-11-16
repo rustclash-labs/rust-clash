@@ -415,7 +415,7 @@ fun NodesScreen(
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "支持离线或连接状态下直接导入 ss://、vless://、trojan://、anytls://、socks5:// 分享链接、Base64 订阅、Clash YAML 或 HTTPS 订阅链接。",
+                        text = "支持离线或连接状态下直接导入 vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls://、socks5:// 分享链接、Base64 订阅、Clash YAML 或 HTTPS 订阅链接。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -894,7 +894,7 @@ fun ImportPayloadBottomSheet(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "支持单条或多行 ss://、vless://、trojan://、anytls://、socks5:// 分享链接、Base64 订阅、Clash YAML 或 HTTPS 订阅链接。",
+                text = "支持单条或多行 vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls://、socks5:// 分享链接、Base64 订阅、Clash YAML 或 HTTPS 订阅链接。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -975,7 +975,7 @@ fun ImportPayloadBottomSheet(
                 shape = RoundedCornerShape(14.dp),
                 placeholder = {
                     Text(
-                        text = "在此粘贴节点链接 (ss:// / vless:// / trojan:// / anytls:// / socks5://)、Base64 文本、Clash YAML 或 https:// 订阅地址…",
+                        text = "在此粘贴节点链接 (vless:// / vmess:// / ss:// / trojan:// / hy2:// / tuic:// / anytls:// / socks5://)、Base64 文本、Clash YAML 或 https:// 订阅地址…",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 },
@@ -1116,14 +1116,23 @@ fun NodeEditorDialog(
     val isEditing = existingNode != null
     val dialogScrollState = rememberScrollState()
     val protocols = listOf(
-        "ss" to "SS",
         "vless" to "VLESS",
+        "vmess" to "VMess",
+        "ss" to "SS",
         "trojan" to "Trojan",
+        "hysteria2" to "Hy2",
+        "tuic" to "TUIC",
         "anytls" to "AnyTLS",
         "socks5" to "SOCKS5",
         "http" to "HTTP",
     )
-    val existingProto = existingNode?.type?.lowercase()?.let { if (it == "socks") "socks5" else it }
+    val existingProto = existingNode?.type?.lowercase()?.let {
+        when (it) {
+            "socks" -> "socks5"
+            "hy2" -> "hysteria2"
+            else -> it
+        }
+    }
     val existingRawObj = remember(existingNode) {
         existingNode?.rawRedactedJson
             ?.takeIf { it.isNotBlank() }
@@ -1131,7 +1140,7 @@ fun NodeEditorDialog(
     }
     var selectedProto by remember(existingNode) {
         mutableStateOf(
-            existingProto?.takeIf { p -> protocols.any { it.first == p } } ?: "ss",
+            existingProto?.takeIf { p -> protocols.any { it.first == p } } ?: "vless",
         )
     }
     var name by remember(existingNode) { mutableStateOf(existingNode?.name ?: "") }
@@ -1139,15 +1148,46 @@ fun NodeEditorDialog(
     var portText by remember(existingNode) { mutableStateOf((existingNode?.port ?: 443).toString()) }
     var username by remember(existingNode) { mutableStateOf(existingNode?.username ?: "") }
     var secret by remember(existingNode) { mutableStateOf("") }
+    var tuicPassword by remember(existingNode) { mutableStateOf("") }
     var cipherOrEnc by remember(existingNode) {
         mutableStateOf(
             when (existingProto) {
                 "ss" -> existingNode.cipher.ifBlank { "aes-256-gcm" }
+                "vmess" -> existingNode.cipher.ifBlank { "auto" }
                 "vless" -> existingNode.encryption.takeIf { it != "***REDACTED***" } ?: "none"
                 else -> "aes-256-gcm"
             },
         )
     }
+    var vlessFlow by remember(existingNode) { mutableStateOf(existingNode?.flow ?: "") }
+    var vlessReality by remember(existingNode) { mutableStateOf(existingNode?.realityEnabled ?: false) }
+    var realityPublicKey by remember(existingNode) {
+        mutableStateOf(existingNode?.realityPublicKey?.takeIf { it != "***REDACTED***" } ?: "")
+    }
+    var realityShortId by remember(existingNode) {
+        mutableStateOf(existingNode?.realityShortId?.takeIf { it != "***REDACTED***" } ?: "")
+    }
+    var clientFingerprint by remember(existingNode) {
+        mutableStateOf(existingNode?.clientFingerprint?.ifBlank { "chrome" } ?: "chrome")
+    }
+    var hy2Ports by remember(existingNode) { mutableStateOf(existingNode?.ports ?: "") }
+    var hy2ObfsEnabled by remember(existingNode) {
+        mutableStateOf(existingNode?.obfs?.equals("salamander", ignoreCase = true) == true)
+    }
+    var hy2ObfsPassword by remember(existingNode) { mutableStateOf("") }
+    var hy2Up by remember(existingNode) {
+        mutableStateOf(existingRawObj?.optString("up", "")?.takeIf { it != "null" } ?: "")
+    }
+    var hy2Down by remember(existingNode) {
+        mutableStateOf(existingRawObj?.optString("down", "")?.takeIf { it != "null" } ?: "")
+    }
+    var tuicUdpRelayMode by remember(existingNode) {
+        mutableStateOf(existingNode?.udpRelayMode?.ifBlank { "native" } ?: "native")
+    }
+    var tuicCongestion by remember(existingNode) {
+        mutableStateOf(existingNode?.congestionController?.ifBlank { "bbr" } ?: "bbr")
+    }
+    var tuicZeroRtt by remember(existingNode) { mutableStateOf(existingNode?.zeroRttHandshake ?: false) }
     var transportNet by remember(existingNode) {
         mutableStateOf(
             existingNode?.network?.lowercase()?.takeIf { it == "ws" || it == "tcp" } ?: "tcp",
@@ -1172,10 +1212,12 @@ fun NodeEditorDialog(
     }
     var tlsEnabled by remember(existingNode) {
         mutableStateOf(
-            if (existingRawObj?.has("tls") == true) {
+            if (existingNode?.realityEnabled == true) {
+                true
+            } else if (existingRawObj?.has("tls") == true) {
                 existingRawObj.optBoolean("tls", existingNode?.tls ?: true)
             } else {
-                existingNode?.tls ?: (selectedProto in setOf("vless", "trojan", "anytls"))
+                existingNode?.tls ?: (selectedProto in setOf("vless", "trojan", "anytls", "hysteria2", "tuic"))
             },
         )
     }
@@ -1206,7 +1248,10 @@ fun NodeEditorDialog(
         }
     }
 
-    val supportsWs = selectedProto == "vless" || selectedProto == "trojan"
+    val supportsWs =
+        (selectedProto == "vless" && !vlessReality && vlessFlow.isBlank()) ||
+            selectedProto == "vmess" ||
+            selectedProto == "trojan"
     val isAuthOptional = selectedProto == "socks5" || selectedProto == "http"
     val protoSwitchedOnEdit = isEditing && selectedProto != existingProto
 
@@ -1253,20 +1298,24 @@ fun NodeEditorDialog(
                                     }
                                     when (protoKey) {
                                         "ss" -> {
-                                            if (cipherOrEnc.isBlank() || cipherOrEnc == "none") {
+                                            if (cipherOrEnc.isBlank() || cipherOrEnc == "none" || cipherOrEnc == "auto") {
                                                 cipherOrEnc = "aes-256-gcm"
                                             }
                                         }
+                                        "vmess" -> {
+                                            if (cipherOrEnc !in setOf("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero")) {
+                                                cipherOrEnc = "auto"
+                                            }
+                                        }
                                         "vless" -> {
-                                            if (cipherOrEnc == "aes-256-gcm" ||
-                                                cipherOrEnc.startsWith("2022-") ||
-                                                cipherOrEnc == "chacha20-ietf-poly1305"
+                                            if (cipherOrEnc in setOf("aes-256-gcm", "auto", "aes-128-gcm", "chacha20-poly1305", "chacha20-ietf-poly1305") ||
+                                                cipherOrEnc.startsWith("2022-")
                                             ) {
                                                 cipherOrEnc = "none"
                                             }
                                             tlsEnabled = true
                                         }
-                                        "trojan", "anytls" -> {
+                                        "trojan", "anytls", "hysteria2", "tuic" -> {
                                             tlsEnabled = true
                                         }
                                     }
@@ -1339,6 +1388,9 @@ fun NodeEditorDialog(
                                 protoSwitchedOnEdit && !isAuthOptional -> "密码 / UUID（切换协议需重新填写）"
                                 isEditing -> "密码 / UUID（留空保留原密钥）"
                                 selectedProto == "vless" -> "VLESS UUID"
+                                selectedProto == "vmess" -> "VMess UUID"
+                                selectedProto == "tuic" -> "TUIC UUID"
+                                selectedProto == "hysteria2" -> "Hysteria2 鉴权密码"
                                 isAuthOptional -> "连接密码 (无鉴权可留空)"
                                 else -> "连接密码 / PSK"
                             },
@@ -1349,7 +1401,30 @@ fun NodeEditorDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
 
-                if (selectedProto == "ss" || selectedProto == "vless") {
+                if (selectedProto == "tuic") {
+                    OutlinedTextField(
+                        value = tuicPassword,
+                        onValueChange = {
+                            tuicPassword = it
+                            clearErrors()
+                        },
+                        enabled = !isSaving,
+                        label = {
+                            Text(
+                                if (isEditing && !protoSwitchedOnEdit) {
+                                    "TUIC 密码（留空保留原密码）"
+                                } else {
+                                    "TUIC 密码（无密码可留空）"
+                                },
+                            )
+                        },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
+                if (selectedProto == "ss" || selectedProto == "vmess" || (selectedProto == "vless" && !vlessReality)) {
                     OutlinedTextField(
                         value = cipherOrEnc,
                         onValueChange = {
@@ -1359,16 +1434,236 @@ fun NodeEditorDialog(
                         enabled = !isSaving,
                         label = {
                             Text(
-                                if (selectedProto == "ss") {
-                                    "加密算法 (默认 aes-256-gcm / 支持 2022-blake3-*)"
-                                } else {
-                                    "VLESS Encryption (默认 none)"
+                                when (selectedProto) {
+                                    "ss" -> "加密算法 (默认 aes-256-gcm / 支持 2022-blake3-*)"
+                                    "vmess" -> "VMess AEAD 算法 (auto / aes-128-gcm / chacha20-poly1305 / none / zero)"
+                                    else -> "VLESS Encryption (默认 none)"
                                 },
                             )
                         },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
+                }
+
+                if (selectedProto == "vless") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Flow：", style = MaterialTheme.typography.bodySmall)
+                        FilterChip(
+                            selected = vlessFlow.isBlank(),
+                            enabled = !isSaving,
+                            onClick = {
+                                vlessFlow = ""
+                                clearErrors()
+                            },
+                            label = { Text("无", style = MaterialTheme.typography.labelSmall) },
+                        )
+                        FilterChip(
+                            selected = vlessFlow == "xtls-rprx-vision",
+                            enabled = !isSaving,
+                            onClick = {
+                                vlessFlow = "xtls-rprx-vision"
+                                transportNet = "tcp"
+                                tlsEnabled = true
+                                clearErrors()
+                            },
+                            label = { Text("xtls-rprx-vision", style = MaterialTheme.typography.labelSmall) },
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = vlessReality,
+                            enabled = !isSaving,
+                            onCheckedChange = {
+                                vlessReality = it
+                                if (it) {
+                                    tlsEnabled = true
+                                    transportNet = "tcp"
+                                }
+                                clearErrors()
+                            },
+                        )
+                        Text("启用 VLESS REALITY 伪装握手", style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (vlessReality) {
+                        OutlinedTextField(
+                            value = realityPublicKey,
+                            onValueChange = {
+                                realityPublicKey = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = {
+                                Text(
+                                    if (isEditing && !protoSwitchedOnEdit && existingNode?.realityPublicKey == "***REDACTED***") {
+                                        "REALITY Public Key (pbk，留空保留原公钥)"
+                                    } else {
+                                        "REALITY Public Key (pbk)"
+                                    },
+                                )
+                            },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = realityShortId,
+                            onValueChange = {
+                                realityShortId = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = {
+                                Text(
+                                    if (isEditing && !protoSwitchedOnEdit && existingNode?.realityShortId == "***REDACTED***") {
+                                        "REALITY Short ID (sid，留空保留原 sid)"
+                                    } else {
+                                        "REALITY Short ID (sid，可选十六进制)"
+                                    },
+                                )
+                            },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = clientFingerprint,
+                            onValueChange = {
+                                clientFingerprint = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = { Text("TLS 指纹 (chrome / firefox / safari / ios)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+
+                if (selectedProto == "hysteria2") {
+                    OutlinedTextField(
+                        value = hy2Ports,
+                        onValueChange = {
+                            hy2Ports = it
+                            clearErrors()
+                        },
+                        enabled = !isSaving,
+                        label = { Text("端口跳跃 Ports (可选，如 20000-50000)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = hy2ObfsEnabled,
+                            enabled = !isSaving,
+                            onCheckedChange = {
+                                hy2ObfsEnabled = it
+                                clearErrors()
+                            },
+                        )
+                        Text("启用 Salamander UDP 混淆", style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (hy2ObfsEnabled) {
+                        OutlinedTextField(
+                            value = hy2ObfsPassword,
+                            onValueChange = {
+                                hy2ObfsPassword = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = {
+                                Text(
+                                    if (isEditing && !protoSwitchedOnEdit && existingRawObj?.optString("obfs-password", "") == "***REDACTED***") {
+                                        "Salamander 混淆密码（留空保留原密码）"
+                                    } else {
+                                        "Salamander 混淆密码"
+                                    },
+                                )
+                            },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = hy2Up,
+                            onValueChange = {
+                                hy2Up = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = { Text("上行带宽 (如 50 Mbps)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                        OutlinedTextField(
+                            value = hy2Down,
+                            onValueChange = {
+                                hy2Down = it
+                                clearErrors()
+                            },
+                            enabled = !isSaving,
+                            label = { Text("下行带宽 (如 200 Mbps)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+
+                if (selectedProto == "tuic") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("UDP 模式：", style = MaterialTheme.typography.bodySmall)
+                        listOf("native" to "Native", "quic" to "QUIC Stream").forEach { (modeKey, modeLabel) ->
+                            FilterChip(
+                                selected = tuicUdpRelayMode.equals(modeKey, ignoreCase = true),
+                                enabled = !isSaving,
+                                onClick = {
+                                    tuicUdpRelayMode = modeKey
+                                    clearErrors()
+                                },
+                                label = { Text(modeLabel, style = MaterialTheme.typography.labelSmall) },
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("拥塞控制：", style = MaterialTheme.typography.bodySmall)
+                        listOf("bbr" to "BBR", "cubic" to "CUBIC", "new_reno" to "NewReno").forEach { (ccKey, ccLabel) ->
+                            FilterChip(
+                                selected = tuicCongestion.equals(ccKey, ignoreCase = true),
+                                enabled = !isSaving,
+                                onClick = {
+                                    tuicCongestion = ccKey
+                                    clearErrors()
+                                },
+                                label = { Text(ccLabel, style = MaterialTheme.typography.labelSmall) },
+                            )
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = tuicZeroRtt,
+                            enabled = !isSaving,
+                            onCheckedChange = {
+                                tuicZeroRtt = it
+                                clearErrors()
+                            },
+                        )
+                        Text("启用 QUIC 0-RTT 握手", style = MaterialTheme.typography.bodySmall)
+                    }
                 }
 
                 if (supportsWs) {
@@ -1435,7 +1730,7 @@ fun NodeEditorDialog(
                     }
                 }
 
-                if (selectedProto in setOf("vless", "trojan", "anytls", "socks5", "http")) {
+                if (selectedProto in setOf("vless", "vmess", "trojan", "hysteria2", "tuic", "anytls", "socks5", "http")) {
                     OutlinedTextField(
                         value = sni,
                         onValueChange = {
@@ -1443,13 +1738,23 @@ fun NodeEditorDialog(
                             clearErrors()
                         },
                         enabled = !isSaving,
-                        label = { Text("TLS SNI (可选)") },
+                        label = {
+                            Text(
+                                if (selectedProto == "vless" && vlessReality) {
+                                    "REALITY 伪装域名 ServerName (必填，如 www.microsoft.com)"
+                                } else {
+                                    "TLS SNI / ServerName (可选)"
+                                },
+                            )
+                        },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
 
-                if (selectedProto in setOf("vless", "trojan", "anytls")) {
+                if ((selectedProto == "vless" && !vlessReality) ||
+                    selectedProto in setOf("vmess", "trojan", "hysteria2", "tuic", "anytls")
+                ) {
                     OutlinedTextField(
                         value = alpnText,
                         onValueChange = {
@@ -1457,13 +1762,15 @@ fun NodeEditorDialog(
                             clearErrors()
                         },
                         enabled = !isSaving,
-                        label = { Text("ALPN (可选，逗号分隔如 h2, http/1.1)") },
+                        label = { Text("ALPN (可选，逗号分隔如 h2, http/1.1 或 h3)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
 
-                if (selectedProto in setOf("vless", "trojan", "socks5", "http")) {
+                if ((selectedProto == "vless" && !vlessReality) ||
+                    selectedProto in setOf("vmess", "trojan", "socks5", "http")
+                ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = tlsEnabled,
@@ -1476,7 +1783,9 @@ fun NodeEditorDialog(
                         Text("启用 TLS 传输加密", style = MaterialTheme.typography.bodySmall)
                     }
                 }
-                if (selectedProto in setOf("vless", "trojan", "anytls", "socks5", "http")) {
+                if ((selectedProto == "vless" && !vlessReality) ||
+                    selectedProto in setOf("vmess", "trojan", "hysteria2", "tuic", "anytls", "socks5", "http")
+                ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = skipCertVerify,
@@ -1541,11 +1850,31 @@ fun NodeEditorDialog(
                     }
                     if ((!isEditing || protoSwitchedOnEdit) && !isAuthOptional && cleanSec.isEmpty()) {
                         validationError = if (protoSwitchedOnEdit) {
-                            "切换节点协议后必须重新填写密码或 VLESS UUID"
+                            "切换节点协议后必须重新填写密码或 UUID"
                         } else {
-                            "新建该协议节点必须填写密码或 VLESS UUID"
+                            "新建该协议节点必须填写密码或 UUID"
                         }
                         return@Button
+                    }
+                    if (selectedProto == "vless" && vlessReality) {
+                        if (sni.trim().isEmpty()) {
+                            validationError = "启用 VLESS REALITY 时必须填写伪装目标域名 (ServerName)"
+                            return@Button
+                        }
+                        val hadRedactedPbk =
+                            isEditing && !protoSwitchedOnEdit && existingNode?.realityPublicKey == "***REDACTED***"
+                        if (realityPublicKey.trim().isEmpty() && !hadRedactedPbk) {
+                            validationError = "启用 VLESS REALITY 时必须填写服务端公钥 (Public Key)"
+                            return@Button
+                        }
+                    }
+                    if (selectedProto == "hysteria2" && hy2ObfsEnabled) {
+                        val hadRedactedObfsPass =
+                            isEditing && !protoSwitchedOnEdit && existingRawObj?.optString("obfs-password", "") == "***REDACTED***"
+                        if (hy2ObfsPassword.trim().isEmpty() && !hadRedactedObfsPass) {
+                            validationError = "启用 Salamander 混淆时必须填写混淆密码"
+                            return@Button
+                        }
                     }
                     val parsedEarlyData = if (supportsWs && transportNet == "ws") {
                         val rawEarly = maxEarlyDataText.trim().ifEmpty { "0" }.toIntOrNull()
@@ -1589,7 +1918,7 @@ fun NodeEditorDialog(
                             }
                         }
                         val applyWsOpts = {
-                            if (transportNet == "ws") {
+                            if (supportsWs && transportNet == "ws") {
                                 put("network", "ws")
                                 remove("transport")
                                 val prevWs = optJSONObject("ws-opts")
@@ -1633,13 +1962,62 @@ fun NodeEditorDialog(
                             }
                             "vless" -> {
                                 put("uuid", cleanSec.ifEmpty { "00000000-0000-0000-0000-000000000000" })
-                                val prevEnc = existingNode?.encryption ?: "none"
-                                val finalEnc = if (cipherOrEnc.trim().isEmpty() && prevEnc == "***REDACTED***") {
-                                    "***REDACTED***"
+                                if (vlessFlow.trim().isNotEmpty()) {
+                                    put("flow", vlessFlow.trim())
                                 } else {
-                                    cipherOrEnc.trim().ifEmpty { "none" }
+                                    remove("flow")
                                 }
-                                put("encryption", finalEnc)
+                                if (vlessReality) {
+                                    put("encryption", "none")
+                                    put("tls", true)
+                                    put("skip-cert-verify", false)
+                                    remove("alpn")
+                                    val pbkVal = if (realityPublicKey.trim().isNotEmpty()) {
+                                        realityPublicKey.trim()
+                                    } else {
+                                        "***REDACTED***"
+                                    }
+                                    val realityObj = JSONObject().apply {
+                                        put("public-key", pbkVal)
+                                        val sidTrim = realityShortId.trim()
+                                        if (sidTrim.isNotEmpty()) {
+                                            put("short-id", sidTrim)
+                                        } else if (isEditing && !protoSwitchedOnEdit && existingNode?.realityShortId == "***REDACTED***") {
+                                            put("short-id", "***REDACTED***")
+                                        }
+                                    }
+                                    put("reality-opts", realityObj)
+                                    if (clientFingerprint.trim().isNotEmpty()) {
+                                        put("client-fingerprint", clientFingerprint.trim())
+                                    } else {
+                                        remove("client-fingerprint")
+                                    }
+                                } else {
+                                    remove("reality-opts")
+                                    val prevEnc = existingNode?.encryption ?: "none"
+                                    val finalEnc = if (cipherOrEnc.trim().isEmpty() && prevEnc == "***REDACTED***") {
+                                        "***REDACTED***"
+                                    } else {
+                                        cipherOrEnc.trim().ifEmpty { "none" }
+                                    }
+                                    put("encryption", finalEnc)
+                                    put("tls", tlsEnabled)
+                                    put("skip-cert-verify", skipCertVerify)
+                                    applyAlpn()
+                                }
+                                if (sni.trim().isNotEmpty()) {
+                                    put("servername", sni.trim())
+                                    remove("sni")
+                                } else {
+                                    remove("servername")
+                                    remove("sni")
+                                }
+                                applyWsOpts()
+                            }
+                            "vmess" -> {
+                                put("uuid", cleanSec.ifEmpty { "00000000-0000-0000-0000-000000000000" })
+                                put("alterId", 0)
+                                put("cipher", cipherOrEnc.trim().ifEmpty { "auto" })
                                 put("tls", tlsEnabled)
                                 if (sni.trim().isNotEmpty()) {
                                     put("servername", sni.trim())
@@ -1665,6 +2043,66 @@ fun NodeEditorDialog(
                                 put("skip-cert-verify", skipCertVerify)
                                 applyAlpn()
                                 applyWsOpts()
+                            }
+                            "hysteria2" -> {
+                                put("password", cleanSec.ifEmpty { "***REDACTED***" })
+                                if (hy2Ports.trim().isNotEmpty()) {
+                                    put("ports", hy2Ports.trim())
+                                } else {
+                                    remove("ports")
+                                }
+                                if (hy2ObfsEnabled) {
+                                    put("obfs", "salamander")
+                                    val obfsPass = hy2ObfsPassword.trim().ifEmpty { "***REDACTED***" }
+                                    put("obfs-password", obfsPass)
+                                } else {
+                                    remove("obfs")
+                                    remove("obfs-password")
+                                }
+                                if (hy2Up.trim().isNotEmpty()) {
+                                    put("up", hy2Up.trim())
+                                } else {
+                                    remove("up")
+                                }
+                                if (hy2Down.trim().isNotEmpty()) {
+                                    put("down", hy2Down.trim())
+                                } else {
+                                    remove("down")
+                                }
+                                if (sni.trim().isNotEmpty()) {
+                                    put("sni", sni.trim())
+                                    remove("servername")
+                                } else {
+                                    remove("sni")
+                                    remove("servername")
+                                }
+                                put("skip-cert-verify", skipCertVerify)
+                                applyAlpn()
+                            }
+                            "tuic" -> {
+                                put("uuid", cleanSec.ifEmpty { "00000000-0000-0000-0000-000000000000" })
+                                val cleanTuicPass = tuicPassword.trim()
+                                val hadRedactedTuicPass =
+                                    isEditing && !protoSwitchedOnEdit && existingRawObj?.optString("password", "") == "***REDACTED***"
+                                if (cleanTuicPass.isNotEmpty()) {
+                                    put("password", cleanTuicPass)
+                                } else if (hadRedactedTuicPass) {
+                                    put("password", "***REDACTED***")
+                                } else {
+                                    put("password", "")
+                                }
+                                put("udp-relay-mode", tuicUdpRelayMode.trim().ifEmpty { "native" })
+                                put("congestion-controller", tuicCongestion.trim().ifEmpty { "bbr" })
+                                put("zero-rtt-handshake", tuicZeroRtt)
+                                if (sni.trim().isNotEmpty()) {
+                                    put("sni", sni.trim())
+                                    remove("servername")
+                                } else {
+                                    remove("sni")
+                                    remove("servername")
+                                }
+                                put("skip-cert-verify", skipCertVerify)
+                                applyAlpn()
                             }
                             "anytls" -> {
                                 put("password", cleanSec.ifEmpty { "***REDACTED***" })

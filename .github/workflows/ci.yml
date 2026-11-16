@@ -247,7 +247,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/interop-bins
-          key: interop-bins-linux-ss1.25.0-xray26.10.31-anytls0.0.13
+          key: interop-bins-linux-ss1.25.0-xray26.10.31-anytls0.0.13-singbox1.14.4
 
       - name: Download & Verify Official Reference Binaries (SHA-256 Pinned)
         if: steps.interop-cache.outputs.cache-hit != 'true'
@@ -255,7 +255,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/interop-bins/xray /tmp/interop-bins/anytls /tmp/interop-dl
+          mkdir -p /tmp/interop-bins/xray /tmp/interop-bins/anytls /tmp/interop-bins/sing-box /tmp/interop-dl
 
           fetch_release_asset() {
             local repo="$1" tag="$2" asset="$3" dest="$4"
@@ -277,19 +277,24 @@ jobs:
             Xray-linux-64.zip /tmp/interop-dl/xray.zip
           fetch_release_asset anytls/anytls-go v0.0.13 \
             anytls_0.0.13_linux_amd64.zip /tmp/interop-dl/anytls.zip
+          fetch_release_asset SagerNet/sing-box v1.14.4 \
+            sing-box-1.14.4-linux-amd64.tar.gz /tmp/interop-dl/sing-box.tar.gz
 
           cat <<'EOF' | sha256sum -c -
           8439bf43c324b0fc273e663d0b1f8926fd8f666cbd1e0fd59b35096f0e778e92  /tmp/interop-dl/ss.tar.xz
           e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214  /tmp/interop-dl/xray.zip
           7e80fc099ea54a71110d256dd60648c47c63c70a3c499eb1f6d7aaa4edb7016f  /tmp/interop-dl/anytls.zip
+          699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968  /tmp/interop-dl/sing-box.tar.gz
           EOF
 
           tar -xJf /tmp/interop-dl/ss.tar.xz -C /tmp/interop-bins
           unzip -q /tmp/interop-dl/xray.zip -d /tmp/interop-bins/xray
           unzip -q /tmp/interop-dl/anytls.zip -d /tmp/interop-bins/anytls
+          tar -xzf /tmp/interop-dl/sing-box.tar.gz --strip-components=1 -C /tmp/interop-bins/sing-box
           chmod +x /tmp/interop-bins/ssserver /tmp/interop-bins/sslocal \
                    /tmp/interop-bins/xray/xray \
-                   /tmp/interop-bins/anytls/anytls-server /tmp/interop-bins/anytls/anytls-client
+                   /tmp/interop-bins/anytls/anytls-server /tmp/interop-bins/anytls/anytls-client \
+                   /tmp/interop-bins/sing-box/sing-box
           rm -rf /tmp/interop-dl
 
       - name: Check Rust Formatting

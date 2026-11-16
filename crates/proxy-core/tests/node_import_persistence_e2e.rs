@@ -667,15 +667,15 @@ async fn strict_vless_rejection_and_zero_secret_leak_on_failed_imports_e2e() {
         format!("vless://{secret_uuid}@example.com:443?type=grpc&serviceName=gun#Bad-GRPC"),
         // VLESS HTTPUpgrade
         format!("vless://{secret_uuid}@example.com:443?type=httpupgrade#Bad-HTTPUpgrade"),
-        // VLESS REALITY + pbk/sid
+        // VLESS REALITY + non-32B pbk (invalid X25519 key)
         format!("vless://{secret_uuid}@example.com:443?security=reality&pbk={secret_pbk}&sid=abcd#Bad-REALITY"),
-        // VLESS XTLS Vision flow
-        format!("vless://{secret_uuid}@example.com:443?security=tls&flow=xtls-rprx-vision#Bad-Flow"),
-        // Base64-encoded unsupported VLESS REALITY link
+        // VLESS legacy XTLS Direct flow (unsupported; only xtls-rprx-vision is supported)
+        format!("vless://{secret_uuid}@example.com:443?security=tls&flow=xtls-rprx-direct#Bad-Flow"),
+        // Base64-encoded invalid VLESS REALITY link (non-32B pbk)
         STANDARD.encode(format!(
             "vless://{secret_uuid}@example.com:443?security=reality&pbk={secret_pbk}#Bad-B64-Reality"
         )),
-        // Clash YAML with unsupported VLESS `reality-opts`
+        // Clash YAML with incompatible VLESS `network: ws` + `reality-opts`
         format!(
             "mixed-port: 7890\nproxies:\n  - name: Bad-YAML-VLESS\n    type: vless\n    server: example.com\n    port: 443\n    uuid: {secret_uuid}\n    network: ws\n    reality-opts:\n      public-key: {secret_pbk}\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [Bad-YAML-VLESS]\nrules:\n  - MATCH,PROXY\n"
         ),
@@ -730,16 +730,16 @@ async fn strict_vless_rejection_and_zero_secret_leak_on_failed_imports_e2e() {
         assert!(!body_put_bad.contains(marker));
     }
 
-    // Also verify `POST /profiles/active/nodes` rejects VLESS `flow: xtls-rprx-vision`
+    // Also verify `POST /profiles/active/nodes` rejects legacy VLESS `flow: xtls-rprx-direct`
     let bad_node_json = serde_json::json!({
         "node": {
             "type": "vless",
-            "name": "Bad-Node-Vision",
+            "name": "Bad-Node-LegacyFlow",
             "server": "example.com",
             "port": 443,
             "uuid": secret_uuid,
             "encryption": "none",
-            "flow": "xtls-rprx-vision",
+            "flow": "xtls-rprx-direct",
             "tls": true
         }
     })
@@ -890,7 +890,7 @@ async fn trojan_vless_ws_socks5_http_and_mixed_subscription_sanitization_e2e() {
         .await
         .unwrap();
 
-    // 5. Import a MIXED Base64 subscription containing 4 valid protocols + 2 unsupported links (`vmess://`, `hysteria2://`)!
+    // 5. Import a MIXED Base64 subscription containing 4 valid protocols + 2 invalid/unsupported links (`vmess://` bad userinfo, `ssr://`)!
     let leaked_vmess_secret = "VMESS_SUPER_SECRET_999";
     let leaked_hy2_secret = "HY2_SUPER_SECRET_888";
     let mixed_uris = [
@@ -910,8 +910,8 @@ async fn trojan_vless_ws_socks5_http_and_mixed_subscription_sanitization_e2e() {
             "http-proxy://huser:hsecret@127.0.0.1:{}#HTTP Connect",
             http_proxy_addr.port()
         ),
-        format!("vmess://{leaked_vmess_secret}@bad.example.com:443#Unsupported VMess"),
-        format!("hysteria2://{leaked_hy2_secret}@bad.example.com:443#Unsupported Hy2"),
+        format!("vmess://{leaked_vmess_secret}@bad.example.com:443#Invalid VMess"),
+        format!("ssr://{leaked_hy2_secret}@bad.example.com:8388#Unsupported SSR"),
     ]
     .join("\n");
     let mixed_b64 = STANDARD.encode(&mixed_uris);

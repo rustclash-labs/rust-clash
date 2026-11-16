@@ -164,6 +164,12 @@ fn node_tls_and_skip_verify(node: &ProxyNodeConfig) -> (bool, bool, bool) {
         ProxyNodeConfig::Ss { .. } => (true, false, false),
         ProxyNodeConfig::Anytls {
             skip_cert_verify, ..
+        }
+        | ProxyNodeConfig::Hysteria2 {
+            skip_cert_verify, ..
+        }
+        | ProxyNodeConfig::Tuic {
+            skip_cert_verify, ..
         } => (true, *skip_cert_verify, false),
         ProxyNodeConfig::Trojan {
             tls,
@@ -174,11 +180,27 @@ fn node_tls_and_skip_verify(node: &ProxyNodeConfig) -> (bool, bool, bool) {
             tls,
             encryption,
             skip_cert_verify,
+            reality_opts,
             ..
         } => {
             let has_pq_or_enc =
                 !encryption.trim().is_empty() && !encryption.trim().eq_ignore_ascii_case("none");
-            let encrypted = *tls || has_pq_or_enc;
+            let has_reality = reality_opts.is_some();
+            let encrypted = *tls || has_reality || has_pq_or_enc;
+            (
+                encrypted,
+                *skip_cert_verify && *tls && !has_reality,
+                !encrypted,
+            )
+        }
+        ProxyNodeConfig::Vmess {
+            tls,
+            cipher,
+            skip_cert_verify,
+            ..
+        } => {
+            let aead_body = !matches!(cipher.trim().to_ascii_lowercase().as_str(), "none" | "zero");
+            let encrypted = *tls || aead_body;
             (encrypted, *skip_cert_verify && *tls, !encrypted)
         }
         ProxyNodeConfig::Socks5 {
@@ -198,6 +220,9 @@ fn node_udp_enabled(node: &ProxyNodeConfig) -> bool {
     match node {
         ProxyNodeConfig::Ss { udp, .. }
         | ProxyNodeConfig::Vless { udp, .. }
+        | ProxyNodeConfig::Vmess { udp, .. }
+        | ProxyNodeConfig::Hysteria2 { udp, .. }
+        | ProxyNodeConfig::Tuic { udp, .. }
         | ProxyNodeConfig::Anytls { udp, .. }
         | ProxyNodeConfig::Trojan { udp, .. }
         | ProxyNodeConfig::Socks5 { udp, .. } => *udp,
@@ -234,14 +259,43 @@ fn credentials_differ(a: &ProxyNodeConfig, b: &ProxyNodeConfig) -> bool {
             ProxyNodeConfig::Vless {
                 uuid: ua,
                 encryption: ea,
+                reality_opts: ra,
                 ..
             },
             ProxyNodeConfig::Vless {
                 uuid: ub,
                 encryption: eb,
+                reality_opts: rb,
                 ..
             },
-        ) => ua != ub || ea != eb,
+        ) => ua != ub || ea != eb || ra != rb,
+        (ProxyNodeConfig::Vmess { uuid: ua, .. }, ProxyNodeConfig::Vmess { uuid: ub, .. }) => {
+            ua != ub
+        }
+        (
+            ProxyNodeConfig::Hysteria2 {
+                password: pa,
+                obfs_password: oa,
+                ..
+            },
+            ProxyNodeConfig::Hysteria2 {
+                password: pb,
+                obfs_password: ob,
+                ..
+            },
+        ) => pa != pb || oa != ob,
+        (
+            ProxyNodeConfig::Tuic {
+                uuid: ua,
+                password: pa,
+                ..
+            },
+            ProxyNodeConfig::Tuic {
+                uuid: ub,
+                password: pb,
+                ..
+            },
+        ) => ua != ub || pa != pb,
         (
             ProxyNodeConfig::Socks5 {
                 username: ua,

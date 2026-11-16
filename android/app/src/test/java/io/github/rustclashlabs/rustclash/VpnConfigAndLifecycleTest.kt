@@ -1628,4 +1628,106 @@ class VpnConfigAndLifecycleTest {
             assertTrue("Route ${r.cidr} must pass VpnService.Builder check", VpnRoutePlanner.isValidVpnBuilderRoute(r))
         }
     }
+
+    @Test
+    fun mainstreamProtocolsDeepLinkExtractionAndSnapshotParsingSupportVmessRealityHy2AndTuic() {
+        for (uri in listOf(
+            "vmess://eyJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMCJ9",
+            "hysteria2://hy2-secret@hy2.example.com:443?sni=hy2.example.com&mport=20000-50000#HK-Hy2",
+            "hy2://hy2-secret@hy2.example.com:443?obfs=salamander&obfs-password=obfs-pass#SG-Hy2",
+            "TUIC://550e8400-e29b-41d4-a716-446655440000:tuic-pass@tuic.example.com:443?congestion_control=bbr&udp_relay_mode=native#JP-TUIC",
+        )) {
+            assertEquals(
+                uri,
+                NodeImportSupport.extractImportPayloadFromIntent(
+                    action = "android.intent.action.VIEW",
+                    mimeType = null,
+                    extraText = null,
+                    dataUriString = uri,
+                ),
+            )
+        }
+
+        val rawSnapshotJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "effectiveOutbound": "HK-Hy2",
+              "effectiveProtocol": "hysteria2",
+              "nodes": [
+                {
+                  "name": "TOKYO-REALITY",
+                  "type": "vless",
+                  "server": "jp.example.com",
+                  "port": 443,
+                  "flow": "xtls-rprx-vision",
+                  "servername": "www.microsoft.com",
+                  "client-fingerprint": "chrome",
+                  "reality-opts": {
+                    "public-key": "***REDACTED***",
+                    "short-id": "***REDACTED***"
+                  }
+                },
+                {
+                  "name": "US-VMess-WS",
+                  "type": "vmess",
+                  "server": "us.example.com",
+                  "port": 443,
+                  "cipher": "auto",
+                  "tls": true,
+                  "network": "ws",
+                  "ws-opts": { "path": "/vmess" }
+                },
+                {
+                  "name": "HK-Hy2",
+                  "type": "hy2",
+                  "server": "hk.example.com",
+                  "port": 443,
+                  "ports": "20000-40000",
+                  "obfs": "salamander"
+                },
+                {
+                  "name": "SG-TUIC",
+                  "type": "tuic",
+                  "server": "sg.example.com",
+                  "port": 443,
+                  "udp-relay-mode": "quic",
+                  "congestion-controller": "bbr",
+                  "zero-rtt-handshake": true
+                }
+              ],
+              "groups": []
+            }
+        """.trimIndent()
+
+        val snap = UiJsonParsers.parseSnapshot(rawSnapshotJson)
+        assertNotNull(snap)
+        assertEquals(4, snap!!.nodes.size)
+        assertEquals("Hy2", snap.effectiveProtocolDisplay)
+
+        val realityNode = snap.nodes[0]
+        assertTrue(realityNode.realityEnabled)
+        assertEquals("xtls-rprx-vision", realityNode.flow)
+        assertEquals("VLESS·REALITY", realityNode.protocolShortBadge)
+        assertEquals("VLESS", realityNode.protocolDisplay)
+
+        val vmessNode = snap.nodes[1]
+        assertEquals("VMess·WS", vmessNode.protocolShortBadge)
+        assertEquals("VMess", vmessNode.protocolDisplay)
+        assertEquals("/vmess", vmessNode.wsPath)
+
+        val hy2Node = snap.nodes[2]
+        assertEquals("hysteria2", hy2Node.type)
+        assertEquals("Hy2", hy2Node.protocolShortBadge)
+        assertEquals("Hysteria2", hy2Node.protocolDisplay)
+        assertEquals("20000-40000", hy2Node.ports)
+        assertEquals("salamander", hy2Node.obfs)
+
+        val tuicNode = snap.nodes[3]
+        assertEquals("TUIC", tuicNode.protocolShortBadge)
+        assertEquals("TUIC v5", tuicNode.protocolDisplay)
+        assertEquals("quic", tuicNode.udpRelayMode)
+        assertEquals("bbr", tuicNode.congestionController)
+        assertTrue(tuicNode.zeroRttHandshake)
+    }
 }

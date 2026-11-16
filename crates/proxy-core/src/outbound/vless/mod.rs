@@ -1,4 +1,6 @@
 pub mod encryption;
+pub mod reality;
+pub mod vision;
 
 use std::{
     collections::HashMap,
@@ -26,7 +28,16 @@ use crate::{
     addr::TargetAddr,
     outbound::{
         BoxedStream, DirectOutbound, OutboundHandler, OutboundUdpSession,
-        vless::encryption::{ClientEncryption, ServerEncryption},
+        vless::{
+            encryption::{ClientEncryption, ServerEncryption},
+            reality::{
+                RealityClientConfig, Tls13HandshakeMode, Tls13VisionStream,
+                accept_reality_tls13_server, connect_tls13_vision_stream,
+            },
+            vision::{
+                VISION_ADDONS_PROTOBUF, VisionStream, VlessVisionFlow, VlessVisionXudpSession,
+            },
+        },
         ws_stream::{WsTransportConfig, accept_ws_stream, connect_ws_stream},
     },
     platform::socket_protect::protected_tcp_connect_host_with_dns,
@@ -54,6 +65,8 @@ pub struct VlessOutboundConfig {
 struct VlessInner {
     cfg: VlessOutboundConfig,
     ws_opts: Option<WsTransportConfig>,
+    flow: Option<VlessVisionFlow>,
+    reality: Option<RealityClientConfig>,
     pq_encryption: Option<Arc<ClientEncryption>>,
     tls_connector: Option<TlsConnector>,
     dns: Option<Arc<crate::dns::FakeIpDnsEngine>>,
@@ -64,7 +77,64 @@ pub struct VlessOutbound {
 }
 
 impl VlessInner {
+    fn effective_sni(&self) -> &str {
+        self.cfg
+            .servername
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.reality.as_ref().map(|r| r.server_name.as_str()))
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.ws_opts.as_ref().and_then(|w| w.host_header()))
+            .unwrap_or(self.cfg.server.as_str())
+    }
+
+    async fn establish_vision_tls(&self) -> io::Result<Tls13VisionStream<TcpStream>> {
+        let tcp = protected_tcp_connect_host_with_dns(
+            &self.cfg.server,
+            self.cfg.port,
+            self.dns.as_deref(),
+        )
+        .await?;
+        let mode = if let Some(rcfg) = &self.reality {
+            Tls13HandshakeMode::Reality(rcfg.clone())
+        } else {
+            Tls13HandshakeMode::StandardTls {
+                server_name: self.effective_sni().to_string(),
+                skip_cert_verify: self.cfg.skip_cert_verify,
+                extra_ca_der: self.cfg.extra_ca_der.clone(),
+                alpn: self.cfg.alpn.clone(),
+            }
+        };
+        crate::outbound::with_handshake_timeout(
+            "VLESS Vision TLS/REALITY handshake",
+            connect_tls13_vision_stream(tcp, &mode),
+        )
+        .await
+    }
+
+    async fn connect_vision_mux_stream(&self) -> io::Result<VisionStream<TcpStream>> {
+        let tls = self.establish_vision_tls().await?;
+        let req_hdr = self.build_vless_vision_mux_header();
+        Ok(VisionStream::new_client(tls, self.cfg.uuid, req_hdr))
+    }
+
     async fn establish_transport(&self) -> io::Result<BoxedStream> {
+        if let Some(rcfg) = &self.reality {
+            let tcp = protected_tcp_connect_host_with_dns(
+                &self.cfg.server,
+                self.cfg.port,
+                self.dns.as_deref(),
+            )
+            .await?;
+            let mode = Tls13HandshakeMode::Reality(rcfg.clone());
+            let tls = crate::outbound::with_handshake_timeout(
+                "VLESS REALITY handshake",
+                connect_tls13_vision_stream(tcp, &mode),
+            )
+            .await?;
+            return Ok(Box::new(tls));
+        }
+
         let tcp = protected_tcp_connect_host_with_dns(
             &self.cfg.server,
             self.cfg.port,
@@ -72,13 +142,7 @@ impl VlessInner {
         )
         .await?;
 
-        let sni_str = self
-            .cfg
-            .servername
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.ws_opts.as_ref().and_then(|w| w.host_header()))
-            .unwrap_or(self.cfg.server.as_str());
+        let sni_str = self.effective_sni();
 
         let tls_or_tcp: BoxedStream = if let Some(connector) = &self.tls_connector {
             let sni = crate::crypto::tls::parse_server_name(sni_str)?;
@@ -115,13 +179,28 @@ impl VlessInner {
     }
 
     fn build_vless_request_header(&self, cmd: u8, target: &TargetAddr) -> io::Result<BytesMut> {
-        let mut hdr = BytesMut::with_capacity(64);
+        let mut hdr = BytesMut::with_capacity(96);
         hdr.put_u8(0x00); // VLESS v0
         hdr.put_slice(self.cfg.uuid.as_bytes());
-        hdr.put_u8(0x00); // Addons length = 0
+        if self.flow.is_some() {
+            hdr.put_u8(VISION_ADDONS_PROTOBUF.len() as u8);
+            hdr.put_slice(VISION_ADDONS_PROTOBUF);
+        } else {
+            hdr.put_u8(0x00); // Addons length = 0
+        }
         hdr.put_u8(cmd);
         target.encode_vless(&mut hdr)?;
         Ok(hdr)
+    }
+
+    fn build_vless_vision_mux_header(&self) -> BytesMut {
+        let mut hdr = BytesMut::with_capacity(40);
+        hdr.put_u8(0x00); // VLESS v0
+        hdr.put_slice(self.cfg.uuid.as_bytes());
+        hdr.put_u8(VISION_ADDONS_PROTOBUF.len() as u8);
+        hdr.put_slice(VISION_ADDONS_PROTOBUF);
+        hdr.put_u8(VLESS_CMD_MUX); // RequestCommandMux omits Address/Port in VLESS header
+        hdr
     }
 }
 
@@ -142,6 +221,16 @@ impl VlessOutbound {
         ws_opts: Option<WsTransportConfig>,
         dns: Option<Arc<crate::dns::FakeIpDnsEngine>>,
     ) -> io::Result<Self> {
+        Self::new_with_vision_and_reality(cfg, ws_opts, None, None, dns)
+    }
+
+    pub fn new_with_vision_and_reality(
+        cfg: VlessOutboundConfig,
+        ws_opts: Option<WsTransportConfig>,
+        flow: Option<VlessVisionFlow>,
+        reality: Option<RealityClientConfig>,
+        dns: Option<Arc<crate::dns::FakeIpDnsEngine>>,
+    ) -> io::Result<Self> {
         let pq_encryption =
             if cfg.encryption.trim().is_empty() || cfg.encryption.eq_ignore_ascii_case("none") {
                 None
@@ -149,7 +238,43 @@ impl VlessOutbound {
                 Some(Arc::new(ClientEncryption::new(&cfg.encryption)?))
             };
 
-        let tls_connector = if cfg.tls {
+        if flow.is_some() {
+            if ws_opts.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS xtls-rprx-vision requires raw TCP transport (WebSocket is incompatible)",
+                ));
+            }
+            if pq_encryption.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS xtls-rprx-vision cannot be combined with VLESS PQ encryption",
+                ));
+            }
+            if reality.is_none() && !cfg.tls {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS xtls-rprx-vision requires TLS or REALITY",
+                ));
+            }
+        }
+
+        if reality.is_some() {
+            if ws_opts.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS REALITY requires raw TCP transport",
+                ));
+            }
+            if pq_encryption.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS REALITY cannot be combined with VLESS PQ encryption",
+                ));
+            }
+        }
+
+        let tls_connector = if cfg.tls && reality.is_none() && flow.is_none() {
             let default_ws_alpn = [b"http/1.1".to_vec()];
             let effective_alpn: &[Vec<u8>] = if ws_opts.is_some() && cfg.alpn.is_empty() {
                 &default_ws_alpn
@@ -170,6 +295,8 @@ impl VlessOutbound {
             inner: Arc::new(VlessInner {
                 cfg,
                 ws_opts,
+                flow,
+                reality,
                 pq_encryption,
                 tls_connector,
                 dns,
@@ -423,10 +550,17 @@ impl OutboundHandler for VlessOutbound {
     }
 
     fn protocol(&self) -> &'static str {
-        if self.inner.pq_encryption.is_some() {
-            "VLESS+Encryption"
-        } else {
-            "VLESS"
+        match (self.inner.flow.is_some(), self.inner.reality.is_some()) {
+            (true, true) => "VLESS+REALITY+Vision",
+            (false, true) => "VLESS+REALITY",
+            (true, false) => "VLESS+Vision",
+            (false, false) => {
+                if self.inner.pq_encryption.is_some() {
+                    "VLESS+Encryption"
+                } else {
+                    "VLESS"
+                }
+            }
         }
     }
 
@@ -450,6 +584,17 @@ impl OutboundHandler for VlessOutbound {
     }
 
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+        if self.inner.flow.is_some() {
+            let tls = self.inner.establish_vision_tls().await?;
+            let req_hdr = self
+                .inner
+                .build_vless_request_header(VLESS_CMD_TCP, target)?;
+            return Ok(Box::new(VisionStream::new_client(
+                tls,
+                self.inner.cfg.uuid,
+                req_hdr,
+            )));
+        }
         let transport = self.inner.establish_transport().await?;
         let req_hdr = self
             .inner
@@ -463,6 +608,16 @@ impl OutboundHandler for VlessOutbound {
                 io::ErrorKind::Unsupported,
                 "UDP disabled on this VLESS outbound",
             ));
+        }
+        if let Some(vision_flow) = self.inner.flow {
+            let inner = Arc::clone(&self.inner);
+            return Ok(Box::new(VlessVisionXudpSession::new(
+                vision_flow,
+                move || {
+                    let inner = Arc::clone(&inner);
+                    async move { inner.connect_vision_mux_stream().await }
+                },
+            )));
         }
         Ok(Box::new(VlessUdpSession::new(Arc::clone(&self.inner))))
     }
@@ -484,6 +639,22 @@ impl OutboundHandler for VlessOutbound {
                 io::ErrorKind::InvalidInput,
                 "VLESS UDP datagram exceeds 65535 bytes",
             ));
+        }
+        if let Some(vision_flow) = self.inner.flow {
+            if !vision_flow.allows_udp_port(target.port) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "XTLS Vision rejected UDP/443 traffic (use xtls-rprx-vision-udp443 to enable)",
+                ));
+            }
+            return tokio::time::timeout(timeout, async {
+                let sess = self.open_udp_session().await?;
+                sess.send_to(payload, target).await?;
+                let (resp, _src) = sess.recv_from().await?;
+                Ok(resp)
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "VLESS Vision XUDP timed out"))?;
         }
 
         tokio::time::timeout(timeout, async {
@@ -813,6 +984,97 @@ async fn spawn_vless_server_inner(
     Ok((bound_addr, handle))
 }
 
+/// Loopback VLESS + REALITY (+ optional `xtls-rprx-vision` & XUDP) test server configuration.
+#[derive(Clone)]
+pub struct VlessRealityServerConfig {
+    pub listen_addr: String,
+    pub allowed_uuid: Uuid,
+    pub reality_private_key: [u8; 32],
+    pub reality_short_id: [u8; 8],
+    pub reality_server_name: String,
+}
+
+pub async fn spawn_vless_reality_vision_server(
+    cfg: VlessRealityServerConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let listener = TcpListener::bind(&cfg.listen_addr).await?;
+    let bound_addr = listener.local_addr()?;
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    let Ok((tcp, _peer)) = accepted else {
+                        continue;
+                    };
+                    let _ = tcp.set_nodelay(true);
+                    let cfg_clone = cfg.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_vless_reality_server_conn(tcp, cfg_clone).await;
+                    });
+                }
+            }
+        }
+    });
+
+    Ok((bound_addr, handle))
+}
+
+async fn handle_vless_reality_server_conn(
+    tcp: TcpStream,
+    cfg: VlessRealityServerConfig,
+) -> io::Result<()> {
+    let mut tls = accept_reality_tls13_server(
+        tcp,
+        &cfg.reality_private_key,
+        &cfg.reality_short_id,
+        &cfg.reality_server_name,
+    )
+    .await?;
+
+    let ver = tls.read_u8().await?;
+    if ver != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported VLESS version 0x{ver:02x}"),
+        ));
+    }
+    let mut uuid_bytes = [0u8; 16];
+    tls.read_exact(&mut uuid_bytes).await?;
+    if Uuid::from_bytes(uuid_bytes) != cfg.allowed_uuid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VLESS UUID mismatch",
+        ));
+    }
+    let addons_len = tls.read_u8().await? as usize;
+    let mut addons = vec![0u8; addons_len];
+    if addons_len > 0 {
+        tls.read_exact(&mut addons).await?;
+    }
+    let is_vision = addons == VISION_ADDONS_PROTOBUF;
+    let cmd = tls.read_u8().await?;
+    let target = match cmd {
+        VLESS_CMD_TCP | VLESS_CMD_UDP => Some(TargetAddr::read_vless(&mut tls).await?),
+        _ => None,
+    };
+
+    if is_vision {
+        let vision_stream: BoxedStream =
+            Box::new(VisionStream::new_server(tls, cfg.allowed_uuid, &[]));
+        dispatch_vless_server_body(vision_stream, cmd, target, true).await
+    } else {
+        let plain_tls: BoxedStream = Box::new(tls);
+        dispatch_vless_server_body(plain_tls, cmd, target, false).await
+    }
+}
+
 async fn handle_vless_server_conn(
     tcp: TcpStream,
     expected_uuid: Uuid,
@@ -859,17 +1121,36 @@ async fn handle_vless_server_conn(
         stream.read_exact(&mut addons).await?;
     }
     let cmd = stream.read_u8().await?;
+    let target = match cmd {
+        VLESS_CMD_TCP | VLESS_CMD_UDP => Some(TargetAddr::read_vless(&mut stream).await?),
+        _ => None,
+    };
+    dispatch_vless_server_body(stream, cmd, target, false).await
+}
+
+async fn dispatch_vless_server_body(
+    mut stream: BoxedStream,
+    cmd: u8,
+    parsed_target: Option<TargetAddr>,
+    resp_hdr_coalesced_by_stream: bool,
+) -> io::Result<()> {
     let direct = DirectOutbound::default();
     match cmd {
         VLESS_CMD_TCP => {
-            let target = TargetAddr::read_vless(&mut stream).await?;
+            let target = parsed_target.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing VLESS TCP target")
+            })?;
             let mut outbound = direct.connect_tcp(&target).await?;
-            stream.write_all(&[0x00, 0x00]).await?;
+            if !resp_hdr_coalesced_by_stream {
+                stream.write_all(&[0x00, 0x00]).await?;
+            }
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await?;
             Ok(())
         }
         VLESS_CMD_UDP => {
-            let target = TargetAddr::read_vless(&mut stream).await?;
+            let target = parsed_target.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing VLESS UDP target")
+            })?;
             let upstream = Arc::new(direct.open_udp_session().await?);
             let upstream_rx = Arc::clone(&upstream);
             let (mut rd, mut wr) = tokio::io::split(stream);
@@ -885,7 +1166,7 @@ async fn handle_vless_server_conn(
             };
 
             let up_to_client = async move {
-                let mut hdr_sent = false;
+                let mut hdr_sent = resp_hdr_coalesced_by_stream;
                 while let Ok(res) =
                     tokio::time::timeout(Duration::from_secs(60), upstream_rx.recv_from()).await
                 {
@@ -917,7 +1198,7 @@ async fn handle_vless_server_conn(
             let (resp_tx, mut resp_rx) = mpsc::channel::<(u16, TargetAddr, Vec<u8>)>(128);
 
             let writer_fut = async move {
-                let mut hdr_sent = false;
+                let mut hdr_sent = resp_hdr_coalesced_by_stream;
                 while let Some((session_id, src_addr, resp)) = resp_rx.recv().await {
                     let mut resp_meta = BytesMut::with_capacity(32);
                     resp_meta.put_u16(session_id);

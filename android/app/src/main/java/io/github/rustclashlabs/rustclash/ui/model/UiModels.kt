@@ -101,6 +101,17 @@ data class ProxyNodeItem(
     val port: Int,
     val cipher: String = "",
     val encryption: String = "",
+    val flow: String = "",
+    val realityEnabled: Boolean = false,
+    val realityPublicKey: String = "",
+    val realityShortId: String = "",
+    val clientFingerprint: String = "",
+    val alterId: Int = 0,
+    val ports: String = "",
+    val obfs: String = "",
+    val udpRelayMode: String = "",
+    val congestionController: String = "",
+    val zeroRttHandshake: Boolean = false,
     val sni: String = "",
     val tls: Boolean = true,
     val skipCertVerify: Boolean = false,
@@ -117,8 +128,11 @@ data class ProxyNodeItem(
         get() = when (type.lowercase(Locale.ROOT)) {
             "ss", "shadowsocks" -> "Shadowsocks"
             "vless" -> "VLESS"
+            "vmess" -> "VMess"
             "anytls" -> "AnyTLS"
             "trojan" -> "Trojan"
+            "hysteria2", "hy2" -> "Hysteria2"
+            "tuic" -> "TUIC v5"
             "socks5", "socks" -> "SOCKS5"
             "http" -> "HTTP"
             "direct" -> "DIRECT"
@@ -129,9 +143,17 @@ data class ProxyNodeItem(
     val protocolShortBadge: String
         get() = when (type.lowercase(Locale.ROOT)) {
             "ss", "shadowsocks" -> "SS"
-            "vless" -> if (network.equals("ws", ignoreCase = true)) "VLESS·WS" else "VLESS"
+            "vless" -> when {
+                realityEnabled -> "VLESS·REALITY"
+                flow.contains("vision", ignoreCase = true) -> "VLESS·Vision"
+                network.equals("ws", ignoreCase = true) -> "VLESS·WS"
+                else -> "VLESS"
+            }
+            "vmess" -> if (network.equals("ws", ignoreCase = true)) "VMess·WS" else "VMess"
             "anytls" -> "AnyTLS"
             "trojan" -> if (network.equals("ws", ignoreCase = true)) "Trojan·WS" else "Trojan"
+            "hysteria2", "hy2" -> "Hy2"
+            "tuic" -> "TUIC"
             "socks5", "socks" -> "SOCKS5"
             "http" -> "HTTP"
             else -> type.uppercase(Locale.ROOT)
@@ -429,8 +451,11 @@ data class AppUiState(
             return when (effectiveProtocol.lowercase(Locale.ROOT)) {
                 "ss", "shadowsocks" -> "SS"
                 "vless" -> "VLESS"
+                "vmess" -> "VMess"
                 "anytls" -> "AnyTLS"
                 "trojan" -> "Trojan"
+                "hysteria2", "hy2" -> "Hy2"
+                "tuic" -> "TUIC"
                 "socks5", "socks" -> "SOCKS5"
                 "http" -> "HTTP"
                 "direct" -> "DIRECT"
@@ -556,16 +581,19 @@ object UiJsonParsers {
             val n = nodesArr.optJSONObject(i) ?: continue
             val name = n.optString("name")
             if (name.isBlank()) continue
-            val nodeType = n.optString("type", "ss")
+            val rawType = n.optString("type", "ss")
+            val nodeType = if (rawType.equals("hy2", ignoreCase = true)) "hysteria2" else rawType
             val sni = n.optString("servername").takeIf { it.isNotBlank() && it != "null" }
                 ?: n.optString("sni").takeIf { it.isNotBlank() && it != "null" }
                 ?: ""
-            val defaultTls = nodeType.lowercase(Locale.ROOT) in setOf("vless", "anytls", "trojan")
+            val defaultTls = nodeType.lowercase(Locale.ROOT) in setOf("vless", "anytls", "trojan", "hysteria2", "tuic")
             val wsOpts = n.optJSONObject("ws-opts")
             val wsHost = wsOpts?.optJSONObject("headers")?.let { hdrs ->
                 hdrs.optString("Host").takeIf { it.isNotBlank() }
                     ?: hdrs.optString("host").takeIf { it.isNotBlank() }
             } ?: ""
+            val realityOpts = n.optJSONObject("reality-opts")
+            val realityEnabled = realityOpts != null
             nodesList.add(
                 ProxyNodeItem(
                     name = name,
@@ -574,8 +602,19 @@ object UiJsonParsers {
                     port = n.optInt("port", 443),
                     cipher = n.optString("cipher", ""),
                     encryption = n.optString("encryption", ""),
+                    flow = n.optString("flow", "").takeIf { it != "null" } ?: "",
+                    realityEnabled = realityEnabled,
+                    realityPublicKey = realityOpts?.optString("public-key", "")?.takeIf { it != "null" } ?: "",
+                    realityShortId = realityOpts?.optString("short-id", "")?.takeIf { it != "null" } ?: "",
+                    clientFingerprint = n.optString("client-fingerprint", "").takeIf { it != "null" } ?: "",
+                    alterId = n.optInt("alterId", 0),
+                    ports = n.optString("ports", "").takeIf { it != "null" } ?: "",
+                    obfs = n.optString("obfs", "").takeIf { it != "null" } ?: "",
+                    udpRelayMode = n.optString("udp-relay-mode", "").takeIf { it != "null" } ?: "",
+                    congestionController = n.optString("congestion-controller", "").takeIf { it != "null" } ?: "",
+                    zeroRttHandshake = n.optBoolean("zero-rtt-handshake", false),
                     sni = sni,
-                    tls = if (n.has("tls")) n.optBoolean("tls", defaultTls) else defaultTls,
+                    tls = if (realityEnabled) true else if (n.has("tls")) n.optBoolean("tls", defaultTls) else defaultTls,
                     skipCertVerify = n.optBoolean("skip-cert-verify", false),
                     udp = n.optBoolean("udp", true),
                     network = n.optString("network", "tcp").ifBlank { "tcp" },

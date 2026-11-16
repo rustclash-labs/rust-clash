@@ -1042,7 +1042,9 @@ fn validate_single_proxy_node(p: &ProxyNodeConfig) -> Result<()> {
         ProxyNodeConfig::Vless {
             uuid,
             encryption,
+            tls,
             flow,
+            reality_opts,
             network,
             ..
         } => {
@@ -1063,21 +1065,14 @@ fn validate_single_proxy_node(p: &ProxyNodeConfig) -> Result<()> {
                     )));
                 }
             }
-            if let Some(flow) = flow {
-                let f = flow.trim();
-                if !f.is_empty() && !f.eq_ignore_ascii_case("none") {
-                    return Err(ProxyError::Config(format!(
-                        "VLESS proxy '{name}' specifies unsupported flow '{f}' (XTLS/Vision flows are not supported; use standard TLS or mlkem768x25519plus encryption)"
-                    )));
-                }
-            }
             if encryption == REDACTED_SECRET {
                 return Err(ProxyError::Config(format!(
                     "VLESS proxy '{name}' encryption credential cannot remain redacted"
                 )));
             }
             let enc = encryption.trim();
-            if !enc.is_empty() && !enc.eq_ignore_ascii_case("none") {
+            let has_pq_enc = !enc.is_empty() && !enc.eq_ignore_ascii_case("none");
+            if has_pq_enc {
                 crate::outbound::vless::encryption::config::parse_client_encryption(enc).map_err(
                     |_| {
                         ProxyError::Config(format!(
@@ -1086,6 +1081,171 @@ fn validate_single_proxy_node(p: &ProxyNodeConfig) -> Result<()> {
                     },
                 )?;
             }
+            let parsed_flow = match flow {
+                Some(f) => crate::outbound::vless::vision::VlessVisionFlow::parse(f).map_err(|_| {
+                    ProxyError::Config(format!(
+                        "VLESS proxy '{name}' specifies unsupported flow '{}' (supported: xtls-rprx-vision, xtls-rprx-vision-udp443)",
+                        f.trim()
+                    ))
+                })?,
+                None => None,
+            };
+            if let Some(vf) = parsed_flow {
+                if p.effective_ws_opts().is_some() {
+                    return Err(ProxyError::Config(format!(
+                        "VLESS proxy '{name}' flow '{}' requires TCP transport (WebSocket is incompatible)",
+                        vf.as_str()
+                    )));
+                }
+                if has_pq_enc {
+                    return Err(ProxyError::Config(format!(
+                        "VLESS proxy '{name}' flow '{}' cannot be combined with VLESS PQ encryption",
+                        vf.as_str()
+                    )));
+                }
+                if !*tls && reality_opts.is_none() {
+                    return Err(ProxyError::Config(format!(
+                        "VLESS proxy '{name}' flow '{}' requires TLS or REALITY",
+                        vf.as_str()
+                    )));
+                }
+            }
+            if let Some(ropts) = reality_opts {
+                if p.effective_ws_opts().is_some() {
+                    return Err(ProxyError::Config(format!(
+                        "VLESS proxy '{name}' REALITY requires TCP transport (WebSocket is incompatible)"
+                    )));
+                }
+                if has_pq_enc {
+                    return Err(ProxyError::Config(format!(
+                        "VLESS proxy '{name}' REALITY cannot be combined with VLESS PQ encryption"
+                    )));
+                }
+                let pbk = ropts.public_key.trim();
+                if pbk.is_empty() || pbk == REDACTED_SECRET {
+                    return Err(ProxyError::Config(format!(
+                        "VLESS proxy '{name}' REALITY public-key cannot be empty or redacted"
+                    )));
+                }
+                crate::outbound::vless::reality::decode_reality_public_key(pbk).map_err(|_| {
+                    ProxyError::Config(format!(
+                        "VLESS proxy '{name}' has an invalid REALITY public-key (expected 32-byte Base64 X25519 key)"
+                    ))
+                })?;
+                if let Some(sid) = &ropts.short_id {
+                    crate::outbound::vless::reality::decode_reality_short_id(sid).map_err(
+                        |_| {
+                            ProxyError::Config(format!(
+                                "VLESS proxy '{name}' has an invalid REALITY short-id (expected 0..=16 hex digits)"
+                            ))
+                        },
+                    )?;
+                }
+            }
+        }
+        ProxyNodeConfig::Vmess {
+            uuid,
+            cipher,
+            network,
+            ..
+        } => {
+            if *uuid == uuid::Uuid::nil() {
+                return Err(ProxyError::Config(format!(
+                    "VMess proxy '{name}' UUID cannot be nil (00000000-0000-0000-0000-000000000000)"
+                )));
+            }
+            if let Some(net) = network {
+                let n = net.trim();
+                if !n.is_empty() && !n.eq_ignore_ascii_case("tcp") && !n.eq_ignore_ascii_case("ws")
+                {
+                    return Err(ProxyError::Config(format!(
+                        "VMess proxy '{name}' specifies unsupported network '{n}' (supported: tcp, ws)"
+                    )));
+                }
+            }
+            crate::outbound::vmess::crypto::VmessSecurity::parse(cipher).map_err(|_| {
+                ProxyError::Config(format!(
+                    "VMess proxy '{name}' specifies unsupported cipher '{}' (supported: auto, aes-128-gcm, chacha20-poly1305, none, zero)",
+                    cipher.trim()
+                ))
+            })?;
+        }
+        ProxyNodeConfig::Hysteria2 {
+            port,
+            ports,
+            password,
+            obfs,
+            obfs_password,
+            up,
+            down,
+            ..
+        } => {
+            if password.is_empty() || password == REDACTED_SECRET {
+                return Err(ProxyError::Config(format!(
+                    "Hysteria2 proxy '{name}' password cannot be empty or redacted"
+                )));
+            }
+            if let Some(ps) = ports
+                && !ps.trim().is_empty()
+            {
+                crate::outbound::quic_common::PortSpec::parse(ps, *port).map_err(|e| {
+                    ProxyError::Config(format!(
+                        "Hysteria2 proxy '{name}' has invalid ports specification: {e}"
+                    ))
+                })?;
+            }
+            if let Some(obfs_mode) = obfs {
+                let m = obfs_mode.trim();
+                if !m.is_empty() && !m.eq_ignore_ascii_case("none") {
+                    if !m.eq_ignore_ascii_case("salamander") {
+                        return Err(ProxyError::Config(format!(
+                            "Hysteria2 proxy '{name}' specifies unsupported obfs '{m}' (supported: salamander)"
+                        )));
+                    }
+                    let pw = obfs_password.as_deref().unwrap_or("");
+                    if pw.is_empty() || pw == REDACTED_SECRET {
+                        return Err(ProxyError::Config(format!(
+                            "Hysteria2 proxy '{name}' obfs 'salamander' requires a non-empty obfs-password"
+                        )));
+                    }
+                    crate::outbound::quic_common::SalamanderObfs::new(pw).map_err(|e| {
+                        ProxyError::Config(format!(
+                            "Hysteria2 proxy '{name}' invalid obfs-password: {e}"
+                        ))
+                    })?;
+                }
+            }
+            crate::outbound::hysteria2::parse_hy2_bandwidth_bytes_per_sec(up.as_deref()).map_err(
+                |e| ProxyError::Config(format!("Hysteria2 proxy '{name}' invalid up rate: {e}")),
+            )?;
+            crate::outbound::hysteria2::parse_hy2_bandwidth_bytes_per_sec(down.as_deref())
+                .map_err(|e| {
+                    ProxyError::Config(format!("Hysteria2 proxy '{name}' invalid down rate: {e}"))
+                })?;
+        }
+        ProxyNodeConfig::Tuic {
+            uuid,
+            password,
+            udp_relay_mode,
+            congestion_controller,
+            ..
+        } => {
+            if *uuid == uuid::Uuid::nil() {
+                return Err(ProxyError::Config(format!(
+                    "TUIC proxy '{name}' UUID cannot be nil (00000000-0000-0000-0000-000000000000)"
+                )));
+            }
+            if password == REDACTED_SECRET {
+                return Err(ProxyError::Config(format!(
+                    "TUIC proxy '{name}' password cannot remain redacted"
+                )));
+            }
+            crate::outbound::tuic::TuicUdpRelayMode::parse_opt(udp_relay_mode.as_deref())
+                .map_err(|e| ProxyError::Config(format!("TUIC proxy '{name}': {e}")))?;
+            crate::outbound::quic_common::QuicCongestionControl::parse_opt(
+                congestion_controller.as_deref(),
+            )
+            .map_err(|e| ProxyError::Config(format!("TUIC proxy '{name}': {e}")))?;
         }
         ProxyNodeConfig::Anytls { password, .. } => {
             if password.is_empty() || password == REDACTED_SECRET {
@@ -1248,19 +1408,42 @@ fn normalize_proxy_yaml_item(item: &mut YamlValue) {
         "name",
         "type",
         "server",
+        "ip",
         "cipher",
         "password",
+        "auth-str",
+        "auth_str",
+        "auth",
         "uuid",
         "encryption",
         "servername",
         "sni",
         "peer",
         "flow",
+        "client-fingerprint",
+        "client_fingerprint",
+        "fp",
         "network",
         "transport",
         "username",
         "security",
         "ws-path",
+        "ports",
+        "mport",
+        "obfs",
+        "obfs-password",
+        "obfs_password",
+        "up",
+        "down",
+        "udp-relay-mode",
+        "udp_relay_mode",
+        "congestion-controller",
+        "congestion_controller",
+        "congestion-control",
+        "congestion_control",
+        "public-key",
+        "short-id",
+        "spider-x",
     ] {
         if let Some(v) = pmap.get_mut(str_k) {
             coerce_yaml_string(v);
@@ -1285,6 +1468,7 @@ fn normalize_proxy_yaml_item(item: &mut YamlValue) {
         let mapped = match low.as_str() {
             "shadowsocks" => "ss",
             "socks" => "socks5",
+            "hy2" => "hysteria2",
             "https" => {
                 force_tls_default = true;
                 "http"
@@ -1294,12 +1478,179 @@ fn normalize_proxy_yaml_item(item: &mut YamlValue) {
         proto_lc = mapped.to_string();
         *t = mapped.to_string();
     }
-    if proto_lc == "vless"
-        && !pmap.contains_key("tls")
-        && yaml_str_field(pmap, "security").is_some_and(|s| s.trim().eq_ignore_ascii_case("tls"))
-    {
-        force_tls_default = true;
+
+    if proto_lc == "vless" {
+        if let Some(ro_alias) = pmap.remove("reality_opts")
+            && !pmap.contains_key("reality-opts")
+        {
+            pmap.insert(yaml_key("reality-opts"), ro_alias);
+        }
+        let flat_pbk = pmap.remove("public-key");
+        let flat_sid = pmap.remove("short-id");
+        let flat_spx = pmap.remove("spider-x");
+        if !pmap.contains_key("reality-opts")
+            && (flat_pbk.is_some() || flat_sid.is_some() || flat_spx.is_some())
+        {
+            let mut rmap = YamlMap::new();
+            if let Some(v) = flat_pbk {
+                rmap.insert(yaml_key("public-key"), v);
+            }
+            if let Some(v) = flat_sid {
+                rmap.insert(yaml_key("short-id"), v);
+            }
+            if let Some(v) = flat_spx {
+                rmap.insert(yaml_key("spider-x"), v);
+            }
+            pmap.insert(yaml_key("reality-opts"), YamlValue::Object(rmap));
+        }
+        if let Some(YamlValue::Object(rmap)) = pmap.get_mut("reality-opts") {
+            strip_null_entries(rmap);
+            for (alias_k, canon_k) in [
+                ("public_key", "public-key"),
+                ("pbk", "public-key"),
+                ("short_id", "short-id"),
+                ("sid", "short-id"),
+                ("spider_x", "spider-x"),
+                ("spx", "spider-x"),
+            ] {
+                if let Some(av) = rmap.remove(alias_k)
+                    && !rmap.contains_key(canon_k)
+                {
+                    rmap.insert(yaml_key(canon_k), av);
+                }
+            }
+            for rk in ["public-key", "short-id", "spider-x"] {
+                if let Some(v) = rmap.get_mut(rk) {
+                    coerce_yaml_string(v);
+                }
+            }
+        }
+        for fp_alias in ["client_fingerprint", "fp"] {
+            if let Some(fv) = pmap.remove(fp_alias)
+                && !pmap.contains_key("client-fingerprint")
+            {
+                pmap.insert(yaml_key("client-fingerprint"), fv);
+            }
+        }
+        if !pmap.contains_key("tls")
+            && (yaml_str_field(pmap, "security").is_some_and(|s| {
+                let st = s.trim();
+                st.eq_ignore_ascii_case("tls") || st.eq_ignore_ascii_case("reality")
+            }) || yaml_has_non_null_key(pmap, "reality-opts"))
+        {
+            force_tls_default = true;
+        }
+    } else if proto_lc == "vmess" {
+        if let Some(sec_val) = pmap.remove("security")
+            && let Some(sec_s) = sec_val.as_str()
+        {
+            let st = sec_s.trim();
+            if st.eq_ignore_ascii_case("tls") {
+                force_tls_default = true;
+            } else if !st.is_empty() && !pmap.contains_key("cipher") {
+                pmap.insert(yaml_key("cipher"), YamlValue::String(st.to_string()));
+            }
+        }
+        for aid_alias in ["alter-id", "alter_id", "aid"] {
+            if let Some(av) = pmap.remove(aid_alias)
+                && !pmap.contains_key("alterId")
+            {
+                pmap.insert(yaml_key("alterId"), av);
+            }
+        }
+        if let Some(gp_alias) = pmap.remove("global_padding")
+            && !pmap.contains_key("global-padding")
+        {
+            pmap.insert(yaml_key("global-padding"), gp_alias);
+        }
+    } else if proto_lc == "hysteria2" {
+        if let Some(mp_val) = pmap.remove("mport")
+            && !pmap.contains_key("ports")
+        {
+            pmap.insert(yaml_key("ports"), mp_val);
+        }
+        for auth_alias in ["auth-str", "auth_str", "auth"] {
+            if let Some(av) = pmap.remove(auth_alias)
+                && !pmap.contains_key("password")
+            {
+                pmap.insert(yaml_key("password"), av);
+            }
+        }
+        if let Some(op_val) = pmap.remove("obfs_password")
+            && !pmap.contains_key("obfs-password")
+        {
+            pmap.insert(yaml_key("obfs-password"), op_val);
+        }
+        let missing_port = match pmap.get("port") {
+            None => true,
+            Some(YamlValue::Number(n)) => n.as_u64() == Some(0),
+            Some(YamlValue::String(s)) => s.trim().is_empty() || s.trim() == "0",
+            _ => false,
+        };
+        if missing_port
+            && let Some(ps) = yaml_str_field(pmap, "ports")
+            && let Ok(spec) = crate::outbound::quic_common::PortSpec::parse(ps, 443)
+        {
+            pmap.insert(
+                yaml_key("port"),
+                YamlValue::Number(spec.first_port().into()),
+            );
+        }
+    } else if proto_lc == "tuic" {
+        if let Some(ip_val) = pmap.remove("ip")
+            && let Some(ip_str) = ip_val.as_str()
+        {
+            let clean_ip = ip_str
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_string();
+            if !clean_ip.is_empty() {
+                if !pmap.contains_key("sni")
+                    && !pmap.contains_key("servername")
+                    && let Some(srv_str) = yaml_str_field(pmap, "server")
+                    && !srv_str.trim().is_empty()
+                {
+                    pmap.insert(
+                        yaml_key("sni"),
+                        YamlValue::String(srv_str.trim().to_string()),
+                    );
+                }
+                pmap.insert(yaml_key("server"), YamlValue::String(clean_ip));
+            }
+        }
+        for (alias_k, canon_k) in [
+            ("udp_relay_mode", "udp-relay-mode"),
+            ("congestion_controller", "congestion-controller"),
+            ("congestion-control", "congestion-controller"),
+            ("congestion_control", "congestion-controller"),
+            ("reduce_rtt", "reduce-rtt"),
+            ("zero-rtt-handshake", "reduce-rtt"),
+            ("disable_sni", "disable-sni"),
+            ("heartbeat_interval", "heartbeat-interval"),
+        ] {
+            if let Some(av) = pmap.remove(alias_k)
+                && !pmap.contains_key(canon_k)
+            {
+                pmap.insert(yaml_key(canon_k), av);
+            }
+        }
+        if let Some(YamlValue::String(hb_s)) = pmap.get_mut("heartbeat-interval") {
+            let ht = hb_s.trim().to_ascii_lowercase();
+            if let Some(ms_part) = ht.strip_suffix("ms") {
+                if let Ok(ms) = ms_part.trim().parse::<u64>() {
+                    *pmap.get_mut("heartbeat-interval").unwrap() = YamlValue::Number(ms.into());
+                }
+            } else if let Some(sec_part) = ht.strip_suffix('s')
+                && let Ok(secs) = sec_part.trim().parse::<u64>()
+            {
+                *pmap.get_mut("heartbeat-interval").unwrap() =
+                    YamlValue::Number((secs.saturating_mul(1000)).into());
+            }
+        }
     }
+
     if force_tls_default && !pmap.contains_key("tls") {
         pmap.insert(yaml_key("tls"), YamlValue::Bool(true));
     }
@@ -1321,7 +1672,7 @@ fn normalize_proxy_yaml_item(item: &mut YamlValue) {
             pmap.insert(yaml_key("network"), tv);
         }
     }
-    if proto_lc == "vless" {
+    if proto_lc == "vless" || proto_lc == "vmess" {
         if pmap.contains_key("servername") && pmap.contains_key("sni") {
             let sni_val = pmap.remove("sni");
             let srv_empty = yaml_str_field(pmap, "servername").is_none_or(|s| s.trim().is_empty());
@@ -1362,6 +1713,8 @@ fn normalize_proxy_yaml_item(item: &mut YamlValue) {
 
     for num_k in [
         "port",
+        "alterId",
+        "heartbeat-interval",
         "idle-session-check-interval",
         "idle-session-timeout",
         "min-idle-session",
@@ -1375,7 +1728,14 @@ fn normalize_proxy_yaml_item(item: &mut YamlValue) {
     {
         *pmap.get_mut("tls").unwrap() = YamlValue::Bool(true);
     }
-    for bool_k in ["udp", "tls", "skip-cert-verify"] {
+    for bool_k in [
+        "udp",
+        "tls",
+        "skip-cert-verify",
+        "global-padding",
+        "reduce-rtt",
+        "disable-sni",
+    ] {
         if let Some(v) = pmap.get_mut(bool_k) {
             coerce_yaml_bool(v);
             if !v.is_boolean() {
@@ -2603,32 +2963,90 @@ fn validate_raw_yaml_proxy_mapping(
                 if !s.is_empty()
                     && !s.eq_ignore_ascii_case("none")
                     && !s.eq_ignore_ascii_case("tls")
+                    && !s.eq_ignore_ascii_case("reality")
                 {
-                    if s.eq_ignore_ascii_case("reality") {
-                        return Err(fail(format!(
-                            "VLESS proxy '{name}' uses security 'reality', which is not supported (supported: none, tls, or VLESS PQ encryption)"
-                        )));
-                    }
                     return Err(fail(format!(
-                        "VLESS proxy '{name}' uses unsupported security '{s}' (supported: none, tls)"
+                        "VLESS proxy '{name}' uses unsupported security '{s}' (supported: none, tls, reality)"
                     )));
                 }
             }
             for unsupported_key in [
-                "reality-opts",
                 "grpc-opts",
                 "h2-opts",
                 "http-opts",
                 "v2ray-http-upgrade",
                 "smux",
                 "ech-opts",
-                "public-key",
-                "short-id",
-                "spider-x",
             ] {
                 if yaml_has_non_null_key(pmap, unsupported_key) {
                     return Err(fail(format!(
-                        "VLESS proxy '{name}' includes unsupported option '{unsupported_key}' (gRPC, REALITY, and Multiplex transports are not supported)"
+                        "VLESS proxy '{name}' includes unsupported option '{unsupported_key}' (gRPC/H2/Multiplex transports are not supported)"
+                    )));
+                }
+            }
+        }
+        "vmess" => {
+            for net_key in ["network", "transport"] {
+                if let Some(net) = yaml_str_field(pmap, net_key) {
+                    let n = net.trim();
+                    if !n.is_empty()
+                        && !n.eq_ignore_ascii_case("tcp")
+                        && !n.eq_ignore_ascii_case("ws")
+                    {
+                        return Err(fail(format!(
+                            "VMess proxy '{name}' specifies unsupported {net_key} '{n}' (supported: tcp, ws)"
+                        )));
+                    }
+                }
+            }
+            for unsupported_key in [
+                "grpc-opts",
+                "h2-opts",
+                "http-opts",
+                "v2ray-http-upgrade",
+                "smux",
+                "reality-opts",
+            ] {
+                if yaml_has_non_null_key(pmap, unsupported_key) {
+                    return Err(fail(format!(
+                        "VMess proxy '{name}' includes unsupported option '{unsupported_key}'"
+                    )));
+                }
+            }
+        }
+        "hysteria2" => {
+            for unsupported_key in [
+                "ca",
+                "ca-str",
+                "smux",
+                "ws-opts",
+                "grpc-opts",
+                "reality-opts",
+            ] {
+                if yaml_has_non_null_key(pmap, unsupported_key) {
+                    return Err(fail(format!(
+                        "Hysteria2 proxy '{name}' includes unsupported option '{unsupported_key}'"
+                    )));
+                }
+            }
+        }
+        "tuic" => {
+            if yaml_has_non_null_key(pmap, "token") && !yaml_has_non_null_key(pmap, "uuid") {
+                return Err(fail(format!(
+                    "TUIC proxy '{name}' uses legacy TUIC v4 'token' authentication (only TUIC v5 with 'uuid' and 'password' is supported)"
+                )));
+            }
+            for unsupported_key in [
+                "ca",
+                "ca-str",
+                "smux",
+                "ws-opts",
+                "grpc-opts",
+                "reality-opts",
+            ] {
+                if yaml_has_non_null_key(pmap, unsupported_key) {
+                    return Err(fail(format!(
+                        "TUIC proxy '{name}' includes unsupported option '{unsupported_key}'"
                     )));
                 }
             }
@@ -2698,7 +3116,7 @@ fn validate_raw_yaml_proxy_mapping(
         }
         other => {
             return Err(fail(format!(
-                "proxy '{name}' uses unsupported protocol type '{other}' (supported: ss, vless, anytls, trojan, socks5, http)"
+                "proxy '{name}' uses unsupported protocol type '{other}' (supported: ss, vmess, vless, trojan, hysteria2, tuic, anytls, socks5, http)"
             )));
         }
     }
@@ -3420,12 +3838,49 @@ fn default_vless_encryption() -> String {
     "none".to_string()
 }
 
+fn default_vmess_cipher() -> String {
+    "auto".to_string()
+}
+
+fn default_tuic_heartbeat_ms() -> u64 {
+    10_000
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_zero_u16(n: &u16) -> bool {
+    *n == 0
+}
+
 fn default_idle_check_secs() -> u64 {
     30
 }
 
 fn default_idle_timeout_secs() -> u64 {
     60
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RealityOptsConfig {
+    #[serde(default, alias = "public_key", alias = "pbk")]
+    pub public_key: String,
+    #[serde(
+        default,
+        alias = "short_id",
+        alias = "sid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub short_id: Option<String>,
+    #[serde(
+        default,
+        alias = "spider_x",
+        alias = "spx",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub spider_x: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3457,10 +3912,146 @@ pub enum ProxyNodeConfig {
         alpn: Vec<String>,
         #[serde(default)]
         flow: Option<String>,
+        #[serde(
+            default,
+            rename = "reality-opts",
+            alias = "reality_opts",
+            skip_serializing_if = "Option::is_none"
+        )]
+        reality_opts: Option<RealityOptsConfig>,
+        #[serde(
+            default,
+            rename = "client-fingerprint",
+            alias = "client_fingerprint",
+            alias = "fp",
+            skip_serializing_if = "Option::is_none"
+        )]
+        client_fingerprint: Option<String>,
         #[serde(default, alias = "transport", skip_serializing_if = "Option::is_none")]
         network: Option<String>,
         #[serde(default, rename = "ws-opts", skip_serializing_if = "Option::is_none")]
         ws_opts: Option<crate::outbound::ws_stream::WsTransportConfig>,
+        #[serde(default = "default_true")]
+        udp: bool,
+    },
+    Vmess {
+        name: String,
+        server: String,
+        port: u16,
+        uuid: uuid::Uuid,
+        #[serde(
+            default,
+            rename = "alterId",
+            alias = "alter-id",
+            alias = "aid",
+            skip_serializing_if = "is_zero_u16"
+        )]
+        alter_id: u16,
+        #[serde(default = "default_vmess_cipher")]
+        cipher: String,
+        #[serde(
+            default,
+            rename = "global-padding",
+            alias = "global_padding",
+            skip_serializing_if = "is_false"
+        )]
+        global_padding: bool,
+        #[serde(default)]
+        tls: bool,
+        #[serde(default, alias = "sni", skip_serializing_if = "Option::is_none")]
+        servername: Option<String>,
+        #[serde(default, rename = "skip-cert-verify")]
+        skip_cert_verify: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        alpn: Vec<String>,
+        #[serde(default, alias = "transport", skip_serializing_if = "Option::is_none")]
+        network: Option<String>,
+        #[serde(default, rename = "ws-opts", skip_serializing_if = "Option::is_none")]
+        ws_opts: Option<crate::outbound::ws_stream::WsTransportConfig>,
+        #[serde(default = "default_true")]
+        udp: bool,
+    },
+    #[serde(alias = "hy2")]
+    Hysteria2 {
+        name: String,
+        server: String,
+        port: u16,
+        #[serde(default, alias = "mport", skip_serializing_if = "Option::is_none")]
+        ports: Option<String>,
+        #[serde(alias = "auth-str", alias = "auth_str", alias = "auth")]
+        password: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obfs: Option<String>,
+        #[serde(
+            default,
+            rename = "obfs-password",
+            alias = "obfs_password",
+            skip_serializing_if = "Option::is_none"
+        )]
+        obfs_password: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        up: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        down: Option<String>,
+        #[serde(default, alias = "servername", skip_serializing_if = "Option::is_none")]
+        sni: Option<String>,
+        #[serde(default, rename = "skip-cert-verify")]
+        skip_cert_verify: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        alpn: Vec<String>,
+        #[serde(default = "default_true")]
+        udp: bool,
+    },
+    Tuic {
+        name: String,
+        server: String,
+        port: u16,
+        uuid: uuid::Uuid,
+        #[serde(default)]
+        password: String,
+        #[serde(
+            default,
+            rename = "udp-relay-mode",
+            alias = "udp_relay_mode",
+            skip_serializing_if = "Option::is_none"
+        )]
+        udp_relay_mode: Option<String>,
+        #[serde(
+            default,
+            rename = "congestion-controller",
+            alias = "congestion_controller",
+            alias = "congestion-control",
+            alias = "congestion_control",
+            skip_serializing_if = "Option::is_none"
+        )]
+        congestion_controller: Option<String>,
+        #[serde(
+            default,
+            rename = "reduce-rtt",
+            alias = "reduce_rtt",
+            alias = "zero-rtt-handshake",
+            skip_serializing_if = "is_false"
+        )]
+        reduce_rtt: bool,
+        #[serde(
+            default,
+            rename = "disable-sni",
+            alias = "disable_sni",
+            skip_serializing_if = "is_false"
+        )]
+        disable_sni: bool,
+        #[serde(
+            default = "default_tuic_heartbeat_ms",
+            rename = "heartbeat-interval",
+            alias = "heartbeat_interval"
+        )]
+        heartbeat_interval: u64,
+        #[serde(default, alias = "servername", skip_serializing_if = "Option::is_none")]
+        sni: Option<String>,
+        #[serde(default, rename = "skip-cert-verify")]
+        skip_cert_verify: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        alpn: Vec<String>,
         #[serde(default = "default_true")]
         udp: bool,
     },
@@ -3548,6 +4139,9 @@ impl ProxyNodeConfig {
         match self {
             Self::Ss { name, .. }
             | Self::Vless { name, .. }
+            | Self::Vmess { name, .. }
+            | Self::Hysteria2 { name, .. }
+            | Self::Tuic { name, .. }
             | Self::Anytls { name, .. }
             | Self::Trojan { name, .. }
             | Self::Socks5 { name, .. }
@@ -3559,6 +4153,9 @@ impl ProxyNodeConfig {
         match self {
             Self::Ss { name, .. }
             | Self::Vless { name, .. }
+            | Self::Vmess { name, .. }
+            | Self::Hysteria2 { name, .. }
+            | Self::Tuic { name, .. }
             | Self::Anytls { name, .. }
             | Self::Trojan { name, .. }
             | Self::Socks5 { name, .. }
@@ -3572,6 +4169,9 @@ impl ProxyNodeConfig {
         match self {
             Self::Ss { server, port, .. }
             | Self::Vless { server, port, .. }
+            | Self::Vmess { server, port, .. }
+            | Self::Hysteria2 { server, port, .. }
+            | Self::Tuic { server, port, .. }
             | Self::Anytls { server, port, .. }
             | Self::Trojan { server, port, .. }
             | Self::Socks5 { server, port, .. }
@@ -3582,6 +4182,9 @@ impl ProxyNodeConfig {
     pub fn effective_ws_opts(&self) -> Option<crate::outbound::ws_stream::WsTransportConfig> {
         match self {
             Self::Vless {
+                network, ws_opts, ..
+            }
+            | Self::Vmess {
                 network, ws_opts, ..
             }
             | Self::Trojan {
@@ -3610,8 +4213,24 @@ impl ProxyNodeConfig {
                     "Shadowsocks"
                 }
             }
-            Self::Vless { encryption, .. } => {
-                if encryption != "none" && !encryption.is_empty() {
+            Self::Vless {
+                encryption,
+                flow,
+                reality_opts,
+                ..
+            } => {
+                let has_vision = flow.as_deref().is_some_and(|f| {
+                    let ft = f.trim();
+                    ft.eq_ignore_ascii_case("xtls-rprx-vision")
+                        || ft.eq_ignore_ascii_case("xtls-rprx-vision-udp443")
+                });
+                if reality_opts.is_some() && has_vision {
+                    "VLESS+REALITY+Vision"
+                } else if reality_opts.is_some() {
+                    "VLESS+REALITY"
+                } else if has_vision {
+                    "VLESS+Vision"
+                } else if encryption != "none" && !encryption.is_empty() {
                     "VLESS+Encryption"
                 } else if self.effective_ws_opts().is_some() {
                     "VLESS+WS"
@@ -3619,6 +4238,15 @@ impl ProxyNodeConfig {
                     "VLESS"
                 }
             }
+            Self::Vmess { .. } => {
+                if self.effective_ws_opts().is_some() {
+                    "VMess+WS"
+                } else {
+                    "VMess"
+                }
+            }
+            Self::Hysteria2 { .. } => "Hysteria2",
+            Self::Tuic { .. } => "TUIC-v5",
             Self::Anytls { .. } => "AnyTLS-v2",
             Self::Trojan { .. } => {
                 if self.effective_ws_opts().is_some() {
@@ -3647,11 +4275,45 @@ impl ProxyNodeConfig {
                 *password = REDACTED_SECRET.to_string();
             }
             Self::Vless {
-                uuid, encryption, ..
+                uuid,
+                encryption,
+                reality_opts,
+                ..
             } => {
                 *uuid = uuid::Uuid::nil();
                 if encryption != "none" && !encryption.is_empty() {
                     *encryption = REDACTED_SECRET.to_string();
+                }
+                if let Some(ropts) = reality_opts {
+                    if !ropts.public_key.is_empty() {
+                        ropts.public_key = REDACTED_SECRET.to_string();
+                    }
+                    if let Some(sid) = &mut ropts.short_id
+                        && !sid.is_empty()
+                    {
+                        *sid = REDACTED_SECRET.to_string();
+                    }
+                }
+            }
+            Self::Vmess { uuid, .. } => {
+                *uuid = uuid::Uuid::nil();
+            }
+            Self::Hysteria2 {
+                password,
+                obfs_password,
+                ..
+            } => {
+                *password = REDACTED_SECRET.to_string();
+                if let Some(op) = obfs_password
+                    && !op.is_empty()
+                {
+                    *op = REDACTED_SECRET.to_string();
+                }
+            }
+            Self::Tuic { uuid, password, .. } => {
+                *uuid = uuid::Uuid::nil();
+                if !password.is_empty() {
+                    *password = REDACTED_SECRET.to_string();
                 }
             }
             Self::Socks5 { password, .. } => {
@@ -3683,8 +4345,27 @@ impl ProxyNodeConfig {
             | Self::Anytls { password, .. }
             | Self::Trojan { password, .. } => password == REDACTED_SECRET,
             Self::Vless {
-                uuid, encryption, ..
-            } => *uuid == uuid::Uuid::nil() || encryption == REDACTED_SECRET,
+                uuid,
+                encryption,
+                reality_opts,
+                ..
+            } => {
+                *uuid == uuid::Uuid::nil()
+                    || encryption == REDACTED_SECRET
+                    || reality_opts.as_ref().is_some_and(|r| {
+                        r.public_key == REDACTED_SECRET
+                            || r.short_id.as_deref() == Some(REDACTED_SECRET)
+                    })
+            }
+            Self::Vmess { uuid, .. } => *uuid == uuid::Uuid::nil(),
+            Self::Hysteria2 {
+                password,
+                obfs_password,
+                ..
+            } => password == REDACTED_SECRET || obfs_password.as_deref() == Some(REDACTED_SECRET),
+            Self::Tuic { uuid, password, .. } => {
+                *uuid == uuid::Uuid::nil() || password == REDACTED_SECRET
+            }
             Self::Socks5 { password, .. } => password.as_deref() == Some(REDACTED_SECRET),
             Self::Http {
                 password, headers, ..
@@ -3709,11 +4390,15 @@ impl ProxyNodeConfig {
             }
             (
                 Self::Vless {
-                    uuid, encryption, ..
+                    uuid,
+                    encryption,
+                    reality_opts,
+                    ..
                 },
                 Self::Vless {
                     uuid: orig_uuid,
                     encryption: orig_enc,
+                    reality_opts: orig_ropts,
                     ..
                 },
             ) => {
@@ -3722,6 +4407,58 @@ impl ProxyNodeConfig {
                 }
                 if encryption == REDACTED_SECRET {
                     *encryption = orig_enc.clone();
+                }
+                if let (Some(cur_r), Some(prev_r)) = (reality_opts, orig_ropts) {
+                    if cur_r.public_key == REDACTED_SECRET {
+                        cur_r.public_key = prev_r.public_key.clone();
+                    }
+                    if cur_r.short_id.as_deref() == Some(REDACTED_SECRET) {
+                        cur_r.short_id = prev_r.short_id.clone();
+                    }
+                }
+            }
+            (
+                Self::Vmess { uuid, .. },
+                Self::Vmess {
+                    uuid: orig_uuid, ..
+                },
+            ) => {
+                if *uuid == uuid::Uuid::nil() {
+                    *uuid = *orig_uuid;
+                }
+            }
+            (
+                Self::Hysteria2 {
+                    password,
+                    obfs_password,
+                    ..
+                },
+                Self::Hysteria2 {
+                    password: orig_pass,
+                    obfs_password: orig_obfs_pass,
+                    ..
+                },
+            ) => {
+                if password == REDACTED_SECRET {
+                    *password = orig_pass.clone();
+                }
+                if obfs_password.as_deref() == Some(REDACTED_SECRET) {
+                    *obfs_password = orig_obfs_pass.clone();
+                }
+            }
+            (
+                Self::Tuic { uuid, password, .. },
+                Self::Tuic {
+                    uuid: orig_uuid,
+                    password: orig_pass,
+                    ..
+                },
+            ) => {
+                if *uuid == uuid::Uuid::nil() {
+                    *uuid = *orig_uuid;
+                }
+                if password == REDACTED_SECRET {
+                    *password = orig_pass.clone();
                 }
             }
             (
@@ -3936,8 +4673,13 @@ rules:
     }
 
     #[test]
-    fn yaml_accepts_ws_trojan_socks5_http_and_rejects_grpc_reality_without_leaking_secrets() {
-        let supported_yaml = r#"
+    fn yaml_accepts_mainstream_protocols_and_rejects_grpc_invalid_reality_without_leaking_secrets()
+    {
+        use base64::Engine as _;
+        let valid_reality_pbk =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11u8; 32]);
+        let supported_yaml = format!(
+            r#"
 proxies:
   - name: WS-VLESS
     type: vless
@@ -3950,6 +4692,47 @@ proxies:
       path: /vless?ed=2048
       headers:
         Host: cdn.example.com
+  - name: REALITY-Vision
+    type: vless
+    server: reality.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    servername: www.microsoft.com
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: {valid_reality_pbk}
+      short-id: 0123456789abcdef
+  - name: AEAD-VMess
+    type: vmess
+    server: vm.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    cipher: aes-128-gcm
+    tls: true
+    network: ws
+    ws-opts:
+      path: /vmess
+  - name: HK-Hy2
+    type: hysteria2
+    server: hy2.example.com
+    port: 443
+    ports: 20000-30000
+    password: hy2-secret-password
+    obfs: salamander
+    obfs-password: salamander-secret-key
+    up: "50 Mbps"
+    down: "200 Mbps"
+  - name: JP-TUIC
+    type: tuic
+    server: tuic.example.com
+    port: 8443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    password: tuic-secret-password
+    udp-relay-mode: quic
+    congestion-controller: bbr
+    reduce-rtt: true
   - name: HK-Trojan
     type: trojan
     server: tj.example.com
@@ -3969,13 +4752,18 @@ proxies:
     tls: true
 rules:
   - MATCH,DIRECT
-"#;
-        let parsed = ClashConfig::from_yaml_str(supported_yaml).expect("supported protocols");
-        assert_eq!(parsed.proxies.len(), 4);
+"#
+        );
+        let parsed = ClashConfig::from_yaml_str(&supported_yaml).expect("supported protocols");
+        assert_eq!(parsed.proxies.len(), 8);
         assert_eq!(parsed.proxies[0].protocol_label(), "VLESS+WS");
-        assert_eq!(parsed.proxies[1].protocol_label(), "Trojan");
-        assert_eq!(parsed.proxies[2].protocol_label(), "SOCKS5");
-        assert_eq!(parsed.proxies[3].protocol_label(), "HTTPS");
+        assert_eq!(parsed.proxies[1].protocol_label(), "VLESS+REALITY+Vision");
+        assert_eq!(parsed.proxies[2].protocol_label(), "VMess+WS");
+        assert_eq!(parsed.proxies[3].protocol_label(), "Hysteria2");
+        assert_eq!(parsed.proxies[4].protocol_label(), "TUIC-v5");
+        assert_eq!(parsed.proxies[5].protocol_label(), "Trojan");
+        assert_eq!(parsed.proxies[6].protocol_label(), "SOCKS5");
+        assert_eq!(parsed.proxies[7].protocol_label(), "HTTPS");
 
         let grpc_yaml = r#"
 proxies:
@@ -3995,7 +4783,7 @@ rules:
             .to_string();
         assert!(err_grpc.contains("network 'grpc'"), "got: {err_grpc}");
 
-        let reality_yaml = r#"
+        let bad_reality_yaml = r#"
 proxies:
   - name: REALITY-VLESS
     type: vless
@@ -4008,16 +4796,16 @@ proxies:
 rules:
   - MATCH,DIRECT
 "#;
-        let err_reality = ClashConfig::from_yaml_str(reality_yaml)
+        let err_reality = ClashConfig::from_yaml_str(bad_reality_yaml)
             .unwrap_err()
             .to_string();
-        assert!(err_reality.contains("reality-opts"), "got: {err_reality}");
+        assert!(err_reality.contains("REALITY"), "got: {err_reality}");
         assert!(
             !err_reality.contains("SUPER_SECRET_REALITY_PBK_999"),
             "must not leak reality key: {err_reality}"
         );
-        // Single unsupported node in sanitized mode must ALSO fail closed!
-        assert!(ClashConfig::from_yaml_str_sanitized(reality_yaml).is_err());
+        // Single invalid node in sanitized mode must ALSO fail closed!
+        assert!(ClashConfig::from_yaml_str_sanitized(bad_reality_yaml).is_err());
 
         // Mixed YAML with supported + unsupported nodes prunes skipped nodes and succeeds!
         let mixed_yaml = r#"
@@ -4027,28 +4815,44 @@ proxies:
     server: tj.example.com
     port: 443
     password: secret-trojan-pass
-  - name: Bad-VMess
+  - name: Good-VMess
     type: vmess
     server: vm.example.com
     port: 443
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-  - name: Bad-Hy2
+    tls: true
+  - name: Good-Hy2
     type: hysteria2
     server: hy2.example.com
     port: 443
     password: secret-hy2-pass
+  - name: Bad-SSR
+    type: ssr
+    server: ssr.example.com
+    port: 8388
+    password: secret-ssr-pass
+  - name: Bad-TUICv4
+    type: tuic
+    server: tuic4.example.com
+    port: 443
+    token: secret-tuic-v4-token
 proxy-groups:
   - name: PROXY
     type: select
-    proxies: [Good-Trojan, Bad-VMess, Bad-Hy2]
+    proxies: [Good-Trojan, Good-VMess, Good-Hy2, Bad-SSR, Bad-TUICv4]
 rules:
   - MATCH,PROXY
 "#;
         let (sanitized, skipped) =
             ClashConfig::from_yaml_str_sanitized(mixed_yaml).expect("mixed YAML sanitized");
-        assert_eq!(sanitized.proxies.len(), 1);
+        assert_eq!(sanitized.proxies.len(), 3);
         assert_eq!(sanitized.proxies[0].name(), "Good-Trojan");
-        assert_eq!(sanitized.proxy_groups[0].proxies, vec!["Good-Trojan"]);
+        assert_eq!(sanitized.proxies[1].name(), "Good-VMess");
+        assert_eq!(sanitized.proxies[2].name(), "Good-Hy2");
+        assert_eq!(
+            sanitized.proxy_groups[0].proxies,
+            vec!["Good-Trojan", "Good-VMess", "Good-Hy2"]
+        );
         assert_eq!(skipped.len(), 2);
 
         let scalar_secret = "ss://SUPER_SECRET_RAW_SCALAR_PASS@example.com:8388";

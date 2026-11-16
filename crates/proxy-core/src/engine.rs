@@ -42,14 +42,22 @@ use crate::{
             spawn_anytls_server,
         },
         http_proxy::{HttpOutbound, HttpOutboundConfig},
+        hysteria2::{
+            Hysteria2Outbound, Hysteria2OutboundConfig, parse_hy2_bandwidth_bytes_per_sec,
+        },
+        quic_common::QuicCongestionControl,
         socks5::{Socks5Outbound, Socks5OutboundConfig},
         ss::{ShadowsocksOutbound, spawn_ss_server},
         trojan::{TrojanOutbound, TrojanOutboundConfig},
+        tuic::{TuicOutbound, TuicOutboundConfig, TuicUdpRelayMode},
         vless::{
             VlessOutbound, VlessOutboundConfig, VlessServerConfig,
             encryption::{config::XorMode, generate_vless_encryption_pair},
+            reality::{RealityClientConfig, decode_reality_public_key, decode_reality_short_id},
             spawn_vless_server,
+            vision::VlessVisionFlow,
         },
+        vmess::{VmessOutbound, VmessOutboundConfig, crypto::VmessSecurity},
     },
     platform::{
         recovery::{default_state_dir, recover_stale_network_state},
@@ -110,26 +118,101 @@ pub fn build_outbounds_with_dns(
                 skip_cert_verify,
                 alpn,
                 flow,
+                reality_opts,
+                client_fingerprint,
                 network: _,
                 ws_opts: _,
                 udp,
             } => {
-                if let Some(f) = flow.as_deref().map(str::trim)
-                    && !f.is_empty()
-                    && !f.eq_ignore_ascii_case("none")
-                {
-                    return Err(ProxyError::Config(format!(
-                        "VLESS node '{name}': unsupported flow '{f}'"
-                    )));
-                }
-                let alpn_bytes = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
-                let ob = VlessOutbound::new_with_transport(
+                let parsed_flow = match flow {
+                    Some(f) => VlessVisionFlow::parse(f)
+                        .map_err(|e| ProxyError::Config(format!("VLESS node '{name}': {e}")))?,
+                    None => None,
+                };
+                let alpn_bytes: Vec<Vec<u8>> = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+                let reality_cfg = match reality_opts {
+                    Some(ropts) => {
+                        let public_key =
+                            decode_reality_public_key(&ropts.public_key).map_err(|_| {
+                                ProxyError::Config(format!(
+                                    "VLESS node '{name}': invalid REALITY public-key"
+                                ))
+                            })?;
+                        let short_id = match &ropts.short_id {
+                            Some(sid) => decode_reality_short_id(sid).map_err(|_| {
+                                ProxyError::Config(format!(
+                                    "VLESS node '{name}': invalid REALITY short-id"
+                                ))
+                            })?,
+                            None => [0u8; 8],
+                        };
+                        let sni_name = servername
+                            .clone()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| server.clone());
+                        Some(RealityClientConfig {
+                            public_key,
+                            short_id,
+                            server_name: sni_name,
+                            fingerprint: client_fingerprint
+                                .clone()
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| "chrome".to_string()),
+                            spider_x: ropts.spider_x.clone().unwrap_or_default(),
+                            alpn: alpn_bytes.clone(),
+                        })
+                    }
+                    None => None,
+                };
+                let ob = VlessOutbound::new_with_vision_and_reality(
                     VlessOutboundConfig {
                         name: name.clone(),
                         server: server.clone(),
                         port: *port,
                         uuid: *uuid,
                         encryption: encryption.clone(),
+                        tls: *tls || reality_cfg.is_some(),
+                        servername: servername.clone(),
+                        skip_cert_verify: *skip_cert_verify && reality_cfg.is_none(),
+                        alpn: alpn_bytes,
+                        extra_ca_der: extra_ca_der.to_vec(),
+                        udp: *udp,
+                    },
+                    ws_opts,
+                    parsed_flow,
+                    reality_cfg,
+                    dns.clone(),
+                )
+                .map_err(|e| ProxyError::Config(format!("VLESS node '{name}': {e}")))?;
+                map.insert(name.clone(), Arc::new(ob));
+            }
+            ProxyNodeConfig::Vmess {
+                name,
+                server,
+                port,
+                uuid,
+                alter_id: _,
+                cipher,
+                global_padding,
+                tls,
+                servername,
+                skip_cert_verify,
+                alpn,
+                network: _,
+                ws_opts: _,
+                udp,
+            } => {
+                let security = VmessSecurity::parse(cipher)
+                    .map_err(|e| ProxyError::Config(format!("VMess node '{name}': {e}")))?;
+                let alpn_bytes = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+                let ob = VmessOutbound::new_with_transport(
+                    VmessOutboundConfig {
+                        name: name.clone(),
+                        server: server.clone(),
+                        port: *port,
+                        uuid: *uuid,
+                        security,
+                        global_padding: *global_padding,
                         tls: *tls,
                         servername: servername.clone(),
                         skip_cert_verify: *skip_cert_verify,
@@ -140,7 +223,101 @@ pub fn build_outbounds_with_dns(
                     ws_opts,
                     dns.clone(),
                 )
-                .map_err(|e| ProxyError::Config(format!("VLESS node '{name}': {e}")))?;
+                .map_err(|e| ProxyError::Config(format!("VMess node '{name}': {e}")))?;
+                map.insert(name.clone(), Arc::new(ob));
+            }
+            ProxyNodeConfig::Hysteria2 {
+                name,
+                server,
+                port,
+                ports,
+                password,
+                obfs,
+                obfs_password,
+                up,
+                down,
+                sni,
+                skip_cert_verify,
+                alpn,
+                udp,
+            } => {
+                let obfs_salamander_password = match obfs.as_deref().map(str::trim) {
+                    Some(m) if m.eq_ignore_ascii_case("salamander") => obfs_password.clone(),
+                    Some(m) if !m.is_empty() && !m.eq_ignore_ascii_case("none") => {
+                        return Err(ProxyError::Config(format!(
+                            "Hysteria2 node '{name}': unsupported obfs '{m}'"
+                        )));
+                    }
+                    _ => None,
+                };
+                let up_bps = parse_hy2_bandwidth_bytes_per_sec(up.as_deref())
+                    .map_err(|e| ProxyError::Config(format!("Hysteria2 node '{name}': {e}")))?;
+                let down_bps = parse_hy2_bandwidth_bytes_per_sec(down.as_deref())
+                    .map_err(|e| ProxyError::Config(format!("Hysteria2 node '{name}': {e}")))?;
+                let alpn_bytes = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+                let ob = Hysteria2Outbound::new_with_dns(
+                    Hysteria2OutboundConfig {
+                        name: name.clone(),
+                        server: server.clone(),
+                        port: *port,
+                        ports: ports.clone(),
+                        password: password.clone(),
+                        obfs_salamander_password,
+                        up_bytes_per_sec: up_bps,
+                        down_bytes_per_sec: down_bps,
+                        servername: sni.clone(),
+                        skip_cert_verify: *skip_cert_verify,
+                        alpn: alpn_bytes,
+                        extra_ca_der: extra_ca_der.to_vec(),
+                        udp: *udp,
+                    },
+                    dns.clone(),
+                )
+                .map_err(|e| ProxyError::Config(format!("Hysteria2 node '{name}': {e}")))?;
+                map.insert(name.clone(), Arc::new(ob));
+            }
+            ProxyNodeConfig::Tuic {
+                name,
+                server,
+                port,
+                uuid,
+                password,
+                udp_relay_mode,
+                congestion_controller,
+                reduce_rtt,
+                disable_sni,
+                heartbeat_interval,
+                sni,
+                skip_cert_verify,
+                alpn,
+                udp,
+            } => {
+                let udp_mode = TuicUdpRelayMode::parse_opt(udp_relay_mode.as_deref())
+                    .map_err(|e| ProxyError::Config(format!("TUIC node '{name}': {e}")))?;
+                let cc = QuicCongestionControl::parse_opt(congestion_controller.as_deref())
+                    .map_err(|e| ProxyError::Config(format!("TUIC node '{name}': {e}")))?;
+                let alpn_bytes = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+                let ob = TuicOutbound::new_with_dns(
+                    TuicOutboundConfig {
+                        name: name.clone(),
+                        server: server.clone(),
+                        port: *port,
+                        uuid: *uuid,
+                        password: password.clone(),
+                        udp_relay_mode: udp_mode,
+                        congestion_control: cc,
+                        zero_rtt_handshake: *reduce_rtt,
+                        disable_sni: *disable_sni,
+                        heartbeat_interval: Duration::from_millis((*heartbeat_interval).max(1_000)),
+                        servername: sni.clone(),
+                        skip_cert_verify: *skip_cert_verify,
+                        alpn: alpn_bytes,
+                        extra_ca_der: extra_ca_der.to_vec(),
+                        udp: *udp,
+                    },
+                    dns.clone(),
+                )
+                .map_err(|e| ProxyError::Config(format!("TUIC node '{name}': {e}")))?;
                 map.insert(name.clone(), Arc::new(ob));
             }
             ProxyNodeConfig::Anytls {
@@ -516,6 +693,8 @@ impl DemoCluster {
                     skip_cert_verify: false,
                     alpn: vec![],
                     flow: None,
+                    reality_opts: None,
+                    client_fingerprint: None,
                     network: None,
                     ws_opts: None,
                     udp: true,
@@ -552,6 +731,8 @@ impl DemoCluster {
                     skip_cert_verify: false,
                     alpn: vec![],
                     flow: None,
+                    reality_opts: None,
+                    client_fingerprint: None,
                     network: None,
                     ws_opts: None,
                     udp: true,
@@ -567,6 +748,8 @@ impl DemoCluster {
                     skip_cert_verify: false,
                     alpn: vec![],
                     flow: None,
+                    reality_opts: None,
+                    client_fingerprint: None,
                     network: None,
                     ws_opts: None,
                     udp: true,
