@@ -3133,6 +3133,8 @@ pub fn default_smart_cn_direct_nameservers() -> Vec<String> {
         "119.29.29.29:53".to_string(),
         "https://223.5.5.5/dns-query".to_string(),
         "https://1.12.12.12/dns-query".to_string(),
+        "tls://223.5.5.5:853".to_string(),
+        "tls://1.12.12.12:853".to_string(),
     ]
 }
 

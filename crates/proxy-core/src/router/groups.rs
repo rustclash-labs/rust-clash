@@ -123,12 +123,32 @@ impl DelayStore {
             return;
         }
         let now_ms = TelemetryHub::now_ms();
-        let should_record = match self.latest_delay_with_time(name) {
-            None => true,
-            Some((last_time, _)) => now_ms.saturating_sub(last_time) >= max_age_ms,
-        };
-        if should_record {
-            self.record(name, rtt_ms);
+        match self.latest_delay_with_time(name) {
+            None => self.record(name, rtt_ms),
+            Some(_) if max_age_ms == 0 => self.record(name, rtt_ms),
+            Some((last_time, last_delay)) => {
+                if now_ms.saturating_sub(last_time) >= max_age_ms {
+                    // Dampen single-connection RRC-wakeup / bootstrap outliers when refreshing a
+                    // previously healthy node so one slow handshake does not pin a multi-second badge.
+                    let effective_ms = if rtt_ms > last_delay.saturating_mul(2)
+                        && rtt_ms.saturating_sub(last_delay) >= 200
+                    {
+                        ((last_delay.saturating_mul(2) + rtt_ms) / 3)
+                            .min(last_delay.saturating_mul(3))
+                    } else {
+                        rtt_ms
+                    };
+                    self.record(name, effective_ms.max(1));
+                } else if last_delay >= 250
+                    && rtt_ms.saturating_mul(2) <= last_delay
+                    && last_delay.saturating_sub(rtt_ms) >= 150
+                {
+                    // Fast downward outlier recovery: if an initial cold-start / radio-wake dial
+                    // recorded an inflated RTT (e.g. 3094ms or 467ms) and a subsequent connection
+                    // completes in <= half that time (e.g. 105ms), immediately correct it downward.
+                    self.record(name, rtt_ms);
+                }
+            }
         }
     }
 
@@ -496,5 +516,41 @@ mod tests {
         grp.apply_probe_results(&outage, &store);
         assert_eq!(store.latest_delay("HK-Auto"), None);
         assert!(store.is_known_failed("HK-Auto"));
+    }
+
+    #[test]
+    fn passive_delay_dampens_upward_wake_spike_and_recovers_fast_downward() {
+        let store = DelayStore::default();
+
+        // 1. Cold-start cellular RRC-wake spike (3094ms) followed immediately by normal 105ms traffic
+        store.record_passive_if_stale("sg-vless", 3094, 180_000);
+        assert_eq!(store.latest_delay("sg-vless"), Some(3094));
+        store.record_passive_if_stale("sg-vless", 105, 180_000);
+        assert_eq!(store.latest_delay("sg-vless"), Some(105));
+
+        // Normal jitter around 105ms (e.g. 88ms or 140ms) must NOT churn fresh entry
+        let rev_after_recovery = store.revision();
+        store.record_passive_if_stale("sg-vless", 88, 180_000);
+        store.record_passive_if_stale("sg-vless", 140, 180_000);
+        assert_eq!(store.latest_delay("sg-vless"), Some(105));
+        assert_eq!(store.revision(), rev_after_recovery);
+
+        // 2. Moderate spike (467ms) followed by normal 128ms handshake also recovers immediately
+        store.record("sg-vless", 467);
+        store.record_passive_if_stale("sg-vless", 128, 180_000);
+        assert_eq!(store.latest_delay("sg-vless"), Some(128));
+
+        // 3. Stale refresh with a 3094ms single-connection outlier is dampened (<= 3x prior 128ms)
+        store.record_passive_if_stale("sg-vless", 3094, 1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_passive_if_stale("sg-vless", 3094, 1);
+        let dampened = store.latest_delay("sg-vless").unwrap();
+        assert!(
+            dampened <= 128 * 3 * 3,
+            "expected dampened spike <= 1152ms, got {dampened}ms"
+        );
+        // Next normal 105ms connection brings it right back down without waiting 3 minutes
+        store.record_passive_if_stale("sg-vless", 105, 180_000);
+        assert_eq!(store.latest_delay("sg-vless"), Some(105));
     }
 }

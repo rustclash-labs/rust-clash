@@ -1042,7 +1042,14 @@ impl ProfileManager {
                     }
                     let mut dns_upgraded = false;
                     if can_upgrade_legacy
-                        && cfg.dns.direct_nameserver == ["223.5.5.5:53", "119.29.29.29:53"]
+                        && (cfg.dns.direct_nameserver == ["223.5.5.5:53", "119.29.29.29:53"]
+                            || cfg.dns.direct_nameserver
+                                == [
+                                    "223.5.5.5:53",
+                                    "119.29.29.29:53",
+                                    "https://223.5.5.5/dns-query",
+                                    "https://1.12.12.12/dns-query",
+                                ])
                     {
                         cfg.dns.direct_nameserver =
                             crate::config::default_smart_cn_direct_nameservers();
@@ -4797,8 +4804,38 @@ rules:
         assert!(
             upgraded
                 .dns
+                .direct_nameserver
+                .contains(&"tls://223.5.5.5:853".to_string())
+        );
+        assert!(
+            upgraded
+                .dns
+                .direct_nameserver
+                .contains(&"tls://1.12.12.12:853".to_string())
+        );
+        assert!(
+            upgraded
+                .dns
                 .nameserver
                 .contains(&"https://223.5.5.5/dns-query".to_string())
+        );
+
+        // Simulate a v0.4.11 4-entry UDP+DoH Smart CN profile and verify reopen adds DoT fallbacks
+        let (mut v0411_cfg, _) = reopened.load_active_config().unwrap();
+        v0411_cfg.dns.direct_nameserver = vec![
+            "223.5.5.5:53".to_string(),
+            "119.29.29.29:53".to_string(),
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://1.12.12.12/dns-query".to_string(),
+        ];
+        fs::write(&yaml_path, v0411_cfg.to_yaml_string().unwrap()).unwrap();
+        drop(reopened);
+
+        let reopened = ProfileManager::open_or_init(&dir).unwrap();
+        let (upgraded_v0411, _) = reopened.load_active_config().unwrap();
+        assert_eq!(
+            upgraded_v0411.dns.direct_nameserver,
+            crate::config::default_smart_cn_direct_nameservers()
         );
 
         // Switch to Custom preset with UDP-only direct_nameserver and verify reopen NEVER overwrites Custom
