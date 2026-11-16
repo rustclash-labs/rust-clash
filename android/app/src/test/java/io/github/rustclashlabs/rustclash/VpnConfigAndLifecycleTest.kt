@@ -1,5 +1,6 @@
 package io.github.rustclashlabs.rustclash
 
+import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.DiagnosticsFilter
 import io.github.rustclashlabs.rustclash.ui.model.ProxyNodeItem
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
@@ -1700,10 +1701,23 @@ class VpnConfigAndLifecycleTest {
             }
         """.trimIndent()
 
-        val snap = UiJsonParsers.parseSnapshot(rawSnapshotJson)
-        assertNotNull(snap)
-        assertEquals(4, snap!!.nodes.size)
-        assertEquals("Hy2", snap.effectiveProtocolDisplay)
+        val snap = UiJsonParsers.parseNodeManagerSnapshot(rawSnapshotJson)
+        assertTrue(snap.ok)
+        assertEquals(4, snap.nodes.size)
+        val uiState = AppUiState(
+            effectiveOutbound = snap.effectiveOutbound,
+            effectiveProtocol = snap.effectiveProtocol,
+            nodes = snap.nodes,
+        )
+        assertEquals("Hy2", uiState.effectiveProtocolDisplay)
+        assertEquals(
+            "VMess",
+            AppUiState(effectiveOutbound = "MissingNode", effectiveProtocol = "vmess").effectiveProtocolDisplay,
+        )
+        assertEquals(
+            "TUIC",
+            AppUiState(effectiveOutbound = "MissingNode", effectiveProtocol = "tuic").effectiveProtocolDisplay,
+        )
 
         val realityNode = snap.nodes[0]
         assertTrue(realityNode.realityEnabled)
