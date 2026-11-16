@@ -16,7 +16,7 @@ use rustls::pki_types::CertificateDer;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex as AsyncMutex, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot},
     task::AbortHandle,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -34,6 +34,7 @@ const DNS_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_POOLED_IO_TIMEOUT: Duration = Duration::from_millis(1200);
 const DNS_TLS_IDLE_TTL: Duration = Duration::from_secs(45);
 const MAX_IDLE_TLS_CONNS_PER_KEY: usize = 4;
+const MAX_CONCURRENT_DOH_STREAMS_PER_ENDPOINT: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TlsDnsPoolKey {
@@ -48,12 +49,28 @@ struct TlsDnsPoolKey {
 type TlsDnsPoolEntry = (Instant, u64, TlsStream<TcpStream>);
 type TlsDnsPoolMap = HashMap<TlsDnsPoolKey, Vec<TlsDnsPoolEntry>>;
 type H2Slot = Arc<AsyncMutex<Option<Arc<H2DohClient>>>>;
+type DohLimiterKey = (SocketAddr, String);
 
 static TLS_DNS_POOL: LazyLock<Mutex<TlsDnsPoolMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static H2_DNS_POOL: LazyLock<Mutex<HashMap<TlsDnsPoolKey, H2Slot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static H2_LIVE_CLIENTS: LazyLock<Mutex<Vec<Weak<H2DohClient>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+static DOH_CONCURRENCY_LIMITERS: LazyLock<Mutex<HashMap<DohLimiterKey, Arc<Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn get_doh_concurrency_limiter(ns: SocketAddr, sni: &str) -> Arc<Semaphore> {
+    let key = (ns, sni.to_ascii_lowercase());
+    let mut guard = DOH_CONCURRENCY_LIMITERS.lock();
+    if guard.len() > 64 {
+        guard.retain(|_, sem| sem.available_permits() < MAX_CONCURRENT_DOH_STREAMS_PER_ENDPOINT);
+    }
+    Arc::clone(
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DOH_STREAMS_PER_ENDPOINT))),
+    )
+}
 
 fn is_tls_pool_entry_fresh(
     stored_mono: Instant,
@@ -175,13 +192,13 @@ pub fn clear_dns_upstream_pools() {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DnsEndpointHost {
     Ip(IpAddr),
     Domain(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DnsUpstream {
     Udp(SocketAddr),
     Tcp(SocketAddr),
@@ -865,6 +882,17 @@ async fn forward_doh_dns_with_timeout(
     if query.len() < 12 {
         return Err(ProxyError::Dns("invalid DoH query length".into()));
     }
+    let limiter = get_doh_concurrency_limiter(ns, sni);
+    let wait_started = Instant::now();
+    let _doh_permit = tokio::time::timeout(io_timeout, limiter.acquire_owned())
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+        .map_err(|_| ProxyError::Dns("DoH concurrency limiter closed".into()))?;
+    let io_timeout = io_timeout.saturating_sub(wait_started.elapsed());
+    if io_timeout.is_zero() {
+        return Err(ProxyError::Timeout);
+    }
+
     let orig_id = [query[0], query[1]];
     // RFC 8484 Section 4.1: DoH clients SHOULD set DNS ID = 0 for HTTP cache friendliness;
     // we restore `orig_id` onto the returned DNS wire packet before returning to caller!
@@ -2820,5 +2848,28 @@ mod tests {
         // Once aborted by wall-clock expiry, `closed` stays true even if queried again.
         assert!(client.closed.load(Ordering::Acquire));
         assert!(!client.is_reusable_at(spawned_wall + 1_000));
+    }
+
+    #[tokio::test]
+    async fn doh_concurrency_limiter_caps_simultaneous_inflight_streams_per_endpoint() {
+        let ep_a: SocketAddr = "127.0.0.1:4443".parse().unwrap();
+        let ep_b: SocketAddr = "127.0.0.1:4444".parse().unwrap();
+        let lim_a1 = get_doh_concurrency_limiter(ep_a, "dns.alidns.com");
+        let lim_a2 = get_doh_concurrency_limiter(ep_a, "DNS.ALIDNS.COM");
+        let lim_b = get_doh_concurrency_limiter(ep_b, "doh.pub");
+        assert!(Arc::ptr_eq(&lim_a1, &lim_a2));
+        assert!(!Arc::ptr_eq(&lim_a1, &lim_b));
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_DOH_STREAMS_PER_ENDPOINT {
+            held.push(lim_a1.clone().try_acquire_owned().expect("permit within 8"));
+        }
+        // 9th simultaneous request to same endpoint waits instead of bursting into HTTP 429,
+        // while independent backup DoH endpoint `ep_b` remains completely unblocked.
+        assert!(lim_a1.try_acquire().is_err());
+        assert!(lim_b.try_acquire().is_ok());
+
+        drop(held.pop());
+        assert!(lim_a1.try_acquire().is_ok());
     }
 }

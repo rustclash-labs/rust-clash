@@ -610,6 +610,23 @@ pub fn domain_matches_any_clash_pattern(domain: &str, raw_key: &str) -> bool {
 
 type BootstrapCacheEntry = (Instant, u64, Vec<IpAddr>);
 
+const UPSTREAM_429_COOLDOWN_MS: u64 = 15_000;
+const UPSTREAM_TIMEOUT_COOLDOWN_MS: u64 = 30_000;
+
+#[derive(Clone, Debug, Default)]
+struct UpstreamHealthState {
+    consecutive_failures: u32,
+    cooldown_until_mono: Option<Instant>,
+    cooldown_until_wall_ms: u64,
+}
+
+impl UpstreamHealthState {
+    fn is_cooled_down(&self, now_mono: Instant, now_wall_ms: u64) -> bool {
+        self.cooldown_until_mono
+            .is_some_and(|until| now_mono < until && now_wall_ms < self.cooldown_until_wall_ms)
+    }
+}
+
 /// Production Multi-Transport DNS Engine supporting:
 /// - `fake-ip` (`198.18.0.0/15`) and `redir-host` / `normal` (Real-IP) modes
 /// - `udp://` (with RFC 1035 `TC=1` -> TCP fallback), `tcp://`, `tls://` (DoT), and `https://` (DoH RFC 8484 HTTP/1.1 + HTTP/2)
@@ -643,6 +660,7 @@ pub struct FakeIpDnsEngine {
     proxy_ip_cache: Mutex<LruCache<String, CachedIpResolution>>,
     packet_cache: Mutex<LruCache<(String, u16, u16), CachedWirePacket>>,
     bootstrap_cache: Mutex<LruCache<String, BootstrapCacheEntry>>,
+    upstream_health: DashMap<DnsUpstream, UpstreamHealthState>,
     inflight_real: InflightMap,
     inflight_direct: InflightMap,
     inflight_proxy: InflightMap,
@@ -901,6 +919,7 @@ impl FakeIpDnsEngine {
             bootstrap_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(256).expect("non-zero cache size"),
             )),
+            upstream_health: DashMap::new(),
             inflight_real: DashMap::new(),
             inflight_direct: DashMap::new(),
             inflight_proxy: DashMap::new(),
@@ -1188,6 +1207,7 @@ impl FakeIpDnsEngine {
         self.proxy_ip_cache.lock().clear();
         self.packet_cache.lock().clear();
         self.bootstrap_cache.lock().clear();
+        self.upstream_health.clear();
     }
 
     /// Flush positive/negative DNS resolution caches, wire packet caches, and pooled DoT/DoH sockets.
@@ -1798,29 +1818,68 @@ impl FakeIpDnsEngine {
         }
     }
 
+    fn record_upstream_outcome(&self, upstream: &DnsUpstream, res: &Result<Vec<u8>>) {
+        match res {
+            Ok(_) => {
+                self.upstream_health.remove(upstream);
+            }
+            Err(err) => {
+                let is_429 = matches!(err, ProxyError::Dns(msg) if msg.contains("HTTP status 429"));
+                let is_transport_fail = matches!(err, ProxyError::Timeout | ProxyError::Io(_));
+                if !is_429 && !is_transport_fail {
+                    return;
+                }
+                if self.upstream_health.len() > 128 {
+                    let now_m = Instant::now();
+                    let now_w = current_epoch_ms();
+                    self.upstream_health
+                        .retain(|_, st| st.is_cooled_down(now_m, now_w));
+                }
+                let mut entry = self.upstream_health.entry(upstream.clone()).or_default();
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                if is_429 {
+                    entry.cooldown_until_mono =
+                        Some(Instant::now() + Duration::from_millis(UPSTREAM_429_COOLDOWN_MS));
+                    entry.cooldown_until_wall_ms =
+                        current_epoch_ms().saturating_add(UPSTREAM_429_COOLDOWN_MS);
+                } else if entry.consecutive_failures >= 2 {
+                    entry.cooldown_until_mono =
+                        Some(Instant::now() + Duration::from_millis(UPSTREAM_TIMEOUT_COOLDOWN_MS));
+                    entry.cooldown_until_wall_ms =
+                        current_epoch_ms().saturating_add(UPSTREAM_TIMEOUT_COOLDOWN_MS);
+                }
+            }
+        }
+    }
+
     async fn exchange_single_upstream(
         &self,
         upstream: &DnsUpstream,
         raw_query: &[u8],
     ) -> Result<Vec<u8>> {
-        let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
-        let resp = Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?;
-        if let Some(&flags_hi) = resp.get(2)
-            && (flags_hi & 0x02) != 0
-        {
-            return Err(ProxyError::Dns(
-                "upstream DNS response remained truncated (TC=1)".into(),
-            ));
-        }
-        if let Some(&flags_lo) = resp.get(3) {
-            let rcode = flags_lo & 0x0F;
-            if rcode == 2 || rcode == 5 {
-                return Err(ProxyError::Dns(format!(
-                    "upstream DNS returned RCODE {rcode}"
-                )));
+        let outcome = async {
+            let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
+            let resp = Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?;
+            if let Some(&flags_hi) = resp.get(2)
+                && (flags_hi & 0x02) != 0
+            {
+                return Err(ProxyError::Dns(
+                    "upstream DNS response remained truncated (TC=1)".into(),
+                ));
             }
+            if let Some(&flags_lo) = resp.get(3) {
+                let rcode = flags_lo & 0x0F;
+                if rcode == 2 || rcode == 5 {
+                    return Err(ProxyError::Dns(format!(
+                        "upstream DNS returned RCODE {rcode}"
+                    )));
+                }
+            }
+            Ok(resp)
         }
-        Ok(resp)
+        .await;
+        self.record_upstream_outcome(upstream, &outcome);
+        outcome
     }
 
     async fn exchange_hedged_pair(
@@ -1863,6 +1922,50 @@ impl FakeIpDnsEngine {
         }
     }
 
+    async fn exchange_upstream_refs(
+        &self,
+        refs: &[&DnsUpstream],
+        raw_query: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut last_err = ProxyError::Dns("no DNS upstreams configured".into());
+        let mut remaining = refs;
+        // Hedge up to three consecutive upstream pairs (e.g. `[UDP1, UDP2, DoH1, DoH2, DoT1, DoT2]`
+        // in `direct-nameserver` / `nameserver`) so port-53 blackholes or rate-limited DoH servers
+        // never serialize into cascading timeouts inside the 15s dial budget.
+        for pair_idx in 0..3 {
+            if remaining.len() < 2 {
+                break;
+            }
+            let stagger = if pair_idx == 0
+                && matches!(
+                    (remaining[0], remaining[1]),
+                    (DnsUpstream::Udp(_), DnsUpstream::Udp(_))
+                ) {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(350)
+            };
+            match self
+                .exchange_hedged_pair(remaining[0], remaining[1], raw_query, stagger)
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last_err = e;
+                    remaining = &remaining[2..];
+                }
+            }
+        }
+
+        for upstream in remaining {
+            match Box::pin(self.exchange_single_upstream(upstream, raw_query)).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
     async fn exchange_with_upstream_slice(
         &self,
         slice: &[DnsUpstream],
@@ -1877,38 +1980,33 @@ impl FakeIpDnsEngine {
             Ok(resp)
         };
 
-        let mut last_err = ProxyError::Dns("no DNS upstreams configured".into());
-        let mut remaining = slice;
-        // Hedge up to two consecutive upstream pairs (e.g. `[UDP1, UDP2, DoH1, DoH2]` in
-        // `direct-nameserver` / `nameserver`) so port-53 blackholes or a single congested DoH
-        // server never serialize into 8s-14s cascading timeouts inside the 15s dial budget.
-        for pair_idx in 0..2 {
-            if remaining.len() < 2 {
-                break;
-            }
-            let stagger = if pair_idx == 0
-                && matches!(
-                    (&remaining[0], &remaining[1]),
-                    (DnsUpstream::Udp(_), DnsUpstream::Udp(_))
-                ) {
-                Duration::from_millis(250)
-            } else {
-                Duration::from_millis(350)
-            };
-            match self
-                .exchange_hedged_pair(&remaining[0], &remaining[1], raw_query, stagger)
-                .await
+        let now_mono = Instant::now();
+        let now_wall = current_epoch_ms();
+        let mut healthy: Vec<&DnsUpstream> = Vec::with_capacity(slice.len());
+        let mut cooled: Vec<&DnsUpstream> = Vec::new();
+        for u in slice {
+            if self
+                .upstream_health
+                .get(u)
+                .is_some_and(|st| st.is_cooled_down(now_mono, now_wall))
             {
-                Ok(resp) => return record_ok(resp),
-                Err(e) => {
-                    last_err = e;
-                    remaining = &remaining[2..];
-                }
+                cooled.push(u);
+            } else {
+                healthy.push(u);
             }
         }
 
-        for upstream in remaining {
-            match Box::pin(self.exchange_single_upstream(upstream, raw_query)).await {
+        let mut last_err = ProxyError::Dns("no DNS upstreams configured".into());
+        if !healthy.is_empty() {
+            match self.exchange_upstream_refs(&healthy, raw_query).await {
+                Ok(resp) => return record_ok(resp),
+                Err(e) => last_err = e,
+            }
+        }
+        // Fallback safety net: if every healthy upstream failed (or all upstreams are currently
+        // cooled down), still attempt the cooled-down upstreams so we never starve or fail early.
+        if !cooled.is_empty() {
+            match self.exchange_upstream_refs(&cooled, raw_query).await {
                 Ok(resp) => return record_ok(resp),
                 Err(e) => last_err = e,
             }
@@ -2460,10 +2558,15 @@ impl FakeIpDnsEngine {
             return res;
         }
 
-        self.direct_ip_cache.lock().put(
-            normalized.clone(),
-            CachedIpResolution::new_transient_failure(),
-        );
+        if !err_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("HTTP status 429"))
+        {
+            self.direct_ip_cache.lock().put(
+                normalized.clone(),
+                CachedIpResolution::new_transient_failure(),
+            );
+        }
         let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
         let res = Err(ProxyError::Dns(format!(
             "direct-nameserver DNS resolution failed for '{normalized}'{suffix}"
@@ -4943,5 +5046,141 @@ mod tests {
         u2_task.abort();
         u3_task.abort();
         u4_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dead_udp_upstreams_enter_cooldown_and_bypass_waterfall_for_subsequent_queries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Two TCP upstreams that immediately reset/refuse (simulating dead primary transports)
+        // followed by a fast healthy TCP DNS server.
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead1 = l1.local_addr().unwrap();
+        drop(l1); // closed port -> immediate ConnectionRefused Io error
+
+        let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead2 = l2.local_addr().unwrap();
+        drop(l2);
+
+        let good_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_listener.local_addr().unwrap();
+        let good_hits = Arc::new(AtomicU64::new(0));
+        let good_hits_bg = Arc::clone(&good_hits);
+        let good_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = good_listener.accept().await {
+                good_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let Ok(len) = stream.read_u16().await else {
+                    continue;
+                };
+                let mut qbuf = vec![0u8; len as usize];
+                if stream.read_exact(&mut qbuf).await.is_err() {
+                    continue;
+                }
+                let Ok(parsed) = DnsQueryPacket::parse(&qbuf) else {
+                    continue;
+                };
+                let wire = parsed.build_response(
+                    &qbuf,
+                    0,
+                    60,
+                    &[DnsAnswerData::A(Ipv4Addr::new(198, 51, 100, 88))],
+                );
+                let _ = stream.write_u16(wire.len() as u16).await;
+                let _ = stream.write_all(&wire).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let cfg = DnsConfig {
+            enable: true,
+            enhanced_mode: "fake-ip".to_string(),
+            direct_nameserver: vec![
+                format!("tcp://{dead1}"),
+                format!("tcp://{dead2}"),
+                format!("tcp://{good_addr}"),
+            ],
+            ..Default::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+        // First two distinct domain lookups observe 2 consecutive failures on dead1 & dead2 -> enter 30s cooldown
+        assert_eq!(
+            engine.resolve_direct_ips("wake1.cn").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88))]
+        );
+        assert_eq!(
+            engine.resolve_direct_ips("wake2.cn").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88))]
+        );
+
+        let now_m = Instant::now();
+        let now_w = current_epoch_ms();
+        let parsed_dead1 = DnsUpstream::parse(&format!("tcp://{dead1}")).unwrap();
+        let parsed_dead2 = DnsUpstream::parse(&format!("tcp://{dead2}")).unwrap();
+        assert!(
+            engine
+                .upstream_health
+                .get(&parsed_dead1)
+                .is_some_and(|s| s.is_cooled_down(now_m, now_w))
+        );
+        assert!(
+            engine
+                .upstream_health
+                .get(&parsed_dead2)
+                .is_some_and(|s| s.is_cooled_down(now_m, now_w))
+        );
+
+        // 3rd lookup goes directly to `good_addr` in a few milliseconds
+        let t0 = Instant::now();
+        assert_eq!(
+            engine.resolve_direct_ips("wake3.cn").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88))]
+        );
+        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert_eq!(good_hits.load(Ordering::SeqCst), 3);
+
+        // Network handoff / cache flush resets upstream health cooldowns immediately
+        engine.clear_local_caches();
+        assert!(engine.upstream_health.is_empty());
+
+        good_task.abort();
+    }
+
+    #[test]
+    fn doh_429_immediately_cools_down_upstream_without_waiting_for_second_failure() {
+        let cfg = DnsConfig {
+            enable: true,
+            enhanced_mode: "fake-ip".to_string(),
+            direct_nameserver: crate::config::default_smart_cn_direct_nameservers(),
+            ..Default::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+        assert_eq!(engine.direct_upstreams.len(), 6);
+
+        let doh_primary = DnsUpstream::parse("https://223.5.5.5/dns-query").unwrap();
+        engine.record_upstream_outcome(
+            &doh_primary,
+            &Err(ProxyError::Dns(
+                "DoH server returned HTTP status 429".into(),
+            )),
+        );
+
+        let now_m = Instant::now();
+        let now_w = current_epoch_ms();
+        assert!(
+            engine
+                .upstream_health
+                .get(&doh_primary)
+                .is_some_and(|s| s.is_cooled_down(now_m, now_w)),
+            "first HTTP 429 must immediately place DoH upstream into 15s cooldown"
+        );
+        // After 15s wall-clock jump (e.g. across brief sleep), cooldown expires automatically
+        assert!(
+            !engine
+                .upstream_health
+                .get(&doh_primary)
+                .unwrap()
+                .is_cooled_down(now_m, now_w + UPSTREAM_429_COOLDOWN_MS)
+        );
     }
 }
