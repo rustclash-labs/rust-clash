@@ -895,7 +895,7 @@ class RustClashUiScreenshotTest {
         // Switch existing SS node to VLESS and attempt to save without entering a new UUID
         composeRule.onNode(hasText("VLESS") and hasAnyAncestor(isDialog())).performClick()
         composeRule.onNode(hasText("保存") and hasAnyAncestor(isDialog())).performClick()
-        composeRule.onNodeWithText("切换节点协议后必须重新填写密码或 VLESS UUID").assertIsDisplayed()
+        composeRule.onNodeWithText("切换节点协议后必须重新填写密码或 UUID").assertIsDisplayed()
         assertFalse(saved)
 
         val dialogFile = File(outDir, "modal_node_editor_error_light.png")

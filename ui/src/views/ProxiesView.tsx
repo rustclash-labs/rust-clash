@@ -49,9 +49,26 @@ const SS_CIPHERS = [
   "2022-blake3-chacha20-poly1305",
 ];
 
+const VMESS_CIPHERS = [
+  "auto",
+  "aes-128-gcm",
+  "chacha20-poly1305",
+  "none",
+  "zero",
+];
+
 type SortOrder = "default" | "latency" | "name";
 type ModalMode = "paste" | "manual";
-type NodeProto = "vless" | "trojan" | "ss" | "anytls" | "socks5" | "http";
+type NodeProto =
+  | "vless"
+  | "vmess"
+  | "hysteria2"
+  | "tuic"
+  | "trojan"
+  | "ss"
+  | "anytls"
+  | "socks5"
+  | "http";
 
 export const ProxiesView: React.FC<ProxiesViewProps> = ({
   config,
@@ -112,6 +129,47 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [vlessServername, setVlessServername] = useState("");
   const [vlessSkipVerify, setVlessSkipVerify] = useState(false);
   const [vlessAlpn, setVlessAlpn] = useState("");
+  const [vlessFlow, setVlessFlow] = useState("");
+  const [vlessReality, setVlessReality] = useState(false);
+  const [vlessRealityPbk, setVlessRealityPbk] = useState("");
+  const [vlessRealityHadRedactedPbk, setVlessRealityHadRedactedPbk] =
+    useState(false);
+  const [vlessRealitySid, setVlessRealitySid] = useState("");
+  const [vlessRealityHadRedactedSid, setVlessRealityHadRedactedSid] =
+    useState(false);
+  const [vlessFingerprint, setVlessFingerprint] = useState("");
+
+  const [vmessUuid, setVmessUuid] = useState("");
+  const [vmessCipher, setVmessCipher] = useState("auto");
+  const [vmessTls, setVmessTls] = useState(true);
+  const [vmessServername, setVmessServername] = useState("");
+  const [vmessSkipVerify, setVmessSkipVerify] = useState(false);
+  const [vmessAlpn, setVmessAlpn] = useState("");
+
+  const [hy2Password, setHy2Password] = useState("");
+  const [hy2Ports, setHy2Ports] = useState("");
+  const [hy2Obfs, setHy2Obfs] = useState<"" | "salamander">("");
+  const [hy2ObfsPassword, setHy2ObfsPassword] = useState("");
+  const [hy2HadRedactedObfsPass, setHy2HadRedactedObfsPass] = useState(false);
+  const [hy2Up, setHy2Up] = useState("");
+  const [hy2Down, setHy2Down] = useState("");
+  const [hy2Sni, setHy2Sni] = useState("");
+  const [hy2SkipVerify, setHy2SkipVerify] = useState(false);
+  const [hy2Alpn, setHy2Alpn] = useState("h3");
+
+  const [tuicUuid, setTuicUuid] = useState("");
+  const [tuicPassword, setTuicPassword] = useState("");
+  const [tuicHadSavedPassword, setTuicHadSavedPassword] = useState(false);
+  const [tuicUdpRelayMode, setTuicUdpRelayMode] = useState<"native" | "quic">(
+    "native",
+  );
+  const [tuicCongestion, setTuicCongestion] = useState<
+    "bbr" | "cubic" | "new_reno"
+  >("bbr");
+  const [tuicReduceRtt, setTuicReduceRtt] = useState(false);
+  const [tuicSni, setTuicSni] = useState("");
+  const [tuicSkipVerify, setTuicSkipVerify] = useState(false);
+  const [tuicAlpn, setTuicAlpn] = useState("h3");
 
   const [trojanPassword, setTrojanPassword] = useState("");
   const [trojanTls, setTrojanTls] = useState(true);
@@ -223,6 +281,38 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setVlessServername("");
     setVlessSkipVerify(false);
     setVlessAlpn("");
+    setVlessFlow("");
+    setVlessReality(false);
+    setVlessRealityPbk("");
+    setVlessRealityHadRedactedPbk(false);
+    setVlessRealitySid("");
+    setVlessRealityHadRedactedSid(false);
+    setVlessFingerprint("");
+    setVmessUuid("");
+    setVmessCipher("auto");
+    setVmessTls(true);
+    setVmessServername("");
+    setVmessSkipVerify(false);
+    setVmessAlpn("");
+    setHy2Password("");
+    setHy2Ports("");
+    setHy2Obfs("");
+    setHy2ObfsPassword("");
+    setHy2HadRedactedObfsPass(false);
+    setHy2Up("");
+    setHy2Down("");
+    setHy2Sni("");
+    setHy2SkipVerify(false);
+    setHy2Alpn("h3");
+    setTuicUuid("");
+    setTuicPassword("");
+    setTuicHadSavedPassword(false);
+    setTuicUdpRelayMode("native");
+    setTuicCongestion("bbr");
+    setTuicReduceRtt(false);
+    setTuicSni("");
+    setTuicSkipVerify(false);
+    setTuicAlpn("h3");
     setTrojanPassword("");
     setTrojanTls(true);
     setTrojanSni("");
@@ -287,10 +377,50 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         setVlessHadRedactedEnc(false);
         setVlessEncryption(rawEnc);
       }
-      setVlessTls(node.tls ?? false);
+      const ro = node["reality-opts"];
+      setVlessReality(Boolean(ro));
+      if (ro) {
+        if (ro["public-key"] === REDACTED_SECRET) {
+          setVlessRealityHadRedactedPbk(true);
+          setVlessRealityPbk("");
+        } else {
+          setVlessRealityHadRedactedPbk(false);
+          setVlessRealityPbk(ro["public-key"] ?? "");
+        }
+        if (ro["short-id"] === REDACTED_SECRET) {
+          setVlessRealityHadRedactedSid(true);
+          setVlessRealitySid("");
+        } else {
+          setVlessRealityHadRedactedSid(false);
+          setVlessRealitySid(ro["short-id"] ?? "");
+        }
+      }
+      setVlessFlow(node.flow ?? "");
+      setVlessFingerprint(node["client-fingerprint"] ?? "");
+      setVlessTls(Boolean(ro) || (node.tls ?? false));
       setVlessServername(node.servername ?? "");
       setVlessSkipVerify(Boolean(node["skip-cert-verify"]));
       setVlessAlpn((node.alpn ?? []).join(", "));
+      const isWs =
+        !ro &&
+        ((node.network ?? "").toLowerCase() === "ws" || Boolean(node["ws-opts"]));
+      setTransportNet(isWs ? "ws" : "tcp");
+      setWsPath(node["ws-opts"]?.path ?? "/");
+      setWsHost(
+        node["ws-opts"]?.headers?.Host ?? node["ws-opts"]?.headers?.host ?? "",
+      );
+      setWsMaxEarlyData(
+        node["ws-opts"]?.["max-early-data"]
+          ? String(node["ws-opts"]["max-early-data"])
+          : "",
+      );
+    } else if (node.type === "vmess") {
+      setVmessUuid("");
+      setVmessCipher(node.cipher ?? "auto");
+      setVmessTls(node.tls ?? false);
+      setVmessServername(node.servername ?? "");
+      setVmessSkipVerify(Boolean(node["skip-cert-verify"]));
+      setVmessAlpn((node.alpn ?? []).join(", "));
       const isWs =
         (node.network ?? "").toLowerCase() === "ws" || Boolean(node["ws-opts"]);
       setTransportNet(isWs ? "ws" : "tcp");
@@ -303,6 +433,41 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
           ? String(node["ws-opts"]["max-early-data"])
           : "",
       );
+    } else if (node.type === "hysteria2") {
+      setHy2Password("");
+      setHy2Ports(node.ports ?? "");
+      const obfsKind =
+        (node.obfs ?? "").toLowerCase() === "salamander" ? "salamander" : "";
+      setHy2Obfs(obfsKind);
+      if (node["obfs-password"] === REDACTED_SECRET) {
+        setHy2HadRedactedObfsPass(true);
+        setHy2ObfsPassword("");
+      } else {
+        setHy2HadRedactedObfsPass(false);
+        setHy2ObfsPassword(node["obfs-password"] ?? "");
+      }
+      setHy2Up(node.up ?? "");
+      setHy2Down(node.down ?? "");
+      setHy2Sni(node.sni ?? "");
+      setHy2SkipVerify(Boolean(node["skip-cert-verify"]));
+      setHy2Alpn((node.alpn ?? []).join(", "));
+    } else if (node.type === "tuic") {
+      setTuicUuid("");
+      setTuicPassword("");
+      setTuicHadSavedPassword(Boolean(node.password));
+      setTuicUdpRelayMode(
+        (node["udp-relay-mode"] ?? "").toLowerCase() === "quic"
+          ? "quic"
+          : "native",
+      );
+      const cc = (node["congestion-controller"] ?? "bbr").toLowerCase();
+      setTuicCongestion(
+        cc === "cubic" ? "cubic" : cc === "new_reno" ? "new_reno" : "bbr",
+      );
+      setTuicReduceRtt(Boolean(node["reduce-rtt"]));
+      setTuicSni(node.sni ?? "");
+      setTuicSkipVerify(Boolean(node["skip-cert-verify"]));
+      setTuicAlpn((node.alpn ?? []).join(", "));
     } else if (node.type === "trojan") {
       setTrojanPassword("");
       setTrojanTls(node.tls ?? true);
@@ -570,20 +735,55 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       if (!sameProto && !rawUuid) {
         throw new Error(tr("请填写 VLESS UUID", "VLESS UUID is required"));
       }
+      const origVless =
+        sameProto && editingOriginalNode?.type === "vless"
+          ? editingOriginalNode
+          : null;
       const encTrimmed = vlessEncryption.trim();
-      const effectiveEnc =
-        sameProto && !encTrimmed && vlessHadRedactedEnc
+      const effectiveEnc = vlessReality
+        ? "none"
+        : sameProto && !encTrimmed && vlessHadRedactedEnc
           ? REDACTED_SECRET
           : encTrimmed || "none";
       const alpnList = vlessAlpn
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      const origVless =
-        sameProto && editingOriginalNode?.type === "vless"
-          ? editingOriginalNode
-          : null;
-      const wsCfg = buildWsTransportPayload(origVless?.["ws-opts"]);
+      const flowTrimmed = vlessFlow.trim();
+      let realityOpts = null;
+      if (vlessReality) {
+        const pbkTrim = vlessRealityPbk.trim();
+        const effectivePbk = pbkTrim
+          ? pbkTrim
+          : sameProto && vlessRealityHadRedactedPbk
+            ? REDACTED_SECRET
+            : "";
+        if (!effectivePbk) {
+          throw new Error(
+            tr(
+              "启用 REALITY 时需填写公钥 (Public Key)",
+              "REALITY Public Key is required",
+            ),
+          );
+        }
+        const sidTrim = vlessRealitySid.trim();
+        const effectiveSid = sidTrim
+          ? sidTrim
+          : sameProto && vlessRealityHadRedactedSid
+            ? REDACTED_SECRET
+            : null;
+        realityOpts = {
+          "public-key": effectivePbk,
+          ...(effectiveSid ? { "short-id": effectiveSid } : {}),
+          ...(origVless?.["reality-opts"]?.["spider-x"]
+            ? { "spider-x": origVless["reality-opts"]["spider-x"] }
+            : {}),
+        };
+      }
+      const wsCfg = vlessReality
+        ? { network: "tcp", wsOpts: undefined }
+        : buildWsTransportPayload(origVless?.["ws-opts"]);
+      const fpTrim = vlessFingerprint.trim();
       return {
         type: "vless",
         name: cleanName,
@@ -591,13 +791,132 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
         port: portNum,
         uuid: rawUuid || NIL_UUID,
         encryption: effectiveEnc,
-        tls: vlessTls,
+        tls: vlessReality || vlessTls,
         servername: vlessServername.trim() || null,
-        "skip-cert-verify": vlessSkipVerify,
+        "skip-cert-verify": vlessReality ? false : vlessSkipVerify,
         alpn: alpnList,
-        ...(origVless?.flow ? { flow: origVless.flow } : {}),
+        ...(flowTrimmed ? { flow: flowTrimmed } : {}),
+        ...(realityOpts ? { "reality-opts": realityOpts } : {}),
+        ...(fpTrim ? { "client-fingerprint": fpTrim } : {}),
         network: wsCfg.network,
         ...(wsCfg.wsOpts ? { "ws-opts": wsCfg.wsOpts } : {}),
+        udp: udpEnabled,
+      };
+    }
+
+    if (proto === "vmess") {
+      const rawUuid = vmessUuid.trim();
+      if (!sameProto && !rawUuid) {
+        throw new Error(tr("请填写 VMess UUID", "VMess UUID is required"));
+      }
+      const origVmess =
+        sameProto && editingOriginalNode?.type === "vmess"
+          ? editingOriginalNode
+          : null;
+      const alpnList = vmessAlpn
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const wsCfg = buildWsTransportPayload(origVmess?.["ws-opts"]);
+      return {
+        type: "vmess",
+        name: cleanName,
+        server: cleanHost,
+        port: portNum,
+        uuid: rawUuid || NIL_UUID,
+        alterId: origVmess?.alterId ?? 0,
+        cipher: vmessCipher || "auto",
+        ...(origVmess?.["global-padding"] ? { "global-padding": true } : {}),
+        tls: vmessTls,
+        servername: vmessServername.trim() || null,
+        "skip-cert-verify": vmessSkipVerify,
+        alpn: alpnList,
+        network: wsCfg.network,
+        ...(wsCfg.wsOpts ? { "ws-opts": wsCfg.wsOpts } : {}),
+        udp: udpEnabled,
+      };
+    }
+
+    if (proto === "hysteria2") {
+      const pass = hy2Password.trim();
+      if (!sameProto && !pass) {
+        throw new Error(
+          tr("请填写 Hysteria2 认证密码", "Hysteria2 password is required"),
+        );
+      }
+      const alpnList = hy2Alpn
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const obfsPassTrim = hy2ObfsPassword.trim();
+      const effectiveObfsPass =
+        hy2Obfs === "salamander"
+          ? obfsPassTrim ||
+            (sameProto && hy2HadRedactedObfsPass ? REDACTED_SECRET : "")
+          : "";
+      if (hy2Obfs === "salamander" && !effectiveObfsPass) {
+        throw new Error(
+          tr(
+            "启用 Salamander 混淆时需填写混淆密码",
+            "Salamander obfs-password is required",
+          ),
+        );
+      }
+      return {
+        type: "hysteria2",
+        name: cleanName,
+        server: cleanHost,
+        port: portNum,
+        ...(hy2Ports.trim() ? { ports: hy2Ports.trim() } : {}),
+        password: pass || REDACTED_SECRET,
+        ...(hy2Obfs === "salamander"
+          ? { obfs: "salamander", "obfs-password": effectiveObfsPass }
+          : {}),
+        ...(hy2Up.trim() ? { up: hy2Up.trim() } : {}),
+        ...(hy2Down.trim() ? { down: hy2Down.trim() } : {}),
+        sni: hy2Sni.trim() || null,
+        "skip-cert-verify": hy2SkipVerify,
+        alpn: alpnList,
+        udp: udpEnabled,
+      };
+    }
+
+    if (proto === "tuic") {
+      const rawUuid = tuicUuid.trim();
+      if (!sameProto && !rawUuid) {
+        throw new Error(tr("请填写 TUIC v5 UUID", "TUIC v5 UUID is required"));
+      }
+      const origTuic =
+        sameProto && editingOriginalNode?.type === "tuic"
+          ? editingOriginalNode
+          : null;
+      const passTrim = tuicPassword.trim();
+      const effectivePass = passTrim
+        ? passTrim
+        : sameProto && tuicHadSavedPassword
+          ? REDACTED_SECRET
+          : "";
+      const alpnList = tuicAlpn
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      return {
+        type: "tuic",
+        name: cleanName,
+        server: cleanHost,
+        port: portNum,
+        uuid: rawUuid || NIL_UUID,
+        password: effectivePass,
+        "udp-relay-mode": tuicUdpRelayMode,
+        "congestion-controller": tuicCongestion,
+        "reduce-rtt": tuicReduceRtt,
+        ...(origTuic?.["disable-sni"] ? { "disable-sni": true } : {}),
+        ...(origTuic?.["heartbeat-interval"] !== undefined
+          ? { "heartbeat-interval": origTuic["heartbeat-interval"] }
+          : {}),
+        sni: tuicSni.trim() || null,
+        "skip-cert-verify": tuicSkipVerify,
+        alpn: alpnList,
         udp: udpEnabled,
       };
     }
@@ -1504,7 +1823,10 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       value={proto}
                       onChange={(e) => setProto(e.target.value as NodeProto)}
                     >
-                      <option value="vless">VLESS</option>
+                      <option value="vless">VLESS (TLS / REALITY / Vision / PQ)</option>
+                      <option value="vmess">VMess (AEAD / WS / TLS)</option>
+                      <option value="hysteria2">Hysteria2 (QUIC / Salamander)</option>
+                      <option value="tuic">TUIC v5 (QUIC 0-RTT)</option>
                       <option value="trojan">Trojan</option>
                       <option value="ss">Shadowsocks (SS / SS-2022)</option>
                       <option value="anytls">AnyTLS v2</option>
@@ -1601,13 +1923,149 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                       </div>
                       <div className="form-field">
                         <label className="form-label">
+                          {tr("SNI / 伪装域名", "Server Name (SNI)")}
+                        </label>
+                        <input
+                          className="input mono"
+                          placeholder={
+                            vlessReality ? "www.microsoft.com" : "edge.example.com"
+                          }
+                          value={vlessServername}
+                          onChange={(e) => setVlessServername(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("XTLS 流控 (Flow)", "XTLS Flow")}
+                        </label>
+                        <select
+                          className="select"
+                          value={vlessFlow}
+                          onChange={(e) => setVlessFlow(e.target.value)}
+                        >
+                          <option value="">{tr("无 (标准 VLESS)", "None (Standard)")}</option>
+                          <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+                          <option value="xtls-rprx-vision-udp443">
+                            xtls-rprx-vision-udp443
+                          </option>
+                        </select>
+                      </div>
+                      {vlessReality ? (
+                        <>
+                          <div className="form-field">
+                            <label className="form-label">
+                              {tr("REALITY 公钥 (pbk)", "REALITY Public Key (pbk)")}
+                            </label>
+                            <input
+                              className="input mono"
+                              placeholder={
+                                editingOriginalName && vlessRealityHadRedactedPbk
+                                  ? tr("留空保持原公钥", "Leave blank to keep saved")
+                                  : "Base64URL X25519 Public Key"
+                              }
+                              value={vlessRealityPbk}
+                              onChange={(e) => setVlessRealityPbk(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">
+                              {tr("REALITY Short ID (sid，可选)", "REALITY Short ID (optional)")}
+                            </label>
+                            <input
+                              className="input mono"
+                              placeholder={
+                                editingOriginalName && vlessRealityHadRedactedSid
+                                  ? tr("留空保持原 Short ID", "Leave blank to keep saved")
+                                  : "01ab23cd"
+                              }
+                              value={vlessRealitySid}
+                              onChange={(e) => setVlessRealitySid(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">
+                              {tr("客户端指纹 (fp，可选)", "Client Fingerprint (optional)")}
+                            </label>
+                            <input
+                              className="input mono"
+                              placeholder="chrome"
+                              value={vlessFingerprint}
+                              onChange={(e) => setVlessFingerprint(e.target.value)}
+                            />
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="form-field">
+                            <label className="form-label">
+                              ALPN ({tr("逗号分隔，可选", "comma-separated, optional")})
+                            </label>
+                            <input
+                              className="input mono"
+                              placeholder="h2, http/1.1"
+                              value={vlessAlpn}
+                              onChange={(e) => setVlessAlpn(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field full">
+                            <label className="form-label">
+                              {tr(
+                                "VLESS 加密参数 (可选 PQ)",
+                                "Encryption (none or mlkem768x25519plus...)",
+                              )}
+                            </label>
+                            <input
+                              className="input mono"
+                              placeholder="none"
+                              value={vlessEncryption}
+                              onChange={(e) => setVlessEncryption(e.target.value)}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </>
+                  )}
+
+                  {proto === "vmess" && (
+                    <>
+                      <div className="form-field">
+                        <label className="form-label">UUID</label>
+                        <input
+                          className="input mono"
+                          placeholder={
+                            editingOriginalName
+                              ? tr("留空保持原 UUID", "Leave blank to keep saved")
+                              : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                          }
+                          value={vmessUuid}
+                          onChange={(e) => setVmessUuid(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("加密方式 (Cipher)", "Cipher")}
+                        </label>
+                        <select
+                          className="select"
+                          value={vmessCipher}
+                          onChange={(e) => setVmessCipher(e.target.value)}
+                        >
+                          {VMESS_CIPHERS.map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
                           {tr("SNI / 域名", "Server Name (SNI)")}
                         </label>
                         <input
                           className="input mono"
                           placeholder="edge.example.com"
-                          value={vlessServername}
-                          onChange={(e) => setVlessServername(e.target.value)}
+                          value={vmessServername}
+                          onChange={(e) => setVmessServername(e.target.value)}
                         />
                       </div>
                       <div className="form-field">
@@ -1617,20 +2075,192 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                         <input
                           className="input mono"
                           placeholder="h2, http/1.1"
-                          value={vlessAlpn}
-                          onChange={(e) => setVlessAlpn(e.target.value)}
+                          value={vmessAlpn}
+                          onChange={(e) => setVmessAlpn(e.target.value)}
+                        />
+                      </div>
+                    </>
+                  )}
+
+                  {proto === "hysteria2" && (
+                    <>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("认证密码", "Auth Password")}
+                        </label>
+                        <input
+                          type="password"
+                          className="input mono"
+                          placeholder={
+                            editingOriginalName
+                              ? tr("留空保持原密码", "Leave blank to keep saved")
+                              : tr("输入 Hysteria2 密码", "Enter Hysteria2 password")
+                          }
+                          value={hy2Password}
+                          onChange={(e) => setHy2Password(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">SNI</label>
+                        <input
+                          className="input mono"
+                          placeholder="hy2.example.com"
+                          value={hy2Sni}
+                          onChange={(e) => setHy2Sni(e.target.value)}
                         />
                       </div>
                       <div className="form-field">
                         <label className="form-label">
-                          {tr("VLESS 加密参数 (可选 PQ)", "Encryption (none or mlkem768x25519plus...)")}
+                          {tr("端口跳跃 (mport，可选)", "Port Hopping (optional)")}
                         </label>
                         <input
                           className="input mono"
-                          placeholder="none"
-                          value={vlessEncryption}
-                          onChange={(e) => setVlessEncryption(e.target.value)}
+                          placeholder="20000-30000"
+                          value={hy2Ports}
+                          onChange={(e) => setHy2Ports(e.target.value)}
                         />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("混淆协议 (Obfs)", "Obfuscation")}
+                        </label>
+                        <select
+                          className="select"
+                          value={hy2Obfs}
+                          onChange={(e) =>
+                            setHy2Obfs(e.target.value as "" | "salamander")
+                          }
+                        >
+                          <option value="">{tr("无 (标准 QUIC)", "None")}</option>
+                          <option value="salamander">Salamander (BLAKE2b)</option>
+                        </select>
+                      </div>
+                      {hy2Obfs === "salamander" && (
+                        <div className="form-field full">
+                          <label className="form-label">
+                            {tr("Salamander 混淆密码", "Salamander Obfs Password")}
+                          </label>
+                          <input
+                            type="password"
+                            className="input mono"
+                            placeholder={
+                              editingOriginalName && hy2HadRedactedObfsPass
+                                ? tr("留空保持原混淆密码", "Leave blank to keep saved")
+                                : tr("输入混淆密码", "Enter obfs-password")
+                            }
+                            value={hy2ObfsPassword}
+                            onChange={(e) => setHy2ObfsPassword(e.target.value)}
+                          />
+                        </div>
+                      )}
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("上行带宽 (可选，如 50 Mbps)", "Up Bandwidth (optional)")}
+                        </label>
+                        <input
+                          className="input mono"
+                          placeholder="50 Mbps"
+                          value={hy2Up}
+                          onChange={(e) => setHy2Up(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("下行带宽 (可选，如 200 Mbps)", "Down Bandwidth (optional)")}
+                        </label>
+                        <input
+                          className="input mono"
+                          placeholder="200 Mbps"
+                          value={hy2Down}
+                          onChange={(e) => setHy2Down(e.target.value)}
+                        />
+                      </div>
+                    </>
+                  )}
+
+                  {proto === "tuic" && (
+                    <>
+                      <div className="form-field">
+                        <label className="form-label">UUID</label>
+                        <input
+                          className="input mono"
+                          placeholder={
+                            editingOriginalName
+                              ? tr("留空保持原 UUID", "Leave blank to keep saved")
+                              : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                          }
+                          value={tuicUuid}
+                          onChange={(e) => setTuicUuid(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("密码 (Password)", "Password")}
+                        </label>
+                        <input
+                          type="password"
+                          className="input mono"
+                          placeholder={
+                            editingOriginalName && tuicHadSavedPassword
+                              ? tr("留空保持原密码", "Leave blank to keep saved")
+                              : tr("输入 TUIC v5 密码", "Enter TUIC v5 password")
+                          }
+                          value={tuicPassword}
+                          onChange={(e) => setTuicPassword(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">SNI</label>
+                        <input
+                          className="input mono"
+                          placeholder="tuic.example.com"
+                          value={tuicSni}
+                          onChange={(e) => setTuicSni(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">ALPN</label>
+                        <input
+                          className="input mono"
+                          placeholder="h3"
+                          value={tuicAlpn}
+                          onChange={(e) => setTuicAlpn(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("UDP 转发模式", "UDP Relay Mode")}
+                        </label>
+                        <select
+                          className="select"
+                          value={tuicUdpRelayMode}
+                          onChange={(e) =>
+                            setTuicUdpRelayMode(
+                              e.target.value as "native" | "quic",
+                            )
+                          }
+                        >
+                          <option value="native">native (QUIC Datagram)</option>
+                          <option value="quic">quic (Uni-Stream)</option>
+                        </select>
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">
+                          {tr("拥塞控制算法", "Congestion Control")}
+                        </label>
+                        <select
+                          className="select"
+                          value={tuicCongestion}
+                          onChange={(e) =>
+                            setTuicCongestion(
+                              e.target.value as "bbr" | "cubic" | "new_reno",
+                            )
+                          }
+                        >
+                          <option value="bbr">BBR</option>
+                          <option value="cubic">CUBIC</option>
+                          <option value="new_reno">NewReno</option>
+                        </select>
                       </div>
                     </>
                   )}
@@ -1761,7 +2391,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     </>
                   )}
 
-                  {(proto === "vless" || proto === "trojan") && (
+                  {((proto === "vless" && !vlessReality && !vlessFlow) ||
+                    proto === "vmess" ||
+                    proto === "trojan") && (
                     <>
                       <div className="form-field">
                         <label className="form-label">
@@ -1839,12 +2471,76 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                         >
                           <input
                             type="checkbox"
-                            checked={vlessTls}
-                            onChange={(e) => setVlessTls(e.target.checked)}
+                            checked={vlessReality}
+                            onChange={(e) => {
+                              const next = e.target.checked;
+                              setVlessReality(next);
+                              if (next) {
+                                setVlessTls(true);
+                                setTransportNet("tcp");
+                              }
+                            }}
+                          />
+                          {tr("启用 REALITY", "Enable REALITY")}
+                        </label>
+                        {!vlessReality && (
+                          <>
+                            <label
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 6,
+                                fontSize: 12.5,
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={vlessTls}
+                                onChange={(e) => setVlessTls(e.target.checked)}
+                              />
+                              {tr("启用 TLS", "Enable TLS")}
+                            </label>
+                            {vlessTls && (
+                              <label
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: 6,
+                                  fontSize: 12.5,
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={vlessSkipVerify}
+                                  onChange={(e) =>
+                                    setVlessSkipVerify(e.target.checked)
+                                  }
+                                />
+                                {tr("跳过证书校验", "Skip Cert Verify")}
+                              </label>
+                            )}
+                          </>
+                        )}
+                      </>
+                    )}
+                    {proto === "vmess" && (
+                      <>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={vmessTls}
+                            onChange={(e) => setVmessTls(e.target.checked)}
                           />
                           {tr("启用 TLS", "Enable TLS")}
                         </label>
-                        {vlessTls && (
+                        {vmessTls && (
                           <label
                             style={{
                               display: "inline-flex",
@@ -1855,14 +2551,67 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                           >
                             <input
                               type="checkbox"
-                              checked={vlessSkipVerify}
+                              checked={vmessSkipVerify}
                               onChange={(e) =>
-                                setVlessSkipVerify(e.target.checked)
+                                setVmessSkipVerify(e.target.checked)
                               }
                             />
                             {tr("跳过证书校验", "Skip Cert Verify")}
                           </label>
                         )}
+                      </>
+                    )}
+                    {proto === "hysteria2" && (
+                      <label
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 6,
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={hy2SkipVerify}
+                          onChange={(e) => setHy2SkipVerify(e.target.checked)}
+                        />
+                        {tr("跳过证书校验", "Skip Cert Verify")}
+                      </label>
+                    )}
+                    {proto === "tuic" && (
+                      <>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={tuicReduceRtt}
+                            onChange={(e) => setTuicReduceRtt(e.target.checked)}
+                          />
+                          {tr("0-RTT 握手加速", "0-RTT Reduce RTT")}
+                        </label>
+                        <label
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={tuicSkipVerify}
+                            onChange={(e) =>
+                              setTuicSkipVerify(e.target.checked)
+                            }
+                          />
+                          {tr("跳过证书校验", "Skip Cert Verify")}
+                        </label>
                       </>
                     )}
                     {proto === "trojan" && (

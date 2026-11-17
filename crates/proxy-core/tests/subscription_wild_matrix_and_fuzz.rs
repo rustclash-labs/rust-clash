@@ -129,10 +129,10 @@ fn wild_mihomo_v2board_xboard_nested_anchors_merges_bom_crlf_and_cycles() {
         "    port: 8388\r\n",
         "    cipher: 2022-blake3-aes-128-gcm\r\n",
         "    password: \"AAAAAAAAAAAAAAAAAAAAAA\"\r\n",
-        "  - name: \"Unsupported-Hysteria2\"\r\n",
-        "    type: hysteria2\r\n",
-        "    server: hy2.example.com\r\n",
-        "    port: 443\r\n",
+        "  - name: \"Unsupported-SSR\"\r\n",
+        "    type: ssr\r\n",
+        "    server: ssr.example.com\r\n",
+        "    port: 8388\r\n",
         "    password: \"CanarySecretPass_X99!\"\r\n",
         "proxy-groups:\r\n",
         "  - name: \"🚀 Proxy\"\r\n",
@@ -180,7 +180,7 @@ fn wild_mihomo_v2board_xboard_nested_anchors_merges_bom_crlf_and_cycles() {
         .map(|(c, _, s)| (c, s))
         .unwrap();
     assert_eq!(cfg.proxies.len(), 3, "expected 3 valid nodes");
-    assert_eq!(skipped.len(), 1, "expected 1 skipped hysteria2 node");
+    assert_eq!(skipped.len(), 1, "expected 1 skipped ssr node");
     assert_zero_secret_leak(&skipped[0].reason);
 
     // `mixed-port` == `external-controller` conflict auto-healed without losing mixed-port
@@ -507,6 +507,9 @@ proptest! {
             Just("vmess"),
             Just("hysteria2"),
             Just("tuic"),
+            Just("ssr"),
+            Just("wireguard"),
+            Just("snell"),
         ],
         port_raw in prop_oneof![
             Just("443".to_string()),
@@ -552,6 +555,9 @@ proptest! {
             Just("https://"),
             Just("clash://install-config?url="),
             Just("vmess://"),
+            Just("hysteria2://"),
+            Just("hy2://"),
+            Just("tuic://"),
             Just("ssr://"),
             Just(""),
         ],
@@ -601,10 +607,11 @@ proptest! {
         port in 1u16..=65535u16,
         pass in "[a-zA-Z0-9!@$%^&*:_.-]{6,32}",
         name in "[A-Za-z0-9_🚀🇭🇰🇯🇵 -]{1,64}",
-        proto_idx in 0u8..4u8,
+        proto_idx in 0u8..8u8,
     ) {
         let clean_name = name.trim();
         let effective_name = if clean_name.is_empty() { "Node" } else { clean_name };
+        let reality_pbk = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
         let yaml_node = match proto_idx {
             0 => serde_json::json!({
                 "name": effective_name,
@@ -635,7 +642,7 @@ proptest! {
                 "skip-cert-verify": false,
                 "udp": true,
             }),
-            _ => serde_json::json!({
+            3 => serde_json::json!({
                 "name": effective_name,
                 "type": "vless",
                 "server": host_choice,
@@ -643,6 +650,55 @@ proptest! {
                 "uuid": "11111111-2222-3333-4444-555555555555",
                 "tls": true,
                 "servername": "edge.example.com",
+                "udp": true,
+            }),
+            4 => serde_json::json!({
+                "name": effective_name,
+                "type": "vless",
+                "server": host_choice,
+                "port": port,
+                "uuid": "11111111-2222-3333-4444-555555555555",
+                "tls": true,
+                "flow": "xtls-rprx-vision",
+                "servername": "www.microsoft.com",
+                "client-fingerprint": "chrome",
+                "reality-opts": {
+                    "public-key": reality_pbk,
+                    "short-id": "01020304",
+                },
+                "udp": true,
+            }),
+            5 => serde_json::json!({
+                "name": effective_name,
+                "type": "vmess",
+                "server": host_choice,
+                "port": port,
+                "uuid": "11111111-2222-3333-4444-555555555555",
+                "cipher": "aes-128-gcm",
+                "tls": true,
+                "servername": "edge.example.com",
+                "udp": true,
+            }),
+            6 => serde_json::json!({
+                "name": effective_name,
+                "type": "hysteria2",
+                "server": host_choice,
+                "port": port,
+                "password": pass,
+                "sni": "edge.example.com",
+                "skip-cert-verify": false,
+                "udp": true,
+            }),
+            _ => serde_json::json!({
+                "name": effective_name,
+                "type": "tuic",
+                "server": host_choice,
+                "port": port,
+                "uuid": "11111111-2222-3333-4444-555555555555",
+                "password": pass,
+                "sni": "edge.example.com",
+                "udp-relay-mode": "native",
+                "congestion-controller": "bbr",
                 "udp": true,
             }),
         };

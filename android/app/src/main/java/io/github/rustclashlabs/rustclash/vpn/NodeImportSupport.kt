@@ -18,8 +18,12 @@ object NodeImportSupport {
     private val SUPPORTED_VIEW_SCHEMES = setOf(
         "ss",
         "vless",
+        "vmess",
         "anytls",
         "trojan",
+        "hysteria2",
+        "hy2",
+        "tuic",
         "socks5",
         "socks",
         "http-proxy",

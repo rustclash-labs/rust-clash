@@ -1,9 +1,13 @@
 pub mod anytls;
 pub mod http_proxy;
+pub mod hysteria2;
+pub mod quic_common;
 pub mod socks5;
 pub mod ss;
 pub mod trojan;
+pub mod tuic;
 pub mod vless;
+pub mod vmess;
 pub mod ws_stream;
 
 use std::{

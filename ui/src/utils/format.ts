@@ -125,11 +125,23 @@ export function delayBadgeVariant(delay: number | undefined): string {
 
 export function protocolBadgeVariant(proto: string): string {
   const lower = proto.toLowerCase();
-  if (lower.includes("vless") || lower.includes("pq")) return "badge-sky";
-  if (lower.includes("anytls") || lower.includes("trojan") || lower.includes("hy")) {
+  if (lower.includes("vless") || lower.includes("reality") || lower.includes("pq")) {
+    return "badge-sky";
+  }
+  if (
+    lower.includes("anytls") ||
+    lower.includes("trojan") ||
+    lower.includes("hy") ||
+    lower.includes("tuic")
+  ) {
     return "badge-emerald";
   }
-  if (lower.includes("2022") || lower.includes("ss") || lower.includes("shadowsocks")) {
+  if (
+    lower.includes("vmess") ||
+    lower.includes("2022") ||
+    lower.includes("ss") ||
+    lower.includes("shadowsocks")
+  ) {
     return "badge-amber";
   }
   return "badge-neutral";
@@ -138,15 +150,24 @@ export function protocolBadgeVariant(proto: string): string {
 export function prettyProtocolLabel(rawType: string): string {
   const lower = rawType.toLowerCase();
   if (lower === "vless") return "VLESS";
+  if (lower === "vless+reality+vision") return "VLESS·REALITY·Vision";
+  if (lower === "vless+reality") return "VLESS·REALITY";
+  if (lower === "vless+vision") return "VLESS·Vision";
+  if (lower === "vless+ws") return "VLESS·WS";
+  if (lower === "vless+encryption") return "VLESS·PQ";
   if (lower === "trojan") return "Trojan";
+  if (lower === "trojan+ws") return "Trojan·WS";
   if (lower === "ss" || lower === "shadowsocks") return "SS";
-  if (lower === "anytls") return "AnyTLS";
+  if (lower === "shadowsocks-2022") return "SS-2022";
+  if (lower === "anytls" || lower === "anytls-v2") return "AnyTLS";
   if (lower === "vmess") return "VMess";
+  if (lower === "vmess+ws") return "VMess·WS";
   if (lower === "hysteria2" || lower === "hy2") return "Hysteria2";
-  if (lower === "tuic") return "TUIC";
+  if (lower === "tuic" || lower === "tuic-v5") return "TUIC v5";
   if (lower === "wireguard") return "WireGuard";
   if (lower === "socks5") return "SOCKS5";
   if (lower === "http") return "HTTP";
+  if (lower === "https") return "HTTPS";
   if (lower === "selector") return "Selector";
   if (lower === "urltest") return "URLTest";
   if (lower === "fallback") return "Fallback";
@@ -160,11 +181,23 @@ export function nodeProtocolBadge(
 ): string {
   if (!node) return fallbackLabel ? prettyProtocolLabel(fallbackLabel) : "Node";
   const isWs =
-    (node.type === "vless" || node.type === "trojan") &&
+    (node.type === "vless" || node.type === "vmess" || node.type === "trojan") &&
     ((node.network ?? "").toLowerCase() === "ws" || Boolean(node["ws-opts"]));
   switch (node.type) {
-    case "vless":
+    case "vless": {
+      const hasReality = Boolean(node["reality-opts"]);
+      const hasVision = Boolean(node.flow);
+      if (hasReality && hasVision) return "VLESS·REALITY·Vision";
+      if (hasReality) return "VLESS·REALITY";
+      if (hasVision) return "VLESS·Vision";
       return isWs ? "VLESS·WS" : "VLESS";
+    }
+    case "vmess":
+      return isWs ? "VMess·WS" : "VMess";
+    case "hysteria2":
+      return "Hysteria2";
+    case "tuic":
+      return "TUIC v5";
     case "trojan":
       return isWs ? "Trojan·WS" : "Trojan";
     case "anytls":

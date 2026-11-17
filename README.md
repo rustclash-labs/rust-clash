@@ -56,7 +56,7 @@
 
 - **一套内核覆盖 Android、Windows、macOS 和 Linux**：原生 Jetpack Compose Android 客户端、Tauri 2 桌面客户端、无头 CLI 与内嵌 Web 控制台。
 - **100% 纯 Rust 内核与 `smoltcp` 用户态 TUN**：无任何 Go / C 代理边车依赖，桌面端常驻内存仅 `~10–25 MiB`、空闲 CPU `0%`。
-- **主流精简协议支持**：支持 **VLESS**（含后量子 `mlkem768x25519plus` 0-RTT/1-RTT）、**Trojan**、**AnyTLS v2**、**Shadowsocks-2022** 与 **SOCKS5 / HTTP(S)**。
+- **主流出站协议全覆盖**：100% 纯 Rust 原生支持 **VLESS**（含 `REALITY` + `xtls-rprx-vision` 与后量子 `mlkem768x25519plus` 0-RTT/1-RTT）、**VMess AEAD**、**Hysteria2**（含 Salamander 混淆与端口跳跃）、**TUIC v5**、**Trojan**、**AnyTLS v2**、**Shadowsocks（AEAD / 2022）** 与 **SOCKS5 / HTTP(S)**。
 - **多传输层国内外分流 DNS**：支持 `Fake-IP` 与真实 IP 模式，内置 `UDP`、`TCP`、`DoT` 与多路复用 `HTTP/2 DoH` 并发竞速及 `Smart CN` 一键分流。
 - **白盒化网络诊断**：内置“网站打不开”一键排障医生、`DNS → 隧道 → TLS → HTTP TTFB` 分段耗时瀑布图及真实 UDP 连通性校验。
 - **配置安全审计（`Clippy for Clash`）**：静态安全评分（`0–100`）、分流路由模拟与订阅更新安全差异对比。
@@ -65,7 +65,7 @@
 
 ## 下载
 
-从 [`v0.4.12` 最新正式版](https://github.com/rustclash-labs/rust-clash/releases/latest) 获取对应平台安装包（所有构建产物均附带 `SHA256SUMS.txt` 校验文件）。
+从 [`v0.5.0` 最新正式版](https://github.com/rustclash-labs/rust-clash/releases/latest) 获取对应平台安装包（所有构建产物均附带 `SHA256SUMS.txt` 校验文件）。
 
 | 平台 | 安装包 | 说明 |
 | --- | --- | --- |
@@ -118,7 +118,7 @@ cargo build --locked --release -p tauri-app --features desktop  # 桌面端客�
 
 ## 状态与文档
 
-- **协议范围说明**：为保持纯 Rust 实现的精简与可维护性，未实现 `VMess`、`Hysteria2`、`TUIC`、VLESS `REALITY` 等历史/扩展协议（导入混合订阅时会自动跳过不支持的节点）。
+- **协议范围说明**：已纯 Rust 内置上述全部主流 Clash / Mihomo 协议；历史遗留或非流式协议（如 `SSR`、`Snell`、`WireGuard` 及 `gRPC` 传输层）暂未内置，导入混合订阅时会自动跳过不支持的节点。
 - **延伸阅读**：[跨平台与 TUN 状态](docs/PLATFORM_SUPPORT.md) · [Android 架构说明](docs/ANDROID_IMPLEMENTATION.md) · [性能基准报告](docs/PERFORMANCE_BENCHMARK.md) · [安全策略](SECURITY.md) · [贡献指南](CONTRIBUTING.md)
 
 ## 许可证

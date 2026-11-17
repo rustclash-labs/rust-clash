@@ -1763,3 +1763,1199 @@ async fn interop_http_connect_plain_tls_and_auth_with_xray_server() {
 
     let _ = shutdown_tx.send(true);
 }
+
+fn reserve_free_udp_port() -> u16 {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP port");
+    let port = sock.local_addr().unwrap().port();
+    drop(sock);
+    port
+}
+
+fn parse_xray_x25519_output(text: &str) -> (String, String) {
+    let mut priv_key = None;
+    let mut pub_key = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("PrivateKey:") {
+            priv_key = Some(v.trim().to_string());
+        } else if let Some(v) = trimmed
+            .strip_prefix("Password (PublicKey):")
+            .or_else(|| trimmed.strip_prefix("PublicKey:"))
+            .or_else(|| trimmed.strip_prefix("Password:"))
+        {
+            pub_key = Some(v.trim().to_string());
+        }
+    }
+    (
+        priv_key.unwrap_or_else(|| panic!("missing PrivateKey in xray x25519:\n{text}")),
+        pub_key.unwrap_or_else(|| panic!("missing PublicKey in xray x25519:\n{text}")),
+    )
+}
+
+async fn dump_child_and_panic(guard: &mut ChildGuard, context: &str) -> ! {
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = guard.0.start_kill();
+    let mut out = String::new();
+    let mut err = String::new();
+    if let Some(mut s) = guard.0.stdout.take() {
+        let _ = s.read_to_string(&mut out).await;
+    }
+    if let Some(mut s) = guard.0.stderr.take() {
+        let _ = s.read_to_string(&mut err).await;
+    }
+    panic!("{context}\nstdout:\n{out}\nstderr:\n{err}");
+}
+
+#[tokio::test]
+async fn interop_vmess_aead_bidirectional_with_xray_and_sing_box() {
+    use proxy_core::outbound::vmess::{
+        VmessOutbound, VmessOutboundConfig, crypto::VmessSecurity, spawn_vmess_server,
+    };
+
+    let Some(xray_bin) = resolve_bin("xray/xray") else {
+        return;
+    };
+    let Some(sing_box_bin) = resolve_bin("sing-box/sing-box") else {
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tcp_echo, udp_echo) = spawn_echo_servers(shutdown_rx.clone()).await;
+    let tcp_target = TargetAddr::from(tcp_echo);
+    let udp_target = TargetAddr::from(udp_echo);
+
+    let uuid = Uuid::new_v4();
+    let sni = "vmess.interop.local";
+    let tmp_dir = TempDirGuard::new("vmess-interop");
+    let (cert_pem_path, key_pem_path, ca_der) =
+        write_ephemeral_pem_cert(tmp_dir.path(), "vmess_tls", &[sni, "127.0.0.1"]);
+
+    // =========================================================================
+    // Direction A1: rust-clash `VmessOutbound` (TCP + WS+TLS+ed=2048 + UDP) -> `xray`
+    // =========================================================================
+    let xray_tcp_port = reserve_free_port();
+    let xray_ws_port = reserve_free_port();
+    let xray_srv_path = tmp_dir.path().join("xray_vmess_srv.json");
+    let xray_srv_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": xray_tcp_port,
+                "protocol": "vmess",
+                "settings": {
+                    "clients": [{ "id": uuid.to_string(), "alterId": 0 }]
+                }
+            },
+            {
+                "listen": "127.0.0.1",
+                "port": xray_ws_port,
+                "protocol": "vmess",
+                "settings": {
+                    "clients": [{ "id": uuid.to_string(), "alterId": 0 }]
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "alpn": ["http/1.1"],
+                        "certificates": [{
+                            "certificateFile": cert_pem_path.to_str().unwrap(),
+                            "keyFile": key_pem_path.to_str().unwrap()
+                        }]
+                    },
+                    "wsSettings": {
+                        "path": "/vmess-ws",
+                        "maxEarlyData": 2048,
+                        "earlyDataHeaderName": "Sec-WebSocket-Protocol"
+                    }
+                }
+            }
+        ],
+        "outbounds": [{
+            "protocol": "freedom",
+            "settings": {
+                "finalRules": [{ "action": "allow" }]
+            }
+        }]
+    });
+    std::fs::write(
+        &xray_srv_path,
+        serde_json::to_vec_pretty(&xray_srv_cfg).unwrap(),
+    )
+    .unwrap();
+
+    let mut xray_srv = ChildGuard(
+        clean_loopback_command(&xray_bin)
+            .args(["run", "-c", xray_srv_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn xray vmess server"),
+    );
+    wait_tcp_ready(xray_tcp_port, &mut xray_srv, "xray vmess-tcp").await;
+    wait_tcp_ready(xray_ws_port, &mut xray_srv, "xray vmess-ws-tls").await;
+
+    let payload: Vec<u8> = (0..131_072).map(|i| ((i * 43 + 17) & 0xFF) as u8).collect();
+
+    for (label, port, sec, tls, ws_opts) in [
+        (
+            "xray-vmess-aes128-tcp",
+            xray_tcp_port,
+            VmessSecurity::Aes128Gcm,
+            false,
+            None,
+        ),
+        (
+            "xray-vmess-chacha-tcp",
+            xray_tcp_port,
+            VmessSecurity::Chacha20Poly1305,
+            false,
+            None,
+        ),
+        (
+            "xray-vmess-ws-tls-ed2048",
+            xray_ws_port,
+            VmessSecurity::Aes128Gcm,
+            true,
+            Some(WsTransportConfig {
+                path: "/vmess-ws?ed=2048".into(),
+                headers: std::collections::HashMap::from([("Host".into(), sni.into())]),
+                max_early_data: Some(2048),
+                early_data_header_name: Some("Sec-WebSocket-Protocol".into()),
+            }),
+        ),
+    ] {
+        let client = VmessOutbound::new_with_transport(
+            VmessOutboundConfig {
+                name: label.into(),
+                server: "127.0.0.1".into(),
+                port,
+                uuid,
+                security: sec,
+                global_padding: true,
+                tls,
+                servername: tls.then(|| sni.into()),
+                skip_cert_verify: false,
+                alpn: if tls {
+                    vec![b"http/1.1".to_vec()]
+                } else {
+                    vec![]
+                },
+                extra_ca_der: if tls { vec![ca_der.clone()] } else { vec![] },
+                udp: true,
+            },
+            ws_opts,
+            None,
+        )
+        .unwrap();
+
+        let mut st = match client.connect_tcp(&tcp_target).await {
+            Ok(s) => s,
+            Err(e) => {
+                dump_child_and_panic(&mut xray_srv, &format!("{label} connect failed: {e}")).await
+            }
+        };
+        st.write_all(&payload).await.unwrap();
+        st.flush().await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        if let Err(e) = st.read_exact(&mut echoed).await {
+            dump_child_and_panic(&mut xray_srv, &format!("{label} read failed: {e}")).await;
+        }
+        assert_eq!(echoed, payload, "{label} 128KB TCP mismatch");
+        drop(st);
+
+        let udp_sess = client.open_udp_session().await.unwrap();
+        for seq in 0..3 {
+            let msg = format!("{label}-udp-{seq}");
+            udp_sess.send_to(msg.as_bytes(), &udp_target).await.unwrap();
+            let (resp, src) = tokio::time::timeout(Duration::from_secs(5), udp_sess.recv_from())
+                .await
+                .unwrap_or_else(|_| panic!("{label} UDP timeout"))
+                .unwrap_or_else(|e| panic!("{label} UDP recv error: {e}"));
+            assert_eq!(resp, format!("EXT-UDP-ECHO:{msg}").into_bytes());
+            assert_eq!(src, udp_target);
+        }
+    }
+    drop(xray_srv);
+
+    // =========================================================================
+    // Direction A2: rust-clash `VmessOutbound` -> official `sing-box` Server
+    // =========================================================================
+    let sb_vmess_port = reserve_free_port();
+    let sb_srv_path = tmp_dir.path().join("sb_vmess_srv.json");
+    let sb_srv_cfg = json!({
+        "log": { "level": "warn" },
+        "inbounds": [{
+            "type": "vmess",
+            "tag": "vmess-in",
+            "listen": "127.0.0.1",
+            "listen_port": sb_vmess_port,
+            "users": [{ "uuid": uuid.to_string(), "alterId": 0 }],
+            "tls": {
+                "enabled": true,
+                "certificate_path": cert_pem_path.to_str().unwrap(),
+                "key_path": key_pem_path.to_str().unwrap()
+            }
+        }],
+        "outbounds": [{ "type": "direct", "tag": "direct" }]
+    });
+    std::fs::write(
+        &sb_srv_path,
+        serde_json::to_vec_pretty(&sb_srv_cfg).unwrap(),
+    )
+    .unwrap();
+
+    let mut sb_srv = ChildGuard(
+        clean_loopback_command(&sing_box_bin)
+            .args(["run", "-c", sb_srv_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn sing-box vmess server"),
+    );
+    wait_tcp_ready(sb_vmess_port, &mut sb_srv, "sing-box vmess-tls").await;
+
+    for sec in [VmessSecurity::Chacha20Poly1305, VmessSecurity::Zero] {
+        let client = VmessOutbound::new(VmessOutboundConfig {
+            name: format!("sb-vmess-{sec:?}"),
+            server: "127.0.0.1".into(),
+            port: sb_vmess_port,
+            uuid,
+            security: sec,
+            global_padding: false,
+            tls: true,
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![],
+            extra_ca_der: vec![ca_der.clone()],
+            udp: true,
+        })
+        .unwrap();
+
+        let mut st = client.connect_tcp(&tcp_target).await.unwrap();
+        st.write_all(&payload).await.unwrap();
+        st.flush().await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        st.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload, "sing-box VMess {sec:?} 128KB mismatch");
+
+        let udp_resp = client
+            .exchange_udp(
+                &udp_target,
+                b"vmess-to-sing-box-udp",
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(udp_resp, b"EXT-UDP-ECHO:vmess-to-sing-box-udp");
+    }
+    drop(sb_srv);
+
+    // =========================================================================
+    // Direction B: official `xray` & `sing-box` VMess Clients -> `spawn_vmess_server`
+    // =========================================================================
+    let our_srv = spawn_vmess_server("127.0.0.1:0".parse().unwrap(), uuid, None, None)
+        .await
+        .expect("spawn_vmess_server");
+
+    let xray_socks = reserve_free_port();
+    let xray_cli_path = tmp_dir.path().join("xray_vmess_cli.json");
+    let xray_cli_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": xray_socks,
+            "protocol": "socks",
+            "settings": { "udp": true }
+        }],
+        "outbounds": [{
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": "127.0.0.1",
+                    "port": our_srv.listen_addr.port(),
+                    "users": [{
+                        "id": uuid.to_string(),
+                        "alterId": 0,
+                        "security": "aes-128-gcm"
+                    }]
+                }]
+            }
+        }]
+    });
+    std::fs::write(
+        &xray_cli_path,
+        serde_json::to_vec_pretty(&xray_cli_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut xray_cli = ChildGuard(
+        clean_loopback_command(&xray_bin)
+            .args(["run", "-c", xray_cli_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn xray vmess client"),
+    );
+    wait_tcp_ready(xray_socks, &mut xray_cli, "xray vmess client").await;
+    assert_eq!(
+        socks5_tcp_roundtrip(xray_socks, tcp_echo, &payload).await,
+        payload
+    );
+    assert_eq!(
+        socks5_udp_roundtrip(xray_socks, udp_echo, b"xray-vmess-cli-udp").await,
+        b"EXT-UDP-ECHO:xray-vmess-cli-udp"
+    );
+    drop(xray_cli);
+
+    let sb_socks = reserve_free_port();
+    let sb_cli_path = tmp_dir.path().join("sb_vmess_cli.json");
+    let sb_cli_cfg = json!({
+        "log": { "level": "warn" },
+        "inbounds": [{
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "listen_port": sb_socks
+        }],
+        "outbounds": [{
+            "type": "vmess",
+            "tag": "vmess-out",
+            "server": "127.0.0.1",
+            "server_port": our_srv.listen_addr.port(),
+            "uuid": uuid.to_string(),
+            "security": "chacha20-poly1305",
+            "alter_id": 0,
+            "packet_encoding": ""
+        }]
+    });
+    std::fs::write(
+        &sb_cli_path,
+        serde_json::to_vec_pretty(&sb_cli_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut sb_cli = ChildGuard(
+        clean_loopback_command(&sing_box_bin)
+            .args(["run", "-c", sb_cli_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn sing-box vmess client"),
+    );
+    wait_tcp_ready(sb_socks, &mut sb_cli, "sing-box vmess client").await;
+    assert_eq!(
+        socks5_tcp_roundtrip(sb_socks, tcp_echo, &payload).await,
+        payload
+    );
+    assert_eq!(
+        socks5_udp_roundtrip(sb_socks, udp_echo, b"sb-vmess-cli-udp").await,
+        b"EXT-UDP-ECHO:sb-vmess-cli-udp"
+    );
+    drop(sb_cli);
+
+    our_srv.shutdown().await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn interop_vless_reality_xtls_vision_bidirectional_with_xray_and_sing_box() {
+    use proxy_core::outbound::vless::{
+        VlessRealityServerConfig,
+        reality::{RealityClientConfig, decode_reality_public_key, decode_reality_short_id},
+        spawn_vless_reality_vision_server,
+        vision::VlessVisionFlow,
+    };
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    let Some(xray_bin) = resolve_bin("xray/xray") else {
+        return;
+    };
+    let Some(sing_box_bin) = resolve_bin("sing-box/sing-box") else {
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tcp_echo, udp_echo) = spawn_echo_servers(shutdown_rx.clone()).await;
+    let tcp_target = TargetAddr::from(tcp_echo);
+    let udp_target = TargetAddr::from(udp_echo);
+
+    // 1. Spawn a local TLS 1.3 camouflage target (`dest`) so `xray` and `sing-box` REALITY servers
+    //    complete REALITY target certificate synthesis strictly on 127.0.0.1 with zero internet access!
+    let camo_sni = "reality.camo.local";
+    let (camo_tls_cfg, _camo_ca) = generate_self_signed_server_config(
+        &[camo_sni.to_string(), "127.0.0.1".to_string()],
+        &[b"h2".to_vec(), b"http/1.1".to_vec()],
+    )
+    .unwrap();
+    let camo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let camo_addr = camo_listener.local_addr().unwrap();
+    let camo_acceptor = TlsAcceptor::from(camo_tls_cfg);
+    let mut camo_stop = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = camo_stop.changed() => break,
+                res = camo_listener.accept() => {
+                    let Ok((tcp, _)) = res else { continue };
+                    let acc = camo_acceptor.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mut tls) = acc.accept(tcp).await {
+                            let mut buf = [0u8; 1024];
+                            let _ = tls.read(&mut buf).await;
+                            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // 2. Spawn an inner TLS 1.3 origin echo server to prove `xtls-rprx-vision` `CMD_PADDING_DIRECT` splice!
+    let inner_sni = "inner.vision.local";
+    let (inner_tls_cfg, inner_ca_der) = generate_self_signed_server_config(
+        &[inner_sni.to_string(), "127.0.0.1".to_string()],
+        &[b"h2".to_vec()],
+    )
+    .unwrap();
+    let inner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inner_tls_addr = inner_listener.local_addr().unwrap();
+    let inner_acceptor = TlsAcceptor::from(inner_tls_cfg);
+    let mut inner_stop = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = inner_stop.changed() => break,
+                res = inner_listener.accept() => {
+                    let Ok((tcp, _)) = res else { continue };
+                    let acc = inner_acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acc.accept(tcp).await else { return };
+                        let mut buf = vec![0u8; 32 * 1024];
+                        while let Ok(n) = tls.read(&mut buf).await {
+                            if n == 0 || tls.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // 3. Generate official X25519 REALITY keypair via `xray x25519`
+    let x25519_out = clean_loopback_command(&xray_bin)
+        .arg("x25519")
+        .output()
+        .await
+        .expect("run xray x25519");
+    assert!(x25519_out.status.success());
+    let (priv_b64, pub_b64) =
+        parse_xray_x25519_output(&String::from_utf8_lossy(&x25519_out.stdout));
+    let pub_bytes = decode_reality_public_key(&pub_b64).unwrap();
+    let priv_bytes = decode_reality_public_key(&priv_b64).unwrap();
+    let sid_hex = "deadbeef01234567";
+    let sid_bytes = decode_reality_short_id(sid_hex).unwrap();
+    let uuid = Uuid::new_v4();
+
+    let tmp_dir = TempDirGuard::new("reality-vision-interop");
+    let payload: Vec<u8> = (0..131_072).map(|i| ((i * 53 + 19) & 0xFF) as u8).collect();
+
+    // =========================================================================
+    // Direction A1 & A2: `rust-clash` REALITY + Vision -> `xray v26` & `sing-box v1.14`
+    // =========================================================================
+    let xray_port = reserve_free_port();
+    let xray_srv_path = tmp_dir.path().join("xray_reality_srv.json");
+    let xray_srv_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": xray_port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{
+                    "id": uuid.to_string(),
+                    "flow": "xtls-rprx-vision"
+                }],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": camo_addr.to_string(),
+                    "xver": 0,
+                    "serverNames": [camo_sni],
+                    "privateKey": priv_b64,
+                    "shortIds": [sid_hex]
+                }
+            }
+        }],
+        "outbounds": [{
+            "protocol": "freedom",
+            "settings": {
+                "finalRules": [{ "action": "allow" }]
+            }
+        }]
+    });
+    std::fs::write(
+        &xray_srv_path,
+        serde_json::to_vec_pretty(&xray_srv_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut xray_srv = ChildGuard(
+        clean_loopback_command(&xray_bin)
+            .args(["run", "-c", xray_srv_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn xray reality server"),
+    );
+    wait_tcp_ready(xray_port, &mut xray_srv, "xray reality-vision server").await;
+
+    let sb_port = reserve_free_port();
+    let sb_srv_path = tmp_dir.path().join("sb_reality_srv.json");
+    let sb_srv_cfg = json!({
+        "log": { "level": "warn" },
+        "inbounds": [{
+            "type": "vless",
+            "tag": "vless-reality-in",
+            "listen": "127.0.0.1",
+            "listen_port": sb_port,
+            "users": [{
+                "uuid": uuid.to_string(),
+                "flow": "xtls-rprx-vision"
+            }],
+            "tls": {
+                "enabled": true,
+                "server_name": camo_sni,
+                "reality": {
+                    "enabled": true,
+                    "handshake": {
+                        "server": "127.0.0.1",
+                        "server_port": camo_addr.port()
+                    },
+                    "private_key": priv_b64,
+                    "short_id": [sid_hex]
+                }
+            }
+        }],
+        "outbounds": [{ "type": "direct", "tag": "direct" }]
+    });
+    std::fs::write(
+        &sb_srv_path,
+        serde_json::to_vec_pretty(&sb_srv_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut sb_srv = ChildGuard(
+        clean_loopback_command(&sing_box_bin)
+            .args(["run", "-c", sb_srv_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn sing-box reality server"),
+    );
+    wait_tcp_ready(sb_port, &mut sb_srv, "sing-box reality-vision server").await;
+
+    let inner_client_cfg =
+        proxy_core::crypto::tls::build_tls_client_config(false, &[inner_ca_der], &[b"h2".to_vec()])
+            .unwrap();
+    let inner_connector = TlsConnector::from(inner_client_cfg);
+
+    for (srv_label, port, fp) in [
+        ("xray-v26-reality-vision", xray_port, "chrome"),
+        ("sing-box-v1.14-reality-vision", sb_port, "firefox"),
+    ] {
+        let our_vless = VlessOutbound::new_with_vision_and_reality(
+            VlessOutboundConfig {
+                name: srv_label.into(),
+                server: "127.0.0.1".into(),
+                port,
+                uuid,
+                encryption: "none".into(),
+                tls: true,
+                servername: Some(camo_sni.into()),
+                skip_cert_verify: false,
+                alpn: vec![],
+                extra_ca_der: vec![],
+                udp: true,
+            },
+            None,
+            Some(VlessVisionFlow::XtlsRprxVision),
+            Some(RealityClientConfig {
+                public_key: pub_bytes,
+                short_id: sid_bytes,
+                server_name: camo_sni.into(),
+                fingerprint: fp.into(),
+                spider_x: "/".into(),
+                alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            }),
+            None,
+        )
+        .unwrap();
+
+        // 1. 128 KB plain TCP stream over REALITY + Vision
+        let mut st = our_vless
+            .connect_tcp(&tcp_target)
+            .await
+            .unwrap_or_else(|e| panic!("{srv_label} plain TCP connect failed: {e}"));
+        st.write_all(&payload).await.unwrap();
+        st.flush().await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        st.read_exact(&mut echoed)
+            .await
+            .unwrap_or_else(|e| panic!("{srv_label} plain TCP read failed: {e}"));
+        assert_eq!(echoed, payload, "{srv_label} plain 128KB mismatch");
+        drop(st);
+
+        // 2. 128 KB nested inner TLS 1.3 stream (`CMD_PADDING_DIRECT` splice!)
+        let raw_tunnel = our_vless
+            .connect_tcp(&TargetAddr::from(inner_tls_addr))
+            .await
+            .unwrap_or_else(|e| panic!("{srv_label} inner TLS tunnel connect failed: {e}"));
+        let sni_name = proxy_core::crypto::tls::parse_server_name(inner_sni).unwrap();
+        let mut nested_tls = inner_connector
+            .connect(sni_name, raw_tunnel)
+            .await
+            .unwrap_or_else(|e| panic!("{srv_label} nested TLS 1.3 handshake failed: {e}"));
+        nested_tls.write_all(&payload).await.unwrap();
+        nested_tls.flush().await.unwrap();
+        let mut tls_echoed = vec![0u8; payload.len()];
+        nested_tls
+            .read_exact(&mut tls_echoed)
+            .await
+            .unwrap_or_else(|e| panic!("{srv_label} nested TLS 1.3 splice read failed: {e}"));
+        assert_eq!(
+            tls_echoed, payload,
+            "{srv_label} nested TLS 1.3 splice mismatch"
+        );
+        drop(nested_tls);
+
+        // 3. Multi-datagram XUDP (`v1.mux.cool:666`) UDP session over REALITY + Vision
+        let udp_sess = our_vless.open_udp_session().await.unwrap();
+        for seq in 0..3 {
+            let msg = format!("{srv_label}-xudp-{seq}");
+            udp_sess.send_to(msg.as_bytes(), &udp_target).await.unwrap();
+            let (resp, src) = tokio::time::timeout(Duration::from_secs(5), udp_sess.recv_from())
+                .await
+                .unwrap_or_else(|_| panic!("{srv_label} XUDP timeout"))
+                .unwrap_or_else(|e| panic!("{srv_label} XUDP error: {e}"));
+            assert_eq!(resp, format!("EXT-UDP-ECHO:{msg}").into_bytes());
+            assert_eq!(src, udp_target);
+        }
+    }
+    drop(xray_srv);
+    drop(sb_srv);
+
+    // =========================================================================
+    // Direction B: official `xray v26` REALITY + Vision Client -> `rust-clash` Server
+    // =========================================================================
+    let (our_reality_addr, _our_task) = spawn_vless_reality_vision_server(
+        VlessRealityServerConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            allowed_uuid: uuid,
+            reality_private_key: priv_bytes,
+            reality_short_id: sid_bytes,
+            reality_server_name: camo_sni.into(),
+        },
+        shutdown_rx.clone(),
+    )
+    .await
+    .expect("spawn_vless_reality_vision_server");
+
+    let xray_socks = reserve_free_port();
+    let xray_cli_path = tmp_dir.path().join("xray_reality_cli.json");
+    let xray_cli_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": xray_socks,
+            "protocol": "socks",
+            "settings": { "udp": true }
+        }],
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": "127.0.0.1",
+                    "port": our_reality_addr.port(),
+                    "users": [{
+                        "id": uuid.to_string(),
+                        "encryption": "none",
+                        "flow": "xtls-rprx-vision"
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "serverName": camo_sni,
+                    "fingerprint": "chrome",
+                    "publicKey": pub_b64,
+                    "shortId": sid_hex,
+                    "spiderX": "/"
+                }
+            }
+        }]
+    });
+    std::fs::write(
+        &xray_cli_path,
+        serde_json::to_vec_pretty(&xray_cli_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut xray_cli = ChildGuard(
+        clean_loopback_command(&xray_bin)
+            .args(["run", "-c", xray_cli_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn xray reality client"),
+    );
+    wait_tcp_ready(xray_socks, &mut xray_cli, "xray reality-vision client").await;
+
+    assert_eq!(
+        socks5_tcp_roundtrip(xray_socks, tcp_echo, &payload).await,
+        payload,
+        "xray -> rust-clash REALITY Vision 128KB TCP mismatch"
+    );
+    assert_eq!(
+        socks5_udp_roundtrip(xray_socks, udp_echo, b"xray-reality-xudp-to-rust").await,
+        b"EXT-UDP-ECHO:xray-reality-xudp-to-rust",
+        "xray -> rust-clash REALITY Vision XUDP mismatch"
+    );
+    drop(xray_cli);
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn interop_hysteria2_plain_and_salamander_bidirectional_with_sing_box() {
+    use proxy_core::outbound::hysteria2::{
+        Hysteria2Outbound, Hysteria2OutboundConfig, spawn_hysteria2_server,
+    };
+
+    let Some(sing_box_bin) = resolve_bin("sing-box/sing-box") else {
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tcp_echo, udp_echo) = spawn_echo_servers(shutdown_rx.clone()).await;
+    let tcp_target = TargetAddr::from(tcp_echo);
+    let udp_target = TargetAddr::from(udp_echo);
+
+    let sni = "hy2.interop.local";
+    let password = "hy2-singbox-interop-secret";
+    let obfs_password = "hy2-salamander-blake2b-secret";
+    let tmp_dir = TempDirGuard::new("hy2-singbox-interop");
+    let (cert_pem_path, key_pem_path, ca_der) =
+        write_ephemeral_pem_cert(tmp_dir.path(), "hy2_tls", &[sni, "127.0.0.1"]);
+
+    // =========================================================================
+    // Direction A: `rust-clash Hysteria2Outbound` -> official `sing-box` Server
+    // =========================================================================
+    let sb_ready_tcp = reserve_free_port();
+    let sb_plain_udp = reserve_free_udp_port();
+    let sb_obfs_udp = reserve_free_udp_port();
+    let sb_srv_path = tmp_dir.path().join("sb_hy2_srv.json");
+    let sb_srv_cfg = json!({
+        "log": { "level": "warn" },
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "ready-probe",
+                "listen": "127.0.0.1",
+                "listen_port": sb_ready_tcp
+            },
+            {
+                "type": "hysteria2",
+                "tag": "hy2-plain",
+                "listen": "127.0.0.1",
+                "listen_port": sb_plain_udp,
+                "users": [{ "password": password }],
+                "tls": {
+                    "enabled": true,
+                    "alpn": ["h3"],
+                    "certificate_path": cert_pem_path.to_str().unwrap(),
+                    "key_path": key_pem_path.to_str().unwrap()
+                }
+            },
+            {
+                "type": "hysteria2",
+                "tag": "hy2-obfs",
+                "listen": "127.0.0.1",
+                "listen_port": sb_obfs_udp,
+                "users": [{ "password": password }],
+                "obfs": {
+                    "type": "salamander",
+                    "password": obfs_password
+                },
+                "tls": {
+                    "enabled": true,
+                    "alpn": ["h3"],
+                    "certificate_path": cert_pem_path.to_str().unwrap(),
+                    "key_path": key_pem_path.to_str().unwrap()
+                }
+            }
+        ],
+        "outbounds": [{ "type": "direct", "tag": "direct" }]
+    });
+    std::fs::write(
+        &sb_srv_path,
+        serde_json::to_vec_pretty(&sb_srv_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut sb_srv = ChildGuard(
+        clean_loopback_command(&sing_box_bin)
+            .args(["run", "-c", sb_srv_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn sing-box hy2 server"),
+    );
+    wait_tcp_ready(sb_ready_tcp, &mut sb_srv, "sing-box hy2 server").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Negative check: wrong Hysteria2 password against sing-box must fail HTTP/3 /auth (non-233)!
+    let bad_hy2 = Hysteria2Outbound::new(Hysteria2OutboundConfig {
+        name: "hy2-bad-pw".into(),
+        server: "127.0.0.1".into(),
+        port: sb_plain_udp,
+        ports: None,
+        password: "wrong-password".into(),
+        obfs_salamander_password: None,
+        up_bytes_per_sec: 0,
+        down_bytes_per_sec: 0,
+        servername: Some(sni.into()),
+        skip_cert_verify: false,
+        alpn: vec![b"h3".to_vec()],
+        extra_ca_der: vec![ca_der.clone()],
+        udp: true,
+    })
+    .unwrap();
+    assert!(
+        bad_hy2.connect_tcp(&tcp_target).await.is_err(),
+        "sing-box must reject wrong Hysteria2 password"
+    );
+
+    let payload: Vec<u8> = (0..131_072).map(|i| ((i * 61 + 29) & 0xFF) as u8).collect();
+    let large_udp: Vec<u8> = (0..3600).map(|i| ((i * 19 + 7) & 0xFF) as u8).collect();
+
+    for (label, port, obfs) in [
+        ("hy2-plain-to-singbox", sb_plain_udp, None),
+        (
+            "hy2-salamander-to-singbox",
+            sb_obfs_udp,
+            Some(obfs_password.to_string()),
+        ),
+    ] {
+        let client = Hysteria2Outbound::new(Hysteria2OutboundConfig {
+            name: label.into(),
+            server: "127.0.0.1".into(),
+            port,
+            ports: None,
+            password: password.into(),
+            obfs_salamander_password: obfs,
+            up_bytes_per_sec: 50_000_000,
+            down_bytes_per_sec: 200_000_000,
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der.clone()],
+            udp: true,
+        })
+        .unwrap();
+
+        let mut st = match client.connect_tcp(&tcp_target).await {
+            Ok(s) => s,
+            Err(e) => {
+                dump_child_and_panic(&mut sb_srv, &format!("{label} connect failed: {e}")).await
+            }
+        };
+        st.write_all(&payload).await.unwrap();
+        st.flush().await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        if let Err(e) = st.read_exact(&mut echoed).await {
+            dump_child_and_panic(&mut sb_srv, &format!("{label} read failed: {e}")).await;
+        }
+        assert_eq!(echoed, payload, "{label} 128KB TCP mismatch");
+        drop(st);
+
+        let udp_resp = client
+            .exchange_udp(&udp_target, &large_udp, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("{label} 3600B fragmented UDP failed: {e}"));
+        let mut expected_udp = b"EXT-UDP-ECHO:".to_vec();
+        expected_udp.extend_from_slice(&large_udp);
+        assert_eq!(udp_resp, expected_udp, "{label} fragmented UDP mismatch");
+    }
+    drop(sb_srv);
+
+    // =========================================================================
+    // Direction B: official `sing-box` Client -> `rust-clash spawn_hysteria2_server`
+    // =========================================================================
+    let (our_tls_cfg, our_ca_der) = generate_self_signed_server_config(
+        &[sni.to_string(), "127.0.0.1".to_string()],
+        &[b"h3".to_vec()],
+    )
+    .unwrap();
+    let our_ca_pem_path = tmp_dir.path().join("our_hy2_ca.pem");
+    std::fs::write(&our_ca_pem_path, der_to_pem_cert(our_ca_der.as_ref())).unwrap();
+
+    let our_hy2_srv = spawn_hysteria2_server(
+        "127.0.0.1:0".parse().unwrap(),
+        password.into(),
+        our_tls_cfg,
+        Some(obfs_password.into()),
+    )
+    .await
+    .expect("spawn_hysteria2_server");
+
+    let sb_socks = reserve_free_port();
+    let sb_cli_path = tmp_dir.path().join("sb_hy2_cli.json");
+    let sb_cli_cfg = json!({
+        "log": { "level": "warn" },
+        "inbounds": [{
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "listen_port": sb_socks
+        }],
+        "outbounds": [{
+            "type": "hysteria2",
+            "tag": "hy2-out",
+            "server": "127.0.0.1",
+            "server_port": our_hy2_srv.listen_addr.port(),
+            "password": password,
+            "obfs": {
+                "type": "salamander",
+                "password": obfs_password
+            },
+            "tls": {
+                "enabled": true,
+                "server_name": sni,
+                "alpn": ["h3"],
+                "certificate_path": our_ca_pem_path.to_str().unwrap()
+            }
+        }]
+    });
+    std::fs::write(
+        &sb_cli_path,
+        serde_json::to_vec_pretty(&sb_cli_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut sb_cli = ChildGuard(
+        clean_loopback_command(&sing_box_bin)
+            .args(["run", "-c", sb_cli_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn sing-box hy2 client"),
+    );
+    wait_tcp_ready(sb_socks, &mut sb_cli, "sing-box hy2 client").await;
+
+    assert_eq!(
+        socks5_tcp_roundtrip(sb_socks, tcp_echo, &payload).await,
+        payload,
+        "sing-box -> rust-clash Hy2+Salamander 128KB TCP mismatch"
+    );
+    let mut expected_udp_b = b"EXT-UDP-ECHO:".to_vec();
+    expected_udp_b.extend_from_slice(&large_udp);
+    assert_eq!(
+        socks5_udp_roundtrip(sb_socks, udp_echo, &large_udp).await,
+        expected_udp_b,
+        "sing-box -> rust-clash Hy2+Salamander 3600B UDP mismatch"
+    );
+    drop(sb_cli);
+    our_hy2_srv.shutdown().await;
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn interop_tuic_v5_native_and_quic_stream_bidirectional_with_sing_box() {
+    use proxy_core::outbound::{
+        quic_common::QuicCongestionControl,
+        tuic::{TuicOutbound, TuicOutboundConfig, TuicUdpRelayMode, spawn_tuic_server},
+    };
+
+    let Some(sing_box_bin) = resolve_bin("sing-box/sing-box") else {
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tcp_echo, udp_echo) = spawn_echo_servers(shutdown_rx.clone()).await;
+    let tcp_target = TargetAddr::from(tcp_echo);
+    let udp_target = TargetAddr::from(udp_echo);
+
+    let sni = "tuic.interop.local";
+    let uuid = Uuid::new_v4();
+    let password = "tuic-v5-singbox-interop-secret";
+    let tmp_dir = TempDirGuard::new("tuic-singbox-interop");
+    let (cert_pem_path, key_pem_path, ca_der) =
+        write_ephemeral_pem_cert(tmp_dir.path(), "tuic_tls", &[sni, "127.0.0.1"]);
+
+    // =========================================================================
+    // Direction A: `rust-clash TuicOutbound` -> official `sing-box` Server
+    // =========================================================================
+    let sb_ready_tcp = reserve_free_port();
+    let sb_tuic_udp = reserve_free_udp_port();
+    let sb_srv_path = tmp_dir.path().join("sb_tuic_srv.json");
+    let sb_srv_cfg = json!({
+        "log": { "level": "warn" },
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "ready-probe",
+                "listen": "127.0.0.1",
+                "listen_port": sb_ready_tcp
+            },
+            {
+                "type": "tuic",
+                "tag": "tuic-in",
+                "listen": "127.0.0.1",
+                "listen_port": sb_tuic_udp,
+                "users": [{
+                    "uuid": uuid.to_string(),
+                    "password": password
+                }],
+                "congestion_control": "bbr",
+                "zero_rtt_handshake": true,
+                "tls": {
+                    "enabled": true,
+                    "alpn": ["h3"],
+                    "certificate_path": cert_pem_path.to_str().unwrap(),
+                    "key_path": key_pem_path.to_str().unwrap()
+                }
+            }
+        ],
+        "outbounds": [{ "type": "direct", "tag": "direct" }]
+    });
+    std::fs::write(
+        &sb_srv_path,
+        serde_json::to_vec_pretty(&sb_srv_cfg).unwrap(),
+    )
+    .unwrap();
+    let mut sb_srv = ChildGuard(
+        clean_loopback_command(&sing_box_bin)
+            .args(["run", "-c", sb_srv_path.to_str().unwrap()])
+            .spawn()
+            .expect("spawn sing-box tuic server"),
+    );
+    wait_tcp_ready(sb_ready_tcp, &mut sb_srv, "sing-box tuic server").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let payload: Vec<u8> = (0..131_072).map(|i| ((i * 73 + 31) & 0xFF) as u8).collect();
+    let large_udp: Vec<u8> = (0..3500).map(|i| ((i * 29 + 11) & 0xFF) as u8).collect();
+
+    for mode in [TuicUdpRelayMode::Native, TuicUdpRelayMode::Quic] {
+        let label = format!("tuic-{}-to-singbox", mode.as_str());
+        let client = TuicOutbound::new(TuicOutboundConfig {
+            name: label.clone(),
+            server: "127.0.0.1".into(),
+            port: sb_tuic_udp,
+            uuid,
+            password: password.into(),
+            udp_relay_mode: mode,
+            congestion_control: QuicCongestionControl::Bbr,
+            zero_rtt_handshake: true,
+            disable_sni: false,
+            heartbeat_interval: Duration::from_secs(10),
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der.clone()],
+            udp: true,
+        })
+        .unwrap();
+
+        let mut st = match client.connect_tcp(&tcp_target).await {
+            Ok(s) => s,
+            Err(e) => {
+                dump_child_and_panic(&mut sb_srv, &format!("{label} connect failed: {e}")).await
+            }
+        };
+        st.write_all(&payload).await.unwrap();
+        st.flush().await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        if let Err(e) = st.read_exact(&mut echoed).await {
+            dump_child_and_panic(&mut sb_srv, &format!("{label} read failed: {e}")).await;
+        }
+        assert_eq!(echoed, payload, "{label} 128KB TCP mismatch");
+        drop(st);
+
+        let udp_resp = client
+            .exchange_udp(&udp_target, &large_udp, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("{label} 3500B fragmented UDP failed: {e}"));
+        let mut expected_udp = b"EXT-UDP-ECHO:".to_vec();
+        expected_udp.extend_from_slice(&large_udp);
+        assert_eq!(udp_resp, expected_udp, "{label} fragmented UDP mismatch");
+    }
+    drop(sb_srv);
+
+    // =========================================================================
+    // Direction B: official `sing-box` Client -> `rust-clash spawn_tuic_server`
+    // =========================================================================
+    let (our_tls_cfg, our_ca_der) = generate_self_signed_server_config(
+        &[sni.to_string(), "127.0.0.1".to_string()],
+        &[b"h3".to_vec()],
+    )
+    .unwrap();
+    let our_ca_pem_path = tmp_dir.path().join("our_tuic_ca.pem");
+    std::fs::write(&our_ca_pem_path, der_to_pem_cert(our_ca_der.as_ref())).unwrap();
+
+    let our_tuic_srv = spawn_tuic_server(
+        "127.0.0.1:0".parse().unwrap(),
+        uuid,
+        password.into(),
+        our_tls_cfg,
+    )
+    .await
+    .expect("spawn_tuic_server");
+
+    for udp_mode in ["native", "quic"] {
+        let sb_socks = reserve_free_port();
+        let sb_cli_path = tmp_dir.path().join(format!("sb_tuic_cli_{udp_mode}.json"));
+        let sb_cli_cfg = json!({
+            "log": { "level": "warn" },
+            "inbounds": [{
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": sb_socks
+            }],
+            "outbounds": [{
+                "type": "tuic",
+                "tag": "tuic-out",
+                "server": "127.0.0.1",
+                "server_port": our_tuic_srv.listen_addr.port(),
+                "uuid": uuid.to_string(),
+                "password": password,
+                "udp_relay_mode": udp_mode,
+                "congestion_control": "bbr",
+                "tls": {
+                    "enabled": true,
+                    "server_name": sni,
+                    "alpn": ["h3"],
+                    "certificate_path": our_ca_pem_path.to_str().unwrap()
+                }
+            }]
+        });
+        std::fs::write(
+            &sb_cli_path,
+            serde_json::to_vec_pretty(&sb_cli_cfg).unwrap(),
+        )
+        .unwrap();
+        let mut sb_cli = ChildGuard(
+            clean_loopback_command(&sing_box_bin)
+                .args(["run", "-c", sb_cli_path.to_str().unwrap()])
+                .spawn()
+                .expect("spawn sing-box tuic client"),
+        );
+        wait_tcp_ready(
+            sb_socks,
+            &mut sb_cli,
+            &format!("sing-box tuic-{udp_mode} client"),
+        )
+        .await;
+
+        assert_eq!(
+            socks5_tcp_roundtrip(sb_socks, tcp_echo, &payload).await,
+            payload,
+            "sing-box -> rust-clash TUIC ({udp_mode}) 128KB TCP mismatch"
+        );
+        let mut expected_udp_b = b"EXT-UDP-ECHO:".to_vec();
+        expected_udp_b.extend_from_slice(&large_udp);
+        assert_eq!(
+            socks5_udp_roundtrip(sb_socks, udp_echo, &large_udp).await,
+            expected_udp_b,
+            "sing-box -> rust-clash TUIC ({udp_mode}) 3500B UDP mismatch"
+        );
+        drop(sb_cli);
+    }
+
+    our_tuic_srv.shutdown().await;
+    let _ = shutdown_tx.send(true);
+}

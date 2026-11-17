@@ -914,7 +914,7 @@ rules:
     let unsupported_only_yaml = r#"
 proxies:
   - name: "Only-Unsupported-1"
-    type: tuic
+    type: snell
     server: "1.2.3.4"
     port: 443
   - name: "Only-Unsupported-2"

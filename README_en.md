@@ -56,7 +56,7 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 
 - **One client across Android, Windows, macOS, and Linux** — native Jetpack Compose Android app, Tauri 2 desktop app, headless CLI, and embedded Web UI.
 - **100% pure-Rust core & userspace `smoltcp` TUN** — zero Go or C/C++ proxy sidecars (`~10–25 MiB` desktop RSS, `0%` idle CPU).
-- **Modern outbound protocols** — **VLESS** (with Post-Quantum `mlkem768x25519plus` 0-RTT/1-RTT), **Trojan**, **AnyTLS v2**, **Shadowsocks-2022**, and **SOCKS5 / HTTP(S)**.
+- **Mainstream outbound protocols** — 100% pure-Rust **VLESS** (`REALITY` + `xtls-rprx-vision` and Post-Quantum `mlkem768x25519plus` 0-RTT/1-RTT), **VMess AEAD**, **Hysteria2** (with Salamander obfuscation & port hopping), **TUIC v5**, **Trojan**, **AnyTLS v2**, **Shadowsocks (AEAD / 2022)**, and **SOCKS5 / HTTP(S)**.
 - **Multi-transport Split-DNS** — `Fake-IP` and Real-IP modes over `UDP`, `TCP`, `DoT`, and multiplexed `HTTP/2 DoH` with hedged failover and `Smart CN` routing.
 - **Glass-box diagnostics** — plain-language Site Connectivity Doctor, `DNS → Tunnel → TLS → HTTP TTFB` waterfall probes, and real UDP relay verification.
 - **`Clippy for Clash` security audit** — built-in static config linter (`0–100` score), Split-DNS route simulator, and subscription refresh diffing.
@@ -65,7 +65,7 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 
 ## Download
 
-Get the latest build from [`v0.4.12` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest) (all artifacts ship with `SHA256SUMS.txt`).
+Get the latest build from [`v0.5.0` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest) (all artifacts ship with `SHA256SUMS.txt`).
 
 | Platform | Packages | Notes |
 | --- | --- | --- |
@@ -118,7 +118,7 @@ cargo build --locked --release -p tauri-app --features desktop  # Desktop client
 
 ## Status & Docs
 
-- **Protocol scope**: Legacy/extended protocols (`VMess`, `Hysteria2`, `TUIC`, VLESS `REALITY`) are intentionally omitted to keep the pure-Rust stack minimal and are automatically skipped during mixed-subscription import.
+- **Protocol scope**: Mainstream Clash / Mihomo protocols are implemented natively in pure Rust; legacy or non-proxy-stream protocols (such as `SSR`, `Snell`, `WireGuard`, and `gRPC` transport) are omitted and automatically skipped during mixed-subscription import.
 - **Documentation**: [Platform & TUN Support](docs/PLATFORM_SUPPORT.md) · [Android Architecture](docs/ANDROID_IMPLEMENTATION.md) · [Benchmarks](docs/PERFORMANCE_BENCHMARK.md) · [Security Policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## License

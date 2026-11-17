@@ -413,7 +413,7 @@ fun HomeScreen(
 
                         if (state.nodes.isEmpty() && !state.demoMode) {
                             Text(
-                                text = "点击导入 ss:// · vless:// · trojan:// · anytls:// 节点",
+                                text = "点击导入 vless:// · vmess:// · ss:// · trojan:// · hy2:// · tuic:// 节点",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = extColors.emerald,
                                 maxLines = 1,

@@ -189,6 +189,12 @@ export interface WsTransportOptions {
   "early-data-header-name"?: string | null;
 }
 
+export interface RealityOptions {
+  "public-key": string;
+  "short-id"?: string | null;
+  "spider-x"?: string | null;
+}
+
 export type ProxyNodeConfigPayload =
   | {
       type: "ss";
@@ -211,8 +217,60 @@ export type ProxyNodeConfigPayload =
       "skip-cert-verify"?: boolean;
       alpn?: string[];
       flow?: string | null;
+      "reality-opts"?: RealityOptions | null;
+      "client-fingerprint"?: string | null;
       network?: string | null;
       "ws-opts"?: WsTransportOptions | null;
+      udp?: boolean;
+    }
+  | {
+      type: "vmess";
+      name: string;
+      server: string;
+      port: number;
+      uuid: string;
+      alterId?: number;
+      cipher?: string;
+      "global-padding"?: boolean;
+      tls?: boolean;
+      servername?: string | null;
+      "skip-cert-verify"?: boolean;
+      alpn?: string[];
+      network?: string | null;
+      "ws-opts"?: WsTransportOptions | null;
+      udp?: boolean;
+    }
+  | {
+      type: "hysteria2";
+      name: string;
+      server: string;
+      port: number;
+      ports?: string | null;
+      password: string;
+      obfs?: string | null;
+      "obfs-password"?: string | null;
+      up?: string | null;
+      down?: string | null;
+      sni?: string | null;
+      "skip-cert-verify"?: boolean;
+      alpn?: string[];
+      udp?: boolean;
+    }
+  | {
+      type: "tuic";
+      name: string;
+      server: string;
+      port: number;
+      uuid: string;
+      password?: string;
+      "udp-relay-mode"?: string | null;
+      "congestion-controller"?: string | null;
+      "reduce-rtt"?: boolean;
+      "disable-sni"?: boolean;
+      "heartbeat-interval"?: number;
+      sni?: string | null;
+      "skip-cert-verify"?: boolean;
+      alpn?: string[];
       udp?: boolean;
     }
   | {
