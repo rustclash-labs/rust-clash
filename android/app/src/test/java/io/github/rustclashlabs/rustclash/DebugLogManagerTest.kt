@@ -1,5 +1,6 @@
 package io.github.rustclashlabs.rustclash
 
+import io.github.rustclashlabs.rustclash.vpn.DebugAnomalyAlertUi
 import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
 import io.github.rustclashlabs.rustclash.vpn.MobileTimelineEvent
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
@@ -7,6 +8,7 @@ import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -839,5 +841,367 @@ class DebugLogManagerTest {
             crashBreadcrumb = null,
         )
         assertFalse(reportAbsentCarry.contains("Carry-Over Streams"))
+    }
+
+    @Test
+    fun anomalySentinelIgnoresBenignDirectTimeoutsApkUpdatesManualStopsAndStaleHistoricalKills() {
+        val nowMs = 1_794_906_078_000L // 2026-11-17
+        val baseMeta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "HONOR",
+            deviceModel = "PGT-AN10",
+            androidRelease = "16",
+            sdkInt = 36,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.5.1",
+            appVersionCode = 30,
+            battery = DebugLogManager.BatterySnapshot(levelPct = 95, isCharging = false, temperatureCelsius = 27.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 9L * 1024L * 1024L,
+            jvmMaxBytes = 512L * 1024L * 1024L,
+            nativeHeapBytes = 15L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+
+        // Realistic 7.3-hour healthy snapshot with domestic PCDN DIRECT timeouts + minor tail P95
+        val healthyDailyJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 26397,
+              "rssBytes": 83319808,
+              "tun": {
+                "rxPackets": 100516,
+                "txPackets": 113189,
+                "txWriteDrops": 2,
+                "protectFailures": 0
+              },
+              "outboundStats": [
+                {
+                  "outbound": "DIRECT",
+                  "protocol": "DIRECT",
+                  "exitType": "DIRECT",
+                  "connections": 115,
+                  "failures": 18,
+                  "handshakeSamples": 97,
+                  "handshakeP50Ms": 40,
+                  "handshakeP95Ms": 6200
+                },
+                {
+                  "outbound": "REJECT",
+                  "protocol": "REJECT",
+                  "exitType": "REJECT",
+                  "connections": 6,
+                  "failures": 6
+                },
+                {
+                  "outbound": "po0-sh-nube-sg-lg",
+                  "protocol": "VLESS",
+                  "exitType": "PROXY",
+                  "connections": 76,
+                  "failures": 1,
+                  "handshakeSamples": 75,
+                  "handshakeP50Ms": 119,
+                  "handshakeP95Ms": 1544
+                }
+              ]
+            }
+        """.trimIndent()
+
+        // 1. Recent Tasks "Clean All" (USER_STOPPED) -> benign, no false alarm
+        val cleanAllExit = "[${DebugLogManager.formatTimestamp(nowMs - 30_000L)}] " +
+            "reason=USER_STOPPED importance=125 pss=50040KB rss=159600KB desc=clean up"
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "periodic",
+                capturedAtMs = nowMs,
+                sessionStartMs = nowMs - 3_600_000L,
+                systemMeta = baseMeta.copy(recentProcessExits = listOf(cleanAllExit)),
+                nativeSnapshotRawJson = healthyDailyJson,
+                crashBreadcrumb = null,
+            ),
+        )
+
+        // 2. APK in-place upgrade (killDueToPackageUpdate) -> benign, no false alarm
+        val apkUpdateExit = "[${DebugLogManager.formatTimestamp(nowMs - 60_000L)}] " +
+            "reason=REASON_16 importance=125 pss=53291KB rss=164036KB desc=stop io.github.rustclashlabs.rustclash due to killDueToPackageUpdate"
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "debug-on",
+                capturedAtMs = nowMs,
+                sessionStartMs = nowMs - 60_000L,
+                systemMeta = baseMeta.copy(recentProcessExits = listOf(apkUpdateExit)),
+                nativeSnapshotRawJson = healthyDailyJson,
+                crashBreadcrumb = null,
+            ),
+        )
+
+        // 3. Stale OEM kill from 3 days ago (> 24h) -> ignored so enabling Debug mode today doesn't false-alarm
+        val staleOemExit = "[${DebugLogManager.formatTimestamp(nowMs - 3L * 86_400_000L)}] " +
+            "reason=OTHER_OEM_KILL importance=125 pss=48000KB rss=140000KB desc=iAware clean"
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "startup-check",
+                capturedAtMs = nowMs,
+                sessionStartMs = 0L,
+                systemMeta = baseMeta.copy(recentProcessExits = listOf(staleOemExit)),
+                nativeSnapshotRawJson = healthyDailyJson,
+                crashBreadcrumb = null,
+            ),
+        )
+
+        // 4. Single transient tail spike on proxy when median latency is fast (p50=120ms, p95=4100ms) -> no false alarm
+        val transientTailJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "rssBytes": 75497472,
+              "outboundStats": [
+                {
+                  "outbound": "SG-Node-01",
+                  "protocol": "VLESS",
+                  "exitType": "PROXY",
+                  "connections": 20,
+                  "failures": 1,
+                  "handshakeSamples": 19,
+                  "handshakeP50Ms": 120,
+                  "handshakeP95Ms": 4100
+                }
+              ]
+            }
+        """.trimIndent()
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "periodic",
+                capturedAtMs = nowMs,
+                sessionStartMs = nowMs - 1_800_000L,
+                systemMeta = baseMeta,
+                nativeSnapshotRawJson = transientTailJson,
+                crashBreadcrumb = null,
+            ),
+        )
+    }
+
+    @Test
+    fun anomalySentinelDetectsCrashesAbnormalExitsProtectFailuresRevokesProxyOutagesAndHighRssWithRedaction() {
+        val nowMs = 1_794_906_078_000L
+        val sessStart = nowMs - 900_000L
+
+        // 1. Crash breadcrumb (critical + secret scrubbing)
+        val crashAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "startup-check",
+            capturedAtMs = nowMs,
+            sessionStartMs = 0L,
+            systemMeta = null,
+            nativeSnapshotRawJson = null,
+            crashBreadcrumb = "[2026-11-17 12:00:00.000 +0800] Thread=main\n" +
+                "java.lang.IllegalStateException: uuid=12345678-1234-4321-abcd-9876543210ff failed",
+        )
+        assertNotNull(crashAlert)
+        assertEquals("critical", crashAlert!!.severity)
+        assertEquals("JVM_CRASH_BREADCRUMB", crashAlert.code)
+        assertFalse(crashAlert.detailZh.contains("12345678-1234-4321-abcd-9876543210ff"))
+
+        // 2. Fresh OEM background kill within 24h (critical)
+        val recentOemKill = "[${DebugLogManager.formatTimestamp(nowMs - 120_000L)}] " +
+            "reason=OTHER_OEM_KILL importance=125 pss=48000KB rss=140000KB desc=powergenie kill"
+        val exitAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "startup-check",
+            capturedAtMs = nowMs,
+            sessionStartMs = 0L,
+            systemMeta = null,
+            nativeSnapshotRawJson = null,
+            crashBreadcrumb = null,
+            recentProcessExitsOverride = listOf(recentOemKill),
+        )
+        assertNotNull(exitAlert)
+        assertEquals("critical", exitAlert!!.severity)
+        assertEquals("PROCESS_EXIT_ABNORMAL", exitAlert.code)
+        assertTrue(exitAlert.detailZh.contains("系统后台省电管控强杀"))
+
+        // 3. Socket protect failure (critical)
+        val protectFailJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "tun": { "protectFailures": 3, "txWriteDrops": 0 }
+            }
+        """.trimIndent()
+        val protectAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "anomaly",
+            capturedAtMs = nowMs,
+            sessionStartMs = sessStart,
+            systemMeta = null,
+            nativeSnapshotRawJson = protectFailJson,
+            crashBreadcrumb = null,
+        )
+        assertNotNull(protectAlert)
+        assertEquals("critical", protectAlert!!.severity)
+        assertEquals("SOCKET_PROTECT_FAIL", protectAlert.code)
+
+        // 4. System VPN Revoke (warning)
+        val revokeAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "revoked",
+            capturedAtMs = nowMs,
+            sessionStartMs = sessStart,
+            systemMeta = null,
+            nativeSnapshotRawJson = """{"ok":true,"vpnRunning":false}""",
+            crashBreadcrumb = null,
+            windowEvents = listOf(MobileTimelineEvent(nowMs - 500L, "VPN_REVOKE", "system revoked VPN tunnel")),
+        )
+        assertNotNull(revokeAlert)
+        assertEquals("warning", revokeAlert!!.severity)
+        assertEquals("VPN_REVOKED", revokeAlert.code)
+
+        // 5. Proxy high failure rate (warning + node IP redaction)
+        val proxyFailJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "rssBytes": 73400320,
+              "outboundStats": [
+                {
+                  "outbound": "SubNode (203.0.113.88)",
+                  "protocol": "Hysteria2",
+                  "exitType": "PROXY",
+                  "connections": 6,
+                  "failures": 4,
+                  "handshakeSamples": 2,
+                  "handshakeP50Ms": 180,
+                  "handshakeP95Ms": 320
+                }
+              ]
+            }
+        """.trimIndent()
+        val proxyFailAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "anomaly",
+            capturedAtMs = nowMs,
+            sessionStartMs = sessStart,
+            systemMeta = null,
+            nativeSnapshotRawJson = proxyFailJson,
+            crashBreadcrumb = null,
+        )
+        assertNotNull(proxyFailAlert)
+        assertEquals("warning", proxyFailAlert!!.severity)
+        assertEquals("PROXY_HIGH_FAIL_RATE", proxyFailAlert.code)
+        assertTrue(proxyFailAlert.detailZh.contains("4/6"))
+        assertFalse(proxyFailAlert.detailZh.contains("203.0.113.88"))
+
+        // 6. Proxy sustained slow handshake (warning)
+        val slowProxyJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "rssBytes": 73400320,
+              "outboundStats": [
+                {
+                  "outbound": "US-TUIC-01",
+                  "protocol": "TUIC",
+                  "exitType": "PROXY",
+                  "connections": 8,
+                  "failures": 0,
+                  "handshakeSamples": 8,
+                  "handshakeP50Ms": 1150,
+                  "handshakeP95Ms": 4650
+                }
+              ]
+            }
+        """.trimIndent()
+        val slowAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "periodic",
+            capturedAtMs = nowMs,
+            sessionStartMs = sessStart,
+            systemMeta = null,
+            nativeSnapshotRawJson = slowProxyJson,
+            crashBreadcrumb = null,
+        )
+        assertNotNull(slowAlert)
+        assertEquals("PROXY_SLOW_HANDSHAKE", slowAlert!!.code)
+
+        // 7. High native RSS memory >= 180 MB (warning)
+        val highRssJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "rssBytes": ${205L * 1024L * 1024L}
+            }
+        """.trimIndent()
+        val rssAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "periodic",
+            capturedAtMs = nowMs,
+            sessionStartMs = sessStart,
+            systemMeta = null,
+            nativeSnapshotRawJson = highRssJson,
+            crashBreadcrumb = null,
+        )
+        assertNotNull(rssAlert)
+        assertEquals("HIGH_MEMORY_RSS", rssAlert!!.code)
+    }
+
+    @Test
+    fun anomalySerializationDismissalBoundingRetentionProtectionAndExportHeaderWorkEndToEnd() {
+        val sliceDir = Files.createTempDirectory("rc-anomaly-slices").toFile()
+        val exportDir = Files.createTempDirectory("rc-anomaly-export").toFile()
+        try {
+            val alert = DebugAnomalyAlertUi(
+                id = "proxy_fail:100:SG-01:500",
+                detectedAtMs = 1_794_900_000_000L,
+                severity = "warning",
+                code = "PROXY_HIGH_FAIL_RATE",
+                headlineZh = "代理节点出现异常断流",
+                detailZh = "节点 SG-01 近期连接失败 5/6 次 (83%)",
+            )
+            val encoded = DebugLogManager.serializeAnomalyJson(alert)
+            val decoded = DebugLogManager.parseAnomalyJson(encoded)
+            assertEquals(alert, decoded)
+
+            // Dismissed IDs deduplicate and cap to maxEntries
+            var dismissedRaw: String? = null
+            for (i in 1..6) {
+                dismissedRaw = DebugLogManager.appendDismissedIdJson(dismissedRaw, "id-$i", maxEntries = 4)
+            }
+            dismissedRaw = DebugLogManager.appendDismissedIdJson(dismissedRaw, "id-5", maxEntries = 4)
+            assertEquals(listOf("id-3", "id-4", "id-6", "id-5"), DebugLogManager.parseDismissedIdsJson(dismissedRaw))
+
+            // Retention protection preserves the anomaly slice when newer periodic slices exceed maxFiles
+            val anomalyFile = File(sliceDir, "rustclash-slice-20261117-100000-000-anomaly.log")
+            anomalyFile.writeText("### RustClash Android Diagnostic Slice (`anomaly`)\nANOMALY_EVIDENCE\n")
+            for (idx in 1..4) {
+                File(sliceDir, "rustclash-slice-20261117-1${idx}0000-000-periodic.log")
+                    .writeText("### RustClash Android Diagnostic Slice (`periodic`)\nPERIODIC_$idx\n")
+            }
+            DebugLogManager.enforceRetentionPolicy(
+                dir = sliceDir,
+                maxFiles = 3,
+                maxTotalBytes = 1024L * 1024L,
+                protectLatestAnomalySlice = true,
+            )
+            val retainedNames = DebugLogManager.listSliceFilesNewestFirst(sliceDir).map { it.name }
+            assertEquals(3, retainedNames.size)
+            assertTrue(retainedNames.contains(anomalyFile.name))
+            assertTrue(retainedNames.contains("rustclash-slice-20261117-140000-000-periodic.log"))
+            assertTrue(retainedNames.contains("rustclash-slice-20261117-130000-000-periodic.log"))
+
+            // Combined export embeds DetectedAnomaly summary in header and includes preserved anomaly slice
+            val exported = DebugLogManager.assembleCombinedExportFromSlices(
+                sliceDir = sliceDir,
+                exportDir = exportDir,
+                nowMs = 1_794_905_000_000L,
+                activeAnomaly = alert,
+            )
+            assertNotNull(exported)
+            val text = exported!!.readText(Charsets.UTF_8)
+            assertTrue(text.contains("- DetectedAnomaly: [WARNING/PROXY_HIGH_FAIL_RATE] 代理节点出现异常断流"))
+            assertTrue(text.contains("ANOMALY_EVIDENCE"))
+        } finally {
+            sliceDir.deleteRecursively()
+            exportDir.deleteRecursively()
+        }
     }
 }

@@ -4,4 +4,7 @@
     <string name="vpn_notification_channel_name">RustClash VPN 运行状态</string>
     <string name="vpn_notification_channel_desc">显示 RustClash VPN 实时网速、当前出站节点与分流连接状态。</string>
     <string name="vpn_action_disconnect">断开连接</string>
+    <string name="diag_alert_channel_name">RustClash 异常诊断提醒</string>
+    <string name="diag_alert_channel_desc">开启 Debug 诊断采集期间，当检测到代理节点异常断流、闪退或后台被系统强杀时主动提醒一键导出日志。</string>
+    <string name="diag_alert_action_export">一键导出日志</string>
 </resources>

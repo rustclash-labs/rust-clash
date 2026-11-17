@@ -13,6 +13,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +30,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Clear
@@ -37,9 +39,12 @@ import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -51,6 +56,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -86,6 +92,8 @@ fun HomeScreen(
     onNavigateToRules: (initialTab: Int) -> Unit,
     onTestActiveLatency: () -> Unit,
     onDismissError: () -> Unit = {},
+    onShareDebugReport: () -> Unit = {},
+    onDismissDebugAnomaly: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var showRoutingSheet by remember { mutableStateOf(false) }
@@ -228,6 +236,99 @@ fun HomeScreen(
                                 contentDescription = "关闭错误提示",
                                 tint = extColors.onDangerContainer.copy(alpha = 0.85f),
                                 modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Debug Anomaly Sentinel Card (proactive high-signal alert when Debug mode is enabled)
+        val activeAnomaly = if (state.debugLog.enabled) state.debugLog.activeAnomaly else null
+        if (activeAnomaly != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            val isCriticalAnomaly = activeAnomaly.severity == "critical"
+            val cardBg = if (isCriticalAnomaly) extColors.dangerContainer else extColors.amberContainer
+            val cardFg = if (isCriticalAnomaly) extColors.onDangerContainer else extColors.onAmberContainer
+            val actionBtnBg = if (isCriticalAnomaly) extColors.danger else extColors.amber
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = cardBg,
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (isCriticalAnomaly) Icons.Rounded.ErrorOutline else Icons.Rounded.BugReport,
+                            contentDescription = null,
+                            tint = cardFg,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = activeAnomaly.headlineZh,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = cardFg,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (activeAnomaly.detectedAtMs > 0L) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = UiJsonParsers.formatEpochTime(activeAnomaly.detectedAtMs),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = cardFg.copy(alpha = 0.8f),
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = activeAnomaly.detailZh,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cardFg,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Button(
+                            onClick = onShareDebugReport,
+                            enabled = !state.isExportingDebugLog,
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = actionBtnBg,
+                                contentColor = Color.White,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Share,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (state.isExportingDebugLog) "正在导出…" else "一键导出日志",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        TextButton(
+                            onClick = onDismissDebugAnomaly,
+                            enabled = !state.isExportingDebugLog,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                        ) {
+                            Text(
+                                text = "忽略本次",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = cardFg.copy(alpha = 0.9f),
                             )
                         }
                     }

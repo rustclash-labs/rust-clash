@@ -89,6 +89,7 @@ import io.github.rustclashlabs.rustclash.ui.screens.RulesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.SettingsScreen
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashTheme
+import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
 import io.github.rustclashlabs.rustclash.vpn.NativeBridge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.RustClashVpnService
@@ -454,6 +455,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleIncomingShareOrDeepLinkIntent(incoming: Intent?) {
         if (incoming == null) return
+        if (incoming.getBooleanExtra(DebugLogManager.EXTRA_AUTO_SHARE_DEBUG_REPORT, false)) {
+            incoming.removeExtra(DebugLogManager.EXTRA_AUTO_SHARE_DEBUG_REPORT)
+            DebugLogManager.cancelAnomalyNotification(this)
+            viewModel.prepareDebugReportForExport { reportFile ->
+                shareDebugReportFile(reportFile)
+            }
+            return
+        }
         val extracted = NodeImportSupport.extractImportPayloadFromIntent(
             action = incoming.action,
             mimeType = incoming.type,
@@ -750,6 +759,8 @@ internal fun RustClashAppScaffold(
                         }
                     },
                     onDismissError = viewModel::clearLastError,
+                    onShareDebugReport = onShareDebugReport,
+                    onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
                 )
 
                 MainDestination.NODES -> NodesScreen(
@@ -869,6 +880,7 @@ internal fun RustClashAppScaffold(
                     onSaveDebugReportToFile = onSaveDebugReportToFile,
                     onClearDebugLogs = viewModel::clearAllDebugLogs,
                     onRefreshDebugSummary = viewModel::refreshDebugLogSummary,
+                    onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
                     onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
                 )
             }

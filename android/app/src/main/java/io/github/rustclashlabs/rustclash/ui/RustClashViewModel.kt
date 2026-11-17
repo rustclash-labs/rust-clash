@@ -198,7 +198,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         }
-        if (dest == MainDestination.SETTINGS) {
+        if (dest == MainDestination.SETTINGS || dest == MainDestination.HOME) {
             refreshDebugLogSummary()
         }
     }
@@ -224,7 +224,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                         syncSnapshotQuietly()
                     }
                 }
-                if (dest == MainDestination.SETTINGS && tickCount % 10 == 0) {
+                if ((dest == MainDestination.SETTINGS || (dest == MainDestination.HOME && _uiState.value.debugLog.enabled)) &&
+                    tickCount % 10 == 0
+                ) {
                     refreshDebugLogSummaryQuietly()
                 }
                 tickCount++
@@ -1318,7 +1320,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             _uiState.update { it.copy(debugLog = summary) }
             emitMessage(
                 if (enabled) {
-                    "已开启 Debug 诊断采集（后台按周期与断开时自动生成脱敏日志切片）"
+                    "已开启 Debug 诊断采集（检测到断流或异常时将主动提醒一键导出日志）"
                 } else {
                     "已关闭 Debug 诊断采集（历史切片仍可随时导出或清空）"
                 },
@@ -1366,6 +1368,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             try {
                 val (reportFile, summary) = withContext(Dispatchers.IO) {
                     val f = DebugLogManager.buildCombinedReportFile(appContext, stateDir)
+                    if (f != null && f.isFile) {
+                        DebugLogManager.acknowledgeActiveAnomaly(appContext)
+                    }
                     f to DebugLogManager.getStorageSummary(appContext)
                 }
                 _uiState.update { it.copy(debugLog = summary) }
@@ -1377,6 +1382,17 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             } finally {
                 _uiState.update { it.copy(isExportingDebugLog = false) }
             }
+        }
+    }
+
+    fun dismissDebugAnomaly() {
+        viewModelScope.launch {
+            val summary = withContext(Dispatchers.IO) {
+                DebugLogManager.acknowledgeActiveAnomaly(appContext)
+                DebugLogManager.getStorageSummary(appContext)
+            }
+            _uiState.update { it.copy(debugLog = summary) }
+            emitMessage("已忽略本次诊断提醒（历史日志切片仍保留在设置中）")
         }
     }
 
