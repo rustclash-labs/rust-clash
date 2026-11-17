@@ -97,6 +97,7 @@ fun SettingsScreen(
     onSaveDebugReportToFile: () -> Unit = {},
     onClearDebugLogs: () -> Unit = {},
     onRefreshDebugSummary: () -> Unit = {},
+    onDismissDebugAnomaly: () -> Unit = {},
     onOpenBatteryOptimizationSettings: () -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
@@ -208,6 +209,7 @@ fun SettingsScreen(
 
             // 6. Debug & Diagnostics
             val debugBadge = when {
+                state.debugLog.enabled && state.debugLog.activeAnomaly != null -> "发现异常"
                 state.debugLog.enabled && state.debugLog.sliceCount > 0 -> "采集中 · ${state.debugLog.sliceCount} 份"
                 state.debugLog.enabled -> "采集中"
                 state.debugLog.sliceCount > 0 -> "已存 ${state.debugLog.sliceCount} 份"
@@ -216,7 +218,7 @@ fun SettingsScreen(
             SettingsRowItem(
                 icon = Icons.Rounded.BugReport,
                 title = "调试与诊断 (Debug)",
-                subtitle = "周期采集运行切片 · 一键导出脱敏报告",
+                subtitle = "异常自动巡检提醒 · 一键导出脱敏报告",
                 trailingBadge = debugBadge,
                 onClick = {
                     onRefreshDebugSummary()
@@ -314,6 +316,7 @@ fun SettingsScreen(
             onShareDebugReport = onShareDebugReport,
             onSaveDebugReportToFile = onSaveDebugReportToFile,
             onClearDebugLogs = onClearDebugLogs,
+            onDismissDebugAnomaly = onDismissDebugAnomaly,
             onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
             onDismiss = { showDebugSheet = false },
         )
@@ -726,6 +729,7 @@ private fun DebugDiagnosticsBottomSheet(
     onShareDebugReport: () -> Unit,
     onSaveDebugReportToFile: () -> Unit,
     onClearDebugLogs: () -> Unit,
+    onDismissDebugAnomaly: () -> Unit = {},
     onOpenBatteryOptimizationSettings: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
@@ -753,10 +757,62 @@ private fun DebugDiagnosticsBottomSheet(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "开启后在使用期间自动采集网络切换、DNS 命中、节点握手耗时与访问分流明细，供性能与耗电分析。密码、UUID 与订阅链接均自动脱敏。",
+                text = "开启后自动巡检代理断流、高延迟、闪退与后台被强杀等异常并主动通知提醒；密码、UUID 与订阅链接均自动脱敏。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            val sheetAnomaly = if (state.debugLog.enabled) state.debugLog.activeAnomaly else null
+            if (sheetAnomaly != null) {
+                Spacer(modifier = Modifier.height(12.dp))
+                val isCritical = sheetAnomaly.severity == "critical"
+                val alertBg = if (isCritical) extColors.dangerContainer else extColors.amberContainer
+                val alertFg = if (isCritical) extColors.onDangerContainer else extColors.onAmberContainer
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    color = alertBg,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.BugReport,
+                                contentDescription = null,
+                                tint = alertFg,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = sheetAnomaly.headlineZh,
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = alertFg,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = onDismissDebugAnomaly,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            ) {
+                                Text(
+                                    text = "忽略本次",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = alertFg.copy(alpha = 0.9f),
+                                )
+                            }
+                        }
+                        Text(
+                            text = sheetAnomaly.detailZh,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = alertFg,
+                        )
+                    }
+                }
+            }
 
             if (!state.isBatteryOptimizationIgnored) {
                 Spacer(modifier = Modifier.height(12.dp))
@@ -779,7 +835,7 @@ private fun DebugDiagnosticsBottomSheet(
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = "后台按周期切片并在断开 VPN 时自动归档一份快照",
+                        text = "后台按周期切片，发现异常时自动冻结快照并通知提醒",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -852,6 +908,8 @@ private fun DebugDiagnosticsBottomSheet(
                                 "periodic" -> "周期归档"
                                 "disconnect" -> "断开归档"
                                 "revoked" -> "系统抢占"
+                                "anomaly" -> "异常抓拍"
+                                "service-destroy" -> "服务回收"
                                 "screen-on" -> "亮屏补齐"
                                 "debug-on" -> "开启基线"
                                 "export" -> "导出快照"

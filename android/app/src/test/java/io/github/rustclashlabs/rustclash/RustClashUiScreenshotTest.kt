@@ -1181,5 +1181,83 @@ class RustClashUiScreenshotTest {
         assertTrue(shareClicked)
         assertTrue(toggledEnabled == null)
     }
+
+    @Test
+    fun homeAndSettingsScreensRenderAnomalySentinelBannerAndTriggerExportAndDismiss() {
+        val fontFamily = buildCjkFontFamily()
+        var shareTriggered = false
+        var dismissTriggered = false
+        val showSettings = androidx.compose.runtime.mutableStateOf(false)
+
+        val anomaly = io.github.rustclashlabs.rustclash.vpn.DebugAnomalyAlertUi(
+            id = "proxy_fail:1:SG-Node:99",
+            detectedAtMs = 1_794_906_000_000L,
+            severity = "warning",
+            code = "PROXY_HIGH_FAIL_RATE",
+            headlineZh = "代理节点出现异常断流",
+            detailZh = "节点 SG-Node 近期连接失败 4/5 次 (80%)，点击一键导出脱敏日志排查。",
+        )
+        val uiState = sampleShowcaseState(ThemePreference.DARK).copy(
+            debugLog = io.github.rustclashlabs.rustclash.vpn.DebugLogSummaryUi(
+                enabled = true,
+                sliceIntervalSecs = 3600L,
+                sliceCount = 3,
+                totalBytes = 32_768L,
+                latestSliceTimeMs = 1_794_906_000_000L,
+                recentSlices = listOf(
+                    io.github.rustclashlabs.rustclash.vpn.DebugSliceItemUi(
+                        fileName = "rustclash-slice-20261117-120000-000-anomaly.log",
+                        trigger = "anomaly",
+                        createdAtMs = 1_794_906_000_000L,
+                        sizeBytes = 14_336L,
+                    ),
+                ),
+                activeAnomaly = anomaly,
+            ),
+        )
+
+        composeRule.setContent {
+            RustClashTheme(themePreference = ThemePreference.DARK, fontFamily = fontFamily) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    if (!showSettings.value) {
+                        HomeScreen(
+                            state = uiState,
+                            onToggleVpn = {},
+                            onOpenQuickImport = {},
+                            onSelectRoutingPreset = {},
+                            onNavigateToNodes = {},
+                            onNavigateToRules = {},
+                            onTestActiveLatency = {},
+                            onShareDebugReport = { shareTriggered = true },
+                            onDismissDebugAnomaly = { dismissTriggered = true },
+                        )
+                    } else {
+                        SettingsScreen(
+                            state = uiState,
+                            onSetThemePreference = {},
+                            onRequestInstalledApps = {},
+                            onSavePerAppPolicy = { _, _ -> },
+                            onSetEnableIpv6 = {},
+                            onSetDemoMode = {},
+                            onFlushDns = {},
+                            onShareDebugReport = { shareTriggered = true },
+                            onDismissDebugAnomaly = { dismissTriggered = true },
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.onNodeWithText("代理节点出现异常断流").assertIsDisplayed()
+        composeRule.onNodeWithText("一键导出日志").performClick()
+        assertTrue(shareTriggered)
+
+        composeRule.onNodeWithText("忽略本次").performClick()
+        assertTrue(dismissTriggered)
+
+        showSettings.value = true
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("发现异常").performScrollTo().assertIsDisplayed()
+    }
 }
 

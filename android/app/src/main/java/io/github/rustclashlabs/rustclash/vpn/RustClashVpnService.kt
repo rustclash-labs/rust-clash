@@ -758,6 +758,7 @@ class RustClashVpnService : VpnService() {
     private fun startDebugSliceTicker() {
         debugSliceJob?.cancel()
         debugSliceJob = serviceScope.launch {
+            var tickCount = 0
             while (isActive && isScreenInteractive && isSessionRunningOrReconnecting()) {
                 delay(30_000L)
                 if (!isScreenInteractive) {
@@ -771,6 +772,7 @@ class RustClashVpnService : VpnService() {
                 if (!DebugLogManager.isEnabled(this@RustClashVpnService)) {
                     continue
                 }
+                tickCount++
                 val intervalMs = DebugLogManager.getSliceIntervalSecs(this@RustClashVpnService) * 1000L
                 if (DebugLogManager.currentWindowAgeMs() >= intervalMs) {
                     runCatching {
@@ -778,6 +780,13 @@ class RustClashVpnService : VpnService() {
                             context = this@RustClashVpnService,
                             stateDir = filesDir.absolutePath,
                             trigger = "periodic",
+                        )
+                    }
+                } else if (tickCount % 4 == 0) {
+                    runCatching {
+                        DebugLogManager.inspectLiveHealthAndCaptureIfAnomalous(
+                            context = this@RustClashVpnService,
+                            stateDir = filesDir.absolutePath,
                         )
                     }
                 }
@@ -980,6 +989,7 @@ class RustClashVpnService : VpnService() {
             setShowBadge(false)
         }
         nm.createNotificationChannel(channel)
+        DebugLogManager.ensureAnomalyNotificationChannel(this)
     }
 
     private fun createConfiguredVpnBuilder(

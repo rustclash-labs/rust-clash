@@ -1,17 +1,26 @@
 package io.github.rustclashlabs.rustclash.vpn
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.ApplicationExitInfo
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
 import android.os.PowerManager
 import androidx.annotation.RequiresApi
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import io.github.rustclashlabs.rustclash.BuildConfig
+import io.github.rustclashlabs.rustclash.MainActivity
+import io.github.rustclashlabs.rustclash.R
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -28,6 +37,15 @@ data class DebugSliceItemUi(
     val sizeBytes: Long,
 )
 
+data class DebugAnomalyAlertUi(
+    val id: String,
+    val detectedAtMs: Long,
+    val severity: String,
+    val code: String,
+    val headlineZh: String,
+    val detailZh: String,
+)
+
 data class DebugLogSummaryUi(
     val enabled: Boolean = false,
     val sliceIntervalSecs: Long = DebugLogManager.DEFAULT_SLICE_INTERVAL_SECS,
@@ -36,6 +54,7 @@ data class DebugLogSummaryUi(
     val latestSliceTimeMs: Long = 0L,
     val hasCrashBreadcrumb: Boolean = false,
     val recentSlices: List<DebugSliceItemUi> = emptyList(),
+    val activeAnomaly: DebugAnomalyAlertUi? = null,
 )
 
 data class MobileTimelineEvent(
@@ -46,12 +65,21 @@ data class MobileTimelineEvent(
 
 /**
  * Android-specific periodic diagnostic collector, mobile lifecycle/battery/handoff recorder,
- * rolling slice manager, and credential-redacted report exporter.
+ * anomaly sentinel detector, rolling slice manager, and credential-redacted report exporter.
  */
 object DebugLogManager {
     const val KEY_DEBUG_LOG_ENABLED = "debug_log_enabled"
     const val KEY_DEBUG_SLICE_INTERVAL_SECS = "debug_slice_interval_secs"
+    const val EXTRA_AUTO_SHARE_DEBUG_REPORT = "extra_auto_share_debug_report"
     const val DEFAULT_SLICE_INTERVAL_SECS = 1800L
+
+    internal const val KEY_ACTIVE_ANOMALY_JSON = "debug_active_anomaly_json"
+    internal const val KEY_DISMISSED_ANOMALY_IDS = "debug_dismissed_anomaly_ids_json"
+    internal const val ANOMALY_NOTIFICATION_CHANNEL_ID = "rust_clash_diag_alert_channel"
+    internal const val ANOMALY_NOTIFICATION_ID = 19819
+    internal const val AUTO_ANOMALY_COOLDOWN_MS = 15L * 60_000L
+    internal const val HISTORICAL_EXIT_MAX_AGE_MS = 24L * 3_600_000L
+    private const val MAX_DISMISSED_ANOMALY_IDS = 32
 
     internal const val DEBUG_DIR_NAME = "debug_logs"
     internal const val EXPORT_CACHE_DIR_NAME = "debug_exports"
@@ -68,6 +96,7 @@ object DebugLogManager {
 
     private val crashHookInstalled = AtomicBoolean(false)
     private val SAFE_TRIGGER_REGEX = Regex("[^a-z0-9_-]")
+    private val EXIT_REASON_REGEX = Regex("""\breason=([^\s]+)""")
     private const val SLICE_REPORT_HEADER_PREFIX = "### RustClash Android Diagnostic Slice ("
     private val lock = Any()
     private val sliceWriteLock = Any()
@@ -82,6 +111,7 @@ object DebugLogManager {
     private var lastNetworkLostMs: Long = 0L
     private var lastNetStateFingerprint: String = ""
     private var lastCumulativeRuleHits: Map<String, Long> = emptyMap()
+    private var lastAutoAnomalyCaptureMs: Long = 0L
     private val timelineEvents = ArrayDeque<MobileTimelineEvent>(MAX_TIMELINE_EVENTS)
 
     fun isEnabled(context: Context): Boolean {
@@ -104,6 +134,9 @@ object DebugLogManager {
     fun setEnabled(context: Context, enabled: Boolean) {
         val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
         prefs.edit().putBoolean(KEY_DEBUG_LOG_ENABLED, enabled).apply()
+        if (!enabled) {
+            cancelAnomalyNotification(context)
+        }
         if (NativeBridge.ensureLoaded()) {
             runCatching { NativeBridge.nativeSetDebugLogging(enabled) }
         }
@@ -322,10 +355,40 @@ object DebugLogManager {
 
     fun getStorageSummary(context: Context): DebugLogSummaryUi {
         val dir = File(context.filesDir, DEBUG_DIR_NAME)
+        val enabled = isEnabled(context)
+        if (enabled && getActiveAnomaly(context) == null) {
+            val crashBreadcrumb = File(dir, CRASH_BREADCRUMB_FILE)
+                .takeIf { it.isFile }
+                ?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
+            val recentExits = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Api30ExitInfoHelper.readRecentExitReasons(context)
+            } else {
+                emptyList()
+            }
+            val startupAnomaly = evaluateSliceAnomalies(
+                trigger = "startup-check",
+                capturedAtMs = System.currentTimeMillis(),
+                sessionStartMs = 0L,
+                systemMeta = null,
+                nativeSnapshotRawJson = null,
+                crashBreadcrumb = crashBreadcrumb,
+                windowEvents = emptyList(),
+                recentProcessExitsOverride = recentExits,
+            )
+            if (startupAnomaly != null) {
+                recordDetectedAnomalyIfUndismissed(
+                    context = context,
+                    candidate = startupAnomaly,
+                    postNotification = false,
+                )
+            }
+        }
+        val activeAnomaly = if (enabled) getActiveAnomaly(context) else null
         return buildStorageSummaryFromDir(
             dir = dir,
-            enabled = isEnabled(context),
+            enabled = enabled,
             sliceIntervalSecs = getSliceIntervalSecs(context),
+            activeAnomaly = activeAnomaly,
         )
     }
 
@@ -333,6 +396,7 @@ object DebugLogManager {
         dir: File,
         enabled: Boolean,
         sliceIntervalSecs: Long,
+        activeAnomaly: DebugAnomalyAlertUi? = null,
     ): DebugLogSummaryUi {
         val sliceFiles = listSliceFilesNewestFirst(dir)
         val totalBytes = sliceFiles.sumOf { it.length() }
@@ -353,7 +417,496 @@ object DebugLogManager {
             latestSliceTimeMs = sliceFiles.firstOrNull()?.lastModified() ?: 0L,
             hasCrashBreadcrumb = crashPresent,
             recentSlices = items,
+            activeAnomaly = activeAnomaly,
         )
+    }
+
+    fun getActiveAnomaly(context: Context): DebugAnomalyAlertUi? {
+        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        return parseAnomalyJson(prefs.getString(KEY_ACTIVE_ANOMALY_JSON, null))
+    }
+
+    fun isAnomalyDismissed(context: Context, anomalyId: String): Boolean {
+        if (anomalyId.isBlank()) return false
+        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        return parseDismissedIdsJson(prefs.getString(KEY_DISMISSED_ANOMALY_IDS, null)).contains(anomalyId)
+    }
+
+    fun acknowledgeActiveAnomaly(context: Context) {
+        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        val current = parseAnomalyJson(prefs.getString(KEY_ACTIVE_ANOMALY_JSON, null))
+        val editor = prefs.edit().remove(KEY_ACTIVE_ANOMALY_JSON)
+        if (current != null && current.id.isNotBlank()) {
+            val updatedDismissed = appendDismissedIdJson(
+                existingRaw = prefs.getString(KEY_DISMISSED_ANOMALY_IDS, null),
+                newId = current.id,
+            )
+            editor.putString(KEY_DISMISSED_ANOMALY_IDS, updatedDismissed)
+        }
+        editor.apply()
+        cancelAnomalyNotification(context)
+    }
+
+    private fun recordDetectedAnomalyIfUndismissed(
+        context: Context,
+        candidate: DebugAnomalyAlertUi,
+        postNotification: Boolean,
+    ): Boolean {
+        if (!isEnabled(context)) return false
+        if (isAnomalyDismissed(context, candidate.id)) return false
+        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        val existing = parseAnomalyJson(prefs.getString(KEY_ACTIVE_ANOMALY_JSON, null))
+        if (existing != null) {
+            if (existing.id == candidate.id) return false
+            if (existing.severity == "critical" && candidate.severity != "critical") return false
+        }
+        prefs.edit().putString(KEY_ACTIVE_ANOMALY_JSON, serializeAnomalyJson(candidate)).apply()
+        if (postNotification) {
+            postAnomalyNotification(context, candidate)
+        }
+        return true
+    }
+
+    fun ensureAnomalyNotificationChannel(context: Context) {
+        val nm = context.getSystemService(NotificationManager::class.java) ?: return
+        val channel = NotificationChannel(
+            ANOMALY_NOTIFICATION_CHANNEL_ID,
+            context.getString(R.string.diag_alert_channel_name),
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            description = context.getString(R.string.diag_alert_channel_desc)
+            setShowBadge(true)
+        }
+        nm.createNotificationChannel(channel)
+    }
+
+    fun cancelAnomalyNotification(context: Context) {
+        runCatching {
+            context.getSystemService(NotificationManager::class.java)?.cancel(ANOMALY_NOTIFICATION_ID)
+        }
+    }
+
+    fun postAnomalyNotification(context: Context, anomaly: DebugAnomalyAlertUi) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) return
+        }
+        ensureAnomalyNotificationChannel(context)
+        val nm = context.getSystemService(NotificationManager::class.java) ?: return
+        val exportIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_NEW_TASK
+            putExtra(EXTRA_AUTO_SHARE_DEBUG_REPORT, true)
+        }
+        val exportPendingIntent = PendingIntent.getActivity(
+            context,
+            19,
+            exportIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val accentColor = if (anomaly.severity == "critical") 0xFFDC2626.toInt() else 0xFFD97706.toInt()
+        val title = "RustClash 诊断提醒 · ${anomaly.headlineZh}"
+        val notification = NotificationCompat.Builder(context, ANOMALY_NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_rustclash_vpn)
+            .setColor(accentColor)
+            .setContentTitle(title)
+            .setContentText(anomaly.detailZh)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(anomaly.detailZh))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ERROR)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(exportPendingIntent)
+            .addAction(
+                android.R.drawable.ic_menu_share,
+                context.getString(R.string.diag_alert_action_export),
+                exportPendingIntent,
+            )
+            .build()
+        runCatching { nm.notify(ANOMALY_NOTIFICATION_ID, notification) }
+    }
+
+    internal fun serializeAnomalyJson(alert: DebugAnomalyAlertUi): String =
+        JSONObject()
+            .put("id", alert.id)
+            .put("detectedAtMs", alert.detectedAtMs)
+            .put("severity", alert.severity)
+            .put("code", alert.code)
+            .put("headlineZh", alert.headlineZh)
+            .put("detailZh", alert.detailZh)
+            .toString()
+
+    internal fun parseAnomalyJson(raw: String?): DebugAnomalyAlertUi? {
+        if (raw.isNullOrBlank()) return null
+        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+        val id = obj.optString("id", "").trim()
+        val headline = obj.optString("headlineZh", "").trim()
+        if (id.isEmpty() || headline.isEmpty()) return null
+        return DebugAnomalyAlertUi(
+            id = id,
+            detectedAtMs = obj.optLong("detectedAtMs", 0L),
+            severity = obj.optString("severity", "warning"),
+            code = obj.optString("code", "UNKNOWN"),
+            headlineZh = headline,
+            detailZh = obj.optString("detailZh", ""),
+        )
+    }
+
+    internal fun parseDismissedIdsJson(raw: String?): List<String> {
+        if (raw.isNullOrBlank()) return emptyList()
+        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return emptyList()
+        val out = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) {
+            val v = arr.optString(i, "").trim()
+            if (v.isNotEmpty()) out.add(v)
+        }
+        return out
+    }
+
+    internal fun appendDismissedIdJson(
+        existingRaw: String?,
+        newId: String,
+        maxEntries: Int = MAX_DISMISSED_ANOMALY_IDS,
+    ): String {
+        val clean = newId.trim()
+        val list = parseDismissedIdsJson(existingRaw).filterNot { it == clean }.toMutableList()
+        if (clean.isNotEmpty()) {
+            list.add(clean)
+        }
+        val bounded = if (list.size > maxEntries) list.takeLast(maxEntries) else list
+        val arr = JSONArray()
+        bounded.forEach { arr.put(it) }
+        return arr.toString()
+    }
+
+    /**
+     * Pure anomaly sentinel evaluator.
+     * Deliberately ignores benign daily noise (`DIRECT`/`REJECT` timeouts, domestic PCDN drops,
+     * `NXDOMAIN`s, APK self-updates `killDueToPackageUpdate`, and manual `USER_STOPPED` clean-all)
+     * while catching crashes, OS/LMK/OEM kills, socket protect failures, VPN revocations, TUN drops,
+     * high proxy failure rates, severe proxy handshake stalls, and abnormal memory growth.
+     */
+    internal fun evaluateSliceAnomalies(
+        trigger: String,
+        capturedAtMs: Long,
+        sessionStartMs: Long,
+        systemMeta: SystemMetadata?,
+        nativeSnapshotRawJson: String?,
+        crashBreadcrumb: String?,
+        windowEvents: List<MobileTimelineEvent> = emptyList(),
+        recentProcessExitsOverride: List<String>? = null,
+    ): DebugAnomalyAlertUi? {
+        // 1. Uncaught JVM crash breadcrumb
+        if (!crashBreadcrumb.isNullOrBlank()) {
+            val firstLine = NodeImportSupport.redactSecretsForUi(
+                crashBreadcrumb.lineSequence().firstOrNull()?.trim().orEmpty(),
+            ).take(80)
+            val summaryLine = NodeImportSupport.redactSecretsForUi(
+                crashBreadcrumb.lineSequence().drop(1).firstOrNull { it.isNotBlank() }?.trim().orEmpty(),
+            ).take(80)
+            val detail = if (summaryLine.isNotEmpty()) {
+                "异常摘要：$summaryLine（点击一键导出脱敏日志分析）"
+            } else {
+                "已自动保存上次崩溃现场堆栈，点击一键导出脱敏日志供排查。"
+            }
+            return DebugAnomalyAlertUi(
+                id = "crash:${firstLine.ifEmpty { "jvm" }}",
+                detectedAtMs = capturedAtMs,
+                severity = "critical",
+                code = "JVM_CRASH_BREADCRUMB",
+                headlineZh = "捕获到上次异常闪退堆栈",
+                detailZh = detail,
+            )
+        }
+
+        // 2. Historical abnormal Android OS / LMK / OEM process exit (within last 24h)
+        val exits = recentProcessExitsOverride ?: systemMeta?.recentProcessExits.orEmpty()
+        val exitAnomaly = parseHistoricalExitAnomaly(exits, capturedAtMs)
+        if (exitAnomaly != null) {
+            return exitAnomaly
+        }
+
+        val sessionBucket = if (sessionStartMs > 0L) sessionStartMs else (capturedAtMs / 3_600_000L)
+        val nativeObj = if (!nativeSnapshotRawJson.isNullOrBlank()) {
+            runCatching { JSONObject(nativeSnapshotRawJson) }.getOrNull()
+        } else {
+            null
+        }
+        val nativeOk = nativeObj?.optBoolean("ok", false) == true
+
+        // 3. Explicit VPN engine runtime error event
+        val vpnErrorEv = windowEvents.lastOrNull { it.category == "VPN_ERROR" }
+        if (vpnErrorEv != null) {
+            val safeErr = NodeImportSupport.redactSecretsForUi(vpnErrorEv.detail).take(96)
+            return DebugAnomalyAlertUi(
+                id = "vpn_err:${vpnErrorEv.timestampMs}",
+                detectedAtMs = capturedAtMs,
+                severity = "critical",
+                code = "VPN_ENGINE_ERROR",
+                headlineZh = "检测到 VPN 引擎运行异常",
+                detailZh = "错误详情：$safeErr（点击一键导出诊断日志）",
+            )
+        }
+
+        // 4. Outbound socket protect failures (risk of routing loop / blackhole)
+        if (nativeOk) {
+            val protectFailures = nativeObj?.optJSONObject("tun")?.optLong("protectFailures", 0L) ?: 0L
+            if (protectFailures > 0L) {
+                return DebugAnomalyAlertUi(
+                    id = "protect_fail:$sessionBucket",
+                    detectedAtMs = capturedAtMs,
+                    severity = "critical",
+                    code = "SOCKET_PROTECT_FAIL",
+                    headlineZh = "检测到 VPN 套接字保护失败",
+                    detailZh = "底层出站 Socket 保护失败 $protectFailures 次，可能导致断流回环，请导出日志排查。",
+                )
+            }
+        }
+
+        // 5. System VPN revocation / preemption
+        val revokeEv = windowEvents.lastOrNull { it.category == "VPN_REVOKE" }
+        if (trigger == "revoked" || revokeEv != null) {
+            val revKey = revokeEv?.timestampMs ?: (capturedAtMs / 60_000L)
+            return DebugAnomalyAlertUi(
+                id = "vpn_revoke:$revKey",
+                detectedAtMs = capturedAtMs,
+                severity = "warning",
+                code = "VPN_REVOKED",
+                headlineZh = "VPN 隧道被系统抢占或意外断开",
+                detailZh = "系统撤销了 VPN 授权或隧道（常见于其他 VPN 抢占或锁屏管控），已保存现场快照。",
+            )
+        }
+
+        if (!nativeOk) return null
+
+        // 6. TUN write queue drops
+        val txWriteDrops = nativeObj?.optJSONObject("tun")?.optLong("txWriteDrops", 0L) ?: 0L
+        if (txWriteDrops >= 5L) {
+            return DebugAnomalyAlertUi(
+                id = "tun_tx_drop:$sessionBucket",
+                detectedAtMs = capturedAtMs,
+                severity = "warning",
+                code = "TUN_TX_DROP",
+                headlineZh = "检测到 TUN 隧道写回丢包",
+                detailZh = "TUN 网卡写队列累计丢弃 $txWriteDrops 个数据包，建议一键导出日志分析。",
+            )
+        }
+
+        // 7 & 8. Proxy outbound high failure rate or severe handshake degradation (strictly excluding DIRECT/REJECT)
+        val outArr = nativeObj?.optJSONArray("outboundStats")
+        val timeWindowBucket = capturedAtMs / 1_800_000L
+        if (outArr != null) {
+            for (i in 0 until outArr.length()) {
+                val o = outArr.optJSONObject(i) ?: continue
+                val rawName = o.optString("outbound", "").trim()
+                val exitType = o.optString("exitType", "").trim().uppercase(Locale.ROOT)
+                if (rawName.isEmpty() ||
+                    rawName.equals("DIRECT", ignoreCase = true) ||
+                    rawName.equals("REJECT", ignoreCase = true) ||
+                    exitType == "DIRECT" ||
+                    exitType == "REJECT"
+                ) {
+                    continue
+                }
+                val safeNode = NodeImportSupport.redactSecretsForUi(rawName)
+                val conns = o.optInt("connections", 0)
+                val fails = o.optInt("failures", 0)
+                val allFailed = conns >= 3 && fails == conns
+                val highFailRatio = fails >= 4 && conns >= 4 && (fails * 100) >= (conns * 35)
+                if (allFailed || highFailRatio) {
+                    val pct = if (conns > 0) (fails * 100) / conns else 100
+                    return DebugAnomalyAlertUi(
+                        id = "proxy_fail:$sessionBucket:$safeNode:$timeWindowBucket",
+                        detectedAtMs = capturedAtMs,
+                        severity = "warning",
+                        code = "PROXY_HIGH_FAIL_RATE",
+                        headlineZh = "代理节点出现异常断流",
+                        detailZh = "节点 $safeNode 近期连接失败 $fails/$conns 次 ($pct%)，点击一键导出脱敏日志排查。",
+                    )
+                }
+            }
+            for (i in 0 until outArr.length()) {
+                val o = outArr.optJSONObject(i) ?: continue
+                val rawName = o.optString("outbound", "").trim()
+                val exitType = o.optString("exitType", "").trim().uppercase(Locale.ROOT)
+                if (rawName.isEmpty() ||
+                    rawName.equals("DIRECT", ignoreCase = true) ||
+                    rawName.equals("REJECT", ignoreCase = true) ||
+                    exitType == "DIRECT" ||
+                    exitType == "REJECT"
+                ) {
+                    continue
+                }
+                val conns = o.optInt("connections", 0)
+                val fails = o.optInt("failures", 0)
+                val hsSamples = if (o.has("handshakeSamples")) {
+                    o.optInt("handshakeSamples", 0)
+                } else {
+                    (conns - fails).coerceAtLeast(0)
+                }
+                val p50 = if (o.isNull("handshakeP50Ms")) -1L else o.optLong("handshakeP50Ms", -1L)
+                val p95 = if (o.isNull("handshakeP95Ms")) -1L else o.optLong("handshakeP95Ms", -1L)
+                if (hsSamples >= 5 && p95 >= 4_000L && (p50 < 0L || p50 >= 800L || p95 >= 6_000L)) {
+                    val safeNode = NodeImportSupport.redactSecretsForUi(rawName)
+                    return DebugAnomalyAlertUi(
+                        id = "proxy_slow:$sessionBucket:$safeNode:$timeWindowBucket",
+                        detectedAtMs = capturedAtMs,
+                        severity = "warning",
+                        code = "PROXY_SLOW_HANDSHAKE",
+                        headlineZh = "代理节点握手延迟显著升高",
+                        detailZh = "节点 $safeNode 握手尾延迟达 P95 ${p95}ms，建议一键导出日志分析。",
+                    )
+                }
+            }
+        }
+
+        // 9. Abnormal native RSS memory growth (>= 180 MB vs normal 65~85 MB)
+        val rssBytes = maxOf(
+            nativeObj?.optLong("rssBytes", 0L) ?: 0L,
+            nativeObj?.optLong("vmRssBytes", 0L) ?: 0L,
+        )
+        if (rssBytes >= 180L * 1024L * 1024L) {
+            return DebugAnomalyAlertUi(
+                id = "high_rss:$sessionBucket",
+                detectedAtMs = capturedAtMs,
+                severity = "warning",
+                code = "HIGH_MEMORY_RSS",
+                headlineZh = "引擎内存占用异常偏高",
+                detailZh = "当前原生内存占用达 ${formatBytesCompact(rssBytes)}，点击一键导出日志检查连接与缓存状态。",
+            )
+        }
+
+        return null
+    }
+
+    private fun parseHistoricalExitAnomaly(
+        recentExits: List<String>,
+        capturedAtMs: Long,
+    ): DebugAnomalyAlertUi? {
+        val latestLine = recentExits.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val tsStr = if (latestLine.startsWith("[") && latestLine.contains("]")) {
+            latestLine.substringAfter("[", "").substringBefore("]", "").trim()
+        } else {
+            ""
+        }
+        val reason = EXIT_REASON_REGEX.find(latestLine)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        if (reason.isEmpty()) return null
+        val desc = latestLine.substringAfter("desc=", "").trim()
+
+        // Explicitly ignore user-requested stops (e.g. Recent Tasks Clean All / Force Stop) and APK updates
+        if (reason == "USER_STOPPED" ||
+            reason == "USER_FORCE_STOP" ||
+            reason == "PERMISSION_CHANGE" ||
+            desc.contains("killDueToPackageUpdate", ignoreCase = true) ||
+            desc.contains("installPackageLI", ignoreCase = true)
+        ) {
+            return null
+        }
+
+        val isAbnormal = reason in setOf(
+            "ANR",
+            "JVM_CRASH",
+            "NATIVE_CRASH",
+            "LOW_MEMORY_LMK",
+            "EXCESSIVE_RESOURCE",
+            "OTHER_OEM_KILL",
+        ) || reason.startsWith("SIGNALED(")
+        if (!isAbnormal) return null
+
+        val exitEpochMs = if (tsStr.isNotEmpty()) {
+            runCatching {
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS Z", Locale.US).parse(tsStr)?.time
+            }.getOrNull()
+        } else {
+            null
+        }
+        if (exitEpochMs != null && capturedAtMs > 0L && (capturedAtMs - exitEpochMs) > HISTORICAL_EXIT_MAX_AGE_MS) {
+            return null
+        }
+
+        val shortTime = when {
+            exitEpochMs != null -> formatShortTime(exitEpochMs)
+            tsStr.isNotEmpty() -> tsStr.take(19)
+            else -> "近期"
+        }
+        val reasonZh = when {
+            reason == "ANR" -> "应用无响应 (ANR)"
+            reason == "JVM_CRASH" -> "应用异常闪退 (JVM)"
+            reason == "NATIVE_CRASH" -> "底层引擎崩溃 (Native)"
+            reason == "LOW_MEMORY_LMK" -> "系统低内存回收 (LMK)"
+            reason == "EXCESSIVE_RESOURCE" -> "系统资源超限强杀"
+            reason == "OTHER_OEM_KILL" -> "系统后台省电管控强杀"
+            reason.startsWith("SIGNALED(") -> "底层信号终止 ($reason)"
+            else -> reason
+        }
+        return DebugAnomalyAlertUi(
+            id = "exit:${tsStr.ifEmpty { reason }}:$reason",
+            detectedAtMs = capturedAtMs,
+            severity = "critical",
+            code = "PROCESS_EXIT_ABNORMAL",
+            headlineZh = "检测到上次后台被系统异常终止",
+            detailZh = NodeImportSupport.redactSecretsForUi("原因：$reasonZh（时间 $shortTime），点击一键导出日志排查。"),
+        )
+    }
+
+    /**
+     * Lightweight live health check invoked periodically while screen is interactive and Debug mode is ON.
+     * Captures a frozen `anomaly` slice and posts a system alert notification within ~2 minutes if a real
+     * degradation occurs between scheduled slice intervals (bounded by a 15-minute cooldown).
+     */
+    fun inspectLiveHealthAndCaptureIfAnomalous(
+        context: Context,
+        stateDir: String = context.filesDir.absolutePath,
+    ): File? = synchronized(sliceWriteLock) {
+        if (!isEnabled(context)) return null
+        val now = System.currentTimeMillis()
+        if (lastAutoAnomalyCaptureMs > 0L && now - lastAutoAnomalyCaptureMs < AUTO_ANOMALY_COOLDOWN_MS) {
+            return null
+        }
+        val (winStart, sessStart, winEvents) = synchronized(lock) {
+            Triple(
+                windowStartMs,
+                sessionStartMs,
+                timelineEvents.filter { it.timestampMs >= windowStartMs },
+            )
+        }
+        if (now - winStart < 45_000L) {
+            return null
+        }
+        val nativeJsonStr = if (NativeBridge.ensureLoaded()) {
+            runCatching {
+                NativeBridge.nativeCollectDebugSnapshotJson(stateDir, winStart, now)
+            }.getOrNull()
+        } else {
+            null
+        } ?: return null
+
+        val battery = readBatterySnapshot(context)
+        val systemMeta = collectSystemMetadata(context, battery)
+        val dir = File(context.filesDir, DEBUG_DIR_NAME)
+        val crashBreadcrumb = File(dir, CRASH_BREADCRUMB_FILE)
+            .takeIf { it.isFile }
+            ?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
+
+        val candidate = evaluateSliceAnomalies(
+            trigger = "anomaly",
+            capturedAtMs = now,
+            sessionStartMs = sessStart,
+            systemMeta = systemMeta,
+            nativeSnapshotRawJson = nativeJsonStr,
+            crashBreadcrumb = crashBreadcrumb,
+            windowEvents = winEvents,
+        ) ?: return null
+
+        if (isAnomalyDismissed(context, candidate.id) || getActiveAnomaly(context)?.id == candidate.id) {
+            return null
+        }
+        lastAutoAnomalyCaptureMs = now
+        captureSlice(context = context, stateDir = stateDir, trigger = "anomaly")
     }
 
     /**
@@ -441,7 +994,31 @@ object DebugLogManager {
                     }
                 }
             }
-            enforceRetentionPolicy(dir, MAX_SLICE_FILES, MAX_TOTAL_SLICE_BYTES)
+            if (isEnabled(context)) {
+                val evaluated = evaluateSliceAnomalies(
+                    trigger = trigger,
+                    capturedAtMs = windowSnap.capturedAtMs,
+                    sessionStartMs = capturedSessionStartMs,
+                    systemMeta = systemMeta,
+                    nativeSnapshotRawJson = nativeJsonStr,
+                    crashBreadcrumb = crashBreadcrumb,
+                    windowEvents = windowSnap.events,
+                )
+                if (evaluated != null) {
+                    recordDetectedAnomalyIfUndismissed(
+                        context = context,
+                        candidate = evaluated,
+                        postNotification = trigger != "export",
+                    )
+                }
+            }
+            val protectAnomaly = getActiveAnomaly(context) != null
+            enforceRetentionPolicy(
+                dir = dir,
+                maxFiles = MAX_SLICE_FILES,
+                maxTotalBytes = MAX_TOTAL_SLICE_BYTES,
+                protectLatestAnomalySlice = protectAnomaly,
+            )
             outFile
         }.onFailure {
             runCatching { tmpFile.delete() }
@@ -457,11 +1034,13 @@ object DebugLogManager {
         context: Context,
         stateDir: String = context.filesDir.absolutePath,
     ): File? {
+        val priorAnomaly = getActiveAnomaly(context)
         val sliceDir = File(context.filesDir, DEBUG_DIR_NAME)
         val newest = listSliceFilesNewestFirst(sliceDir).firstOrNull()
         if (newest == null || System.currentTimeMillis() - newest.lastModified() >= 15_000L) {
             captureSlice(context = context, stateDir = stateDir, trigger = "export")
         }
+        val activeAnomaly = priorAnomaly ?: getActiveAnomaly(context)
         val exportDir = File(context.cacheDir, EXPORT_CACHE_DIR_NAME).apply { mkdirs() }
         // Clean up stale export files older than 1 hour
         val cutoff = System.currentTimeMillis() - 3_600_000L
@@ -475,6 +1054,7 @@ object DebugLogManager {
             exportDir = exportDir,
             nowMs = System.currentTimeMillis(),
             maxBytes = MAX_COMBINED_EXPORT_BYTES,
+            activeAnomaly = activeAnomaly,
         )
     }
 
@@ -483,6 +1063,7 @@ object DebugLogManager {
         exportDir: File,
         nowMs: Long,
         maxBytes: Int = MAX_COMBINED_EXPORT_BYTES,
+        activeAnomaly: DebugAnomalyAlertUi? = null,
     ): File? {
         val newestFirst = listSliceFilesNewestFirst(sliceDir)
         if (newestFirst.isEmpty()) return null
@@ -492,6 +1073,14 @@ object DebugLogManager {
             appendLine("# RustClash Android Diagnostic Report Bundle")
             appendLine("- GeneratedAt: ${formatTimestamp(nowMs)}")
             appendLine("- IncludedSlicesAvailable: ${newestFirst.size}")
+            if (activeAnomaly != null) {
+                val safeHeadline = NodeImportSupport.redactSecretsForUi(activeAnomaly.headlineZh)
+                val safeDetail = NodeImportSupport.redactSecretsForUi(activeAnomaly.detailZh)
+                appendLine(
+                    "- DetectedAnomaly: [${activeAnomaly.severity.uppercase(Locale.ROOT)}/${activeAnomaly.code}] " +
+                        "$safeHeadline — $safeDetail (at ${formatTimestamp(activeAnomaly.detectedAtMs)})",
+                )
+            }
             appendLine("- RedactionPolicy: Visited domains, rules & node names preserved; passwords/UUIDs/subscription URLs redacted")
             appendLine()
         }
@@ -576,11 +1165,18 @@ object DebugLogManager {
 
     fun clearAllLogs(context: Context) {
         synchronized(sliceWriteLock) {
+            lastAutoAnomalyCaptureMs = 0L
             val dir = File(context.filesDir, DEBUG_DIR_NAME)
             dir.listFiles()?.forEach { runCatching { it.delete() } }
             val exportDir = File(context.cacheDir, EXPORT_CACHE_DIR_NAME)
             exportDir.listFiles()?.forEach { runCatching { it.delete() } }
         }
+        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .remove(KEY_ACTIVE_ANOMALY_JSON)
+            .remove(KEY_DISMISSED_ANOMALY_IDS)
+            .apply()
+        cancelAnomalyNotification(context)
         val now = System.currentTimeMillis()
         val batteryNow = readBatterySnapshot(context).levelPct
         resetTimelineWindowOnClear(
@@ -637,18 +1233,39 @@ object DebugLogManager {
         dir: File,
         maxFiles: Int,
         maxTotalBytes: Long,
+        protectLatestAnomalySlice: Boolean = false,
     ) {
         val filesNewestFirst = listSliceFilesNewestFirst(dir).toMutableList()
+        val protectedFile = if (protectLatestAnomalySlice) {
+            filesNewestFirst.firstOrNull { f ->
+                parseTriggerFromFileName(f.name) in setOf("anomaly", "revoked")
+            }
+        } else {
+            null
+        }
         while (filesNewestFirst.size > maxFiles) {
-            val oldest = filesNewestFirst.removeAt(filesNewestFirst.lastIndex)
-            runCatching { oldest.delete() }
+            val evictIdx = findOldestEvictableIndex(filesNewestFirst, protectedFile)
+            val evicted = filesNewestFirst.removeAt(evictIdx)
+            runCatching { evicted.delete() }
         }
         var total = filesNewestFirst.sumOf { it.length() }
         while (filesNewestFirst.size > 1 && total > maxTotalBytes) {
-            val oldest = filesNewestFirst.removeAt(filesNewestFirst.lastIndex)
-            total -= oldest.length()
-            runCatching { oldest.delete() }
+            val evictIdx = findOldestEvictableIndex(filesNewestFirst, protectedFile)
+            val evicted = filesNewestFirst.removeAt(evictIdx)
+            total -= evicted.length()
+            runCatching { evicted.delete() }
         }
+    }
+
+    private fun findOldestEvictableIndex(filesNewestFirst: List<File>, protectedFile: File?): Int {
+        if (protectedFile != null && filesNewestFirst.size > 1) {
+            for (idx in filesNewestFirst.lastIndex downTo 1) {
+                if (filesNewestFirst[idx] != protectedFile) {
+                    return idx
+                }
+            }
+        }
+        return filesNewestFirst.lastIndex
     }
 
     internal fun parseTriggerFromFileName(fileName: String): String {
