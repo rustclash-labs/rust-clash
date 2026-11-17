@@ -34,7 +34,7 @@ use crate::{
         },
         quic_common::{
             CachedQuicSlot, PortSpec, QuicBiStream, QuicCongestionControl, QuicSessionLease,
-            SalamanderObfs, bind_quinn_server_endpoint, build_quinn_client_config,
+            QuicWorkLease, SalamanderObfs, bind_quinn_server_endpoint, build_quinn_client_config,
             build_quinn_server_config, build_quinn_transport_config, decode_quic_varint_slice,
             dial_protected_quic_connection, encode_quic_varint, read_quic_varint,
         },
@@ -243,6 +243,10 @@ impl Hy2AuthenticatedConn {
     fn is_usable(&self) -> bool {
         self.lease.is_usable()
     }
+
+    fn is_idle(&self) -> bool {
+        self.lease.active_work_count() == 0 && self.udp_sessions.is_empty()
+    }
 }
 
 struct Hysteria2Inner {
@@ -268,22 +272,98 @@ impl Hysteria2Inner {
             .unwrap_or(self.cfg.server.as_str())
     }
 
-    async fn get_or_dial_session(&self) -> io::Result<Arc<Hy2AuthenticatedConn>> {
-        if let Some(existing) = self.cached_conn.get_if(Hy2AuthenticatedConn::is_usable) {
-            return Ok(existing);
+    fn reap_idle_for_low_power(&self) {
+        if let Some(evicted) = self
+            .cached_conn
+            .reap_if_low_power_idle(Hy2AuthenticatedConn::is_idle)
+        {
+            evicted.lease.close_immediately(b"low power idle");
         }
-        let _guard = self.connect_lock.lock().await;
-        if let Some(existing) = self.cached_conn.get_if(Hy2AuthenticatedConn::is_usable) {
-            return Ok(existing);
-        }
-        let session = self.dial_fresh_session().await?;
-        self.cached_conn.store(Arc::clone(&session));
-        Ok(session)
     }
 
-    async fn dial_fresh_session(&self) -> io::Result<Arc<Hy2AuthenticatedConn>> {
+    async fn checkout_or_dial_session(
+        self: &Arc<Self>,
+    ) -> io::Result<(Arc<Hy2AuthenticatedConn>, QuicWorkLease)> {
+        if let Some(pair) = self
+            .cached_conn
+            .checkout_if_usable(Hy2AuthenticatedConn::is_usable, |s| s.lease.acquire_work())
+        {
+            return Ok(pair);
+        }
+        let _guard = self.connect_lock.lock().await;
+        if let Some(pair) = self
+            .cached_conn
+            .checkout_if_usable(Hy2AuthenticatedConn::is_usable, |s| s.lease.acquire_work())
+        {
+            return Ok(pair);
+        }
+
+        for attempt in 0..2 {
+            let dial_gen = self.cached_conn.current_generation();
+            let session = self.dial_fresh_session().await?;
+            match self.cached_conn.store_if_generation_and_checkout(
+                dial_gen,
+                Arc::clone(&session),
+                Hy2AuthenticatedConn::is_usable,
+                |s| s.lease.acquire_work(),
+            ) {
+                Ok((replaced, work)) => {
+                    if let Some(old) = replaced {
+                        old.lease.close_immediately(b"replaced");
+                    }
+                    return Ok((session, work));
+                }
+                Err(stale) => {
+                    stale.lease.close_immediately(b"stale network generation");
+                    if attempt == 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "network switched during Hysteria2 QUIC handshake",
+                        ));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn preconnect_session(self: &Arc<Self>) -> io::Result<()> {
+        if self.cached_conn.is_low_power_mode() {
+            return Ok(());
+        }
+        if self
+            .cached_conn
+            .get_if(Hy2AuthenticatedConn::is_usable)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let _guard = self.connect_lock.lock().await;
+        if self.cached_conn.is_low_power_mode()
+            || self
+                .cached_conn
+                .get_if(Hy2AuthenticatedConn::is_usable)
+                .is_some()
+        {
+            return Ok(());
+        }
+        let dial_gen = self.cached_conn.current_generation();
+        let session = self.dial_fresh_session().await?;
+        if let Err(rejected) = self.cached_conn.store_preconnect_if_generation(
+            dial_gen,
+            session,
+            Hy2AuthenticatedConn::is_usable,
+        ) {
+            rejected
+                .lease
+                .close_immediately(b"preconnect superseded or low power");
+        }
+        Ok(())
+    }
+
+    async fn dial_fresh_session(self: &Arc<Self>) -> io::Result<Arc<Hy2AuthenticatedConn>> {
         let port = self.port_spec.pick_port();
-        let (endpoint, conn, _) = dial_protected_quic_connection(
+        let (endpoint, conn, _, pre_epoch) = dial_protected_quic_connection(
             &self.cfg.server,
             port,
             self.sni_host(),
@@ -354,18 +434,23 @@ impl Hysteria2Inner {
                     continue;
                 };
                 let sid = frame.session_id;
-                let dead = if let Some(entry) = udp_map_bg.get(&sid) {
-                    entry.try_send(frame).is_err() && entry.is_closed()
-                } else {
-                    false
-                };
-                if dead {
-                    udp_map_bg.remove(&sid);
+                let tx = udp_map_bg.get(&sid).map(|entry| entry.value().clone());
+                if let Some(tx) = tx
+                    && tx.try_send(frame).is_err()
+                    && tx.is_closed()
+                {
+                    udp_map_bg.remove_if(&sid, |_, cur| cur.same_channel(&tx));
                 }
             }
         });
 
-        let lease = QuicSessionLease::new(endpoint, conn);
+        let lease = QuicSessionLease::new_with_epoch(pre_epoch, endpoint, conn);
+        let weak_inner = Arc::downgrade(self);
+        lease.set_idle_hook(move || {
+            if let Some(inner) = weak_inner.upgrade() {
+                inner.reap_idle_for_low_power();
+            }
+        });
         Ok(Arc::new(Hy2AuthenticatedConn {
             lease,
             server_udp_enabled,
@@ -380,6 +465,7 @@ impl Hysteria2Inner {
     async fn open_tcp_on_session(
         &self,
         sess: &Arc<Hy2AuthenticatedConn>,
+        work: QuicWorkLease,
         target: &TargetAddr,
     ) -> io::Result<BoxedStream> {
         let (mut send, mut recv) = sess
@@ -445,7 +531,7 @@ impl Hysteria2Inner {
             send,
             recv,
             BytesMut::new(),
-            Some(Arc::clone(&sess.lease) as Arc<dyn Send + Sync>),
+            Some(Arc::new(work) as Arc<dyn Send + Sync>),
         )))
     }
 }
@@ -564,13 +650,16 @@ struct Hysteria2UdpSession {
     conn: Arc<Hy2AuthenticatedConn>,
     session_id: u32,
     next_pkt_id: AtomicU16,
-    rx: AsyncMutex<mpsc::Receiver<Hy2UdpFrame>>,
+    rx: Option<AsyncMutex<mpsc::Receiver<Hy2UdpFrame>>>,
     defragger: Mutex<Hy2Defragger>,
+    _work: Option<QuicWorkLease>,
 }
 
 impl Drop for Hysteria2UdpSession {
     fn drop(&mut self) {
+        let _ = self.rx.take();
         self.conn.udp_sessions.remove(&self.session_id);
+        let _ = self._work.take();
     }
 }
 
@@ -600,7 +689,13 @@ impl OutboundUdpSession for Hysteria2UdpSession {
     }
 
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
-        let mut rx = self.rx.lock().await;
+        let rx_mutex = self.rx.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Hysteria2 QUIC UDP session closed",
+            )
+        })?;
+        let mut rx = rx_mutex.lock().await;
         loop {
             let Some(frame) = rx.recv().await else {
                 return Err(io::Error::new(
@@ -638,11 +733,21 @@ impl OutboundHandler for Hysteria2Outbound {
     }
 
     fn on_network_change(&self) -> usize {
-        if let Some(evicted) = self.inner.cached_conn.take() {
+        if let Some(evicted) = self.inner.cached_conn.advance_generation_and_take() {
             evicted.lease.close_immediately(b"network change");
             1
         } else {
             0
+        }
+    }
+
+    fn set_low_power_mode(&self, enabled: bool) {
+        if let Some(evicted) = self
+            .inner
+            .cached_conn
+            .set_low_power_and_take_idle(enabled, Hy2AuthenticatedConn::is_idle)
+        {
+            evicted.lease.close_immediately(b"low power idle");
         }
     }
 
@@ -651,20 +756,20 @@ impl OutboundHandler for Hysteria2Outbound {
             if let Some(dns) = &self.inner.dns {
                 let _ = dns.prewarm_proxy_server_ips(&self.inner.cfg.server).await;
             }
-            let _ = self.inner.get_or_dial_session().await?;
+            self.inner.preconnect_session().await?;
         }
         Ok(())
     }
 
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
-        let sess = self.inner.get_or_dial_session().await?;
-        match self.inner.open_tcp_on_session(&sess, target).await {
+        let (sess, work) = self.inner.checkout_or_dial_session().await?;
+        match self.inner.open_tcp_on_session(&sess, work, target).await {
             Ok(stream) => Ok(stream),
             Err(first_err) if sess.lease.conn.close_reason().is_some() => {
-                let _ = self.inner.cached_conn.take();
-                let fresh = self.inner.get_or_dial_session().await?;
+                self.inner.cached_conn.evict_if_same(&sess);
+                let (fresh, fresh_work) = self.inner.checkout_or_dial_session().await?;
                 self.inner
-                    .open_tcp_on_session(&fresh, target)
+                    .open_tcp_on_session(&fresh, fresh_work, target)
                     .await
                     .or(Err(first_err))
             }
@@ -679,7 +784,7 @@ impl OutboundHandler for Hysteria2Outbound {
                 "UDP disabled on this Hysteria2 outbound",
             ));
         }
-        let sess = self.inner.get_or_dial_session().await?;
+        let (sess, work) = self.inner.checkout_or_dial_session().await?;
         if !sess.server_udp_enabled {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -693,8 +798,9 @@ impl OutboundHandler for Hysteria2Outbound {
             conn: sess,
             session_id,
             next_pkt_id: AtomicU16::new(1),
-            rx: AsyncMutex::new(rx),
+            rx: Some(AsyncMutex::new(rx)),
             defragger: Mutex::new(Hy2Defragger::default()),
+            _work: Some(work),
         }))
     }
 }

@@ -89,6 +89,12 @@ pub struct MacOsRecoveryRecord {
     pub dns_backups: Vec<MacOsDnsBackup>,
 }
 
+impl MacOsRecoveryRecord {
+    pub fn is_empty(&self) -> bool {
+        self.owned_route_del_args.is_empty() && self.dns_backups.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsRouteRecord {
     pub destination_prefix: String,
@@ -107,12 +113,30 @@ pub struct WindowsDnsFamilySnapshot {
     pub search_list: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+const fn default_restore_ipv4_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsDnsInterfaceBackup {
     pub interface_guid: String,
     pub ipv4: WindowsDnsFamilySnapshot,
     #[serde(default)]
     pub ipv6: Option<WindowsDnsFamilySnapshot>,
+    /// Whether `ipv4` still needs restoration (`true` initially; cleared if IPv4 succeeded while IPv6 failed).
+    #[serde(default = "default_restore_ipv4_true")]
+    pub restore_ipv4: bool,
+}
+
+impl Default for WindowsDnsInterfaceBackup {
+    fn default() -> Self {
+        Self {
+            interface_guid: String::new(),
+            ipv4: WindowsDnsFamilySnapshot::default(),
+            ipv6: None,
+            restore_ipv4: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +150,17 @@ pub struct WindowsRecoveryRecord {
     /// Full pre-mutation IPv4 & IPv6 `GetInterfaceDnsSettings` snapshot for exact restoration.
     #[serde(default)]
     pub dns_backup: Option<WindowsDnsInterfaceBackup>,
+}
+
+impl WindowsRecoveryRecord {
+    pub fn is_empty(&self) -> bool {
+        let has_dns = self
+            .dns_backup
+            .as_ref()
+            .is_some_and(|b| b.restore_ipv4 || b.ipv6.is_some())
+            || self.previous_dns_servers.is_some();
+        self.owned_routes.is_empty() && !has_dns
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +506,98 @@ pub(crate) fn clear_sysproxy_journal_entry(state_dir: &Path) -> io::Result<()> {
     journal.save_atomic(state_dir)
 }
 
+fn finalize_tun_teardown_journal_inner<F>(
+    state_dir: &Path,
+    caller_pid: u32,
+    apply_remaining: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&mut RecoveryJournal) -> bool,
+{
+    let _mem_guard = JOURNAL_MUTEX.lock();
+    let _file_guard = acquire_journal_file_lock(state_dir);
+
+    let existing = RecoveryJournal::load_from(state_dir).ok().flatten();
+    let mut journal = RecoveryJournal::new_for_pid(caller_pid);
+    if let Some(ref ex) = existing
+        && ex.pid == caller_pid
+    {
+        journal.started_at_unix_ms = ex.started_at_unix_ms;
+    }
+
+    let has_unrecovered_tun = apply_remaining(&mut journal);
+    let final_tun_pid = if has_unrecovered_tun {
+        // Mark unrecovered TUN state with `pid = 0` (`!is_pid_alive(0)`) so `recover_stale_network_state`
+        // retries restoring DNS/routes even while the current daemon stays running!
+        Some(0)
+    } else if let Some(ref ex) = existing
+        && ex.has_tun()
+    {
+        let ex_tun_pid = ex.effective_tun_pid();
+        if ex_tun_pid != caller_pid && ex_tun_pid != 0 {
+            journal.linux_tun = ex.linux_tun.clone();
+            journal.macos_tun = ex.macos_tun.clone();
+            journal.windows_tun = ex.windows_tun.clone();
+            Some(ex_tun_pid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let final_sp_pid = if let Some(ref ex) = existing
+        && ex.sysproxy.is_some()
+    {
+        let ex_sp_pid = ex.effective_sysproxy_pid();
+        if ex_sp_pid == caller_pid || is_pid_alive(ex_sp_pid) {
+            journal.sysproxy = ex.sysproxy.clone();
+            Some(ex_sp_pid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    journal.normalize_owner_pids(final_tun_pid, final_sp_pid, caller_pid);
+    journal.save_atomic(state_dir)
+}
+
+/// Update `network_recovery.json` after macOS TUN teardown (`stop()` or failed `start()`):
+/// retains ONLY genuinely unrecovered routes/DNS backups (with `tun_owner_pid = 0`) and clears
+/// the TUN journal entry when teardown succeeded cleanly.
+pub fn finalize_macos_tun_teardown_journal(
+    state_dir: &Path,
+    remaining: Option<MacOsRecoveryRecord>,
+) -> io::Result<()> {
+    finalize_tun_teardown_journal_inner(state_dir, std::process::id(), |j| {
+        if let Some(rem) = remaining.filter(|r| !r.is_empty()) {
+            j.macos_tun = Some(rem);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Update `network_recovery.json` after Windows Wintun teardown (`stop()` or failed `start()`):
+/// retains ONLY genuinely unrecovered routes/DNS backups (with `tun_owner_pid = 0`) and clears
+/// the TUN journal entry when teardown succeeded cleanly.
+pub fn finalize_windows_tun_teardown_journal(
+    state_dir: &Path,
+    remaining: Option<WindowsRecoveryRecord>,
+) -> io::Result<()> {
+    finalize_tun_teardown_journal_inner(state_dir, std::process::id(), |j| {
+        if let Some(rem) = remaining.filter(|r| !r.is_empty()) {
+            j.windows_tun = Some(rem);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Check whether OS process `pid` is currently alive.
 pub fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -690,6 +817,9 @@ where
         Some(journal.pid)
     };
 
+    let mut remaining_macos: Option<MacOsRecoveryRecord> = None;
+    let mut remaining_windows: Option<WindowsRecoveryRecord> = None;
+
     if tun_stale {
         if let Some(linux) = &journal.linux_tun {
             for args in linux.owned_v4_rule_del_args.iter().rev() {
@@ -729,32 +859,21 @@ where
         }
 
         if let Some(macos) = &journal.macos_tun {
-            for args in macos.owned_route_del_args.iter().rev() {
-                let desc = format!("route {}", args.join(" "));
-                match run_cmd("route", args) {
-                    Ok(()) => outcome.actions_executed.push(desc),
-                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-                }
-            }
-            for dns in &macos.dns_backups {
-                let mut args = vec!["-setdnsservers".to_string(), dns.service_name.clone()];
-                if dns.previous_servers.is_empty() {
-                    args.push("Empty".to_string());
-                } else {
-                    args.extend(dns.previous_servers.iter().cloned());
-                }
-                let desc = format!("networksetup {}", args.join(" "));
-                match run_cmd("networksetup", &args) {
-                    Ok(()) => outcome.actions_executed.push(desc),
-                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-                }
-            }
+            remaining_macos = crate::platform::tun::macos::rollback_macos_record_with_runner(
+                macos,
+                &mut outcome,
+                run_cmd,
+            );
         }
 
         if let Some(win) = &journal.windows_tun {
             #[cfg(windows)]
             {
-                crate::platform::tun::windows::recover_windows_tun_record(win, &mut outcome);
+                remaining_windows =
+                    crate::platform::tun::windows::recover_windows_tun_record_pruning(
+                        win,
+                        &mut outcome,
+                    );
             }
             #[cfg(not(windows))]
             {
@@ -765,14 +884,14 @@ where
                     .or(win.dns_interface_guid.as_deref());
                 if let Some(guid) = target_guid {
                     let v4_servers: Option<Vec<String>> = if let Some(b) = &win.dns_backup {
-                        Some(
+                        b.restore_ipv4.then(|| {
                             b.ipv4
                                 .name_server
                                 .split([',', ' '])
                                 .filter(|s| !s.is_empty())
                                 .map(str::to_string)
-                                .collect(),
-                        )
+                                .collect()
+                        })
                     } else {
                         win.previous_dns_servers.clone()
                     };
@@ -793,7 +912,14 @@ where
                         let desc = format!("netsh {}", args.join(" "));
                         match run_cmd("netsh", &args) {
                             Ok(()) => outcome.actions_executed.push(desc),
-                            Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
+                            Err(e) => {
+                                if !crate::platform::tun::windows::is_windows_benign_absent_error(
+                                    &e,
+                                ) {
+                                    outcome.warnings.push(format!("{desc}: {e}"));
+                                    remaining_windows = Some(win.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -823,14 +949,15 @@ where
         let _ = fs::remove_file(state_dir.join("sysproxy_active.json"));
     }
 
-    // Preserve any remaining section owned by a still-live process; if none remain, `save_atomic`
-    // removes `network_recovery.json` cleanly.
+    // Preserve any remaining section owned by a still-live process AND any genuinely unrecovered
+    // macOS / Windows TUN rollback items (`pid = 0` so future recovery retries them); if none remain,
+    // `save_atomic` removes `network_recovery.json` cleanly.
     let mut survivor = journal;
     let keep_tun_pid = if tun_stale {
         survivor.linux_tun = None;
-        survivor.macos_tun = None;
-        survivor.windows_tun = None;
-        None
+        survivor.macos_tun = remaining_macos.filter(|r| !r.is_empty());
+        survivor.windows_tun = remaining_windows.filter(|r| !r.is_empty());
+        survivor.has_tun().then_some(0)
     } else {
         survivor.has_tun().then_some(tun_pid)
     };
@@ -851,31 +978,39 @@ where
     outcome
 }
 
-fn default_command_runner(program: &str, args: &[String]) -> io::Result<()> {
-    let resolved = if program == "ip" {
-        for cand in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"] {
-            if Path::new(cand).exists() {
-                let out = std::process::Command::new(cand).args(args).output()?;
-                return if out.status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(
-                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                    ))
-                };
-            }
-        }
-        program
-    } else {
-        program
+fn format_cmd_output_error(out: &std::process::Output) -> io::Error {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let se = stderr.trim();
+    let so = stdout.trim();
+    let combined = match (se.is_empty(), so.is_empty()) {
+        (false, false) => format!("{se}; {so}"),
+        (false, true) => se.to_string(),
+        (true, false) => so.to_string(),
+        (true, true) => format!("exit status {}", out.status),
     };
+    io::Error::other(combined)
+}
+
+fn default_command_runner(program: &str, args: &[String]) -> io::Result<()> {
+    let candidates: &[&str] = match program {
+        "ip" => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"],
+        "route" => &["/sbin/route", "/usr/sbin/route"],
+        "networksetup" => &["/usr/sbin/networksetup"],
+        _ => &[],
+    };
+    let mut resolved = program;
+    for &cand in candidates {
+        if Path::new(cand).exists() {
+            resolved = cand;
+            break;
+        }
+    }
     let out = std::process::Command::new(resolved).args(args).output()?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ))
+        Err(format_cmd_output_error(&out))
     }
 }
 
@@ -1068,6 +1203,103 @@ mod tests {
         assert_eq!(surviving.linux_tun.as_ref(), Some(&tun_rec));
         assert!(surviving.sysproxy.is_none());
         assert_eq!(surviving.effective_tun_pid(), daemon_pid);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_macos_teardown_retains_stale_journal_until_retry_succeeds_while_preserving_live_sysproxy()
+     {
+        let dir =
+            std::env::temp_dir().join(format!("rc-macos-partial-journal-{}", uuid::Uuid::new_v4()));
+        let my_pid = std::process::id();
+
+        let sp_rec = SysProxyRecoveryRecord {
+            platform: "linux-gnome".to_string(),
+            linux_gnome_mode: Some("none".to_string()),
+            ..Default::default()
+        };
+        let full_macos = MacOsRecoveryRecord {
+            utun_name: "utun9".to_string(),
+            owned_route_del_args: vec![vec![
+                "-n".to_string(),
+                "delete".to_string(),
+                "-net".to_string(),
+                "0.0.0.0/1".to_string(),
+                "-interface".to_string(),
+                "utun9".to_string(),
+            ]],
+            dns_backups: vec![MacOsDnsBackup {
+                service_name: "Wi-Fi".to_string(),
+                previous_servers: Vec::new(),
+            }],
+        };
+
+        // Active daemon owns both macOS TUN and system proxy.
+        update_current_journal(&dir, |j| {
+            j.macos_tun = Some(full_macos.clone());
+            j.sysproxy = Some(sp_rec.clone());
+        })
+        .unwrap();
+
+        // Normal `stop()` encounters a `networksetup` failure for Wi-Fi DNS while utun route was cleaned up:
+        // `finalize_macos_tun_teardown_journal` MUST keep Wi-Fi DNS in `network_recovery.json` marked
+        // with `effective_tun_pid() == 0` so `recover_stale_network_state` retries it even while `my_pid` lives!
+        let remaining_dns_only = MacOsRecoveryRecord {
+            utun_name: "utun9".to_string(),
+            owned_route_del_args: Vec::new(),
+            dns_backups: full_macos.dns_backups.clone(),
+        };
+        finalize_macos_tun_teardown_journal(&dir, Some(remaining_dns_only.clone())).unwrap();
+
+        let after_stop = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(after_stop.macos_tun.as_ref(), Some(&remaining_dns_only));
+        assert_eq!(
+            after_stop.effective_tun_pid(),
+            0,
+            "unrecovered teardown state must use sentinel PID 0 so recovery runs even while daemon is alive"
+        );
+        assert_eq!(after_stop.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(after_stop.effective_sysproxy_pid(), my_pid);
+
+        // Retry #1: `networksetup` still fails -> journal MUST remain on disk with Wi-Fi DNS intact,
+        // and live `sysproxy` owned by `my_pid` MUST NOT be touched!
+        let fail_outcome = recover_stale_network_state_with_runner(&dir, &mut |prog, _args| {
+            if prog == "networksetup" {
+                Err(io::Error::other(
+                    "authorization denied while setting DNS servers",
+                ))
+            } else {
+                panic!("unexpected command during macOS DNS retry: {prog}");
+            }
+        });
+        assert!(fail_outcome.found_stale_journal);
+        assert_eq!(fail_outcome.warnings.len(), 1);
+        let still_pending = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(still_pending.macos_tun.as_ref(), Some(&remaining_dns_only));
+        assert_eq!(still_pending.sysproxy.as_ref(), Some(&sp_rec));
+
+        // Retry #2: `networksetup` succeeds -> `macos_tun` is cleared while live `sysproxy` stays!
+        let mut executed = Vec::new();
+        let ok_outcome = recover_stale_network_state_with_runner(&dir, &mut |prog, args| {
+            executed.push(format!("{prog} {}", args.join(" ")));
+            Ok(())
+        });
+        assert!(ok_outcome.found_stale_journal);
+        assert!(ok_outcome.warnings.is_empty());
+        assert_eq!(executed, vec!["networksetup -setdnsservers Wi-Fi Empty"]);
+
+        let after_retry = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert!(after_retry.macos_tun.is_none());
+        assert_eq!(after_retry.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(after_retry.effective_sysproxy_pid(), my_pid);
+
+        // Clearing live `sysproxy` now deletes `network_recovery.json` completely.
+        update_current_journal(&dir, |j| {
+            j.sysproxy = None;
+        })
+        .unwrap();
+        assert!(RecoveryJournal::load_from(&dir).unwrap().is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

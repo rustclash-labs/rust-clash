@@ -1886,6 +1886,7 @@ async fn post_import_uris(
                         "added-nodes": report.added_nodes,
                         "skipped-duplicates": report.skipped_duplicates,
                         "skipped-unsupported": report.skipped_unsupported,
+                        "rule-sanitization": report.rule_sanitization,
                         "total-nodes": report.total_nodes,
                         "nodes": nodes,
                         "selected-groups": report.selected_groups,
@@ -1909,21 +1910,23 @@ async fn post_import_uris(
                 let preview_res: Result<(
                     Vec<ProxyNodeConfig>,
                     Vec<crate::config::SkippedProxyEntry>,
+                    Option<crate::config::RuleSanitizationReport>,
                 )> = match kind {
                     crate::profile::ImportInputKind::ShareUris
                     | crate::profile::ImportInputKind::Base64UriList => {
                         crate::config::uri::parse_subscription_uris_best_effort(&normalized)
+                            .map(|(nodes, skipped)| (nodes, skipped, None))
                     }
                     crate::profile::ImportInputKind::ClashYaml => {
-                        ClashConfig::from_yaml_str_sanitized(&normalized)
-                            .map(|(c, skipped)| (c.proxies, skipped))
+                        ClashConfig::from_yaml_str_sanitized_with_report(&normalized)
+                            .map(|(c, skipped, r_rep)| (c.proxies, skipped, Some(r_rep)))
                     }
                     crate::profile::ImportInputKind::HttpsSubscriptionUrl => {
-                        Ok((Vec::new(), Vec::new()))
+                        Ok((Vec::new(), Vec::new(), None))
                     }
                 };
                 match preview_res {
-                    Ok((nodes, skipped)) => {
+                    Ok((nodes, skipped, rule_sanitization)) => {
                         let summaries: Vec<_> = nodes.iter().map(summarize_node_redacted).collect();
                         (
                             StatusCode::OK,
@@ -1932,6 +1935,7 @@ async fn post_import_uris(
                                 "input-kind": kind,
                                 "count": summaries.len(),
                                 "skipped-unsupported": skipped,
+                                "rule-sanitization": rule_sanitization,
                                 "nodes": summaries,
                             })),
                         )
@@ -2622,8 +2626,9 @@ async fn post_create_profile_api(
     let prev_secret = prev_snap.secret.filter(|s| !s.trim().is_empty());
     let checkpoint = mgr.capture_checkpoint();
 
-    match mgr.create_profile_detailed(spec).await {
-        Ok((meta, maybe_cfg, skipped_unsupported)) => {
+    match mgr.create_profile_full(spec).await {
+        Ok((meta, maybe_cfg, skipped_unsupported, rule_sanitization)) => {
+            let mode_for_warn = maybe_cfg.as_ref().map(|c| c.mode).unwrap_or(RunMode::Rule);
             if let Some(mut cfg) = maybe_cfg {
                 if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
                     cfg.secret = prev_secret;
@@ -2651,11 +2656,19 @@ async fn post_create_profile_api(
                     meta.name, meta.proxy_count
                 ),
             );
+            if let Some(ref rep) = rule_sanitization
+                && let Some(warn_msg) = rep.warning_summary(mode_for_warn)
+            {
+                engine
+                    .hub()
+                    .push_log("warn", format!("[Profile '{}'] {warn_msg}", meta.name));
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "profile": meta,
                     "skipped-unsupported": skipped_unsupported,
+                    "rule-sanitization": rule_sanitization,
                     "snapshot": mgr.snapshot(),
                 })),
             )
@@ -2751,12 +2764,13 @@ async fn post_refresh_profile_api(
     let prev_secret = prev_snap.secret.filter(|s| !s.trim().is_empty());
     let checkpoint = mgr.capture_checkpoint();
 
-    match mgr.refresh_subscription(&id).await {
-        Ok((meta, mut cfg, is_active)) => {
+    match mgr.refresh_subscription_with_report(&id).await {
+        Ok((meta, mut cfg, is_active, rule_sanitization)) => {
             let diff_opt = prev_cfg_opt
                 .as_ref()
                 .map(|prev| crate::audit::diff_configs(prev, &cfg));
             let audit = crate::audit::audit_config(&cfg);
+            let cfg_mode = cfg.mode;
 
             if is_active && !engine.demo_info().enabled {
                 if cfg.secret.as_deref().unwrap_or("").trim().is_empty() {
@@ -2782,10 +2796,18 @@ async fn post_refresh_profile_api(
                     meta.name, meta.proxy_count, audit.grade, audit.score
                 ),
             );
+            if let Some(ref rep) = rule_sanitization
+                && let Some(warn_msg) = rep.warning_summary(cfg_mode)
+            {
+                engine
+                    .hub()
+                    .push_log("warn", format!("[Profile '{}'] {warn_msg}", meta.name));
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "profile": meta,
+                    "rule-sanitization": rule_sanitization,
                     "snapshot": mgr.snapshot(),
                     "diff": diff_opt,
                     "audit_score": audit.score,

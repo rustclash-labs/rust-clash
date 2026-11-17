@@ -71,7 +71,7 @@ enum InflightOutcome {
     Cancelled,
 }
 
-type InflightKey = (String, bool);
+type InflightKey = (u64, String, bool);
 type InflightMap = DashMap<InflightKey, watch::Sender<InflightOutcome>>;
 
 struct InflightLookupGuard<'a> {
@@ -665,6 +665,7 @@ pub struct FakeIpDnsEngine {
     inflight_direct: InflightMap,
     inflight_proxy: InflightMap,
     inflight_bootstrap: InflightMap,
+    cache_epoch: AtomicU64,
     total_queries: AtomicU64,
     fake_ip_hits: AtomicU64,
     cache_hits: AtomicU64,
@@ -924,6 +925,7 @@ impl FakeIpDnsEngine {
             inflight_direct: DashMap::new(),
             inflight_proxy: DashMap::new(),
             inflight_bootstrap: DashMap::new(),
+            cache_epoch: AtomicU64::new(0),
             total_queries: AtomicU64::new(0),
             fake_ip_hits: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
@@ -1155,6 +1157,7 @@ impl FakeIpDnsEngine {
             }
         };
 
+        let start_epoch = self.current_cache_epoch();
         match self.resolve_proxy_server_ips(host).await {
             Ok(ips) => Ok(ips),
             Err(e) => {
@@ -1175,13 +1178,15 @@ impl FakeIpDnsEngine {
                             .min(stale_until_wall_ms),
                     );
                     let mut guard = self.proxy_ip_cache.lock();
-                    if !matches!(
-                        guard.peek(&clean),
-                        Some(
-                            CachedIpResolution::Positive { .. }
-                                | CachedIpResolution::Negative { .. }
+                    if self.cache_epoch.load(Ordering::Acquire) == start_epoch
+                        && !matches!(
+                            guard.peek(&clean),
+                            Some(
+                                CachedIpResolution::Positive { .. }
+                                    | CachedIpResolution::Negative { .. }
+                            )
                         )
-                    ) {
+                    {
                         guard.put(
                             clean,
                             CachedIpResolution::Positive {
@@ -1200,8 +1205,54 @@ impl FakeIpDnsEngine {
         }
     }
 
+    #[inline]
+    pub fn current_cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
+    }
+
+    fn put_ip_cache_if_epoch(
+        &self,
+        cache: &Mutex<LruCache<String, CachedIpResolution>>,
+        expected_epoch: u64,
+        key: String,
+        entry: CachedIpResolution,
+    ) {
+        let mut guard = cache.lock();
+        if self.cache_epoch.load(Ordering::Acquire) == expected_epoch {
+            guard.put(key, entry);
+        }
+    }
+
+    fn put_packet_cache_if_epoch(
+        &self,
+        expected_epoch: u64,
+        key: (String, u16, u16),
+        entry: CachedWirePacket,
+    ) {
+        let mut guard = self.packet_cache.lock();
+        if self.cache_epoch.load(Ordering::Acquire) == expected_epoch {
+            guard.put(key, entry);
+        }
+    }
+
+    fn put_bootstrap_cache_if_epoch(
+        &self,
+        expected_epoch: u64,
+        key: String,
+        entry: BootstrapCacheEntry,
+    ) {
+        let mut guard = self.bootstrap_cache.lock();
+        if self.cache_epoch.load(Ordering::Acquire) == expected_epoch {
+            guard.put(key, entry);
+        }
+    }
+
     /// Clear engine-local positive/negative DNS caches without evicting process-wide DoT/DoH pools.
+    /// Increments `cache_epoch` BEFORE acquiring cache locks so in-flight queries from the previous
+    /// network generation cannot write stale results back or coalesce with new queries, while keeping
+    /// Fake-IP <-> domain mappings in `self.pool` intact.
     pub fn clear_local_caches(&self) {
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.real_ip_cache.lock().clear();
         self.direct_ip_cache.lock().clear();
         self.proxy_ip_cache.lock().clear();
@@ -1737,15 +1788,19 @@ impl FakeIpDnsEngine {
                     return Ok(valid);
                 }
 
+                let mut start_epoch = self.current_cache_epoch();
                 let inflight_guard = match InflightLookupGuard::acquire(
                     &self.inflight_bootstrap,
-                    (norm.clone(), want_ipv6),
+                    (start_epoch, norm.clone(), want_ipv6),
                 ) {
                     Ok(guard) => Some(guard),
                     Err(mut rx) => {
-                        if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                        if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await
+                            && self.current_cache_epoch() == start_epoch
+                        {
                             return outcome;
                         }
+                        start_epoch = self.current_cache_epoch();
                         if let Some((expires_at, expires_wall_ms, ips)) =
                             self.bootstrap_cache.lock().get(&norm).cloned()
                             && Instant::now() < expires_at
@@ -1801,7 +1856,8 @@ impl FakeIpDnsEngine {
                     return res;
                 }
 
-                self.bootstrap_cache.lock().put(
+                self.put_bootstrap_cache_if_epoch(
+                    start_epoch,
                     norm,
                     (
                         Instant::now() + Duration::from_secs(min_ttl),
@@ -1818,12 +1874,20 @@ impl FakeIpDnsEngine {
         }
     }
 
-    fn record_upstream_outcome(&self, upstream: &DnsUpstream, res: &Result<Vec<u8>>) {
+    fn record_upstream_outcome(
+        &self,
+        upstream: &DnsUpstream,
+        res: &Result<Vec<u8>>,
+        expected_epoch: u64,
+    ) {
         match res {
             Ok(_) => {
                 self.upstream_health.remove(upstream);
             }
             Err(err) => {
+                if self.current_cache_epoch() != expected_epoch {
+                    return;
+                }
                 let is_429 = matches!(err, ProxyError::Dns(msg) if msg.contains("HTTP status 429"));
                 let is_transport_fail = matches!(err, ProxyError::Timeout | ProxyError::Io(_));
                 if !is_429 && !is_transport_fail {
@@ -1857,6 +1921,7 @@ impl FakeIpDnsEngine {
         upstream: &DnsUpstream,
         raw_query: &[u8],
     ) -> Result<Vec<u8>> {
+        let start_epoch = self.current_cache_epoch();
         let outcome = async {
             let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
             let resp = Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?;
@@ -1878,7 +1943,7 @@ impl FakeIpDnsEngine {
             Ok(resp)
         }
         .await;
-        self.record_upstream_outcome(upstream, &outcome);
+        self.record_upstream_outcome(upstream, &outcome, start_epoch);
         outcome
     }
 
@@ -2317,15 +2382,19 @@ impl FakeIpDnsEngine {
             return cached;
         }
 
+        let mut start_epoch = self.current_cache_epoch();
         let inflight_guard = match InflightLookupGuard::acquire(
             &self.inflight_real,
-            (normalized.clone(), want_ipv6),
+            (start_epoch, normalized.clone(), want_ipv6),
         ) {
             Ok(guard) => Some(guard),
             Err(mut rx) => {
-                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await
+                    && self.current_cache_epoch() == start_epoch
+                {
                     return outcome;
                 }
+                start_epoch = self.current_cache_epoch();
                 if let Some(cached) =
                     Self::lookup_cached_ips(&self.real_ip_cache, &normalized, want_ipv6, false)
                 {
@@ -2388,7 +2457,9 @@ impl FakeIpDnsEngine {
             let is_nxdomain = saw_nxdomain && !saw_nodata;
             if saw_nxdomain || saw_nodata {
                 let ttl = compute_negative_ttl_secs(min_neg_ttl, is_nxdomain);
-                self.real_ip_cache.lock().put(
+                self.put_ip_cache_if_epoch(
+                    &self.real_ip_cache,
+                    start_epoch,
                     normalized.clone(),
                     CachedIpResolution::new_negative(ttl, is_nxdomain),
                 );
@@ -2406,7 +2477,9 @@ impl FakeIpDnsEngine {
                     }
                     return res;
                 }
-                self.real_ip_cache.lock().put(
+                self.put_ip_cache_if_epoch(
+                    &self.real_ip_cache,
+                    start_epoch,
                     normalized.clone(),
                     CachedIpResolution::new_transient_failure(),
                 );
@@ -2426,7 +2499,9 @@ impl FakeIpDnsEngine {
 
         if min_pos_ttl != Some(0) {
             let ttl = min_pos_ttl.unwrap_or(60);
-            self.real_ip_cache.lock().put(
+            self.put_ip_cache_if_epoch(
+                &self.real_ip_cache,
+                start_epoch,
                 normalized,
                 CachedIpResolution::new_positive(ttl, resolved.clone()),
             );
@@ -2483,15 +2558,19 @@ impl FakeIpDnsEngine {
             return cached;
         }
 
+        let mut start_epoch = self.current_cache_epoch();
         let inflight_guard = match InflightLookupGuard::acquire(
             &self.inflight_direct,
-            (normalized.clone(), want_ipv6),
+            (start_epoch, normalized.clone(), want_ipv6),
         ) {
             Ok(guard) => Some(guard),
             Err(mut rx) => {
-                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
+                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await
+                    && self.current_cache_epoch() == start_epoch
+                {
                     return outcome;
                 }
+                start_epoch = self.current_cache_epoch();
                 if let Some(cached) =
                     Self::lookup_cached_ips(&self.direct_ip_cache, &normalized, want_ipv6, false)
                 {
@@ -2517,7 +2596,9 @@ impl FakeIpDnsEngine {
         if !resolved.is_empty() {
             if min_pos_ttl != Some(0) {
                 let ttl = min_pos_ttl.unwrap_or(60);
-                self.direct_ip_cache.lock().put(
+                self.put_ip_cache_if_epoch(
+                    &self.direct_ip_cache,
+                    start_epoch,
                     normalized,
                     CachedIpResolution::new_positive(ttl, resolved.clone()),
                 );
@@ -2532,7 +2613,9 @@ impl FakeIpDnsEngine {
         if saw_nxdomain || saw_nodata {
             let is_nxdomain = saw_nxdomain && !saw_nodata;
             let neg_ttl_secs = compute_negative_ttl_secs(min_neg_ttl, is_nxdomain);
-            self.direct_ip_cache.lock().put(
+            self.put_ip_cache_if_epoch(
+                &self.direct_ip_cache,
+                start_epoch,
                 normalized.clone(),
                 CachedIpResolution::new_negative(neg_ttl_secs, is_nxdomain),
             );
@@ -2562,7 +2645,9 @@ impl FakeIpDnsEngine {
             .as_deref()
             .is_some_and(|d| d.contains("HTTP status 429"))
         {
-            self.direct_ip_cache.lock().put(
+            self.put_ip_cache_if_epoch(
+                &self.direct_ip_cache,
+                start_epoch,
                 normalized.clone(),
                 CachedIpResolution::new_transient_failure(),
             );
@@ -2620,21 +2705,27 @@ impl FakeIpDnsEngine {
             return cached;
         }
 
-        let inflight_guard =
-            match InflightLookupGuard::acquire(&self.inflight_proxy, (clean.clone(), want_ipv6)) {
-                Ok(guard) => Some(guard),
-                Err(mut rx) => {
-                    if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await {
-                        return outcome;
-                    }
-                    if let Some(cached) =
-                        Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
-                    {
-                        return cached;
-                    }
-                    None
+        let mut start_epoch = self.current_cache_epoch();
+        let inflight_guard = match InflightLookupGuard::acquire(
+            &self.inflight_proxy,
+            (start_epoch, clean.clone(), want_ipv6),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(mut rx) => {
+                if let Some(outcome) = wait_for_inflight_outcome(&mut rx).await
+                    && self.current_cache_epoch() == start_epoch
+                {
+                    return outcome;
                 }
-            };
+                start_epoch = self.current_cache_epoch();
+                if let Some(cached) =
+                    Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
+                {
+                    return cached;
+                }
+                None
+            }
+        };
 
         if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
         {
@@ -2649,7 +2740,9 @@ impl FakeIpDnsEngine {
                 |ips: Vec<IpAddr>, ttl_opt: Option<u64>| -> Result<Vec<IpAddr>> {
                     if ttl_opt != Some(0) {
                         let ttl = ttl_opt.unwrap_or(60);
-                        self.proxy_ip_cache.lock().put(
+                        self.put_ip_cache_if_epoch(
+                            &self.proxy_ip_cache,
+                            start_epoch,
                             clean.clone(),
                             CachedIpResolution::new_positive(ttl, ips.clone()),
                         );
@@ -2668,9 +2761,12 @@ impl FakeIpDnsEngine {
                 if saw_nx || saw_nodata {
                     let is_nx = saw_nx && !saw_nodata;
                     let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
-                    self.proxy_ip_cache
-                        .lock()
-                        .put(clean.clone(), CachedIpResolution::new_negative(ttl, is_nx));
+                    self.put_ip_cache_if_epoch(
+                        &self.proxy_ip_cache,
+                        start_epoch,
+                        clean.clone(),
+                        CachedIpResolution::new_negative(ttl, is_nx),
+                    );
                 } else {
                     if let Some(stale_ips) = Self::try_serve_stale_on_error(
                         &self.proxy_ip_cache,
@@ -2681,9 +2777,12 @@ impl FakeIpDnsEngine {
                         self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(stale_ips);
                     }
-                    self.proxy_ip_cache
-                        .lock()
-                        .put(clean.clone(), CachedIpResolution::new_transient_failure());
+                    self.put_ip_cache_if_epoch(
+                        &self.proxy_ip_cache,
+                        start_epoch,
+                        clean.clone(),
+                        CachedIpResolution::new_transient_failure(),
+                    );
                 }
                 let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
                 return Err(ProxyError::Dns(format!(
@@ -2702,9 +2801,12 @@ impl FakeIpDnsEngine {
                 if saw_nx || saw_nodata {
                     let is_nx = saw_nx && !saw_nodata;
                     let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
-                    self.proxy_ip_cache
-                        .lock()
-                        .put(clean.clone(), CachedIpResolution::new_negative(ttl, is_nx));
+                    self.put_ip_cache_if_epoch(
+                        &self.proxy_ip_cache,
+                        start_epoch,
+                        clean.clone(),
+                        CachedIpResolution::new_negative(ttl, is_nx),
+                    );
                 } else {
                     if let Some(stale_ips) = Self::try_serve_stale_on_error(
                         &self.proxy_ip_cache,
@@ -2715,9 +2817,12 @@ impl FakeIpDnsEngine {
                         self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(stale_ips);
                     }
-                    self.proxy_ip_cache
-                        .lock()
-                        .put(clean.clone(), CachedIpResolution::new_transient_failure());
+                    self.put_ip_cache_if_epoch(
+                        &self.proxy_ip_cache,
+                        start_epoch,
+                        clean.clone(),
+                        CachedIpResolution::new_transient_failure(),
+                    );
                 }
                 let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
                 return Err(ProxyError::Dns(format!(
@@ -2735,9 +2840,12 @@ impl FakeIpDnsEngine {
                 if saw_nx || saw_nodata {
                     let is_nx = saw_nx && !saw_nodata;
                     let ttl = compute_negative_ttl_secs(neg_ttl, is_nx);
-                    self.proxy_ip_cache
-                        .lock()
-                        .put(clean.clone(), CachedIpResolution::new_negative(ttl, is_nx));
+                    self.put_ip_cache_if_epoch(
+                        &self.proxy_ip_cache,
+                        start_epoch,
+                        clean.clone(),
+                        CachedIpResolution::new_negative(ttl, is_nx),
+                    );
                 } else {
                     if let Some(stale_ips) = Self::try_serve_stale_on_error(
                         &self.proxy_ip_cache,
@@ -2748,9 +2856,12 @@ impl FakeIpDnsEngine {
                         self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(stale_ips);
                     }
-                    self.proxy_ip_cache
-                        .lock()
-                        .put(clean.clone(), CachedIpResolution::new_transient_failure());
+                    self.put_ip_cache_if_epoch(
+                        &self.proxy_ip_cache,
+                        start_epoch,
+                        clean.clone(),
+                        CachedIpResolution::new_transient_failure(),
+                    );
                 }
                 let suffix = err_detail.map_or_else(String::new, |d| format!(" ({d})"));
                 return Err(ProxyError::Dns(format!(
@@ -3166,6 +3277,7 @@ impl FakeIpDnsEngine {
             ));
         }
 
+        let start_epoch = self.current_cache_epoch();
         let upstream_res = if let Some(pol_ups) =
             Self::matching_policy_upstreams(&self.policy_rules, &normalized)
         {
@@ -3182,20 +3294,25 @@ impl FakeIpDnsEngine {
                     if meta.min_ttl != Some(0) {
                         let ttl = u64::from(meta.min_ttl.unwrap_or(60))
                             .clamp(MIN_POSITIVE_TTL_SECS, MAX_POSITIVE_TTL_SECS);
-                        self.packet_cache
-                            .lock()
-                            .put(cache_key, CachedWirePacket::new(ttl, resp.clone()));
+                        self.put_packet_cache_if_epoch(
+                            start_epoch,
+                            cache_key,
+                            CachedWirePacket::new(ttl, resp.clone()),
+                        );
                     }
                 } else if meta.rcode == 3 || (meta.rcode == 0 && meta.ancount == 0) {
                     if meta.min_ttl != Some(0) {
                         let ttl =
                             compute_negative_ttl_secs(meta.min_ttl.map(u64::from), meta.rcode == 3);
-                        self.packet_cache
-                            .lock()
-                            .put(cache_key, CachedWirePacket::new(ttl, resp.clone()));
+                        self.put_packet_cache_if_epoch(
+                            start_epoch,
+                            cache_key,
+                            CachedWirePacket::new(ttl, resp.clone()),
+                        );
                     }
                 } else if meta.rcode == 2 || meta.rcode == 5 {
-                    self.packet_cache.lock().put(
+                    self.put_packet_cache_if_epoch(
+                        start_epoch,
                         cache_key,
                         CachedWirePacket::new(SERVFAIL_NEGATIVE_TTL_SECS, resp.clone()),
                     );
@@ -3205,8 +3322,10 @@ impl FakeIpDnsEngine {
         }
 
         // Return SERVFAIL (2) if no upstream responded, caching briefly to suppress retry storms
+        // ONLY if `cache_epoch` did not advance during the failed upstream attempt.
         let servfail_resp = query.build_response(raw_query, 2, 0, &[]);
-        self.packet_cache.lock().put(
+        self.put_packet_cache_if_epoch(
+            start_epoch,
             cache_key,
             CachedWirePacket::new(SERVFAIL_NEGATIVE_TTL_SECS, servfail_resp.clone()),
         );
@@ -5163,6 +5282,7 @@ mod tests {
             &Err(ProxyError::Dns(
                 "DoH server returned HTTP status 429".into(),
             )),
+            engine.current_cache_epoch(),
         );
 
         let now_m = Instant::now();
@@ -5182,5 +5302,212 @@ mod tests {
                 .unwrap()
                 .is_cooled_down(now_m, now_w + UPSTREAM_429_COOLDOWN_MS)
         );
+    }
+
+    #[tokio::test]
+    async fn flush_cache_isolates_inflight_queries_and_blocks_stale_writeback_while_preserving_fake_ip()
+     {
+        use std::sync::atomic::AtomicUsize;
+
+        let upstream_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+
+        let direct_a_queries = Arc::new(AtomicUsize::new(0));
+        let packet_queries = Arc::new(AtomicUsize::new(0));
+        let (q1_arrived_tx, q1_arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_q1_tx, release_q1_rx) = tokio::sync::oneshot::channel();
+        let (pkt1_arrived_tx, pkt1_arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_pkt1_tx, release_pkt1_rx) = tokio::sync::oneshot::channel();
+
+        let q1_arrived_opt = Arc::new(Mutex::new(Some(q1_arrived_tx)));
+        let release_q1_opt = Arc::new(tokio::sync::Mutex::new(Some(release_q1_rx)));
+        let pkt1_arrived_opt = Arc::new(Mutex::new(Some(pkt1_arrived_tx)));
+        let release_pkt1_opt = Arc::new(tokio::sync::Mutex::new(Some(release_pkt1_rx)));
+
+        let srv_sock = Arc::clone(&upstream_sock);
+        let direct_cnt = Arc::clone(&direct_a_queries);
+        let pkt_cnt = Arc::clone(&packet_queries);
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = srv_sock.recv_from(&mut buf).await {
+                let req = buf[..n].to_vec();
+                let parsed = DnsQueryPacket::parse(&req).unwrap();
+                let sock_tx = Arc::clone(&srv_sock);
+                let qname = parsed.question.name.to_ascii_lowercase();
+                let qtype = parsed.question.qtype;
+
+                if qname == "race.example.com" {
+                    if qtype == QTYPE_AAAA {
+                        let empty = parsed.build_response(&req, 0, 120, &[]);
+                        let _ = sock_tx.send_to(&empty, peer).await;
+                        continue;
+                    }
+                    let seq = direct_cnt.fetch_add(1, Ordering::SeqCst);
+                    let arrived = Arc::clone(&q1_arrived_opt);
+                    let release = Arc::clone(&release_q1_opt);
+                    tokio::spawn(async move {
+                        if seq == 0 {
+                            if let Some(tx) = arrived.lock().take() {
+                                let _ = tx.send(());
+                            }
+                            if let Some(rx) = release.lock().await.take() {
+                                let _ = rx.await;
+                            }
+                            // Stale pre-switch network response (198.51.100.10) arriving AFTER flush_cache()
+                            let stale_resp = parsed.build_response(
+                                &req,
+                                0,
+                                300,
+                                &[DnsAnswerData::A(Ipv4Addr::new(198, 51, 100, 10))],
+                            );
+                            let _ = sock_tx.send_to(&stale_resp, peer).await;
+                        } else {
+                            // Fresh post-switch network response (203.0.113.99)
+                            let fresh_resp = parsed.build_response(
+                                &req,
+                                0,
+                                300,
+                                &[DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 99))],
+                            );
+                            let _ = sock_tx.send_to(&fresh_resp, peer).await;
+                        }
+                    });
+                } else if qname == "portal.lan" && qtype == QTYPE_A {
+                    let seq = pkt_cnt.fetch_add(1, Ordering::SeqCst);
+                    let arrived = Arc::clone(&pkt1_arrived_opt);
+                    let release = Arc::clone(&release_pkt1_opt);
+                    tokio::spawn(async move {
+                        if seq == 0 {
+                            if let Some(tx) = arrived.lock().take() {
+                                let _ = tx.send(());
+                            }
+                            if let Some(rx) = release.lock().await.take() {
+                                let _ = rx.await;
+                            }
+                            // Stale pre-switch NXDOMAIN (`rcode = 3`) arriving AFTER flush_cache()
+                            let stale_nx = parsed.build_response(&req, 3, 120, &[]);
+                            let _ = sock_tx.send_to(&stale_nx, peer).await;
+                        } else {
+                            // Fresh post-switch positive response (203.0.113.77)
+                            let fresh_resp = parsed.build_response(
+                                &req,
+                                0,
+                                300,
+                                &[DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 77))],
+                            );
+                            let _ = sock_tx.send_to(&fresh_resp, peer).await;
+                        }
+                    });
+                }
+            }
+        });
+
+        let cfg = DnsConfig {
+            enable: true,
+            ipv6: false,
+            enhanced_mode: "fake-ip".to_string(),
+            default_nameserver: vec![upstream_addr.to_string()],
+            nameserver: vec![upstream_addr.to_string()],
+            direct_nameserver: vec![upstream_addr.to_string()],
+            fallback: Vec::new(),
+            ..DnsConfig::default()
+        };
+        let engine = Arc::new(FakeIpDnsEngine::new(&cfg).unwrap());
+
+        // Assign a Fake-IP before network switch; it MUST survive `flush_cache()`.
+        let pre_switch_fip = engine.assign_fake_ip("race.example.com");
+
+        // 1. Launch pre-switch `resolve_direct_ips("race.example.com")` and `handle_dns_packet("portal.lan")`
+        //    (`*.lan` matches default `fake_ip_filter`, exercising `packet_cache` + `real_ip_cache`).
+        let eng_q1 = Arc::clone(&engine);
+        let pre_direct_task =
+            tokio::spawn(async move { eng_q1.resolve_direct_ips("race.example.com").await });
+
+        let eng_p1 = Arc::clone(&engine);
+        let pre_pkt_task = tokio::spawn(async move {
+            let wire = build_dns_query(0x6101, "portal.lan", QTYPE_A);
+            eng_p1.handle_dns_packet(&wire).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), q1_arrived_rx)
+            .await
+            .expect("pre-switch direct query must reach upstream")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), pkt1_arrived_rx)
+            .await
+            .expect("pre-switch bypassed packet query must reach upstream")
+            .unwrap();
+
+        // 2. Simulate Wi-Fi -> 5G handover (`flush_cache()`) while both pre-switch queries are still in flight!
+        engine.flush_cache();
+        assert_eq!(
+            engine.lookup_domain(IpAddr::V4(pre_switch_fip)).as_deref(),
+            Some("race.example.com"),
+            "Fake-IP <-> domain bidirectional mapping must remain intact across flush_cache()"
+        );
+        assert_eq!(engine.assign_fake_ip("race.example.com"), pre_switch_fip);
+
+        // 3. Post-switch queries for the SAME domains MUST NOT piggyback on the stalled pre-switch
+        //    `InflightLookupGuard` and must resolve fresh 5G answers immediately.
+        let post_direct = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.resolve_direct_ips("race.example.com"),
+        )
+        .await
+        .expect("post-switch query must not wait on stalled pre-switch inflight lookup")
+        .unwrap();
+        assert_eq!(
+            post_direct,
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99))]
+        );
+        assert_eq!(direct_a_queries.load(Ordering::SeqCst), 2);
+
+        let post_pkt_wire = build_dns_query(0x6102, "portal.lan", QTYPE_A);
+        let post_pkt_resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.handle_dns_packet(&post_pkt_wire),
+        )
+        .await
+        .expect("post-switch bypassed DNS packet must resolve immediately")
+        .unwrap();
+        assert_eq!(dns_response_rcode(&post_pkt_resp).unwrap(), 0);
+        assert_eq!(
+            extract_ip_answers(&post_pkt_resp).unwrap(),
+            vec![DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 77))]
+        );
+        assert_eq!(packet_queries.load(Ordering::SeqCst), 2);
+
+        // 4. Release the delayed pre-switch responses (`198.51.100.10` and `NXDOMAIN`) and verify
+        //    they CANNOT overwrite or poison the post-switch caches!
+        let _ = release_q1_tx.send(());
+        let _ = release_pkt1_tx.send(());
+        let pre_direct_res = pre_direct_task.await.unwrap().unwrap();
+        assert_eq!(
+            pre_direct_res,
+            vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))]
+        );
+        let pre_pkt_res = pre_pkt_task.await.unwrap().unwrap();
+        assert_eq!(dns_response_rcode(&pre_pkt_res).unwrap(), 3);
+
+        // Subsequent lookups hit the post-switch cache (no extra upstream queries, fresh IPs preserved!)
+        let cached_direct = engine.resolve_direct_ips("race.example.com").await.unwrap();
+        assert_eq!(
+            cached_direct,
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99))],
+            "late pre-switch response must not overwrite post-switch direct_ip_cache"
+        );
+        assert_eq!(direct_a_queries.load(Ordering::SeqCst), 2);
+
+        let cached_pkt_wire = build_dns_query(0x6103, "portal.lan", QTYPE_A);
+        let cached_pkt_resp = engine.handle_dns_packet(&cached_pkt_wire).await.unwrap();
+        assert_eq!(dns_response_rcode(&cached_pkt_resp).unwrap(), 0);
+        assert_eq!(
+            extract_ip_answers(&cached_pkt_resp).unwrap(),
+            vec![DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 77))],
+            "late pre-switch NXDOMAIN must not poison post-switch packet_cache"
+        );
+        assert_eq!(packet_queries.load(Ordering::SeqCst), 2);
+
+        srv_task.abort();
     }
 }

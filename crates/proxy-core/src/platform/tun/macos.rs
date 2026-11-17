@@ -194,6 +194,106 @@ pub fn map_bsd_device_to_network_service(output: &str, bsd_device: &str) -> Opti
     None
 }
 
+pub fn is_utun_split_route_del_arg(args: &[String], utun_name: &str) -> bool {
+    !utun_name.is_empty()
+        && args
+            .windows(2)
+            .any(|w| w[0] == "-interface" && w[1] == utun_name)
+}
+
+pub fn is_macos_benign_route_delete_error(msg: &str) -> bool {
+    let low = msg.to_ascii_lowercase();
+    low.contains("not in table")
+        || low.contains("no such process")
+        || low.contains("can't locate")
+        || low.contains("network is unreachable")
+}
+
+pub fn is_macos_benign_dns_restore_error(msg: &str) -> bool {
+    let low = msg.to_ascii_lowercase();
+    low.contains("not a recognized network service")
+}
+
+/// Restore backed-up macOS `networksetup -setdnsservers` entries, returning ONLY entries whose
+/// restoration genuinely failed (ignoring services that were unplugged/removed from the OS).
+pub fn restore_macos_dns_backups_with_runner<F>(
+    dns_backups: &[crate::platform::recovery::MacOsDnsBackup],
+    outcome: &mut crate::platform::recovery::RecoveryOutcome,
+    run_cmd: &mut F,
+) -> Vec<crate::platform::recovery::MacOsDnsBackup>
+where
+    F: FnMut(&str, &[String]) -> io::Result<()>,
+{
+    let mut unrecovered = Vec::new();
+    for dns in dns_backups {
+        let mut args = vec!["-setdnsservers".to_string(), dns.service_name.clone()];
+        if dns.previous_servers.is_empty() {
+            args.push("Empty".to_string());
+        } else {
+            args.extend(dns.previous_servers.iter().cloned());
+        }
+        let desc = format!("networksetup {}", args.join(" "));
+        match run_cmd("networksetup", &args) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                let msg = e.to_string();
+                if !is_macos_benign_dns_restore_error(&msg) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    unrecovered.push(dns.clone());
+                }
+            }
+        }
+    }
+    unrecovered
+}
+
+/// Roll back routes and DNS backups from a `MacOsRecoveryRecord`, returning `Some(remaining)`
+/// containing ONLY physical routes / DNS backups whose rollback genuinely failed so they stay in
+/// `network_recovery.json` for subsequent recovery instead of leaving broken host DNS behind.
+pub fn rollback_macos_record_with_runner<F>(
+    rec: &crate::platform::recovery::MacOsRecoveryRecord,
+    outcome: &mut crate::platform::recovery::RecoveryOutcome,
+    run_cmd: &mut F,
+) -> Option<crate::platform::recovery::MacOsRecoveryRecord>
+where
+    F: FnMut(&str, &[String]) -> io::Result<()>,
+{
+    let mut failed_routes_rev = Vec::new();
+    for args in rec.owned_route_del_args.iter().rev() {
+        let desc = format!("route {}", args.join(" "));
+        match run_cmd("route", args) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_utun_route = is_utun_split_route_del_arg(args, &rec.utun_name);
+                if is_utun_route {
+                    // Darwin XNU destroys `utunN` and all `-interface utunN` routes automatically
+                    // when the `utun` fd closes; never retain dynamic `utunN` route deletions across restarts.
+                    let low = msg.to_ascii_lowercase();
+                    if !is_macos_benign_route_delete_error(&msg)
+                        && !low.contains("bad address")
+                        && !low.contains("does not exist")
+                    {
+                        outcome.warnings.push(format!("{desc}: {e}"));
+                    }
+                } else if !is_macos_benign_route_delete_error(&msg) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    failed_routes_rev.push(args.clone());
+                }
+            }
+        }
+    }
+    failed_routes_rev.reverse();
+    let unrecovered_dns = restore_macos_dns_backups_with_runner(&rec.dns_backups, outcome, run_cmd);
+
+    let remaining = crate::platform::recovery::MacOsRecoveryRecord {
+        utun_name: rec.utun_name.clone(),
+        owned_route_del_args: failed_routes_rev,
+        dns_backups: unrecovered_dns,
+    };
+    (!remaining.is_empty()).then_some(remaining)
+}
+
 #[cfg(target_os = "macos")]
 mod darwin_impl {
     use std::{
@@ -215,13 +315,18 @@ mod darwin_impl {
 
     use super::{
         build_macos_bypass_route_commands, decode_darwin_utun_packet, encode_darwin_utun_packet,
-        map_bsd_device_to_network_service, normalize_macos_ipv6_gateway,
-        parse_macos_route_get_default, resolve_macos_default_egress_outputs,
+        is_utun_split_route_del_arg, map_bsd_device_to_network_service,
+        normalize_macos_ipv6_gateway, parse_macos_route_get_default,
+        resolve_macos_default_egress_outputs, restore_macos_dns_backups_with_runner,
+        rollback_macos_record_with_runner,
     };
     use crate::{
         inbound::tun::VirtualTunHandle,
         platform::{
-            recovery::{MacOsDnsBackup, MacOsRecoveryRecord, update_current_journal},
+            recovery::{
+                MacOsDnsBackup, MacOsRecoveryRecord, RecoveryOutcome,
+                finalize_macos_tun_teardown_journal, update_current_journal,
+            },
             socket_protect::{
                 MacOsBoundIfProtector, clear_global_socket_protector, global_socket_protector,
                 set_global_socket_protector,
@@ -269,11 +374,18 @@ mod darwin_impl {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
+            let se = String::from_utf8_lossy(&out.stderr);
+            let so = String::from_utf8_lossy(&out.stdout);
+            let detail = match (se.trim().is_empty(), so.trim().is_empty()) {
+                (false, false) => format!("{}; {}", se.trim(), so.trim()),
+                (false, true) => se.trim().to_string(),
+                (true, false) => so.trim().to_string(),
+                (true, true) => String::new(),
+            };
             Err(io::Error::other(format!(
-                "`{program} {}` failed ({}): {}",
+                "`{program} {}` failed ({}): {detail}",
                 args.join(" "),
                 out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
             )))
         }
     }
@@ -466,18 +578,14 @@ mod darwin_impl {
         Ok((fd, assigned))
     }
 
-    fn restore_macos_dns_backups(dns_backups: &[MacOsDnsBackup]) {
-        for dns in dns_backups {
-            let mut args = vec!["-setdnsservers", dns.service_name.as_str()];
-            if dns.previous_servers.is_empty() {
-                args.push("Empty");
-            } else {
-                for s in &dns.previous_servers {
-                    args.push(s.as_str());
-                }
-            }
-            let _ = run_cmd("/usr/sbin/networksetup", &args);
-        }
+    fn darwin_cmd_runner(program: &str, args: &[String]) -> io::Result<()> {
+        let resolved = match program {
+            "route" => "/sbin/route",
+            "networksetup" => "/usr/sbin/networksetup",
+            other => other,
+        };
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_cmd(resolved, &refs).map(|_| ())
     }
 
     fn bind_macos_service_dns_for_iface(
@@ -489,18 +597,29 @@ mod darwin_impl {
         if let Some(if_name) = bsd_if
             && let Ok(order_out) = run_cmd("/usr/sbin/networksetup", &["-listnetworkserviceorder"])
             && let Some(svc) = map_bsd_device_to_network_service(&order_out, if_name)
-            && let Ok(prev_dns_out) = run_cmd("/usr/sbin/networksetup", &["-getdnsservers", &svc])
         {
-            let prev_servers: Vec<String> = prev_dns_out
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.contains("There aren't any DNS Servers"))
-                .map(ToOwned::to_owned)
-                .collect();
-            rec.dns_backups.push(MacOsDnsBackup {
-                service_name: svc.clone(),
-                previous_servers: prev_servers,
-            });
+            // Never overwrite an earlier unrestored original DNS backup for the same service
+            // (which would capture our own `198.18.0.2` TUN DNS instead of the user's true servers).
+            if !rec.dns_backups.iter().any(|b| b.service_name == svc) {
+                if let Ok(prev_dns_out) =
+                    run_cmd("/usr/sbin/networksetup", &["-getdnsservers", &svc])
+                {
+                    let prev_servers: Vec<String> = prev_dns_out
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.contains("There aren't any DNS Servers"))
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    rec.dns_backups.push(MacOsDnsBackup {
+                        service_name: svc.clone(),
+                        previous_servers: prev_servers,
+                    });
+                } else {
+                    let rec_snap = rec.clone();
+                    let _ = update_current_journal(state_dir, |j| j.macos_tun = Some(rec_snap));
+                    return;
+                }
+            }
             let rec_snap = rec.clone();
             let _ = update_current_journal(state_dir, |j| j.macos_tun = Some(rec_snap));
             let _ = run_cmd("/usr/sbin/networksetup", &["-setdnsservers", &svc, dns_str]);
@@ -530,17 +649,22 @@ mod darwin_impl {
         }
     }
 
-    fn is_utun_split_route_del_arg(args: &[String], utun_name: &str) -> bool {
-        args.windows(2)
-            .any(|w| w[0] == "-interface" && w[1] == utun_name)
-    }
-
-    fn rollback_macos_record(rec: &MacOsRecoveryRecord) {
-        for args in rec.owned_route_del_args.iter().rev() {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let _ = run_cmd("/sbin/route", &refs);
+    fn rollback_macos_record_and_finalize(
+        rec: &MacOsRecoveryRecord,
+        state_dir: &Path,
+    ) -> RecoveryOutcome {
+        let mut outcome = RecoveryOutcome::default();
+        let remaining =
+            rollback_macos_record_with_runner(rec, &mut outcome, &mut darwin_cmd_runner);
+        for warn_msg in &outcome.warnings {
+            tracing::warn!("macOS utun teardown recovery warning: {}", warn_msg);
         }
-        restore_macos_dns_backups(&rec.dns_backups);
+        if let Err(e) = finalize_macos_tun_teardown_journal(state_dir, remaining) {
+            let msg = format!("failed updating macOS recovery journal: {e}");
+            tracing::warn!("{}", msg);
+            outcome.warnings.push(msg);
+        }
+        outcome
     }
 
     pub struct MacOsUtunSession {
@@ -554,6 +678,7 @@ mod darwin_impl {
         tx_packets: Arc<AtomicU64>,
         network_transitions: Arc<AtomicU64>,
         egress_snapshot: Arc<Mutex<MacOsDualStackEgress>>,
+        last_error: Arc<Mutex<Option<String>>>,
         rx_thread: Option<JoinHandle<()>>,
         tx_thread: Option<JoinHandle<()>>,
         watch_thread: Option<JoinHandle<()>>,
@@ -657,9 +782,8 @@ mod darwin_impl {
             })();
 
             if let Err(err) = setup_res {
-                rollback_macos_record(&rec);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                let _ = rollback_macos_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
 
@@ -668,9 +792,8 @@ mod darwin_impl {
             let tx_raw = unsafe { libc::dup(utun_fd.as_raw_fd()) };
             if tx_raw < 0 {
                 let err = io::Error::last_os_error();
-                rollback_macos_record(&rec);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                let _ = rollback_macos_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
             // SAFETY: `tx_raw >= 0` is newly duplicated and uniquely owned by `tx_fd`.
@@ -691,6 +814,7 @@ mod darwin_impl {
             let tx_packets = Arc::new(AtomicU64::new(0));
             let network_transitions = Arc::new(AtomicU64::new(0));
             let egress_snapshot = Arc::new(Mutex::new(initial_egress));
+            let last_error = Arc::new(Mutex::new(None));
 
             let VirtualTunHandle {
                 ingress_tx,
@@ -763,9 +887,11 @@ mod darwin_impl {
                 Err(err) => {
                     stop_flag.store(true, Ordering::Release);
                     let _ = stop_watch_tx.send(true);
-                    rollback_macos_record(&recovery_record.lock());
                     clear_global_socket_protector();
-                    let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                    let _ = rollback_macos_record_and_finalize(
+                        &recovery_record.lock(),
+                        &spec.state_dir,
+                    );
                     return Err(err);
                 }
             };
@@ -805,9 +931,9 @@ mod darwin_impl {
                     stop_flag.store(true, Ordering::Release);
                     let _ = stop_watch_tx.send(true);
                     let _ = rx_thread.join();
-                    rollback_macos_record(&recovery_record.lock());
                     clear_global_socket_protector();
-                    let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                    let _ =
+                        rollback_macos_record_and_finalize(&recovery_record.lock(), &spec.state_dir);
                     return Err(err);
                 }
             };
@@ -816,6 +942,7 @@ mod darwin_impl {
             let egress_watch = Arc::clone(&egress_snapshot);
             let transitions_watch = Arc::clone(&network_transitions);
             let rec_watch = Arc::clone(&recovery_record);
+            let last_err_watch = Arc::clone(&last_error);
             let spec_watch = spec.clone();
             let utun_name_watch = utun_name.clone();
             let dns_watch = spec.dns_engine.clone();
@@ -880,7 +1007,20 @@ mod darwin_impl {
 
                             if if_changed {
                                 let prev_dns = std::mem::take(&mut rec_guard.dns_backups);
-                                restore_macos_dns_backups(&prev_dns);
+                                let mut handoff_outcome = RecoveryOutcome::default();
+                                rec_guard.dns_backups = restore_macos_dns_backups_with_runner(
+                                    &prev_dns,
+                                    &mut handoff_outcome,
+                                    &mut darwin_cmd_runner,
+                                );
+                                if !handoff_outcome.warnings.is_empty() {
+                                    let joined = handoff_outcome.warnings.join("; ");
+                                    tracing::warn!(
+                                        "macOS DNS restore warning during interface switch: {}",
+                                        joined
+                                    );
+                                    *last_err_watch.lock() = Some(joined);
+                                }
                                 bind_macos_service_dns_for_iface(
                                     latest.primary_if.as_deref(),
                                     &dns_str_for_watch,
@@ -909,9 +1049,11 @@ mod darwin_impl {
                     let _ = stop_watch_tx.send(true);
                     let _ = rx_thread.join();
                     let _ = tx_thread.join();
-                    rollback_macos_record(&recovery_record.lock());
                     clear_global_socket_protector();
-                    let _ = update_current_journal(&spec.state_dir, |j| j.macos_tun = None);
+                    let _ = rollback_macos_record_and_finalize(
+                        &recovery_record.lock(),
+                        &spec.state_dir,
+                    );
                     return Err(err);
                 }
             };
@@ -927,6 +1069,7 @@ mod darwin_impl {
                 tx_packets,
                 network_transitions,
                 egress_snapshot,
+                last_error,
                 rx_thread: Some(rx_thread),
                 tx_thread: Some(tx_thread),
                 watch_thread: Some(watch_thread),
@@ -960,7 +1103,7 @@ mod darwin_impl {
                 network_transitions: self.network_transitions.load(Ordering::Relaxed),
                 rx_packets: self.rx_packets.load(Ordering::Relaxed),
                 tx_packets: self.tx_packets.load(Ordering::Relaxed),
-                last_error: None,
+                last_error: self.last_error.lock().clone(),
             }
         }
 
@@ -983,9 +1126,11 @@ mod darwin_impl {
             }
 
             let rec_final = self.recovery_record.lock().clone();
-            rollback_macos_record(&rec_final);
             clear_global_socket_protector();
-            let _ = update_current_journal(&self.spec.state_dir, |j| j.macos_tun = None);
+            let outcome = rollback_macos_record_and_finalize(&rec_final, &self.spec.state_dir);
+            if !outcome.warnings.is_empty() {
+                *self.last_error.lock() = Some(outcome.warnings.join("; "));
+            }
         }
     }
 
@@ -1148,6 +1293,102 @@ mod tests {
                 "2606:4700:4700::1111",
                 "fe80::1%en0"
             ]
+        );
+    }
+
+    #[test]
+    fn macos_rollback_retains_only_failed_dns_and_physical_routes_while_dropping_utun_and_unplugged_services()
+     {
+        use crate::platform::recovery::{MacOsDnsBackup, MacOsRecoveryRecord, RecoveryOutcome};
+
+        let rec = MacOsRecoveryRecord {
+            utun_name: "utun7".into(),
+            owned_route_del_args: vec![
+                // Dynamic `-interface utun7` split route already gone when utun7 fd closed -> benign!
+                vec![
+                    "-n".into(),
+                    "delete".into(),
+                    "-net".into(),
+                    "0.0.0.0/1".into(),
+                    "-interface".into(),
+                    "utun7".into(),
+                ],
+                // Physical gateway bypass route that genuinely failed -> MUST be retained!
+                vec![
+                    "-n".into(),
+                    "delete".into(),
+                    "-host".into(),
+                    "1.1.1.1".into(),
+                    "192.168.1.1".into(),
+                ],
+                // Physical gateway bypass route that succeeded -> pruned!
+                vec![
+                    "-n".into(),
+                    "delete".into(),
+                    "-host".into(),
+                    "8.8.8.8".into(),
+                    "192.168.1.1".into(),
+                ],
+            ],
+            dns_backups: vec![
+                MacOsDnsBackup {
+                    service_name: "USB 10/100/1000 LAN".into(),
+                    previous_servers: vec!["Empty".into()],
+                },
+                MacOsDnsBackup {
+                    service_name: "Thunderbolt Ethernet".into(),
+                    previous_servers: vec!["9.9.9.9".into()],
+                },
+                MacOsDnsBackup {
+                    service_name: "Wi-Fi".into(),
+                    previous_servers: vec!["192.168.1.1".into()],
+                },
+            ],
+        };
+
+        let mut outcome = RecoveryOutcome::default();
+        let remaining = rollback_macos_record_with_runner(&rec, &mut outcome, &mut |prog, args| {
+            match prog {
+                "route" => {
+                    if args.iter().any(|a| a == "utun7") {
+                        Err(io::Error::other("route: bad address: utun7"))
+                    } else if args.iter().any(|a| a == "1.1.1.1") {
+                        Err(io::Error::other("route: writing to routing socket: EPERM"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                "networksetup" => {
+                    if args.iter().any(|a| a == "USB 10/100/1000 LAN") {
+                        // macOS networksetup prints this to stdout on exit code 4 when an adapter was unplugged
+                        Err(io::Error::other(
+                            "USB 10/100/1000 LAN is not a recognized network service.\n** Error: The parameters were not valid.",
+                        ))
+                    } else if args.iter().any(|a| a == "Wi-Fi") {
+                        Err(io::Error::other(
+                            "** Error: Unable to commit changes to network database.",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                other => panic!("unexpected command {other}"),
+            }
+        });
+
+        let rem = remaining.expect("failed Wi-Fi DNS and 1.1.1.1 route must be retained");
+        assert_eq!(rem.dns_backups.len(), 1);
+        assert_eq!(rem.dns_backups[0].service_name, "Wi-Fi");
+        assert_eq!(rem.owned_route_del_args.len(), 1);
+        assert_eq!(
+            rem.owned_route_del_args[0],
+            vec!["-n", "delete", "-host", "1.1.1.1", "192.168.1.1"]
+        );
+        assert_eq!(
+            outcome.warnings.len(),
+            2,
+            "only real failures (Wi-Fi DNS + 1.1.1.1 route) should produce warnings: {:?}",
+            outcome.warnings
         );
     }
 }
