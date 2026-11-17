@@ -65,7 +65,7 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 
 ## Download
 
-Get the latest build from [`v0.5.0` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest) (all artifacts ship with `SHA256SUMS.txt`).
+Get the latest build from [`v0.5.1` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest) (all artifacts ship with `SHA256SUMS.txt`).
 
 | Platform | Packages | Notes |
 | --- | --- | --- |
