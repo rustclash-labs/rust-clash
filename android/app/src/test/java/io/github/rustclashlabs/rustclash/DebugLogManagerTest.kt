@@ -1067,7 +1067,7 @@ class DebugLogManagerTest {
               "rssBytes": 73400320,
               "outboundStats": [
                 {
-                  "outbound": "SubNode (203.0.113.88)",
+                  "outbound": "Sub (203.0.113.88)",
                   "protocol": "Hysteria2",
                   "exitType": "PROXY",
                   "connections": 6,
