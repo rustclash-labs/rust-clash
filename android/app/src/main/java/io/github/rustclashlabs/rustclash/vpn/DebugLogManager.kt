@@ -79,6 +79,7 @@ object DebugLogManager {
     internal const val ANOMALY_NOTIFICATION_ID = 19819
     internal const val AUTO_ANOMALY_COOLDOWN_MS = 15L * 60_000L
     internal const val HISTORICAL_EXIT_MAX_AGE_MS = 24L * 3_600_000L
+    internal const val HIGH_PRIVATE_RSS_THRESHOLD_BYTES = 256L * 1024L * 1024L
     private const val MAX_DISMISSED_ANOMALY_IDS = 32
 
     internal const val DEBUG_DIR_NAME = "debug_logs"
@@ -423,7 +424,13 @@ object DebugLogManager {
 
     fun getActiveAnomaly(context: Context): DebugAnomalyAlertUi? {
         val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
-        return parseAnomalyJson(prefs.getString(KEY_ACTIVE_ANOMALY_JSON, null))
+        val parsed = parseAnomalyJson(prefs.getString(KEY_ACTIVE_ANOMALY_JSON, null)) ?: return null
+        if (parsed.code == "HIGH_MEMORY_RSS" && parsed.detailZh.startsWith("当前原生内存占用达 ")) {
+            prefs.edit().remove(KEY_ACTIVE_ANOMALY_JSON).apply()
+            cancelAnomalyNotification(context)
+            return null
+        }
+        return parsed
     }
 
     fun isAnomalyDismissed(context: Context, anomalyId: String): Boolean {
@@ -764,19 +771,17 @@ object DebugLogManager {
             }
         }
 
-        // 9. Abnormal native RSS memory growth (>= 180 MB vs normal 65~85 MB)
-        val rssBytes = maxOf(
-            nativeObj?.optLong("rssBytes", 0L) ?: 0L,
-            nativeObj?.optLong("vmRssBytes", 0L) ?: 0L,
-        )
-        if (rssBytes >= 180L * 1024L * 1024L) {
+        // 9. Abnormal private RSS memory growth (`RssAnon` >= 256 MB; explicitly exclude `vmRssBytes`
+        // which includes ~130 MB of Android Zygote / Compose shared read-only framework mappings)
+        val privateRssBytes = nativeObj?.optLong("rssBytes", 0L) ?: 0L
+        if (privateRssBytes >= HIGH_PRIVATE_RSS_THRESHOLD_BYTES) {
             return DebugAnomalyAlertUi(
                 id = "high_rss:$sessionBucket",
                 detectedAtMs = capturedAtMs,
                 severity = "warning",
                 code = "HIGH_MEMORY_RSS",
                 headlineZh = "引擎内存占用异常偏高",
-                detailZh = "当前原生内存占用达 ${formatBytesCompact(rssBytes)}，点击一键导出日志检查连接与缓存状态。",
+                detailZh = "当前进程私有内存占用达 ${formatBytesCompact(privateRssBytes)}（阈值 256 MB），点击一键导出日志检查连接与缓存状态。",
             )
         }
 
@@ -956,6 +961,21 @@ object DebugLogManager {
             .takeIf { it.isFile }
             ?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
 
+        val debugEnabled = isEnabled(context)
+        val evaluatedAnomaly = if (debugEnabled) {
+            evaluateSliceAnomalies(
+                trigger = trigger,
+                capturedAtMs = windowSnap.capturedAtMs,
+                sessionStartMs = capturedSessionStartMs,
+                systemMeta = systemMeta,
+                nativeSnapshotRawJson = nativeJsonStr,
+                crashBreadcrumb = crashBreadcrumb,
+                windowEvents = windowSnap.events,
+            )
+        } else {
+            null
+        }
+
         val formatted = formatSliceReport(
             trigger = trigger,
             window = windowSnap,
@@ -963,6 +983,7 @@ object DebugLogManager {
             nativeSnapshotRawJson = nativeJsonStr,
             crashBreadcrumb = crashBreadcrumb,
             previousRuleHits = prevRuleHitsSnap,
+            detectedAnomaly = evaluatedAnomaly,
         )
 
         val safeTrigger = trigger.lowercase(Locale.ROOT)
@@ -994,30 +1015,18 @@ object DebugLogManager {
                     }
                 }
             }
-            if (isEnabled(context)) {
-                val evaluated = evaluateSliceAnomalies(
-                    trigger = trigger,
-                    capturedAtMs = windowSnap.capturedAtMs,
-                    sessionStartMs = capturedSessionStartMs,
-                    systemMeta = systemMeta,
-                    nativeSnapshotRawJson = nativeJsonStr,
-                    crashBreadcrumb = crashBreadcrumb,
-                    windowEvents = windowSnap.events,
+            if (debugEnabled && evaluatedAnomaly != null) {
+                recordDetectedAnomalyIfUndismissed(
+                    context = context,
+                    candidate = evaluatedAnomaly,
+                    postNotification = trigger != "export",
                 )
-                if (evaluated != null) {
-                    recordDetectedAnomalyIfUndismissed(
-                        context = context,
-                        candidate = evaluated,
-                        postNotification = trigger != "export",
-                    )
-                }
             }
-            val protectAnomaly = getActiveAnomaly(context) != null
             enforceRetentionPolicy(
                 dir = dir,
                 maxFiles = MAX_SLICE_FILES,
                 maxTotalBytes = MAX_TOTAL_SLICE_BYTES,
-                protectLatestAnomalySlice = protectAnomaly,
+                protectLatestAnomalySlice = true,
             )
             outFile
         }.onFailure {
@@ -1440,6 +1449,7 @@ object DebugLogManager {
         nativeSnapshotRawJson: String,
         crashBreadcrumb: String?,
         previousRuleHits: Map<String, Long> = emptyMap(),
+        detectedAnomaly: DebugAnomalyAlertUi? = null,
     ): String {
         val windowDurationSecs = ((window.capturedAtMs - window.windowStartMs).coerceAtLeast(0L)) / 1000L
         val nativeObj = runCatching { JSONObject(nativeSnapshotRawJson) }.getOrNull()
@@ -1452,6 +1462,12 @@ object DebugLogManager {
                 "`${systemMeta.deviceManufacturer} ${systemMeta.deviceModel}` · " +
                 "Android `${systemMeta.androidRelease}` (API ${systemMeta.sdkInt}, `${systemMeta.primaryAbi}`)",
         )
+        if (detectedAnomaly != null) {
+            sb.appendLine(
+                "- TriggeredAnomaly: `[${detectedAnomaly.severity.uppercase(Locale.ROOT)}/${detectedAnomaly.code}]` " +
+                    "${detectedAnomaly.headlineZh} — ${detectedAnomaly.detailZh}",
+            )
+        }
 
         val batStart = window.startBatteryPct
         val batEnd = systemMeta.battery.levelPct

@@ -852,8 +852,8 @@ class DebugLogManagerTest {
             androidRelease = "16",
             sdkInt = 36,
             primaryAbi = "arm64-v8a",
-            appVersionName = "0.5.1",
-            appVersionCode = 30,
+            appVersionName = "0.5.2",
+            appVersionCode = 31,
             battery = DebugLogManager.BatterySnapshot(levelPct = 95, isCharging = false, temperatureCelsius = 27.0),
             isInteractive = true,
             isPowerSaveMode = false,
@@ -869,13 +869,14 @@ class DebugLogManagerTest {
             recentProcessExits = emptyList(),
         )
 
-        // Realistic 7.3-hour healthy snapshot with domestic PCDN DIRECT timeouts + minor tail P95
+        // Realistic 7.3-hour healthy snapshot with domestic PCDN DIRECT timeouts + shared Zygote vmRss ~217 MB
         val healthyDailyJson = """
             {
               "ok": true,
               "vpnRunning": true,
               "uptimeSecs": 26397,
               "rssBytes": 83319808,
+              "vmRssBytes": ${217L * 1024L * 1024L},
               "tun": {
                 "rxPackets": 100516,
                 "txPackets": 113189,
@@ -1124,16 +1125,37 @@ class DebugLogManagerTest {
         assertNotNull(slowAlert)
         assertEquals("PROXY_SLOW_HANDSHAKE", slowAlert!!.code)
 
-        // 7. High native RSS memory >= 180 MB (warning)
+        // 7. Foreground Compose UI private rssBytes=145 MB + shared Zygote vmRssBytes=275 MB -> NO false alarm
+        val foregroundUiMemoryJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "rssBytes": ${145L * 1024L * 1024L},
+              "vmRssBytes": ${275L * 1024L * 1024L}
+            }
+        """.trimIndent()
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "anomaly",
+                capturedAtMs = nowMs,
+                sessionStartMs = sessStart,
+                systemMeta = null,
+                nativeSnapshotRawJson = foregroundUiMemoryJson,
+                crashBreadcrumb = null,
+            ),
+        )
+
+        // 8. Genuine high private RSS memory >= 256 MB (warning) + embedded TriggeredAnomaly slice header
         val highRssJson = """
             {
               "ok": true,
               "vpnRunning": true,
-              "rssBytes": ${205L * 1024L * 1024L}
+              "rssBytes": ${265L * 1024L * 1024L},
+              "vmRssBytes": ${395L * 1024L * 1024L}
             }
         """.trimIndent()
         val rssAlert = DebugLogManager.evaluateSliceAnomalies(
-            trigger = "periodic",
+            trigger = "anomaly",
             capturedAtMs = nowMs,
             sessionStartMs = sessStart,
             systemMeta = null,
@@ -1142,6 +1164,48 @@ class DebugLogManagerTest {
         )
         assertNotNull(rssAlert)
         assertEquals("HIGH_MEMORY_RSS", rssAlert!!.code)
+        assertTrue(rssAlert.detailZh.contains("265.00 MB"))
+        assertTrue(rssAlert.detailZh.contains("阈值 256 MB"))
+
+        val sliceBody = DebugLogManager.formatSliceReport(
+            trigger = "anomaly",
+            window = DebugLogManager.WindowTelemetryState(
+                windowStartMs = nowMs - 300_000L,
+                capturedAtMs = nowMs,
+                sessionStartMs = sessStart,
+                screenOnMs = 120_000L,
+                screenOffMs = 180_000L,
+                startBatteryPct = 80,
+                events = emptyList(),
+            ),
+            systemMeta = DebugLogManager.SystemMetadata(
+                deviceManufacturer = "HONOR",
+                deviceModel = "BVL-AN00",
+                androidRelease = "17",
+                sdkInt = 37,
+                primaryAbi = "arm64-v8a",
+                appVersionName = "0.5.2",
+                appVersionCode = 31,
+                battery = DebugLogManager.BatterySnapshot(79, false, 35.0),
+                isInteractive = true,
+                isPowerSaveMode = false,
+                isDeviceIdleDoze = false,
+                ignoringBatteryOptimizations = true,
+                jvmUsedBytes = 12L * 1024L * 1024L,
+                jvmMaxBytes = 384L * 1024L * 1024L,
+                nativeHeapBytes = 40L * 1024L * 1024L,
+                perAppMode = "ALL_APPS",
+                selectedPackagesCount = 0,
+                enableIpv6 = true,
+                demoMode = false,
+                recentProcessExits = emptyList(),
+            ),
+            nativeSnapshotRawJson = proxyFailJson,
+            crashBreadcrumb = null,
+            detectedAnomaly = proxyFailAlert,
+        )
+        assertTrue(sliceBody.contains("- TriggeredAnomaly: `[WARNING/PROXY_HIGH_FAIL_RATE]` 代理节点出现异常断流"))
+        assertFalse(sliceBody.contains("203.0.113.88"))
     }
 
     @Test
