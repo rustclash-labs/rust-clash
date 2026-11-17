@@ -1073,3 +1073,146 @@ async fn tuic_v5_zero_rtt_tcp_and_native_plus_quic_stream_fragmented_udp_full_st
     srv.shutdown().await;
     let _ = shutdown_tx.send(true);
 }
+
+#[tokio::test]
+async fn hysteria2_and_tuic_low_power_mode_and_network_switch_preserve_active_streams_and_reconnect()
+ {
+    use proxy_core::outbound::{
+        hysteria2::{Hysteria2Outbound, Hysteria2OutboundConfig, spawn_hysteria2_server},
+        quic_common::QuicCongestionControl,
+        tuic::{TuicOutbound, TuicOutboundConfig, TuicUdpRelayMode, spawn_tuic_server},
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tcp_echo, _udp_echo) = spawn_echo_servers(shutdown_rx.clone()).await;
+
+    let sni = "power-switch.e2e.local";
+    let (hy2_tls, hy2_ca) = generate_self_signed_server_config(
+        &[sni.to_string(), "127.0.0.1".to_string()],
+        &[b"h3".to_vec()],
+    )
+    .unwrap();
+    let (tuic_tls, tuic_ca) = generate_self_signed_server_config(
+        &[sni.to_string(), "127.0.0.1".to_string()],
+        &[b"h3".to_vec()],
+    )
+    .unwrap();
+
+    let hy2_srv = spawn_hysteria2_server(
+        "127.0.0.1:0".parse().unwrap(),
+        "hy2-lp-secret".into(),
+        hy2_tls,
+        None,
+    )
+    .await
+    .unwrap();
+    let tuic_uuid = Uuid::new_v4();
+    let tuic_srv = spawn_tuic_server(
+        "127.0.0.1:0".parse().unwrap(),
+        tuic_uuid,
+        "tuic-lp-secret".into(),
+        tuic_tls,
+    )
+    .await
+    .unwrap();
+
+    let hy2 = Hysteria2Outbound::new(Hysteria2OutboundConfig {
+        name: "hy2-lp".into(),
+        server: "127.0.0.1".into(),
+        port: hy2_srv.listen_addr.port(),
+        ports: None,
+        password: "hy2-lp-secret".into(),
+        obfs_salamander_password: None,
+        up_bytes_per_sec: 20_000_000,
+        down_bytes_per_sec: 100_000_000,
+        servername: Some(sni.into()),
+        skip_cert_verify: false,
+        alpn: vec![b"h3".to_vec()],
+        extra_ca_der: vec![hy2_ca],
+        udp: true,
+    })
+    .unwrap();
+
+    let tuic = TuicOutbound::new(TuicOutboundConfig {
+        name: "tuic-lp".into(),
+        server: "127.0.0.1".into(),
+        port: tuic_srv.listen_addr.port(),
+        uuid: tuic_uuid,
+        password: "tuic-lp-secret".into(),
+        udp_relay_mode: TuicUdpRelayMode::Quic,
+        congestion_control: QuicCongestionControl::Bbr,
+        zero_rtt_handshake: false,
+        disable_sni: false,
+        heartbeat_interval: Duration::from_millis(250),
+        servername: Some(sni.into()),
+        skip_cert_verify: false,
+        alpn: vec![b"h3".to_vec()],
+        extra_ca_der: vec![tuic_ca],
+        udp: true,
+    })
+    .unwrap();
+
+    for (label, outbound) in [
+        ("hysteria2", &hy2 as &dyn OutboundHandler),
+        ("tuic", &tuic as &dyn OutboundHandler),
+    ] {
+        // 1. Open an active TCP stream, then enable screen-off `low_power_mode(true)` WHILE the stream is open:
+        //    the active stream MUST NOT be killed mid-transfer!
+        let mut active_stream = outbound
+            .connect_tcp(&TargetAddr::from(tcp_echo))
+            .await
+            .unwrap();
+        outbound.set_low_power_mode(true);
+
+        active_stream
+            .write_all(b"still-alive-in-doze")
+            .await
+            .unwrap();
+        active_stream.flush().await.unwrap();
+        let mut buf = [0u8; 19];
+        active_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf, b"still-alive-in-doze",
+            "{label} broke active stream on low-power"
+        );
+
+        // Dropping the last active stream while in low-power mode reaps the idle QUIC session cleanly;
+        // waking up (`set_low_power_mode(false)`) and opening a new stream dials a fresh session seamlessly.
+        drop(active_stream);
+        outbound.set_low_power_mode(false);
+
+        let mut after_wake = outbound
+            .connect_tcp(&TargetAddr::from(tcp_echo))
+            .await
+            .unwrap();
+        after_wake
+            .write_all(b"fresh-after-screen-on")
+            .await
+            .unwrap();
+        after_wake.flush().await.unwrap();
+        let mut buf2 = [0u8; 21];
+        after_wake.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"fresh-after-screen-on", "{label} failed after wake");
+        drop(after_wake);
+
+        // 2. Trigger `on_network_change()` (advances QUIC pool generation and closes cached connection)
+        //    and verify immediate post-handover reconnect succeeds.
+        outbound.on_network_change();
+        let mut after_switch = outbound
+            .connect_tcp(&TargetAddr::from(tcp_echo))
+            .await
+            .unwrap();
+        after_switch.write_all(b"post-5g-handover").await.unwrap();
+        after_switch.flush().await.unwrap();
+        let mut buf3 = [0u8; 16];
+        after_switch.read_exact(&mut buf3).await.unwrap();
+        assert_eq!(
+            &buf3, b"post-5g-handover",
+            "{label} failed after network switch"
+        );
+    }
+
+    hy2_srv.shutdown().await;
+    tuic_srv.shutdown().await;
+    let _ = shutdown_tx.send(true);
+}

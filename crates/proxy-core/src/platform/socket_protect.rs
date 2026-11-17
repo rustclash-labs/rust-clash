@@ -579,7 +579,7 @@ pub fn global_socket_protector() -> Arc<dyn SocketProtector> {
 /// Per-socket TCP `connect()` timeout: 5s covers Linux/Android RFC 6298 initial SYN (`0s`) plus two
 /// retransmissions (`+1s` at `1.0s`, `+2s` at `3.0–3.2s`) with `~1.8s` cellular RRC wake-up / bufferbloat RTT headroom.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const MAX_HAPPY_EYEBALLS_CANDIDATES: usize = 6;
 /// Overall Happy Eyeballs ceiling (`>= (MAX_HAPPY_EYEBALLS_CANDIDATES - 1) * 250ms + TCP_CONNECT_TIMEOUT`)
 /// so staggered IPv4/IPv6 fallback candidates receive their full per-socket connect budget.
@@ -657,6 +657,11 @@ fn note_tcp_connect_outcome_at(addr: SocketAddr, res: Result<(), &io::Error>, no
         Err(err) if is_demotable_connect_error(err) => record_recent_failed_addr_at(addr, now),
         Err(_) => {}
     }
+}
+
+pub(crate) fn note_addr_connect_outcome(addr: SocketAddr, res: Result<(), &io::Error>) {
+    note_direct_addr_connect_result(addr, res);
+    note_tcp_connect_outcome_at(addr, res, Instant::now());
 }
 
 /// Open a protected non-blocking TCP connection to a resolved `SocketAddr` with connect timeout and TCP keepalive.
@@ -826,6 +831,51 @@ pub async fn connect_protected_addrs_happy_eyeballs(addrs: &[SocketAddr]) -> io:
     .await
 }
 
+/// Race candidate `SocketAddr`s using RFC 8305 Happy Eyeballs for non-TCP transports (such as QUIC),
+/// staggering candidate dials by `stagger_delay` and granting every staggered candidate a full
+/// `per_attempt_timeout` budget.
+pub(crate) async fn connect_addrs_happy_eyeballs_with<T, F, Fut>(
+    addrs: &[SocketAddr],
+    stagger_delay: Duration,
+    per_attempt_timeout: Duration,
+    mut dial: F,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    match addrs {
+        [] => {
+            return Err(io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                "no resolved target addresses",
+            ));
+        }
+        [single] => return dial(*single).await,
+        _ => {}
+    }
+
+    let mut ordered = prioritize_healthy_happy_eyeballs_addrs(addrs);
+    ordered.truncate(MAX_HAPPY_EYEBALLS_CANDIDATES);
+    let extra_stagger = stagger_delay * (ordered.len().saturating_sub(1) as u32);
+    let total_timeout = per_attempt_timeout.saturating_add(extra_stagger);
+    race_happy_eyeballs_candidates(ordered, stagger_delay, total_timeout, dial).await
+}
+
+fn demote_earlier_stalled_candidates(
+    ordered: &[SocketAddr],
+    winner: SocketAddr,
+    inflight: &[SocketAddr],
+) {
+    let now = Instant::now();
+    for &earlier in ordered.iter().take_while(|&&c| c != winner) {
+        if inflight.contains(&earlier) {
+            record_recent_failed_addr_at(earlier, now);
+        }
+    }
+}
+
 async fn race_happy_eyeballs_candidates<T, F, Fut>(
     ordered: Vec<SocketAddr>,
     stagger_delay: Duration,
@@ -868,6 +918,7 @@ where
                         match joined {
                             Some(Ok((addr, Ok(stream)))) => {
                                 inflight.retain(|a| *a != addr);
+                                demote_earlier_stalled_candidates(&ordered, addr, &inflight);
                                 join_set.abort_all();
                                 return Ok(stream);
                             }
@@ -899,6 +950,7 @@ where
                 match join_set.join_next().await {
                     Some(Ok((addr, Ok(stream)))) => {
                         inflight.retain(|a| *a != addr);
+                        demote_earlier_stalled_candidates(&ordered, addr, &inflight);
                         join_set.abort_all();
                         return Ok(stream);
                     }
@@ -921,7 +973,7 @@ where
         Ok(res) => res,
         Err(_) => {
             join_set.abort_all();
-            let err = io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out");
+            let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
             let now = Instant::now();
             if inflight.is_empty() {
                 note_tcp_connect_outcome_at(primary_candidate, Err(&err), now);

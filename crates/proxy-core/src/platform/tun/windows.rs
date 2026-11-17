@@ -6,6 +6,7 @@ use std::{
 
 use crate::platform::recovery::{
     RecoveryOutcome, WindowsDnsFamilySnapshot, WindowsDnsInterfaceBackup, WindowsRecoveryRecord,
+    WindowsRouteRecord,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -249,25 +250,54 @@ pub fn apply_windows_adapter_dns_transactional<B: WindowsDnsOps>(
         interface_guid: guid,
         ipv4: prev_v4,
         ipv6: prev_v6,
+        restore_ipv4: true,
     })
 }
 
-/// Restore backed-up Windows IPv4 and IPv6 DNS settings and record accurate results/warnings in `outcome`.
-pub fn restore_windows_adapter_dns_with_ops<B: WindowsDnsOps>(
+/// Returns `true` when a Windows route/DNS rollback error indicates the target route or network
+/// adapter has already vanished (`ERROR_FILE_NOT_FOUND=2`, `ERROR_NOT_FOUND=1168`, `ERROR_OBJECT_NOT_FOUND=5010`).
+pub fn is_windows_benign_absent_error(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    if matches!(err.raw_os_error(), Some(2 | 1168 | 5010)) {
+        return true;
+    }
+    let low = err.to_string().to_ascii_lowercase();
+    low.contains("element not found")
+        || low.contains("object not found")
+        || low.contains("not found")
+}
+
+/// Restore backed-up Windows IPv4 and IPv6 DNS settings, returning a pruned `WindowsRecoveryRecord`
+/// (without routes) if any family genuinely failed so it stays in `network_recovery.json` for retry.
+pub fn restore_windows_adapter_dns_pruning_with_ops<B: WindowsDnsOps>(
     backend: &mut B,
     rec: &WindowsRecoveryRecord,
     outcome: &mut RecoveryOutcome,
-) {
+) -> Option<WindowsRecoveryRecord> {
     if let Some(backup) = &rec.dns_backup {
-        let desc_v4 = format!(
-            "RestoreInterfaceDnsSettings(IPv4='{}') on {}",
-            backup.ipv4.name_server, backup.interface_guid
-        );
-        match backend.set_dns_settings(&backup.interface_guid, false, &backup.ipv4) {
-            Ok(()) => outcome.actions_executed.push(desc_v4),
-            Err(e) => outcome.warnings.push(format!("{desc_v4} failed: {e}")),
+        let mut v4_still_pending = backup.restore_ipv4;
+        if backup.restore_ipv4 {
+            let desc_v4 = format!(
+                "RestoreInterfaceDnsSettings(IPv4='{}') on {}",
+                backup.ipv4.name_server, backup.interface_guid
+            );
+            match backend.set_dns_settings(&backup.interface_guid, false, &backup.ipv4) {
+                Ok(()) => {
+                    outcome.actions_executed.push(desc_v4);
+                    v4_still_pending = false;
+                }
+                Err(e) if is_windows_benign_absent_error(&e) => {
+                    v4_still_pending = false;
+                }
+                Err(e) => {
+                    outcome.warnings.push(format!("{desc_v4} failed: {e}"));
+                }
+            }
         }
 
+        let mut remaining_v6 = None;
         if let Some(v6_snap) = &backup.ipv6 {
             let desc_v6 = format!(
                 "RestoreInterfaceDnsSettings(IPv6='{}') on {}",
@@ -275,10 +305,32 @@ pub fn restore_windows_adapter_dns_with_ops<B: WindowsDnsOps>(
             );
             match backend.set_dns_settings(&backup.interface_guid, true, v6_snap) {
                 Ok(()) => outcome.actions_executed.push(desc_v6),
-                Err(e) => outcome.warnings.push(format!("{desc_v6} failed: {e}")),
+                Err(e) if is_windows_benign_absent_error(&e) => {}
+                Err(e) => {
+                    outcome.warnings.push(format!("{desc_v6} failed: {e}"));
+                    remaining_v6 = Some(v6_snap.clone());
+                }
             }
         }
-        return;
+
+        if v4_still_pending || remaining_v6.is_some() {
+            return Some(WindowsRecoveryRecord {
+                adapter_name: rec.adapter_name.clone(),
+                adapter_luid: rec.adapter_luid,
+                owned_routes: Vec::new(),
+                dns_interface_guid: Some(backup.interface_guid.clone()),
+                previous_dns_servers: v4_still_pending
+                    .then(|| rec.previous_dns_servers.clone())
+                    .flatten(),
+                dns_backup: Some(WindowsDnsInterfaceBackup {
+                    interface_guid: backup.interface_guid.clone(),
+                    ipv4: backup.ipv4.clone(),
+                    ipv6: remaining_v6,
+                    restore_ipv4: v4_still_pending,
+                }),
+            });
+        }
+        return None;
     }
 
     // Legacy recovery journal fallback (`dns_backup` absent, `previous_dns_servers` present)
@@ -286,7 +338,7 @@ pub fn restore_windows_adapter_dns_with_ops<B: WindowsDnsOps>(
         let guid_res = match &rec.dns_interface_guid {
             Some(g) => Ok(g.clone()),
             None if rec.adapter_luid != 0 => backend.resolve_luid_guid(rec.adapter_luid),
-            None => return,
+            None => return None,
         };
         match guid_res {
             Ok(guid) => {
@@ -300,16 +352,101 @@ pub fn restore_windows_adapter_dns_with_ops<B: WindowsDnsOps>(
                     snap.name_server, guid
                 );
                 match backend.set_dns_settings(&guid, false, &snap) {
-                    Ok(()) => outcome.actions_executed.push(desc),
-                    Err(e) => outcome.warnings.push(format!("{desc} failed: {e}")),
+                    Ok(()) => {
+                        outcome.actions_executed.push(desc);
+                        return None;
+                    }
+                    Err(e) if is_windows_benign_absent_error(&e) => {
+                        return None;
+                    }
+                    Err(e) => {
+                        outcome.warnings.push(format!("{desc} failed: {e}"));
+                        return Some(WindowsRecoveryRecord {
+                            adapter_name: rec.adapter_name.clone(),
+                            adapter_luid: rec.adapter_luid,
+                            owned_routes: Vec::new(),
+                            dns_interface_guid: Some(guid),
+                            previous_dns_servers: Some(prev_servers.clone()),
+                            dns_backup: None,
+                        });
+                    }
                 }
             }
-            Err(e) => outcome.warnings.push(format!(
-                "ConvertInterfaceLuidToGuid({}) failed during DNS recovery: {e}",
-                rec.adapter_luid
-            )),
+            Err(e) if is_windows_benign_absent_error(&e) => return None,
+            Err(e) => {
+                outcome.warnings.push(format!(
+                    "ConvertInterfaceLuidToGuid({}) failed during DNS recovery: {e}",
+                    rec.adapter_luid
+                ));
+                return Some(WindowsRecoveryRecord {
+                    adapter_name: rec.adapter_name.clone(),
+                    adapter_luid: rec.adapter_luid,
+                    owned_routes: Vec::new(),
+                    dns_interface_guid: rec.dns_interface_guid.clone(),
+                    previous_dns_servers: Some(prev_servers.clone()),
+                    dns_backup: None,
+                });
+            }
         }
     }
+
+    None
+}
+
+/// Restore backed-up Windows IPv4 and IPv6 DNS settings and record accurate results/warnings in `outcome`.
+pub fn restore_windows_adapter_dns_with_ops<B: WindowsDnsOps>(
+    backend: &mut B,
+    rec: &WindowsRecoveryRecord,
+    outcome: &mut RecoveryOutcome,
+) {
+    let _ = restore_windows_adapter_dns_pruning_with_ops(backend, rec, outcome);
+}
+
+/// Roll back owned Windows routes and DNS overrides, returning `Some(remaining)` containing ONLY
+/// physical routes / DNS settings whose restoration genuinely failed.
+pub fn rollback_windows_record_with_ops<B, R>(
+    rec: &WindowsRecoveryRecord,
+    backend: &mut B,
+    mut delete_route: R,
+    outcome: &mut RecoveryOutcome,
+) -> Option<WindowsRecoveryRecord>
+where
+    B: WindowsDnsOps,
+    R: FnMut(&WindowsRouteRecord) -> io::Result<()>,
+{
+    let mut failed_routes_rev = Vec::new();
+    for r in rec.owned_routes.iter().rev() {
+        let desc = format!(
+            "DeleteIpForwardEntry2 {}/{} -> {}",
+            r.destination_prefix, r.prefix_length, r.next_hop
+        );
+        match delete_route(r) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                let on_wintun = rec.adapter_luid != 0 && r.interface_luid == rec.adapter_luid;
+                if !is_windows_benign_absent_error(&e) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    if !on_wintun {
+                        failed_routes_rev.push(r.clone());
+                    }
+                }
+            }
+        }
+    }
+    failed_routes_rev.reverse();
+
+    let dns_rem = restore_windows_adapter_dns_pruning_with_ops(backend, rec, outcome);
+    let remaining = WindowsRecoveryRecord {
+        adapter_name: rec.adapter_name.clone(),
+        adapter_luid: rec.adapter_luid,
+        owned_routes: failed_routes_rev,
+        dns_interface_guid: dns_rem.as_ref().and_then(|d| d.dns_interface_guid.clone()),
+        previous_dns_servers: dns_rem
+            .as_ref()
+            .and_then(|d| d.previous_dns_servers.clone()),
+        dns_backup: dns_rem.and_then(|d| d.dns_backup),
+    };
+    (!remaining.is_empty()).then_some(remaining)
 }
 
 #[cfg(windows)]
@@ -371,7 +508,7 @@ mod win_impl {
         ForwardRouteCandidate, PhysicalEgressInfo, WINDOWS_SPLIT_IPV4_PREFIXES,
         WINDOWS_SPLIT_IPV6_PREFIXES, WindowsDnsOps, apply_windows_adapter_dns_transactional,
         format_braced_guid, merge_non_zero_protector_indices, parse_braced_guid,
-        resolve_secure_wintun_dll_path, restore_windows_adapter_dns_with_ops,
+        resolve_secure_wintun_dll_path, rollback_windows_record_with_ops,
         select_physical_default_egress,
     };
     use crate::{
@@ -379,7 +516,7 @@ mod win_impl {
         platform::{
             recovery::{
                 RecoveryOutcome, WindowsDnsFamilySnapshot, WindowsRecoveryRecord,
-                WindowsRouteRecord, update_current_journal,
+                WindowsRouteRecord, finalize_windows_tun_teardown_journal, update_current_journal,
             },
             socket_protect::{
                 WindowsUnicastIfProtector, clear_global_socket_protector, global_socket_protector,
@@ -952,19 +1089,33 @@ mod win_impl {
         }
     }
 
-    pub fn recover_windows_tun_record(rec: &WindowsRecoveryRecord, outcome: &mut RecoveryOutcome) {
-        for r in rec.owned_routes.iter().rev() {
-            let desc = format!(
-                "DeleteIpForwardEntry2 {}/{} -> {}",
-                r.destination_prefix, r.prefix_length, r.next_hop
-            );
-            match delete_iphlpapi_route(r) {
-                Ok(()) => outcome.actions_executed.push(desc),
-                Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-            }
-        }
+    pub fn recover_windows_tun_record_pruning(
+        rec: &WindowsRecoveryRecord,
+        outcome: &mut RecoveryOutcome,
+    ) -> Option<WindowsRecoveryRecord> {
         let mut dns_backend = IpHlpApiDnsBackend;
-        restore_windows_adapter_dns_with_ops(&mut dns_backend, rec, outcome);
+        rollback_windows_record_with_ops(rec, &mut dns_backend, delete_iphlpapi_route, outcome)
+    }
+
+    pub fn recover_windows_tun_record(rec: &WindowsRecoveryRecord, outcome: &mut RecoveryOutcome) {
+        let _ = recover_windows_tun_record_pruning(rec, outcome);
+    }
+
+    fn rollback_windows_record_and_finalize(
+        rec: &WindowsRecoveryRecord,
+        state_dir: &Path,
+    ) -> RecoveryOutcome {
+        let mut outcome = RecoveryOutcome::default();
+        let remaining = recover_windows_tun_record_pruning(rec, &mut outcome);
+        for warn_msg in &outcome.warnings {
+            tracing::warn!("Windows Wintun teardown recovery warning: {}", warn_msg);
+        }
+        if let Err(e) = finalize_windows_tun_teardown_journal(state_dir, remaining) {
+            let msg = format!("failed updating Windows recovery journal: {e}");
+            tracing::warn!("{}", msg);
+            outcome.warnings.push(msg);
+        }
+        outcome
     }
 
     fn install_physical_bypass_routes(
@@ -1154,6 +1305,7 @@ mod win_impl {
         tx_packets: Arc<AtomicU64>,
         network_transitions: Arc<AtomicU64>,
         egress_state: Arc<Mutex<PhysicalEgressInfo>>,
+        last_error: Arc<Mutex<Option<String>>>,
         rx_thread: Option<JoinHandle<()>>,
         tx_thread: Option<JoinHandle<()>>,
     }
@@ -1336,15 +1488,14 @@ mod win_impl {
             })();
 
             if let Err(err) = setup_res {
-                let mut dummy = RecoveryOutcome::default();
-                recover_windows_tun_record(&rec, &mut dummy);
+                let outcome = rollback_windows_record_and_finalize(&rec, &spec.state_dir);
+                let _ = outcome;
                 // SAFETY: Ending Wintun session and closing adapter on rollback.
                 unsafe {
                     (api.end_session)(session);
                     (api.close_adapter)(adapter);
                 }
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.windows_tun = None);
                 return Err(err);
             }
 
@@ -1353,14 +1504,12 @@ mod win_impl {
             let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
             if stop_event.is_null() {
                 let err = io::Error::last_os_error();
-                let mut dummy = RecoveryOutcome::default();
-                recover_windows_tun_record(&rec, &mut dummy);
+                let _ = rollback_windows_record_and_finalize(&rec, &spec.state_dir);
                 unsafe {
                     (api.end_session)(session);
                     (api.close_adapter)(adapter);
                 }
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.windows_tun = None);
                 return Err(err);
             }
 
@@ -1371,6 +1520,7 @@ mod win_impl {
             let tx_packets = Arc::new(AtomicU64::new(0));
             let network_transitions = Arc::new(AtomicU64::new(0));
             let egress_state = Arc::new(Mutex::new(initial_egress));
+            let last_error = Arc::new(Mutex::new(None));
 
             // Register `NotifyIpInterfaceChange` for instant Wi-Fi/Ethernet/sleep/wake recovery!
             let mut notify_ctx = Box::new(NetChangeCallbackCtx {
@@ -1483,9 +1633,8 @@ mod win_impl {
                         }
                     }
                     drop(notify_ctx);
-                    let mut outcome = RecoveryOutcome::default();
                     let rec_final = recovery_record.lock().clone();
-                    recover_windows_tun_record(&rec_final, &mut outcome);
+                    let _ = rollback_windows_record_and_finalize(&rec_final, &spec.state_dir);
                     // SAFETY: No worker thread spawned; safe to end session, close adapter, and close event.
                     unsafe {
                         (api.end_session)(session);
@@ -1493,7 +1642,6 @@ mod win_impl {
                         let _ = CloseHandle(stop_event);
                     }
                     clear_global_socket_protector();
-                    let _ = update_current_journal(&spec.state_dir, |j| j.windows_tun = None);
                     return Err(err);
                 }
             };
@@ -1548,16 +1696,14 @@ mod win_impl {
                     }
                     drop(notify_ctx);
                     let _ = rx_thread.join();
-                    let mut outcome = RecoveryOutcome::default();
                     let rec_final = recovery_record.lock().clone();
-                    recover_windows_tun_record(&rec_final, &mut outcome);
+                    let _ = rollback_windows_record_and_finalize(&rec_final, &spec.state_dir);
                     unsafe {
                         (api.end_session)(session);
                         (api.close_adapter)(adapter);
                         let _ = CloseHandle(stop_event);
                     }
                     clear_global_socket_protector();
-                    let _ = update_current_journal(&spec.state_dir, |j| j.windows_tun = None);
                     return Err(err);
                 }
             };
@@ -1580,6 +1726,7 @@ mod win_impl {
                 tx_packets,
                 network_transitions,
                 egress_state,
+                last_error,
                 rx_thread: Some(rx_thread),
                 tx_thread: Some(tx_thread),
             })
@@ -1629,7 +1776,7 @@ mod win_impl {
                 network_transitions: self.network_transitions.load(Ordering::Relaxed),
                 rx_packets: self.rx_packets.load(Ordering::Relaxed),
                 tx_packets: self.tx_packets.load(Ordering::Relaxed),
-                last_error: None,
+                last_error: self.last_error.lock().clone(),
             }
         }
 
@@ -1665,12 +1812,11 @@ mod win_impl {
                 let _ = h.join();
             }
 
-            // 3. Roll back routes & DNS overrides, end Wintun session, close adapter & event, clear journal
-            let mut outcome = RecoveryOutcome::default();
+            // 3. Roll back routes & DNS overrides, end Wintun session, close adapter & event, finalize journal
             let rec_final = self.recovery_record.lock().clone();
-            recover_windows_tun_record(&rec_final, &mut outcome);
-            for warn_msg in &outcome.warnings {
-                tracing::warn!("Windows Wintun teardown recovery warning: {}", warn_msg);
+            let outcome = rollback_windows_record_and_finalize(&rec_final, &self.spec.state_dir);
+            if !outcome.warnings.is_empty() {
+                *self.last_error.lock() = Some(outcome.warnings.join("; "));
             }
 
             // SAFETY: Worker threads have joined, so `session`, `adapter`, and `stop_event` have single ownership.
@@ -1690,7 +1836,6 @@ mod win_impl {
             }
 
             clear_global_socket_protector();
-            let _ = update_current_journal(&self.spec.state_dir, |j| j.windows_tun = None);
         }
     }
 
@@ -1704,7 +1849,7 @@ mod win_impl {
 #[cfg(windows)]
 pub use win_impl::{
     WindowsWintunSession, detect_windows_physical_egress, is_windows_process_elevated,
-    preflight_windows_tun, recover_windows_tun_record,
+    preflight_windows_tun, recover_windows_tun_record, recover_windows_tun_record_pruning,
 };
 
 #[cfg(test)]
@@ -2031,6 +2176,7 @@ mod tests {
                 interface_guid: guid.to_string(),
                 ipv4: orig_v4,
                 ipv6: None,
+                restore_ipv4: true,
             }),
         };
         let mut outcome = RecoveryOutcome::default();
@@ -2166,5 +2312,122 @@ mod tests {
         assert_eq!(merge_non_zero_protector_indices(11, 11, 15, 15), (15, 15));
         // Initially IPv4-only (11, 0), then IPv6 comes online (11, 11) -> (11, 11).
         assert_eq!(merge_non_zero_protector_indices(11, 0, 11, 11), (11, 11));
+    }
+
+    #[test]
+    fn windows_dns_partial_rollback_retains_only_unrestored_family_and_treats_absent_adapter_as_benign()
+     {
+        use crate::platform::recovery::{
+            RecoveryOutcome, WindowsDnsFamilySnapshot, WindowsDnsInterfaceBackup,
+            WindowsRecoveryRecord, WindowsRouteRecord,
+        };
+
+        struct PartialFailDnsOps {
+            fail_ipv6: bool,
+            v4_calls: usize,
+            v6_calls: usize,
+        }
+
+        impl WindowsDnsOps for PartialFailDnsOps {
+            fn resolve_luid_guid(&mut self, _luid_value: u64) -> io::Result<String> {
+                Ok("{11111111-2222-3333-4444-555555555555}".to_string())
+            }
+            fn get_dns_settings(
+                &mut self,
+                _interface_guid: &str,
+                _ipv6: bool,
+            ) -> io::Result<WindowsDnsFamilySnapshot> {
+                unreachable!("not used during rollback")
+            }
+            fn set_dns_settings(
+                &mut self,
+                _interface_guid: &str,
+                ipv6: bool,
+                _settings: &WindowsDnsFamilySnapshot,
+            ) -> io::Result<()> {
+                if ipv6 {
+                    self.v6_calls += 1;
+                    if self.fail_ipv6 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Access is denied (os error 5)",
+                        ));
+                    }
+                } else {
+                    self.v4_calls += 1;
+                }
+                Ok(())
+            }
+        }
+
+        let guid = "{11111111-2222-3333-4444-555555555555}".to_string();
+        let rec = WindowsRecoveryRecord {
+            adapter_name: "RustClash".to_string(),
+            adapter_luid: 0x0006_0000_0000_0099,
+            owned_routes: vec![
+                // Wintun split route that already disappeared with adapter (`ERROR_NOT_FOUND = 1168`)
+                WindowsRouteRecord {
+                    destination_prefix: "0.0.0.0".to_string(),
+                    prefix_length: 1,
+                    next_hop: "198.18.0.1".to_string(),
+                    interface_luid: 0x0006_0000_0000_0099,
+                },
+            ],
+            dns_interface_guid: Some(guid.clone()),
+            previous_dns_servers: Some(vec!["192.168.1.1".to_string()]),
+            dns_backup: Some(WindowsDnsInterfaceBackup {
+                interface_guid: guid.clone(),
+                ipv4: WindowsDnsFamilySnapshot {
+                    name_server: "192.168.1.1".to_string(),
+                    domain: None,
+                    search_list: None,
+                },
+                ipv6: Some(WindowsDnsFamilySnapshot {
+                    name_server: "fe80::1".to_string(),
+                    domain: None,
+                    search_list: None,
+                }),
+                restore_ipv4: true,
+            }),
+        };
+
+        // Pass 1: route delete returns benign `ERROR_NOT_FOUND (1168)`, IPv4 DNS succeeds, IPv6 DNS fails.
+        let mut ops = PartialFailDnsOps {
+            fail_ipv6: true,
+            v4_calls: 0,
+            v6_calls: 0,
+        };
+        let mut outcome1 = RecoveryOutcome::default();
+        let rem1 = rollback_windows_record_with_ops(
+            &rec,
+            &mut ops,
+            |_r| Err(io::Error::from_raw_os_error(1168)),
+            &mut outcome1,
+        )
+        .expect("failed IPv6 DNS restore must retain pruned WindowsRecoveryRecord");
+        assert_eq!(ops.v4_calls, 1);
+        assert_eq!(ops.v6_calls, 1);
+        assert_eq!(outcome1.warnings.len(), 1);
+        assert!(rem1.owned_routes.is_empty());
+        let rem_backup = rem1.dns_backup.as_ref().unwrap();
+        assert!(
+            !rem_backup.restore_ipv4,
+            "already-restored IPv4 DNS must not be re-applied on retry"
+        );
+        assert!(rem_backup.ipv6.is_some());
+
+        // Pass 2: retry restores ONLY IPv6 DNS (`v4_calls` stays 1) and returns `None`.
+        ops.fail_ipv6 = false;
+        let mut outcome2 = RecoveryOutcome::default();
+        let rem2 = rollback_windows_record_with_ops(
+            &rem1,
+            &mut ops,
+            |_r| unreachable!("no remaining routes"),
+            &mut outcome2,
+        );
+        assert!(rem2.is_none());
+        assert!(outcome2.warnings.is_empty());
+        assert_eq!(ops.v4_calls, 1);
+        assert_eq!(ops.v6_calls, 2);
     }
 }

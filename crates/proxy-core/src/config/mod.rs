@@ -213,6 +213,78 @@ pub struct SkippedProxyEntry {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSanitizationReport {
+    pub input_rule_count: usize,
+    pub kept_rule_count: usize,
+    pub filtered_rule_count: usize,
+    #[serde(default)]
+    pub synthesized_match_fallback: bool,
+    pub match_only_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_fallback_target: Option<String>,
+}
+
+impl RuleSanitizationReport {
+    pub fn warning_summary(&self, mode: RunMode) -> Option<String> {
+        let mode_label = match mode {
+            RunMode::Rule => "rule",
+            RunMode::Global => "global",
+            RunMode::Direct => "direct",
+        };
+        if self.match_only_fallback
+            && let Some(target) = self.match_fallback_target.as_deref()
+        {
+            if self.filtered_rule_count > 0 {
+                let origin = if self.synthesized_match_fallback {
+                    " (auto-generated fallback)"
+                } else {
+                    ""
+                };
+                return Some(format!(
+                    "Filtered {} unsupported/invalid rule(s) (of {}); only 'MATCH,{target}' remains{origin} — in '{mode_label}' mode all traffic routes via '{target}'",
+                    self.filtered_rule_count, self.input_rule_count
+                ));
+            }
+            if self.synthesized_match_fallback {
+                return Some(format!(
+                    "Profile contained no valid routing rules; synthesized fallback 'MATCH,{target}' — in '{mode_label}' mode all traffic routes via '{target}'"
+                ));
+            }
+            if mode == RunMode::Rule && !target.eq_ignore_ascii_case("DIRECT") {
+                return Some(format!(
+                    "Profile in 'rule' mode contains only fallback rule 'MATCH,{target}'; all traffic routes via '{target}' without split-tunneling"
+                ));
+            }
+        }
+        if self.filtered_rule_count > 0 {
+            return Some(format!(
+                "Filtered {} unsupported/invalid rule(s) during import ({} of {} rule(s) kept)",
+                self.filtered_rule_count, self.kept_rule_count, self.input_rule_count
+            ));
+        }
+        None
+    }
+}
+
+/// If `cfg.rules` effectively starts with a catch-all `MATCH` rule (meaning zero split-tunneling
+/// rules precede `MATCH`), returns `Some(target)` of that `MATCH` rule.
+pub fn effective_match_only_target(cfg: &ClashConfig) -> Option<String> {
+    for line in &cfg.rules {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let compiled = CompiledRule::parse_with_context(trimmed, None, None).ok()?;
+        return if matches!(compiled.matcher, crate::router::rules::RuleMatcher::Match) {
+            Some(compiled.target)
+        } else {
+            None
+        };
+    }
+    None
+}
+
 pub(crate) type YamlValue = serde_json::Value;
 pub(crate) type YamlMap = serde_json::Map<String, serde_json::Value>;
 
@@ -543,12 +615,28 @@ impl ClashConfig {
     ///   unsupported rule types, `:53` / `:9090` listeners) are normalized into valid `ClashConfig` structures.
     /// - If `skipped` is non-empty and `0` valid proxy nodes remain, fails closed with the redacted error!
     pub fn from_yaml_str_sanitized(yaml: &str) -> Result<(Self, Vec<SkippedProxyEntry>)> {
+        let (cfg, skipped, _) = Self::from_yaml_str_sanitized_with_report(yaml)?;
+        Ok((cfg, skipped))
+    }
+
+    pub fn from_yaml_str_sanitized_with_report(
+        yaml: &str,
+    ) -> Result<(Self, Vec<SkippedProxyEntry>, RuleSanitizationReport)> {
         let mut root = parse_yaml_value_with_merges(yaml)?;
         let YamlValue::Object(ref mut map) = root else {
             return Err(ProxyError::Config(
                 "YAML configuration root must be a key-value mapping".into(),
             ));
         };
+
+        let non_string_yaml_rules =
+            map.get("rules")
+                .and_then(YamlValue::as_array)
+                .map_or(0, |arr| {
+                    arr.iter()
+                        .filter(|v| !v.is_string() && !v.is_null())
+                        .count()
+                });
 
         normalize_clash_yaml_root_mapping(map, true);
 
@@ -630,10 +718,14 @@ impl ClashConfig {
 
         cfg.normalize_secret();
         cfg.sync_root_hosts_into_dns();
-        sanitize_subscription_groups_and_rules(&mut cfg, &skipped_names);
+        let mut rule_report = sanitize_subscription_groups_and_rules(&mut cfg, &skipped_names);
+        if non_string_yaml_rules > 0 {
+            rule_report.input_rule_count += non_string_yaml_rules;
+            rule_report.filtered_rule_count += non_string_yaml_rules;
+        }
 
         cfg.validate()?;
-        Ok((cfg, skipped))
+        Ok((cfg, skipped, rule_report))
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -2623,7 +2715,10 @@ pub(crate) fn decode_http_chunked_body(mut input: &[u8], max_bytes: usize) -> Re
     }
 }
 
-fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: &HashSet<String>) {
+fn sanitize_subscription_groups_and_rules(
+    cfg: &mut ClashConfig,
+    skipped_names: &HashSet<String>,
+) -> RuleSanitizationReport {
     // Neutralize dangerous listener, authentication, secret, host-path probing, and privilege-escalation
     // fields from untrusted remote subscription payloads.
     cfg.secret = None;
@@ -2804,12 +2899,15 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
         None
     };
 
+    let mut input_rule_count = 0usize;
+    let mut filtered_rule_count = 0usize;
     let mut sanitized_rules = Vec::with_capacity(cfg.rules.len());
     for line in &cfg.rules {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        input_rule_count += 1;
         let mut rewritten = trimmed.to_string();
         let mut parts: Vec<String> = trimmed.split(',').map(|s| s.trim().to_string()).collect();
         if parts.len() == 2
@@ -2832,6 +2930,7 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
 
         let Ok(compiled) = CompiledRule::parse_with_context(&rewritten, dummy_mmdb.as_ref(), None)
         else {
+            filtered_rule_count += 1;
             continue;
         };
         if let crate::router::rules::RuleMatcher::RuleSet {
@@ -2839,21 +2938,39 @@ fn sanitize_subscription_groups_and_rules(cfg: &mut ClashConfig, skipped_names: 
         } = compiled.matcher
             && !cfg.rule_providers.contains_key(provider_name)
         {
+            filtered_rule_count += 1;
             continue;
         }
         if !valid_rule_targets.contains(compiled.target.as_str()) {
             if matches!(compiled.matcher, crate::router::rules::RuleMatcher::Match) {
                 sanitized_rules.push(format!("MATCH,{fallback_target}"));
+            } else {
+                filtered_rule_count += 1;
             }
             continue;
         }
         sanitized_rules.push(rewritten);
     }
 
+    let mut synthesized_match_fallback = false;
     if sanitized_rules.is_empty() && (had_non_empty_rules || !cfg.proxies.is_empty()) {
         sanitized_rules.push(format!("MATCH,{fallback_target}"));
+        synthesized_match_fallback = true;
     }
+    let kept_rule_count = sanitized_rules.len();
     cfg.rules = sanitized_rules;
+
+    let match_fallback_target = effective_match_only_target(cfg);
+    let match_only_fallback = match_fallback_target.is_some();
+
+    RuleSanitizationReport {
+        input_rule_count,
+        kept_rule_count,
+        filtered_rule_count,
+        synthesized_match_fallback,
+        match_only_fallback,
+        match_fallback_target,
+    }
 }
 
 fn yaml_str_field<'a>(map: &'a YamlMap, key: &str) -> Option<&'a str> {
@@ -5269,5 +5386,101 @@ rules:
             }
             other => panic!("unexpected node: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rule_sanitization_report_tracks_filtered_rules_and_match_only_fallback_target() {
+        // Case 1: `mode: Rule` subscription whose split rules are ALL unsupported (`SUB-RULE`, `IN-TYPE`,
+        // dangling `RULE-SET`) -> synthesizes `MATCH,🚀 节点选择` and reports `match_only_fallback`.
+        let all_filtered_yaml = r#"
+mode: Rule
+proxies:
+  - name: HK-Node
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies: [HK-Node, DIRECT]
+rules:
+  - SUB-RULE,(NETWORK,tcp),SUB-GROUP
+  - IN-TYPE,SOCKS/HTTP,DIRECT
+  - RULE-SET,missing-provider,DIRECT
+"#;
+        let (cfg1, skipped1, rep1) =
+            ClashConfig::from_yaml_str_sanitized_with_report(all_filtered_yaml).unwrap();
+        assert!(skipped1.is_empty());
+        assert_eq!(cfg1.mode, RunMode::Rule);
+        assert_eq!(rep1.input_rule_count, 3);
+        assert_eq!(rep1.filtered_rule_count, 3);
+        assert_eq!(rep1.kept_rule_count, 1);
+        assert!(rep1.synthesized_match_fallback);
+        assert!(rep1.match_only_fallback);
+        assert_eq!(rep1.match_fallback_target.as_deref(), Some("🚀 节点选择"));
+        let warn1 = rep1
+            .warning_summary(cfg1.mode)
+            .expect("must emit warning summary");
+        assert!(warn1.contains("Filtered 3 unsupported/invalid rule(s)"));
+        assert!(warn1.contains("only 'MATCH,🚀 节点选择' remains"));
+        assert!(warn1.contains("all traffic routes via '🚀 节点选择'"));
+
+        // Case 2: Unsupported split rules + explicit `MATCH,🚀 节点选择` -> still `match_only_fallback`,
+        // with `synthesized_match_fallback == false`.
+        let explicit_match_yaml = r#"
+mode: Rule
+proxies:
+  - name: HK-Node
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies: [HK-Node, DIRECT]
+rules:
+  - SUB-RULE,(NETWORK,tcp),SUB-GROUP
+  - IN-TYPE,SOCKS/HTTP,DIRECT
+  - MATCH,🚀 节点选择
+"#;
+        let (cfg2, _, rep2) =
+            ClashConfig::from_yaml_str_sanitized_with_report(explicit_match_yaml).unwrap();
+        assert_eq!(rep2.input_rule_count, 3);
+        assert_eq!(rep2.filtered_rule_count, 2);
+        assert_eq!(rep2.kept_rule_count, 1);
+        assert!(!rep2.synthesized_match_fallback);
+        assert!(rep2.match_only_fallback);
+        assert_eq!(rep2.match_fallback_target.as_deref(), Some("🚀 节点选择"));
+        assert!(rep2.warning_summary(cfg2.mode).is_some());
+
+        // Case 3: Surviving split rule (`DOMAIN-SUFFIX,cn,DIRECT`) + 1 unsupported rule + `MATCH,🚀 节点选择`
+        // -> NOT `match_only_fallback`, but still reports `filtered_rule_count == 1`.
+        let partial_yaml = r#"
+mode: Rule
+proxies:
+  - name: HK-Node
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies: [HK-Node, DIRECT]
+rules:
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - SUB-RULE,(NETWORK,tcp),SUB-GROUP
+  - MATCH,🚀 节点选择
+"#;
+        let (cfg3, _, rep3) =
+            ClashConfig::from_yaml_str_sanitized_with_report(partial_yaml).unwrap();
+        assert_eq!(rep3.input_rule_count, 3);
+        assert_eq!(rep3.filtered_rule_count, 1);
+        assert_eq!(rep3.kept_rule_count, 2);
+        assert!(!rep3.synthesized_match_fallback);
+        assert!(!rep3.match_only_fallback);
+        assert!(rep3.match_fallback_target.is_none());
+        let warn3 = rep3.warning_summary(cfg3.mode).unwrap();
+        assert!(warn3.contains("Filtered 1 unsupported/invalid rule(s)"));
+        assert!(!warn3.contains("only 'MATCH"));
     }
 }

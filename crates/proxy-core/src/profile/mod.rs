@@ -19,7 +19,8 @@ use uuid::Uuid;
 use crate::{
     addr::TargetAddr,
     config::{
-        ClashConfig, ProxyGroupConfig, ProxyGroupType, ProxyNodeConfig, RunMode, SkippedProxyEntry,
+        ClashConfig, ProxyGroupConfig, ProxyGroupType, ProxyNodeConfig, RuleSanitizationReport,
+        RunMode, SkippedProxyEntry, effective_match_only_target,
         uri::{
             is_proxy_uri_token, parse_subscription_uris, parse_subscription_uris_best_effort,
             proxy_node_dedup_key, redact_sensitive_text, try_decode_base64_uri_list,
@@ -75,6 +76,8 @@ pub struct NodeMutationReport {
     pub skipped_duplicates: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_unsupported: Vec<SkippedProxyEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_sanitization: Option<RuleSanitizationReport>,
     pub total_nodes: usize,
     pub selected_groups: HashMap<String, String>,
     #[serde(skip)]
@@ -164,6 +167,10 @@ pub struct ProfileMetadata {
     pub rule_count: usize,
     #[serde(default)]
     pub last_skipped_count: usize,
+    #[serde(default)]
+    pub last_filtered_rule_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_only_fallback_target: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub selected_groups: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -873,10 +880,25 @@ pub fn parse_subscription_payload_sanitized(
     raw_body: &str,
     extra_ca_der: &[CertificateDer<'static>],
 ) -> Result<(ClashConfig, String, Vec<SkippedProxyEntry>)> {
+    let (cfg, yaml, skipped, _) =
+        parse_subscription_payload_sanitized_with_report(raw_body, extra_ca_der)?;
+    Ok((cfg, yaml, skipped))
+}
+
+pub fn parse_subscription_payload_sanitized_with_report(
+    raw_body: &str,
+    extra_ca_der: &[CertificateDer<'static>],
+) -> Result<(
+    ClashConfig,
+    String,
+    Vec<SkippedProxyEntry>,
+    Option<RuleSanitizationReport>,
+)> {
     let (kind, normalized) = classify_import_input(raw_body)?;
     match kind {
         ImportInputKind::ClashYaml => {
-            let (mut cfg, skipped) = ClashConfig::from_yaml_str_sanitized(&normalized)?;
+            let (mut cfg, skipped, rule_report) =
+                ClashConfig::from_yaml_str_sanitized_with_report(&normalized)?;
             cfg.secret = None;
             cfg.allow_lan = false;
             cfg.bind_address = "127.0.0.1".to_string();
@@ -900,7 +922,7 @@ pub fn parse_subscription_payload_sanitized(
             }
             validate_profile_config(&cfg, extra_ca_der)?;
             let persisted_yaml = cfg.to_yaml_string()?;
-            Ok((cfg, persisted_yaml, skipped))
+            Ok((cfg, persisted_yaml, skipped, Some(rule_report)))
         }
         ImportInputKind::ShareUris | ImportInputKind::Base64UriList => {
             let (mut cfg, skipped) = synthesize_config_from_uris_sanitized(&normalized)?;
@@ -916,7 +938,7 @@ pub fn parse_subscription_payload_sanitized(
             );
             validate_profile_config(&cfg, extra_ca_der)?;
             let yaml = cfg.to_yaml_string()?;
-            Ok((cfg, yaml, skipped))
+            Ok((cfg, yaml, skipped, None))
         }
         ImportInputKind::HttpsSubscriptionUrl => Err(ProxyError::Config(
             "subscription payload unexpectedly contained another URL instead of nodes or YAML"
@@ -1184,6 +1206,8 @@ impl ProfileManager {
                     group_count: starter_cfg.proxy_groups.len(),
                     rule_count,
                     last_skipped_count: 0,
+                    last_filtered_rule_count: 0,
+                    match_only_fallback_target: None,
                     selected_groups: default_selected_groups_for_config(
                         &starter_cfg,
                         &HashMap::new(),
@@ -1539,6 +1563,10 @@ impl ProfileManager {
                 }
                 p.last_error = None;
                 p.rule_preset = Some(next_preset);
+                if next_preset == RulePreset::SmartCn {
+                    p.last_filtered_rule_count = 0;
+                }
+                p.match_only_fallback_target = effective_match_only_target(&cfg);
                 p.custom_rules_backup = backup;
                 p.selected_groups = normalized_sel;
             }
@@ -1585,6 +1613,8 @@ impl ProfileManager {
                     p.last_updated_ms = now_unix_ms();
                 }
                 p.last_error = None;
+                p.last_filtered_rule_count = 0;
+                p.match_only_fallback_target = effective_match_only_target(&cfg);
                 p.rule_preset = Some(RulePreset::Custom);
                 p.custom_rules_backup = cleaned;
                 p.selected_groups = default_selected_groups_for_config(&cfg, &p.selected_groups);
@@ -1677,6 +1707,7 @@ impl ProfileManager {
                 p.last_updated_ms = now_unix_ms();
             }
             p.last_error = None;
+            p.match_only_fallback_target = effective_match_only_target(cfg);
             p.rule_preset = Some(detected_preset);
             if detected_preset == RulePreset::Custom {
                 p.custom_rules_backup = cfg.rules.clone();
@@ -1810,6 +1841,7 @@ impl ProfileManager {
             removed_nodes: Vec::new(),
             skipped_duplicates,
             skipped_unsupported,
+            rule_sanitization: None,
             total_nodes: cfg.proxies.len(),
             selected_groups,
             config: cfg,
@@ -1860,8 +1892,8 @@ impl ProfileManager {
                 self.import_nodes_to_active(raw_input, deduplicate, auto_select)
             }
             ImportInputKind::ClashYaml => {
-                let (mut cfg, skipped_unsupported) =
-                    ClashConfig::from_yaml_str_sanitized(&normalized).map_err(|e| {
+                let (mut cfg, skipped_unsupported, mut rule_report) =
+                    ClashConfig::from_yaml_str_sanitized_with_report(&normalized).map_err(|e| {
                         ProxyError::config_clean(redact_sensitive_text(&e.to_string()))
                     })?;
                 // Sanitize external template `tun.enable` so non-Admin cold restarts never fail on Wintun.
@@ -1870,6 +1902,8 @@ impl ProfileManager {
                 if deduplicate {
                     let (removed, _) = deduplicate_config_in_place(&mut cfg, &mut HashMap::new());
                     skipped_duplicates = removed.len();
+                    rule_report.match_fallback_target = effective_match_only_target(&cfg);
+                    rule_report.match_only_fallback = rule_report.match_fallback_target.is_some();
                 }
                 let (proxy_count, rule_count) = validate_profile_config(&cfg, &self.extra_ca_der)
                     .map_err(|e| {
@@ -1921,15 +1955,23 @@ impl ProfileManager {
                             activate: true,
                         })
                         .await?;
-                    if !skipped_unsupported.is_empty() {
+                    if !skipped_unsupported.is_empty()
+                        || rule_report.filtered_rule_count > 0
+                        || rule_report.match_fallback_target.is_some()
+                    {
                         meta.last_skipped_count = skipped_unsupported.len();
+                        meta.last_filtered_rule_count = rule_report.filtered_rule_count;
+                        meta.match_only_fallback_target = rule_report.match_fallback_target.clone();
                         let mut idx = self.index.lock();
                         if let Some(p) = idx.profiles.iter_mut().find(|p| p.id == meta.id) {
                             p.last_skipped_count = skipped_unsupported.len();
+                            p.last_filtered_rule_count = rule_report.filtered_rule_count;
+                            p.match_only_fallback_target =
+                                rule_report.match_fallback_target.clone();
                             if let Err(e) =
                                 save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)
                             {
-                                tracing::warn!("failed saving profile index skipped count: {e}");
+                                tracing::warn!("failed saving profile index diagnostics: {e}");
                             }
                         }
                     }
@@ -1940,6 +1982,7 @@ impl ProfileManager {
                         removed_nodes: Vec::new(),
                         skipped_duplicates,
                         skipped_unsupported,
+                        rule_sanitization: Some(rule_report),
                         total_nodes: cfg.proxies.len(),
                         selected_groups: meta.selected_groups,
                         config: cfg,
@@ -1976,6 +2019,8 @@ impl ProfileManager {
                         p.manual_proxy_count = 0;
                         p.rule_count = rule_count;
                         p.last_skipped_count = skipped_unsupported.len();
+                        p.last_filtered_rule_count = rule_report.filtered_rule_count;
+                        p.match_only_fallback_target = rule_report.match_fallback_target.clone();
                         p.last_updated_ms = now_unix_ms();
                         p.last_error = None;
                         p.rule_preset = Some(detected_preset);
@@ -1997,6 +2042,7 @@ impl ProfileManager {
                     removed_nodes: Vec::new(),
                     skipped_duplicates,
                     skipped_unsupported,
+                    rule_sanitization: Some(rule_report),
                     total_nodes: cfg.proxies.len(),
                     selected_groups,
                     config: cfg,
@@ -2029,8 +2075,8 @@ impl ProfileManager {
                     Some(secs) => Some(secs.max(60)),
                 };
 
-                let (meta, activated_cfg, skipped_unsupported) = self
-                    .create_profile_detailed(CreateProfileSpec {
+                let (meta, activated_cfg, skipped_unsupported, rule_sanitization) = self
+                    .create_profile_full(CreateProfileSpec {
                         name: sub_name,
                         yaml: None,
                         uris: None,
@@ -2055,6 +2101,7 @@ impl ProfileManager {
                     removed_nodes: Vec::new(),
                     skipped_duplicates: 0,
                     skipped_unsupported,
+                    rule_sanitization,
                     total_nodes: cfg.proxies.len(),
                     selected_groups: meta.selected_groups,
                     config: cfg,
@@ -2217,6 +2264,7 @@ impl ProfileManager {
             removed_nodes: Vec::new(),
             skipped_duplicates: 0,
             skipped_unsupported: Vec::new(),
+            rule_sanitization: None,
             total_nodes: cfg.proxies.len(),
             selected_groups,
             config: cfg,
@@ -2291,6 +2339,7 @@ impl ProfileManager {
             removed_nodes: vec![clean_target.to_string()],
             skipped_duplicates: 0,
             skipped_unsupported: Vec::new(),
+            rule_sanitization: None,
             total_nodes: cfg.proxies.len(),
             selected_groups,
             config: cfg,
@@ -2344,6 +2393,7 @@ impl ProfileManager {
             removed_nodes,
             skipped_duplicates,
             skipped_unsupported: Vec::new(),
+            rule_sanitization: None,
             total_nodes: cfg.proxies.len(),
             selected_groups,
             config: cfg,
@@ -2432,7 +2482,7 @@ impl ProfileManager {
         &self,
         spec: CreateProfileSpec,
     ) -> Result<(ProfileMetadata, Option<ClashConfig>)> {
-        let (meta, cfg, _) = self.create_profile_detailed(spec).await?;
+        let (meta, cfg, _, _) = self.create_profile_full(spec).await?;
         Ok((meta, cfg))
     }
 
@@ -2440,6 +2490,19 @@ impl ProfileManager {
         &self,
         spec: CreateProfileSpec,
     ) -> Result<(ProfileMetadata, Option<ClashConfig>, Vec<SkippedProxyEntry>)> {
+        let (meta, cfg, skipped, _) = self.create_profile_full(spec).await?;
+        Ok((meta, cfg, skipped))
+    }
+
+    pub async fn create_profile_full(
+        &self,
+        spec: CreateProfileSpec,
+    ) -> Result<(
+        ProfileMetadata,
+        Option<ClashConfig>,
+        Vec<SkippedProxyEntry>,
+        Option<RuleSanitizationReport>,
+    )> {
         let clean_name = spec.name.trim();
         if clean_name.is_empty() {
             return Err(ProxyError::Config("profile name cannot be empty".into()));
@@ -2447,7 +2510,7 @@ impl ProfileManager {
 
         let id = format!("prof-{}", &Uuid::new_v4().simple().to_string()[..12]);
         let fallback_proxy = self.fallback_proxy_outbound();
-        let (kind, cfg, yaml_str, redacted_url, userinfo, skipped_unsupported) =
+        let (kind, cfg, yaml_str, redacted_url, userinfo, skipped_unsupported, rule_report) =
             if let Some(raw_sub_url) = spec.subscription_url.as_deref().map(str::trim)
                 && !raw_sub_url.is_empty()
             {
@@ -2462,10 +2525,11 @@ impl ProfileManager {
                         .replace(raw_sub_url, "***REDACTED_URL***");
                     ProxyError::config_clean(safe)
                 })?;
-                let (parsed_cfg, normalized_yaml, skipped) =
-                    parse_subscription_payload_sanitized(&body, &self.extra_ca_der).map_err(
-                        |e| ProxyError::config_clean(redact_sensitive_text(&e.to_string())),
-                    )?;
+                let (parsed_cfg, normalized_yaml, skipped, r_rep) =
+                    parse_subscription_payload_sanitized_with_report(&body, &self.extra_ca_der)
+                        .map_err(|e| {
+                            ProxyError::config_clean(redact_sensitive_text(&e.to_string()))
+                        })?;
                 self.vault
                     .put_secret(&Self::sub_vault_key(&id), raw_sub_url)
                     .map_err(ProxyError::Io)?;
@@ -2476,6 +2540,7 @@ impl ProfileManager {
                     Some(redact_subscription_url(raw_sub_url)),
                     uinfo,
                     skipped,
+                    r_rep,
                 )
             } else if let Some(raw_uris) = spec.uris.as_deref().map(str::trim)
                 && !raw_uris.is_empty()
@@ -2490,12 +2555,15 @@ impl ProfileManager {
                     None,
                     None,
                     skipped,
+                    None,
                 )
             } else if let Some(raw_yaml) = spec.yaml.as_deref().map(str::trim)
                 && !raw_yaml.is_empty()
             {
-                let (mut parsed_cfg, skipped) = ClashConfig::from_yaml_str_sanitized(raw_yaml)
-                    .map_err(|e| ProxyError::config_clean(redact_sensitive_text(&e.to_string())))?;
+                let (mut parsed_cfg, skipped, r_rep) =
+                    ClashConfig::from_yaml_str_sanitized_with_report(raw_yaml).map_err(|e| {
+                        ProxyError::config_clean(redact_sensitive_text(&e.to_string()))
+                    })?;
                 parsed_cfg.tun.enable = false;
                 let persisted_yaml = parsed_cfg.to_yaml_string()?;
                 (
@@ -2505,6 +2573,7 @@ impl ProfileManager {
                     None,
                     None,
                     skipped,
+                    Some(r_rep),
                 )
             } else {
                 return Err(ProxyError::Config(
@@ -2540,6 +2609,8 @@ impl ProfileManager {
             group_count: cfg.proxy_groups.len(),
             rule_count,
             last_skipped_count: skipped_unsupported.len(),
+            last_filtered_rule_count: rule_report.as_ref().map_or(0, |r| r.filtered_rule_count),
+            match_only_fallback_target: effective_match_only_target(&cfg),
             selected_groups,
             rule_preset: Some(detected_preset),
             custom_rules_backup,
@@ -2558,7 +2629,7 @@ impl ProfileManager {
         }
 
         let activated_cfg = if spec.activate { Some(cfg) } else { None };
-        Ok((meta, activated_cfg, skipped_unsupported))
+        Ok((meta, activated_cfg, skipped_unsupported, rule_report))
     }
 
     /// Refresh an HTTPS subscription profile.
@@ -2568,6 +2639,19 @@ impl ProfileManager {
         &self,
         id: &str,
     ) -> Result<(ProfileMetadata, ClashConfig, bool)> {
+        let (meta, cfg, is_active, _) = self.refresh_subscription_with_report(id).await?;
+        Ok((meta, cfg, is_active))
+    }
+
+    pub async fn refresh_subscription_with_report(
+        &self,
+        id: &str,
+    ) -> Result<(
+        ProfileMetadata,
+        ClashConfig,
+        bool,
+        Option<RuleSanitizationReport>,
+    )> {
         let exists = {
             let idx = self.index.lock();
             idx.profiles
@@ -2593,27 +2677,42 @@ impl ProfileManager {
                 ))
             })?;
 
+        struct FetchedSubscriptionPayload {
+            cfg: ClashConfig,
+            yaml: String,
+            uinfo: Option<SubscriptionUserInfo>,
+            skipped: Vec<SkippedProxyEntry>,
+            rule_report: Option<RuleSanitizationReport>,
+        }
+
         let fallback_proxy = self.fallback_proxy_outbound();
-        let outcome: Result<(
-            ClashConfig,
-            String,
-            Option<SubscriptionUserInfo>,
-            Vec<SkippedProxyEntry>,
-        )> = async {
+        let outcome: Result<FetchedSubscriptionPayload> = async {
             let (body, uinfo) = fetch_subscription_http_with_proxy(
                 &raw_url,
                 &self.extra_ca_der,
                 fallback_proxy.as_ref(),
             )
             .await?;
-            let (cfg, yaml, skipped) =
-                parse_subscription_payload_sanitized(&body, &self.extra_ca_der)?;
-            Ok((cfg, yaml, uinfo, skipped))
+            let (cfg, yaml, skipped, rule_report) =
+                parse_subscription_payload_sanitized_with_report(&body, &self.extra_ca_der)?;
+            Ok(FetchedSubscriptionPayload {
+                cfg,
+                yaml,
+                uinfo,
+                skipped,
+                rule_report,
+            })
         }
         .await;
 
         match outcome {
-            Ok((mut cfg, mut yaml, uinfo, skipped)) => {
+            Ok(FetchedSubscriptionPayload {
+                mut cfg,
+                mut yaml,
+                uinfo,
+                skipped,
+                mut rule_report,
+            }) => {
                 let prev_cfg = ClashConfig::from_file(self.profile_yaml_path(id)).ok();
                 let mut cfg_mutated = false;
 
@@ -2654,6 +2753,7 @@ impl ProfileManager {
                 let manual_proxy_count = overlay.proxies.len();
 
                 let mut fresh_custom_backup: Option<Vec<String>> = None;
+                let mut smart_cn_applied = false;
                 if exists.rule_preset == Some(RulePreset::SmartCn) && !is_smart_cn_rule_list(&cfg) {
                     fresh_custom_backup = Some(cfg.rules.clone());
                     if cfg.proxy_groups.is_empty() {
@@ -2676,6 +2776,8 @@ impl ProfileManager {
                         cfg.dns.direct_nameserver =
                             crate::config::default_smart_cn_direct_nameservers();
                     }
+                    smart_cn_applied = true;
+                    rule_report = None;
                     cfg_mutated = true;
                 }
 
@@ -2721,6 +2823,12 @@ impl ProfileManager {
                         p.manual_proxy_count = manual_proxy_count;
                         p.rule_count = rule_count;
                         p.last_skipped_count = skipped.len();
+                        p.last_filtered_rule_count = if smart_cn_applied {
+                            0
+                        } else {
+                            rule_report.as_ref().map_or(0, |r| r.filtered_rule_count)
+                        };
+                        p.match_only_fallback_target = effective_match_only_target(&cfg);
                         p.rule_preset = Some(detected_preset);
                         if let Some(backup) = fresh_custom_backup {
                             p.custom_rules_backup = backup;
@@ -2737,7 +2845,7 @@ impl ProfileManager {
                     }
                 }
                 save_index_atomic(&self.profiles_dir.join(INDEX_FILE), &idx)?;
-                Ok((updated_meta.unwrap_or(exists), cfg, is_active))
+                Ok((updated_meta.unwrap_or(exists), cfg, is_active, rule_report))
             }
             Err(err) => {
                 self.last_attempt_ms
@@ -4973,6 +5081,68 @@ rules:
         assert_eq!(st, 200);
         assert_eq!(parsed_body, body);
         server_task.abort();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn yaml_import_surfaces_rule_sanitization_in_report_and_metadata_and_clears_on_smart_cn()
+    {
+        let dir = std::env::temp_dir().join(format!("rc-rule-san-meta-{}", Uuid::new_v4()));
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+
+        let raw_yaml = r#"
+mode: Rule
+proxies:
+  - name: SG-Fast
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: 🌏 Proxy
+    type: select
+    proxies: [SG-Fast, DIRECT]
+rules:
+  - SUB-RULE,(NETWORK,tcp),SUB-GROUP
+  - RULE-SET,non-existent-provider,DIRECT
+  - MATCH,🌏 Proxy
+"#;
+
+        let report = mgr
+            .import_unified_input(raw_yaml, None, true, true)
+            .await
+            .unwrap();
+        let rs = report
+            .rule_sanitization
+            .as_ref()
+            .expect("YAML import must attach rule_sanitization report");
+        assert_eq!(rs.filtered_rule_count, 2);
+        assert!(rs.match_only_fallback);
+        assert_eq!(rs.match_fallback_target.as_deref(), Some("🌏 Proxy"));
+
+        let snap = mgr.snapshot();
+        let active_meta = snap
+            .profiles
+            .iter()
+            .find(|p| p.id == snap.active_profile_id)
+            .unwrap();
+        assert_eq!(active_meta.last_filtered_rule_count, 2);
+        assert_eq!(
+            active_meta.match_only_fallback_target.as_deref(),
+            Some("🌏 Proxy")
+        );
+
+        // Switching to `smart-cn` restores real domestic/international split rules and clears both flags!
+        mgr.apply_routing_preset(RoutingPresetChoice::SmartCn)
+            .unwrap();
+        let snap_after = mgr.snapshot();
+        let meta_after = snap_after
+            .profiles
+            .iter()
+            .find(|p| p.id == snap_after.active_profile_id)
+            .unwrap();
+        assert_eq!(meta_after.last_filtered_rule_count, 0);
+        assert!(meta_after.match_only_fallback_target.is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

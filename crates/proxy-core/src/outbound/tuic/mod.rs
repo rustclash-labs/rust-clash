@@ -28,7 +28,7 @@ use crate::{
     outbound::{
         BoxedStream, DirectOutbound, OutboundHandler, OutboundUdpSession, hash_write_prefix,
         quic_common::{
-            CachedQuicSlot, QuicBiStream, QuicCongestionControl, QuicSessionLease,
+            CachedQuicSlot, QuicBiStream, QuicCongestionControl, QuicSessionLease, QuicWorkLease,
             bind_quinn_server_endpoint, build_quinn_server_config, build_quinn_transport_config,
             dial_protected_quic_connection,
         },
@@ -570,6 +570,10 @@ impl TuicAuthenticatedConn {
     fn is_usable(&self) -> bool {
         self.lease.is_usable()
     }
+
+    fn is_idle(&self) -> bool {
+        self.lease.active_work_count() == 0 && self.udp_sessions.is_empty()
+    }
 }
 
 struct TuicInner {
@@ -597,21 +601,97 @@ impl TuicInner {
         }
     }
 
-    async fn get_or_dial_session(&self) -> io::Result<Arc<TuicAuthenticatedConn>> {
-        if let Some(existing) = self.cached_conn.get_if(TuicAuthenticatedConn::is_usable) {
-            return Ok(existing);
+    fn reap_idle_for_low_power(&self) {
+        if let Some(evicted) = self
+            .cached_conn
+            .reap_if_low_power_idle(TuicAuthenticatedConn::is_idle)
+        {
+            evicted.lease.close_immediately(b"low power idle");
         }
-        let _guard = self.connect_lock.lock().await;
-        if let Some(existing) = self.cached_conn.get_if(TuicAuthenticatedConn::is_usable) {
-            return Ok(existing);
-        }
-        let session = self.dial_fresh_session().await?;
-        self.cached_conn.store(Arc::clone(&session));
-        Ok(session)
     }
 
-    async fn dial_fresh_session(&self) -> io::Result<Arc<TuicAuthenticatedConn>> {
-        let (endpoint, conn, _) = dial_protected_quic_connection(
+    async fn checkout_or_dial_session(
+        self: &Arc<Self>,
+    ) -> io::Result<(Arc<TuicAuthenticatedConn>, QuicWorkLease)> {
+        if let Some(pair) = self
+            .cached_conn
+            .checkout_if_usable(TuicAuthenticatedConn::is_usable, |s| s.lease.acquire_work())
+        {
+            return Ok(pair);
+        }
+        let _guard = self.connect_lock.lock().await;
+        if let Some(pair) = self
+            .cached_conn
+            .checkout_if_usable(TuicAuthenticatedConn::is_usable, |s| s.lease.acquire_work())
+        {
+            return Ok(pair);
+        }
+
+        for attempt in 0..2 {
+            let dial_gen = self.cached_conn.current_generation();
+            let session = self.dial_fresh_session().await?;
+            match self.cached_conn.store_if_generation_and_checkout(
+                dial_gen,
+                Arc::clone(&session),
+                TuicAuthenticatedConn::is_usable,
+                |s| s.lease.acquire_work(),
+            ) {
+                Ok((replaced, work)) => {
+                    if let Some(old) = replaced {
+                        old.lease.close_immediately(b"replaced");
+                    }
+                    return Ok((session, work));
+                }
+                Err(stale) => {
+                    stale.lease.close_immediately(b"stale network generation");
+                    if attempt == 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "network switched during TUIC QUIC handshake",
+                        ));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn preconnect_session(self: &Arc<Self>) -> io::Result<()> {
+        if self.cached_conn.is_low_power_mode() {
+            return Ok(());
+        }
+        if self
+            .cached_conn
+            .get_if(TuicAuthenticatedConn::is_usable)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let _guard = self.connect_lock.lock().await;
+        if self.cached_conn.is_low_power_mode()
+            || self
+                .cached_conn
+                .get_if(TuicAuthenticatedConn::is_usable)
+                .is_some()
+        {
+            return Ok(());
+        }
+        let dial_gen = self.cached_conn.current_generation();
+        let session = self.dial_fresh_session().await?;
+        if let Err(rejected) = self.cached_conn.store_preconnect_if_generation(
+            dial_gen,
+            session,
+            TuicAuthenticatedConn::is_usable,
+        ) {
+            rejected
+                .lease
+                .close_immediately(b"preconnect superseded or low power");
+        }
+        Ok(())
+    }
+
+    async fn dial_fresh_session(self: &Arc<Self>) -> io::Result<Arc<TuicAuthenticatedConn>> {
+        let (endpoint, conn, _, pre_epoch) = dial_protected_quic_connection(
             &self.cfg.server,
             self.cfg.port,
             self.sni_host(),
@@ -683,13 +763,12 @@ impl TuicInner {
                     continue;
                 };
                 let aid = pkt.assoc_id;
-                let dead = if let Some(tx) = udp_dgram_map.get(&aid) {
-                    tx.try_send(pkt).is_err() && tx.is_closed()
-                } else {
-                    false
-                };
-                if dead {
-                    udp_dgram_map.remove(&aid);
+                let tx = udp_dgram_map.get(&aid).map(|entry| entry.value().clone());
+                if let Some(tx) = tx
+                    && tx.try_send(pkt).is_err()
+                    && tx.is_closed()
+                {
+                    udp_dgram_map.remove_if(&aid, |_, cur| cur.same_channel(&tx));
                 }
             }
         });
@@ -704,13 +783,13 @@ impl TuicInner {
                         return;
                     };
                     let aid = pkt.assoc_id;
-                    let dead = if let Some(tx) = map_ref.get(&aid) {
-                        tx.send(pkt).await.is_err()
-                    } else {
-                        false
-                    };
-                    if dead {
-                        map_ref.remove(&aid);
+                    // Clone `mpsc::Sender` and drop the `DashMap` shard read guard BEFORE `.await`ing
+                    // so a full per-session queue can never deadlock `TuicUdpSession::drop` (`remove()`).
+                    let tx = map_ref.get(&aid).map(|entry| entry.value().clone());
+                    if let Some(tx) = tx
+                        && tx.send(pkt).await.is_err()
+                    {
+                        map_ref.remove_if(&aid, |_, cur| cur.same_channel(&tx));
                     }
                 });
             }
@@ -731,7 +810,13 @@ impl TuicInner {
             }
         });
 
-        let lease = QuicSessionLease::new(endpoint, conn);
+        let lease = QuicSessionLease::new_with_epoch(pre_epoch, endpoint, conn);
+        let weak_inner = Arc::downgrade(self);
+        lease.set_idle_hook(move || {
+            if let Some(inner) = weak_inner.upgrade() {
+                inner.reap_idle_for_low_power();
+            }
+        });
         Ok(Arc::new(TuicAuthenticatedConn {
             lease,
             udp_sessions,
@@ -745,6 +830,7 @@ impl TuicInner {
     async fn open_tcp_on_session(
         &self,
         sess: &Arc<TuicAuthenticatedConn>,
+        work: QuicWorkLease,
         target: &TargetAddr,
     ) -> io::Result<BoxedStream> {
         let (send, recv) = sess
@@ -762,7 +848,7 @@ impl TuicInner {
             send,
             recv,
             BytesMut::new(),
-            Some(Arc::clone(&sess.lease) as Arc<dyn Send + Sync>),
+            Some(Arc::new(work) as Arc<dyn Send + Sync>),
         );
         Ok(Box::new(TuicClientStream::new(quic_bi, hdr)))
     }
@@ -821,12 +907,16 @@ struct TuicUdpSession {
     assoc_id: u16,
     relay_mode: TuicUdpRelayMode,
     next_pkt_id: AtomicU16,
-    rx: AsyncMutex<mpsc::Receiver<TuicUdpPacket>>,
+    rx: Option<AsyncMutex<mpsc::Receiver<TuicUdpPacket>>>,
     defragger: Mutex<TuicDefragger>,
+    _work: Option<QuicWorkLease>,
 }
 
 impl Drop for TuicUdpSession {
     fn drop(&mut self) {
+        // Drop the `mpsc::Receiver` FIRST so any in-flight `tx.send(pkt).await` wakes up immediately
+        // with `SendError` before we touch `udp_sessions` or drop `_work`.
+        let _ = self.rx.take();
         self.conn.udp_sessions.remove(&self.assoc_id);
         let quic_conn = self.conn.lease.conn.clone();
         let aid = self.assoc_id;
@@ -844,6 +934,7 @@ impl Drop for TuicUdpSession {
                 }
             });
         }
+        let _ = self._work.take();
     }
 }
 
@@ -903,7 +994,10 @@ impl OutboundUdpSession for TuicUdpSession {
     }
 
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
-        let mut rx = self.rx.lock().await;
+        let rx_mutex = self.rx.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "TUIC UDP session closed")
+        })?;
+        let mut rx = rx_mutex.lock().await;
         loop {
             let Some(pkt) = rx.recv().await else {
                 return Err(io::Error::new(
@@ -938,11 +1032,21 @@ impl OutboundHandler for TuicOutbound {
     }
 
     fn on_network_change(&self) -> usize {
-        if let Some(evicted) = self.inner.cached_conn.take() {
+        if let Some(evicted) = self.inner.cached_conn.advance_generation_and_take() {
             evicted.lease.close_immediately(b"network change");
             1
         } else {
             0
+        }
+    }
+
+    fn set_low_power_mode(&self, enabled: bool) {
+        if let Some(evicted) = self
+            .inner
+            .cached_conn
+            .set_low_power_and_take_idle(enabled, TuicAuthenticatedConn::is_idle)
+        {
+            evicted.lease.close_immediately(b"low power idle");
         }
     }
 
@@ -951,20 +1055,20 @@ impl OutboundHandler for TuicOutbound {
             if let Some(dns) = &self.inner.dns {
                 let _ = dns.prewarm_proxy_server_ips(&self.inner.cfg.server).await;
             }
-            let _ = self.inner.get_or_dial_session().await?;
+            self.inner.preconnect_session().await?;
         }
         Ok(())
     }
 
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
-        let sess = self.inner.get_or_dial_session().await?;
-        match self.inner.open_tcp_on_session(&sess, target).await {
+        let (sess, work) = self.inner.checkout_or_dial_session().await?;
+        match self.inner.open_tcp_on_session(&sess, work, target).await {
             Ok(s) => Ok(s),
             Err(first_err) if sess.lease.conn.close_reason().is_some() => {
-                let _ = self.inner.cached_conn.take();
-                let fresh = self.inner.get_or_dial_session().await?;
+                self.inner.cached_conn.evict_if_same(&sess);
+                let (fresh, fresh_work) = self.inner.checkout_or_dial_session().await?;
                 self.inner
-                    .open_tcp_on_session(&fresh, target)
+                    .open_tcp_on_session(&fresh, fresh_work, target)
                     .await
                     .or(Err(first_err))
             }
@@ -979,7 +1083,7 @@ impl OutboundHandler for TuicOutbound {
                 "UDP disabled on this TUIC outbound",
             ));
         }
-        let sess = self.inner.get_or_dial_session().await?;
+        let (sess, work) = self.inner.checkout_or_dial_session().await?;
         let assoc_id = sess.next_assoc_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(128);
         sess.udp_sessions.insert(assoc_id, tx);
@@ -988,8 +1092,9 @@ impl OutboundHandler for TuicOutbound {
             assoc_id,
             relay_mode: self.inner.cfg.udp_relay_mode,
             next_pkt_id: AtomicU16::new(1),
-            rx: AsyncMutex::new(rx),
+            rx: Some(AsyncMutex::new(rx)),
             defragger: Mutex::new(TuicDefragger::default()),
+            _work: Some(work),
         }))
     }
 }
@@ -1351,5 +1456,101 @@ mod tests {
         let (assembled, src) = out.unwrap();
         assert_eq!(assembled, big);
         assert_eq!(src, target);
+    }
+
+    #[tokio::test]
+    async fn tuic_quic_stream_udp_drop_while_recv_queue_full_does_not_deadlock() {
+        let flood_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let flood_addr = flood_sock.local_addr().unwrap();
+        let (flood_done_tx, flood_done_rx) = tokio::sync::oneshot::channel();
+
+        let flood_bg = Arc::clone(&flood_sock);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            if let Ok((_, peer)) = flood_bg.recv_from(&mut buf).await {
+                // Send 220 packets (> 128 mpsc channel capacity) without the client reading any,
+                // forcing `uni_task` to fill the channel and park on `tx.send(pkt).await`.
+                let payload = [0x42u8; 64];
+                for _ in 0..220 {
+                    let _ = flood_bg.send_to(&payload, peer).await;
+                }
+                let _ = flood_done_tx.send(());
+            }
+        });
+
+        let sni = "tuic.deadlock.test";
+        let (tls_cfg, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let uuid = Uuid::new_v4();
+        let password = "tuic-deadlock-test-pw";
+        let srv = spawn_tuic_server(
+            "127.0.0.1:0".parse().unwrap(),
+            uuid,
+            password.to_string(),
+            tls_cfg,
+        )
+        .await
+        .unwrap();
+
+        let outbound = TuicOutbound::new(TuicOutboundConfig {
+            name: "tuic-quic-udp-flood".into(),
+            server: "127.0.0.1".into(),
+            port: srv.listen_addr.port(),
+            uuid,
+            password: password.into(),
+            udp_relay_mode: TuicUdpRelayMode::Quic,
+            congestion_control: QuicCongestionControl::Bbr,
+            zero_rtt_handshake: false,
+            disable_sni: false,
+            heartbeat_interval: Duration::from_secs(30),
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der],
+            udp: true,
+        })
+        .unwrap();
+
+        let udp_sess = outbound.open_udp_session().await.unwrap();
+        let flood_target = TargetAddr::from(flood_addr);
+        udp_sess.send_to(b"start", &flood_target).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), flood_done_rx)
+            .await
+            .expect("UDP flood server timed out")
+            .unwrap();
+        // Allow QUIC uni-streams to deliver >128 packets so `uni_task` blocks on full mpsc channel.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            drop(udp_sess);
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("dropping TuicUdpSession with full recv channel must not deadlock");
+
+        // Verify `udp_sessions` DashMap is unlocked and a fresh UDP session works on the same conn!
+        let echo_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 64];
+            if let Ok((n, p)) = echo_sock.recv_from(&mut b).await {
+                let _ = echo_sock.send_to(&b[..n], p).await;
+            }
+        });
+        let echoed = outbound
+            .exchange_udp(
+                &TargetAddr::from(echo_addr),
+                b"still-alive",
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("multiplexed TUIC session must remain usable after full-queue session drop");
+        assert_eq!(echoed, b"still-alive");
+
+        srv.shutdown().await;
     }
 }

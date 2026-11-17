@@ -4,7 +4,10 @@ use std::{
     io::{self, IoSliceMut},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -28,8 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use zeroize::Zeroize;
 
 use crate::platform::socket_protect::{
-    current_protector_epoch, global_socket_protector, prioritize_healthy_happy_eyeballs_addrs,
-    protected_udp_bind, resolve_protected_host_addrs,
+    HAPPY_EYEBALLS_DELAY, connect_addrs_happy_eyeballs_with, current_protector_epoch,
+    global_socket_protector, network_generation, note_addr_connect_outcome, protected_udp_bind,
+    resolve_protected_host_addrs,
 };
 
 /// Hysteria2 Salamander UDP obfuscator (`[8B random salt][payload ^ BLAKE2b-256(psk || salt)]`).
@@ -501,7 +505,174 @@ impl PortSpec {
     }
 }
 
-/// Resolve and connect a protected QUIC `Endpoint` + `quinn::Connection` across candidate addresses.
+/// Snapshot of socket-protector and network-reachability epochs captured BEFORE binding a UDP socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuicPreDialEpoch {
+    pub protector_epoch: u64,
+    pub net_generation: u64,
+}
+
+impl QuicPreDialEpoch {
+    pub fn capture() -> Self {
+        Self {
+            protector_epoch: current_protector_epoch(),
+            net_generation: network_generation(),
+        }
+    }
+
+    pub fn is_current(self) -> bool {
+        self.protector_epoch == current_protector_epoch()
+            && self.net_generation == network_generation()
+    }
+}
+
+/// RAII wrapper ensuring any losing Happy Eyeballs QUIC `Endpoint` closes its UDP driver task on abort/error.
+struct ScopedQuinnEndpoint(Option<Endpoint>);
+
+impl ScopedQuinnEndpoint {
+    fn new(ep: Endpoint) -> Self {
+        Self(Some(ep))
+    }
+
+    fn as_ref(&self) -> &Endpoint {
+        self.0.as_ref().expect("endpoint still owned")
+    }
+
+    fn into_inner(mut self) -> Endpoint {
+        self.0.take().expect("endpoint still owned")
+    }
+}
+
+impl Drop for ScopedQuinnEndpoint {
+    fn drop(&mut self) {
+        if let Some(ep) = self.0.take() {
+            ep.close(VarInt::from_u32(0), b"happy eyeballs cancelled");
+        }
+    }
+}
+
+async fn dial_single_quic_addr(
+    remote_addr: SocketAddr,
+    effective_sni: String,
+    client_cfg: QuinnClientConfig,
+    salamander: Option<SalamanderObfs>,
+    use_0rtt: bool,
+    handshake_timeout: Duration,
+) -> io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> {
+    let pre_epoch = QuicPreDialEpoch::capture();
+    let attempt: io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> = async {
+        let scoped_ep = ScopedQuinnEndpoint::new(bind_protected_quinn_client_endpoint(
+            remote_addr,
+            salamander,
+        )?);
+        let connecting = scoped_ep
+            .as_ref()
+            .connect_with(client_cfg, remote_addr, &effective_sni)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("QUIC connect setup failed: {e}"),
+                )
+            })?;
+        if use_0rtt {
+            match connecting.into_0rtt() {
+                Ok((conn, zero_rtt_accepted)) => {
+                    tokio::spawn(async move {
+                        let _ = zero_rtt_accepted.await;
+                    });
+                    return Ok((scoped_ep.into_inner(), conn, true, pre_epoch));
+                }
+                Err(connecting) => {
+                    let conn = tokio::time::timeout(handshake_timeout, connecting)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "QUIC handshake timed out after {}ms",
+                                    handshake_timeout.as_millis()
+                                ),
+                            )
+                        })?
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!("QUIC handshake failed: {e}"),
+                            )
+                        })?;
+                    return Ok((scoped_ep.into_inner(), conn, false, pre_epoch));
+                }
+            }
+        }
+        let conn = tokio::time::timeout(handshake_timeout, connecting)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "QUIC handshake timed out after {}ms",
+                        handshake_timeout.as_millis()
+                    ),
+                )
+            })?
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("QUIC handshake failed: {e}"),
+                )
+            })?;
+        Ok((scoped_ep.into_inner(), conn, false, pre_epoch))
+    }
+    .await;
+
+    note_addr_connect_outcome(remote_addr, attempt.as_ref().map(|_| ()));
+    attempt
+}
+
+/// Race pre-resolved candidate `SocketAddr`s for QUIC using RFC 8305 staggered Happy Eyeballs.
+pub async fn dial_protected_quic_addrs_happy_eyeballs(
+    addrs: &[SocketAddr],
+    sni_host: &str,
+    client_cfg: &QuinnClientConfig,
+    salamander: Option<&SalamanderObfs>,
+    use_0rtt: bool,
+    stagger_delay: Duration,
+    per_attempt_timeout: Duration,
+) -> io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "no candidate addresses for QUIC server",
+        ));
+    }
+    let clean_sni = sni_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let effective_sni = if clean_sni.is_empty() {
+        "localhost".to_string()
+    } else {
+        clean_sni.to_string()
+    };
+    let cfg_template = client_cfg.clone();
+    let salamander_template = salamander.cloned();
+
+    connect_addrs_happy_eyeballs_with(
+        addrs,
+        stagger_delay,
+        per_attempt_timeout,
+        move |remote_addr| {
+            let sni = effective_sni.clone();
+            let cfg = cfg_template.clone();
+            let obfs = salamander_template.clone();
+            dial_single_quic_addr(remote_addr, sni, cfg, obfs, use_0rtt, per_attempt_timeout)
+        },
+    )
+    .await
+}
+
+/// Resolve and connect a protected QUIC `Endpoint` + `quinn::Connection` across candidate addresses
+/// using 250ms RFC 8305 Happy Eyeballs staggering.
 pub async fn dial_protected_quic_connection(
     server_host: &str,
     port: u16,
@@ -510,7 +681,7 @@ pub async fn dial_protected_quic_connection(
     salamander: Option<&SalamanderObfs>,
     use_0rtt: bool,
     dns: Option<&crate::dns::FakeIpDnsEngine>,
-) -> io::Result<(Endpoint, quinn::Connection, bool)> {
+) -> io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> {
     let addrs = resolve_protected_host_addrs(server_host, port, dns).await?;
     if addrs.is_empty() {
         return Err(io::Error::new(
@@ -518,97 +689,64 @@ pub async fn dial_protected_quic_connection(
             format!("DNS lookup returned no addresses for QUIC server '{server_host}'"),
         ));
     }
-    let ordered = prioritize_healthy_happy_eyeballs_addrs(&addrs);
-    let clean_sni = sni_host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let effective_sni = if clean_sni.is_empty() {
-        "localhost"
-    } else {
-        clean_sni
-    };
-
-    let mut last_err: Option<io::Error> = None;
-    for remote_addr in ordered.into_iter().take(4) {
-        let attempt: io::Result<(Endpoint, quinn::Connection, bool)> = async {
-            let endpoint = bind_protected_quinn_client_endpoint(remote_addr, salamander.cloned())?;
-            let connecting = endpoint
-                .connect_with(client_cfg.clone(), remote_addr, effective_sni)
-                .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("QUIC connect setup failed: {e}"),
-                    )
-                })?;
-            if use_0rtt {
-                match connecting.into_0rtt() {
-                    Ok((conn, zero_rtt_accepted)) => {
-                        tokio::spawn(async move {
-                            let _ = zero_rtt_accepted.await;
-                        });
-                        return Ok((endpoint, conn, true));
-                    }
-                    Err(connecting) => {
-                        let conn =
-                            crate::outbound::with_handshake_timeout("QUIC handshake", async move {
-                                connecting.await.map_err(|e| {
-                                    io::Error::new(
-                                        io::ErrorKind::ConnectionRefused,
-                                        format!("QUIC handshake failed: {e}"),
-                                    )
-                                })
-                            })
-                            .await?;
-                        return Ok((endpoint, conn, false));
-                    }
-                }
-            }
-            let conn = crate::outbound::with_handshake_timeout("QUIC handshake", async move {
-                connecting.await.map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("QUIC handshake failed: {e}"),
-                    )
-                })
-            })
-            .await?;
-            Ok((endpoint, conn, false))
-        }
-        .await;
-
-        match attempt {
-            Ok(ok) => return Ok(ok),
-            Err(e) => last_err = Some(e),
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::HostUnreachable,
-            "unable to connect QUIC endpoint",
-        )
-    }))
+    dial_protected_quic_addrs_happy_eyeballs(
+        &addrs,
+        sni_host,
+        client_cfg,
+        salamander,
+        use_0rtt,
+        HAPPY_EYEBALLS_DELAY,
+        crate::outbound::OUTBOUND_HANDSHAKE_TIMEOUT,
+    )
+    .await
 }
 
-/// Shared holder keeping a `quinn::Endpoint` alive for as long as its `quinn::Connection` or child streams live.
+/// Shared holder keeping a `quinn::Endpoint` alive for as long as its `quinn::Connection` or child streams live,
+/// while tracking active stream/UDP session count for screen-off (`low_power_mode`) idle reaping.
 pub struct QuicSessionLease {
-    pub protector_epoch: u64,
+    pub pre_epoch: QuicPreDialEpoch,
     pub endpoint: Endpoint,
     pub conn: quinn::Connection,
+    active_work: AtomicUsize,
+    idle_hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl QuicSessionLease {
     pub fn new(endpoint: Endpoint, conn: quinn::Connection) -> Arc<Self> {
+        Self::new_with_epoch(QuicPreDialEpoch::capture(), endpoint, conn)
+    }
+
+    pub fn new_with_epoch(
+        pre_epoch: QuicPreDialEpoch,
+        endpoint: Endpoint,
+        conn: quinn::Connection,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            protector_epoch: current_protector_epoch(),
+            pre_epoch,
             endpoint,
             conn,
+            active_work: AtomicUsize::new(0),
+            idle_hook: OnceLock::new(),
         })
     }
 
+    pub fn set_idle_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.idle_hook.set(Box::new(hook));
+    }
+
+    pub fn active_work_count(&self) -> usize {
+        self.active_work.load(Ordering::Acquire)
+    }
+
+    pub fn acquire_work(self: &Arc<Self>) -> QuicWorkLease {
+        self.active_work.fetch_add(1, Ordering::AcqRel);
+        QuicWorkLease {
+            lease: Arc::clone(self),
+        }
+    }
+
     pub fn is_usable(&self) -> bool {
-        self.protector_epoch == current_protector_epoch() && self.conn.close_reason().is_none()
+        self.pre_epoch.is_current() && self.conn.close_reason().is_none()
     }
 
     pub fn close_immediately(&self, reason: &'static [u8]) {
@@ -617,12 +755,37 @@ impl QuicSessionLease {
     }
 }
 
-/// Evictable single-slot cache helper for multiplexed QUIC sessions.
-pub struct CachedQuicSlot<T>(Mutex<Option<Arc<T>>>);
+/// RAII lease representing one active TCP stream or stateful UDP session multiplexed over a `QuicSessionLease`.
+pub struct QuicWorkLease {
+    lease: Arc<QuicSessionLease>,
+}
+
+impl Drop for QuicWorkLease {
+    fn drop(&mut self) {
+        if self.lease.active_work.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(hook) = self.lease.idle_hook.get()
+        {
+            hook();
+        }
+    }
+}
+
+struct CachedQuicState<T> {
+    generation: u64,
+    low_power_mode: bool,
+    current: Option<Arc<T>>,
+}
+
+/// Generation-aware, low-power-aware single-slot cache helper for multiplexed QUIC sessions.
+pub struct CachedQuicSlot<T>(Mutex<CachedQuicState<T>>);
 
 impl<T> Default for CachedQuicSlot<T> {
     fn default() -> Self {
-        Self(Mutex::new(None))
+        Self(Mutex::new(CachedQuicState {
+            generation: 0,
+            low_power_mode: false,
+            current: None,
+        }))
     }
 }
 
@@ -631,23 +794,130 @@ impl<T> CachedQuicSlot<T> {
         Self::default()
     }
 
+    pub fn current_generation(&self) -> u64 {
+        self.0.lock().generation
+    }
+
+    pub fn is_low_power_mode(&self) -> bool {
+        self.0.lock().low_power_mode
+    }
+
     pub fn get_if(&self, pred: impl FnOnce(&T) -> bool) -> Option<Arc<T>> {
         let mut guard = self.0.lock();
-        if let Some(existing) = guard.as_ref() {
+        if let Some(existing) = guard.current.as_ref() {
             if pred(existing) {
                 return Some(Arc::clone(existing));
             }
-            *guard = None;
+            guard.current = None;
         }
         None
     }
 
-    pub fn store(&self, val: Arc<T>) {
-        *self.0.lock() = Some(val);
+    /// Atomically validate `usable(existing)` and acquire a work lease inside the slot mutex
+    /// so `set_low_power_mode(true)` can never race and reap a session being checked out.
+    pub fn checkout_if_usable<U, A, W>(&self, usable: U, acquire: A) -> Option<(Arc<T>, W)>
+    where
+        U: FnOnce(&T) -> bool,
+        A: FnOnce(&T) -> W,
+    {
+        let mut guard = self.0.lock();
+        if let Some(existing) = guard.current.as_ref() {
+            if usable(existing) {
+                let work = acquire(existing);
+                return Some((Arc::clone(existing), work));
+            }
+            guard.current = None;
+        }
+        None
     }
 
-    pub fn take(&self) -> Option<Arc<T>> {
-        self.0.lock().take()
+    /// Store `val` and acquire a work lease ONLY if `dial_gen == self.generation` and `usable(&val)`.
+    /// Returns `Err(val)` without modifying the slot if a network switch bumped `generation` while dialing.
+    pub fn store_if_generation_and_checkout<U, A, W>(
+        &self,
+        dial_gen: u64,
+        val: Arc<T>,
+        usable: U,
+        acquire: A,
+    ) -> Result<(Option<Arc<T>>, W), Arc<T>>
+    where
+        U: FnOnce(&T) -> bool,
+        A: FnOnce(&T) -> W,
+    {
+        let mut guard = self.0.lock();
+        if guard.generation != dial_gen || !usable(&val) {
+            return Err(val);
+        }
+        let work = acquire(&val);
+        let replaced = guard.current.replace(val);
+        Ok((replaced, work))
+    }
+
+    /// Store a preconnected idle session ONLY if `dial_gen == self.generation`, `!low_power_mode`,
+    /// `usable(&val)`, and no usable session is already cached.
+    pub fn store_preconnect_if_generation<U>(
+        &self,
+        dial_gen: u64,
+        val: Arc<T>,
+        mut usable: U,
+    ) -> Result<(), Arc<T>>
+    where
+        U: FnMut(&T) -> bool,
+    {
+        let mut guard = self.0.lock();
+        if guard.generation != dial_gen || guard.low_power_mode || !usable(&val) {
+            return Err(val);
+        }
+        if guard.current.as_ref().is_some_and(|ex| usable(ex)) {
+            return Err(val);
+        }
+        guard.current = Some(val);
+        Ok(())
+    }
+
+    /// Evict the cached session ONLY if it is pointer-identical to `failed`, preserving any newer
+    /// session concurrently established by another task.
+    pub fn evict_if_same(&self, failed: &Arc<T>) -> bool {
+        let mut guard = self.0.lock();
+        if guard
+            .current
+            .as_ref()
+            .is_some_and(|cur| Arc::ptr_eq(cur, failed))
+        {
+            guard.current = None;
+            return true;
+        }
+        false
+    }
+
+    /// Atomically increment `generation` and take any cached session for `on_network_change()`.
+    pub fn advance_generation_and_take(&self) -> Option<Arc<T>> {
+        let mut guard = self.0.lock();
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.current.take()
+    }
+
+    /// Update `low_power_mode` and, when enabling low-power mode, evict the cached session if `is_idle`.
+    pub fn set_low_power_and_take_idle(
+        &self,
+        enabled: bool,
+        is_idle: impl FnOnce(&T) -> bool,
+    ) -> Option<Arc<T>> {
+        let mut guard = self.0.lock();
+        guard.low_power_mode = enabled;
+        if enabled && guard.current.as_deref().is_some_and(is_idle) {
+            return guard.current.take();
+        }
+        None
+    }
+
+    /// Evict and return the cached session if `low_power_mode` is active and `is_idle` holds.
+    pub fn reap_if_low_power_idle(&self, is_idle: impl FnOnce(&T) -> bool) -> Option<Arc<T>> {
+        let mut guard = self.0.lock();
+        if guard.low_power_mode && guard.current.as_deref().is_some_and(is_idle) {
+            return guard.current.take();
+        }
+        None
     }
 }
 
@@ -825,5 +1095,297 @@ mod tests {
         }
         assert!(PortSpec::parse("30000-20000", 443).is_err());
         assert!(PortSpec::parse("0", 443).is_err());
+    }
+
+    #[test]
+    fn cached_quic_slot_generation_isolation_and_evict_if_same() {
+        #[derive(Debug)]
+        struct DummySession {
+            id: usize,
+            active: AtomicUsize,
+        }
+        impl DummySession {
+            fn new(id: usize) -> Arc<Self> {
+                Arc::new(Self {
+                    id,
+                    active: AtomicUsize::new(0),
+                })
+            }
+            fn acquire_work(&self) -> usize {
+                self.active.fetch_add(1, Ordering::AcqRel) + 1
+            }
+        }
+
+        let slot: CachedQuicSlot<DummySession> = CachedQuicSlot::new();
+        let dial_gen = slot.current_generation();
+        assert_eq!(dial_gen, 0);
+
+        // Simulate a network transition (`on_network_change`) occurring while an old QUIC dial is in flight.
+        assert!(slot.advance_generation_and_take().is_none());
+        assert_eq!(slot.current_generation(), 1);
+
+        let stale = DummySession::new(10);
+        assert!(
+            slot.store_if_generation_and_checkout(
+                dial_gen,
+                Arc::clone(&stale),
+                |_| true,
+                |s| { s.acquire_work() }
+            )
+            .is_err(),
+            "stale generation dial must be rejected and never repopulate the pool"
+        );
+        assert!(
+            slot.store_preconnect_if_generation(dial_gen, stale, |_| true)
+                .is_err(),
+            "stale generation preconnect must also be rejected"
+        );
+        assert!(slot.get_if(|_| true).is_none());
+
+        // Store `conn_a` at generation 1, then concurrently replace with `conn_b`.
+        let conn_a = DummySession::new(20);
+        let conn_b = DummySession::new(21);
+        assert!(
+            slot.store_if_generation_and_checkout(
+                1,
+                Arc::clone(&conn_a),
+                |_| true,
+                |s| { s.acquire_work() }
+            )
+            .is_ok()
+        );
+        let (replaced, _work_b) = slot
+            .store_if_generation_and_checkout(
+                1,
+                Arc::clone(&conn_b),
+                |_| true,
+                |s| s.acquire_work(),
+            )
+            .unwrap();
+        assert_eq!(replaced.unwrap().id, 20);
+
+        // Retry path for `conn_a` must NOT evict `conn_b`!
+        assert!(!slot.evict_if_same(&conn_a));
+        assert_eq!(slot.get_if(|_| true).unwrap().id, 21);
+
+        // Evicting the actual cached `conn_b` succeeds.
+        assert!(slot.evict_if_same(&conn_b));
+        assert!(slot.get_if(|_| true).is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_quic_slot_low_power_reaps_idle_immediately_and_defers_busy_until_idle() {
+        struct TestSession(Arc<QuicSessionLease>);
+
+        let sni = "quic.lowpower.test";
+        let (srv_tls, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let srv_transport = build_quinn_transport_config(
+            QuicCongestionControl::Bbr,
+            Some(Duration::from_secs(15)),
+            Duration::from_secs(30),
+            true,
+        );
+        let srv_cfg = build_quinn_server_config(srv_tls, srv_transport).unwrap();
+        let srv_ep =
+            bind_quinn_server_endpoint("127.0.0.1:0".parse().unwrap(), srv_cfg, None).unwrap();
+        let srv_addr = srv_ep.local_addr().unwrap();
+
+        let srv_bg = srv_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(inc) = srv_bg.accept().await {
+                tokio::spawn(async move {
+                    let _ = inc.await;
+                });
+            }
+        });
+
+        let cli_transport = build_quinn_transport_config(
+            QuicCongestionControl::Bbr,
+            Some(Duration::from_secs(15)),
+            Duration::from_secs(30),
+            true,
+        );
+        let cli_cfg = build_quinn_client_config(
+            false,
+            std::slice::from_ref(&ca_der),
+            &[b"h3".to_vec()],
+            false,
+            cli_transport,
+        )
+        .unwrap();
+
+        let slot: Arc<CachedQuicSlot<TestSession>> = Arc::new(CachedQuicSlot::new());
+
+        // 1. Purely idle cached QUIC session is reaped immediately on `set_low_power_and_take_idle(true)`.
+        let (ep1, conn1, _, pre1) = dial_protected_quic_addrs_happy_eyeballs(
+            &[srv_addr],
+            sni,
+            &cli_cfg,
+            None,
+            false,
+            HAPPY_EYEBALLS_DELAY,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let idle_lease = QuicSessionLease::new_with_epoch(pre1, ep1, conn1);
+        assert!(
+            slot.store_preconnect_if_generation(
+                0,
+                Arc::new(TestSession(Arc::clone(&idle_lease))),
+                |s| s.0.is_usable(),
+            )
+            .is_ok()
+        );
+        let evicted_idle = slot
+            .set_low_power_and_take_idle(true, |s| s.0.active_work_count() == 0)
+            .expect("idle QUIC session must be evicted immediately on screen-off");
+        evicted_idle.0.close_immediately(b"low power idle");
+        assert!(idle_lease.conn.close_reason().is_some());
+        assert!(slot.get_if(|s| s.0.is_usable()).is_none());
+
+        // Reset low-power mode to false, dial a busy session with two active work leases, then enable low-power mode.
+        slot.set_low_power_and_take_idle(false, |_| true);
+        let (ep2, conn2, _, pre2) = dial_protected_quic_addrs_happy_eyeballs(
+            &[srv_addr],
+            sni,
+            &cli_cfg,
+            None,
+            false,
+            HAPPY_EYEBALLS_DELAY,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let busy_lease = QuicSessionLease::new_with_epoch(pre2, ep2, conn2);
+        let slot_weak = Arc::downgrade(&slot);
+        busy_lease.set_idle_hook(move || {
+            if let Some(slot_arc) = slot_weak.upgrade()
+                && let Some(reaped) =
+                    slot_arc.reap_if_low_power_idle(|s| s.0.active_work_count() == 0)
+            {
+                reaped.0.close_immediately(b"low power idle");
+            }
+        });
+        let Ok((_, work1)) = slot.store_if_generation_and_checkout(
+            0,
+            Arc::new(TestSession(Arc::clone(&busy_lease))),
+            |s| s.0.is_usable(),
+            |s| s.0.acquire_work(),
+        ) else {
+            panic!("storing current-generation busy session must succeed");
+        };
+        let work2 = busy_lease.acquire_work();
+        assert_eq!(busy_lease.active_work_count(), 2);
+
+        // Enabling low-power mode while active streams exist MUST keep the session alive!
+        assert!(
+            slot.set_low_power_and_take_idle(true, |s| s.0.active_work_count() == 0)
+                .is_none()
+        );
+        assert!(busy_lease.is_usable());
+
+        drop(work1);
+        assert_eq!(busy_lease.active_work_count(), 1);
+        assert!(
+            busy_lease.is_usable(),
+            "session must stay alive until the final work lease drops"
+        );
+
+        drop(work2);
+        assert_eq!(busy_lease.active_work_count(), 0);
+        assert!(
+            busy_lease.conn.close_reason().is_some(),
+            "idle_hook must close and reap the session as soon as active_work hits 0 in low-power mode"
+        );
+        assert!(slot.get_if(|s| s.0.is_usable()).is_none());
+
+        srv_ep.close(quinn::VarInt::from_u32(0), b"done");
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn quic_happy_eyeballs_races_staggered_fallback_when_primary_blackholes() {
+        use crate::platform::socket_protect::prioritize_healthy_happy_eyeballs_addrs;
+
+        // Primary candidate: bound UDP socket that never replies (simulating silent IPv6/IPv4 blackhole, no ICMP error).
+        let blackhole_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blackhole_addr = blackhole_udp.local_addr().unwrap();
+
+        // Secondary candidate: live local Quinn QUIC server.
+        let sni = "quic.happy.eyeballs.test";
+        let (srv_tls, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let srv_transport = build_quinn_transport_config(
+            QuicCongestionControl::Bbr,
+            Some(Duration::from_secs(15)),
+            Duration::from_secs(30),
+            true,
+        );
+        let srv_cfg = build_quinn_server_config(srv_tls, srv_transport).unwrap();
+        let srv_ep =
+            bind_quinn_server_endpoint("127.0.0.1:0".parse().unwrap(), srv_cfg, None).unwrap();
+        let live_addr = srv_ep.local_addr().unwrap();
+
+        let srv_bg = srv_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(inc) = srv_bg.accept().await {
+                tokio::spawn(async move {
+                    let _ = inc.await;
+                });
+            }
+        });
+
+        let cli_transport = build_quinn_transport_config(
+            QuicCongestionControl::Bbr,
+            Some(Duration::from_secs(15)),
+            Duration::from_secs(30),
+            true,
+        );
+        let cli_cfg = build_quinn_client_config(
+            false,
+            std::slice::from_ref(&ca_der),
+            &[b"h3".to_vec()],
+            false,
+            cli_transport,
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let (ep, conn, _used_0rtt, pre_dial) = dial_protected_quic_addrs_happy_eyeballs(
+            &[blackhole_addr, live_addr],
+            sni,
+            &cli_cfg,
+            None,
+            false,
+            HAPPY_EYEBALLS_DELAY,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Happy Eyeballs QUIC dial must succeed via secondary candidate");
+        let elapsed = start.elapsed();
+        let lease = QuicSessionLease::new_with_epoch(pre_dial, ep, conn);
+
+        assert_eq!(lease.conn.remote_address(), live_addr);
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(2000),
+            "expected ~250ms staggered Happy Eyeballs win instead of 12s serial timeout, got {elapsed:?}"
+        );
+
+        // Verify stalled primary candidate was recorded in `RECENT_FAILED_ADDRS` so subsequent dials prefer `live_addr` immediately!
+        let reordered = prioritize_healthy_happy_eyeballs_addrs(&[blackhole_addr, live_addr]);
+        assert_eq!(reordered[0], live_addr);
+
+        lease.close_immediately(b"done");
+        drop(blackhole_udp);
+        srv_ep.close(quinn::VarInt::from_u32(0), b"done");
+        accept_task.abort();
     }
 }

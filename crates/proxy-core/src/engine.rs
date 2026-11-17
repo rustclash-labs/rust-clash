@@ -2895,10 +2895,11 @@ impl ProxyEngine {
                         if !eng.is_low_power_mode() {
                             let due_ids = mgr.due_auto_update_ids();
                             for id in due_ids {
-                                match mgr.refresh_subscription(&id).await {
-                                    Ok((meta, cfg, is_active)) => {
+                                match mgr.refresh_subscription_with_report(&id).await {
+                                    Ok((meta, cfg, is_active, rule_rep)) => {
                                         let safe_name =
                                             crate::config::uri::redact_sensitive_text(&meta.name);
+                                        let cfg_mode = cfg.mode;
                                         eng.hub.push_log(
                                             "info",
                                             format!(
@@ -2906,6 +2907,14 @@ impl ProxyEngine {
                                                 meta.proxy_count
                                             ),
                                         );
+                                        if let Some(ref rep) = rule_rep
+                                            && let Some(warn_msg) = rep.warning_summary(cfg_mode)
+                                        {
+                                            eng.hub.push_log(
+                                                "warn",
+                                                format!("[Profile '{safe_name}'] {warn_msg}"),
+                                            );
+                                        }
                                         if is_active
                                             && eng.demo_cluster.read().is_none()
                                             && let Err(err) = eng
@@ -4033,6 +4042,11 @@ impl ProxyEngine {
                 eff.effective_protocol
             ),
         );
+        if let Some(ref rule_rep) = report.rule_sanitization
+            && let Some(warn_msg) = rule_rep.warning_summary(self.config_snapshot().mode)
+        {
+            self.hub.push_log("warn", warn_msg);
+        }
         Ok(report)
     }
 
