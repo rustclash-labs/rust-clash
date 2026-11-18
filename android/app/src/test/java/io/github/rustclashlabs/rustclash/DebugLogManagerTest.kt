@@ -1024,7 +1024,56 @@ class DebugLogManagerTest {
         assertNotNull(exitAlert)
         assertEquals("critical", exitAlert!!.severity)
         assertEquals("PROCESS_EXIT_ABNORMAL", exitAlert.code)
+        assertTrue(exitAlert.id.endsWith(":OTHER_OEM_KILL:imp125"))
         assertTrue(exitAlert.detailZh.contains("系统后台省电管控强杀"))
+
+        // 2b. Routine LMK / OEM reclaim of an idle cached UI process (`importance >= 400`) after VPN stop -> ignored
+        for (reason in listOf("LOW_MEMORY_LMK", "OTHER_OEM_KILL", "EXCESSIVE_RESOURCE")) {
+            val cachedReclaim = "[${DebugLogManager.formatTimestamp(nowMs - 90_000L)}] " +
+                "reason=$reason importance=400 pss=0KB rss=158300KB"
+            assertNull(
+                DebugLogManager.evaluateSliceAnomalies(
+                    trigger = "startup-check",
+                    capturedAtMs = nowMs,
+                    sessionStartMs = 0L,
+                    systemMeta = null,
+                    nativeSnapshotRawJson = null,
+                    crashBreadcrumb = null,
+                    recentProcessExitsOverride = listOf(cachedReclaim),
+                ),
+            )
+        }
+
+        // 2c. Foreground VPN service LMK (`importance=125`) and cached-state real crashes (`NATIVE_CRASH importance=400`) MUST still alert
+        val fgServiceLmk = "[${DebugLogManager.formatTimestamp(nowMs - 60_000L)}] " +
+            "reason=LOW_MEMORY_LMK importance=125 pss=62000KB rss=162000KB"
+        val fgLmkAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "startup-check",
+            capturedAtMs = nowMs,
+            sessionStartMs = 0L,
+            systemMeta = null,
+            nativeSnapshotRawJson = null,
+            crashBreadcrumb = null,
+            recentProcessExitsOverride = listOf(fgServiceLmk),
+        )
+        assertNotNull(fgLmkAlert)
+        assertEquals("PROCESS_EXIT_ABNORMAL", fgLmkAlert!!.code)
+        assertTrue(fgLmkAlert.id.endsWith(":LOW_MEMORY_LMK:imp125"))
+
+        val cachedNativeCrash = "[${DebugLogManager.formatTimestamp(nowMs - 45_000L)}] " +
+            "reason=NATIVE_CRASH importance=400 pss=24000KB rss=120000KB desc=SIGSEGV"
+        val cachedCrashAlert = DebugLogManager.evaluateSliceAnomalies(
+            trigger = "startup-check",
+            capturedAtMs = nowMs,
+            sessionStartMs = 0L,
+            systemMeta = null,
+            nativeSnapshotRawJson = null,
+            crashBreadcrumb = null,
+            recentProcessExitsOverride = listOf(cachedNativeCrash),
+        )
+        assertNotNull(cachedCrashAlert)
+        assertEquals("PROCESS_EXIT_ABNORMAL", cachedCrashAlert!!.code)
+        assertTrue(cachedCrashAlert.id.endsWith(":NATIVE_CRASH:imp400"))
 
         // 3. Socket protect failure (critical)
         val protectFailJson = """
@@ -1263,6 +1312,66 @@ class DebugLogManagerTest {
             val text = exported!!.readText(Charsets.UTF_8)
             assertTrue(text.contains("- DetectedAnomaly: [WARNING/PROXY_HIGH_FAIL_RATE] 代理节点出现异常断流"))
             assertTrue(text.contains("ANOMALY_EVIDENCE"))
+        } finally {
+            sliceDir.deleteRecursively()
+            exportDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun assembleCombinedExportReservesBudgetForOlderAnomalySliceAndContextUnderCap() {
+        val sliceDir = Files.createTempDirectory("rc-export-budget-slices").toFile()
+        val exportDir = Files.createTempDirectory("rc-export-budget-out").toFile()
+        try {
+            val alert = DebugAnomalyAlertUi(
+                id = "protect_fail:100:2",
+                detectedAtMs = 1_794_901_000_000L,
+                severity = "critical",
+                code = "SOCKET_PROTECT_FAIL",
+                headlineZh = "底层套接字保护失败",
+                detailZh = "检测到 2 次 protectSocket 失败",
+            )
+            val entries = listOf(
+                "rustclash-slice-20261118-100000-000-periodic.log" to "OLDEST_1000",
+                "rustclash-slice-20261118-103000-000-periodic.log" to "PRE_CONTEXT_1030",
+                "rustclash-slice-20261118-104500-000-anomaly.log" to "INCIDENT_SCENE_1045",
+                "rustclash-slice-20261118-110000-000-periodic.log" to "POST_CONTEXT_1100",
+                "rustclash-slice-20261118-113000-000-periodic.log" to "NEWER_1130",
+                "rustclash-slice-20261118-120000-000-manual.log" to "LATEST_STATE_1200",
+            )
+            entries.forEach { (name, marker) ->
+                val trigger = DebugLogManager.parseTriggerFromFileName(name)
+                val body = buildString {
+                    appendLine("### RustClash Android Diagnostic Slice (`$trigger`)")
+                    if (trigger == "anomaly") {
+                        appendLine("- TriggeredAnomaly: `[CRITICAL/SOCKET_PROTECT_FAIL]` 底层套接字保护失败")
+                    }
+                    appendLine("MARKER=$marker")
+                    appendLine("payload=" + "x".repeat(900))
+                }
+                File(sliceDir, name).writeText(body, Charsets.UTF_8)
+            }
+
+            // Cap export at 4,600 bytes: all 6 slices (~7,800 bytes) cannot fit; budget allows ~3 slices.
+            // Exporter MUST keep INCIDENT_SCENE_1045 + LATEST_STATE_1200 + PRE_CONTEXT_1030 in chronological order.
+            val maxBytes = 4_600
+            val exported = DebugLogManager.assembleCombinedExportFromSlices(
+                sliceDir = sliceDir,
+                exportDir = exportDir,
+                nowMs = 1_794_905_000_000L,
+                maxBytes = maxBytes,
+                activeAnomaly = alert,
+            )
+            assertNotNull(exported)
+            assertTrue("Exported bundle (${exported!!.length()}B) must stay <= $maxBytes", exported.length() <= maxBytes)
+            val bundle = exported.readText(Charsets.UTF_8)
+            val idxPre = bundle.indexOf("MARKER=PRE_CONTEXT_1030")
+            val idxAnomaly = bundle.indexOf("MARKER=INCIDENT_SCENE_1045")
+            val idxLatest = bundle.indexOf("MARKER=LATEST_STATE_1200")
+            assertTrue("Pre-anomaly context slice should be included", idxPre >= 0)
+            assertTrue("Protected anomaly slice must be preserved", idxAnomaly > idxPre)
+            assertTrue("Newest slice must follow anomaly slice chronologically", idxLatest > idxAnomaly)
+            assertFalse("Unrelated middle slice should yield budget to incident scene", bundle.contains("MARKER=NEWER_1130"))
         } finally {
             sliceDir.deleteRecursively()
             exportDir.deleteRecursively()

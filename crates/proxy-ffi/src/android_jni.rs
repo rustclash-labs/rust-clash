@@ -1153,8 +1153,7 @@ pub fn android_status_json_core() -> serde_json::Value {
         let (up_rate, down_rate) = rt
             .engine
             .hub()
-            .traffic_history()
-            .last()
+            .latest_traffic_point()
             .map(|p| (p.up, p.down))
             .unwrap_or((0, 0));
         let (up_total, down_total) = rt.engine.hub().totals();
@@ -3621,8 +3620,7 @@ pub fn android_collect_debug_snapshot_window_core(
         };
 
         let (up_rate, down_rate) = hub
-            .traffic_history()
-            .last()
+            .latest_traffic_point()
             .map(|p| (p.up, p.down))
             .unwrap_or((0, 0));
         let (up_total, down_total) = hub.totals();

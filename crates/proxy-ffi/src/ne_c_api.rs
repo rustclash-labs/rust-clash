@@ -548,8 +548,7 @@ pub extern "C" fn rc_ne_get_status_json(handle: *mut RcNeEngineHandle) -> *mut c
         let (up, down) = ctx
             .engine
             .hub()
-            .traffic_history()
-            .last()
+            .latest_traffic_point()
             .map(|p| (p.up, p.down))
             .unwrap_or((0, 0));
         let (up_tot, down_tot) = ctx.engine.hub().totals();
