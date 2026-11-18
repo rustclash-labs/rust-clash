@@ -80,6 +80,8 @@ object DebugLogManager {
     internal const val AUTO_ANOMALY_COOLDOWN_MS = 15L * 60_000L
     internal const val HISTORICAL_EXIT_MAX_AGE_MS = 24L * 3_600_000L
     internal const val HIGH_PRIVATE_RSS_THRESHOLD_BYTES = 256L * 1024L * 1024L
+    internal const val CACHED_PROCESS_IMPORTANCE_THRESHOLD =
+        ActivityManager.RunningAppProcessInfo.IMPORTANCE_CACHED
     private const val MAX_DISMISSED_ANOMALY_IDS = 32
 
     internal const val DEBUG_DIR_NAME = "debug_logs"
@@ -98,6 +100,7 @@ object DebugLogManager {
     private val crashHookInstalled = AtomicBoolean(false)
     private val SAFE_TRIGGER_REGEX = Regex("[^a-z0-9_-]")
     private val EXIT_REASON_REGEX = Regex("""\breason=([^\s]+)""")
+    private val EXIT_IMPORTANCE_REGEX = Regex("""\bimportance=(\d+)""")
     private const val SLICE_REPORT_HEADER_PREFIX = "### RustClash Android Diagnostic Slice ("
     private val lock = Any()
     private val sliceWriteLock = Any()
@@ -430,6 +433,21 @@ object DebugLogManager {
             cancelAnomalyNotification(context)
             return null
         }
+        if (parsed.code == "PROCESS_EXIT_ABNORMAL" && !parsed.id.contains(":imp")) {
+            val exits = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Api30ExitInfoHelper.readRecentExitReasons(context)
+            } else {
+                emptyList()
+            }
+            val rechecked = parseHistoricalExitAnomaly(exits, System.currentTimeMillis())
+            if (rechecked == null) {
+                prefs.edit().remove(KEY_ACTIVE_ANOMALY_JSON).apply()
+                cancelAnomalyNotification(context)
+                return null
+            }
+            prefs.edit().putString(KEY_ACTIVE_ANOMALY_JSON, serializeAnomalyJson(rechecked)).apply()
+            return rechecked
+        }
         return parsed
     }
 
@@ -461,12 +479,12 @@ object DebugLogManager {
     ): Boolean {
         if (!isEnabled(context)) return false
         if (isAnomalyDismissed(context, candidate.id)) return false
-        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
-        val existing = parseAnomalyJson(prefs.getString(KEY_ACTIVE_ANOMALY_JSON, null))
+        val existing = getActiveAnomaly(context)
         if (existing != null) {
             if (existing.id == candidate.id) return false
             if (existing.severity == "critical" && candidate.severity != "critical") return false
         }
+        val prefs = context.getSharedPreferences(RustClashVpnService.PREFS_VPN_SETTINGS, Context.MODE_PRIVATE)
         prefs.edit().putString(KEY_ACTIVE_ANOMALY_JSON, serializeAnomalyJson(candidate)).apply()
         if (postNotification) {
             postAnomalyNotification(context, candidate)
@@ -800,6 +818,7 @@ object DebugLogManager {
         }
         val reason = EXIT_REASON_REGEX.find(latestLine)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         if (reason.isEmpty()) return null
+        val importance = EXIT_IMPORTANCE_REGEX.find(latestLine)?.groupValues?.getOrNull(1)?.toIntOrNull()
         val desc = latestLine.substringAfter("desc=", "").trim()
 
         // Explicitly ignore user-requested stops (e.g. Recent Tasks Clean All / Force Stop) and APK updates
@@ -809,6 +828,16 @@ object DebugLogManager {
             desc.contains("killDueToPackageUpdate", ignoreCase = true) ||
             desc.contains("installPackageLI", ignoreCase = true)
         ) {
+            return null
+        }
+
+        // Ignore routine Android LMK / OEM reclaims of an idle cached UI process (`importance >= 400`,
+        // `IMPORTANCE_CACHED`) after the user has already stopped the foreground VPN service (`importance = 125`).
+        // Crashes and fatal signals (`ANR`, `JVM_CRASH`, `NATIVE_CRASH`, `SIGNALED`) are still reported at any importance.
+        val isCachedBackgroundReclaim = importance != null &&
+            importance >= CACHED_PROCESS_IMPORTANCE_THRESHOLD &&
+            reason in setOf("LOW_MEMORY_LMK", "EXCESSIVE_RESOURCE", "OTHER_OEM_KILL")
+        if (isCachedBackgroundReclaim) {
             return null
         }
 
@@ -849,7 +878,7 @@ object DebugLogManager {
             else -> reason
         }
         return DebugAnomalyAlertUi(
-            id = "exit:${tsStr.ifEmpty { reason }}:$reason",
+            id = "exit:${tsStr.ifEmpty { reason }}:$reason:imp${importance ?: -1}",
             detectedAtMs = capturedAtMs,
             severity = "critical",
             code = "PROCESS_EXIT_ABNORMAL",
@@ -1094,36 +1123,109 @@ object DebugLogManager {
             appendLine()
         }
 
-        val selectedBodies = ArrayList<Pair<String, String>>()
+        val separatorBytes = 260
         var usedBytes = header.toByteArray(Charsets.UTF_8).size
-        val separatorBytes = 200
-        for (file in newestFirst) {
-            val content = runCatching { file.readText(Charsets.UTF_8) }.getOrNull() ?: continue
+        val selectedByIndex = ArrayList<Triple<Int, String, String>>()
+        val sanitizedCache = HashMap<Int, Pair<String, ByteArray>>()
+
+        fun readSanitizedSliceAt(idx: Int): Pair<String, ByteArray>? {
+            sanitizedCache[idx]?.let { return it }
+            val file = newestFirst.getOrNull(idx) ?: return null
+            val content = runCatching { file.readText(Charsets.UTF_8) }.getOrNull() ?: return null
             // Slices written by formatSliceReport are already scrubbed once on disk; avoid a second full-file regex pass
             val sanitized = if (content.startsWith(SLICE_REPORT_HEADER_PREFIX)) {
                 content
             } else {
                 NodeImportSupport.redactSecretsForUi(content)
             }
-            val sanitizedUtf8Bytes = sanitized.toByteArray(Charsets.UTF_8)
-            if (selectedBodies.isNotEmpty() && usedBytes + sanitizedUtf8Bytes.size + separatorBytes > maxBytes) {
-                break
-            }
-            val (bounded, boundedByteLen) = if (usedBytes + sanitizedUtf8Bytes.size + separatorBytes > maxBytes) {
-                val suffix = "\n...[truncated]...\n"
-                val suffixByteLen = suffix.toByteArray(Charsets.UTF_8).size
-                val budgetBytes = (maxBytes - usedBytes - separatorBytes - suffixByteLen).coerceAtLeast(1024)
-                val truncated = truncateUtf8BytesSafe(sanitizedUtf8Bytes, budgetBytes) + suffix
-                truncated to truncated.toByteArray(Charsets.UTF_8).size
-            } else {
-                sanitized to sanitizedUtf8Bytes.size
-            }
-            selectedBodies.add(file.name to bounded)
-            usedBytes += boundedByteLen + separatorBytes
+            return (sanitized to sanitized.toByteArray(Charsets.UTF_8)).also { sanitizedCache[idx] = it }
         }
 
-        // Order chronologically (oldest -> newest among selected recent slices) for natural timeline analysis
-        selectedBodies.reverse()
+        fun fitSliceWithinBudget(
+            sanitized: String,
+            sanitizedUtf8Bytes: ByteArray,
+            budgetBytesWithSeparator: Int,
+        ): Pair<String, Int> {
+            val maxBodyBytes = budgetBytesWithSeparator - separatorBytes
+            if (sanitizedUtf8Bytes.size <= maxBodyBytes) {
+                return sanitized to sanitizedUtf8Bytes.size
+            }
+            val suffix = "\n...[truncated]...\n"
+            val suffixByteLen = suffix.toByteArray(Charsets.UTF_8).size
+            val cutBudget = (maxBodyBytes - suffixByteLen).coerceAtLeast(256)
+            val truncated = truncateUtf8BytesSafe(sanitizedUtf8Bytes, cutBudget) + suffix
+            return truncated to truncated.toByteArray(Charsets.UTF_8).size
+        }
+
+        val triggerAnomalyIdx = newestFirst.indexOfFirst {
+            parseTriggerFromFileName(it.name) in setOf("anomaly", "revoked")
+        }
+        val protectedIdx = when {
+            triggerAnomalyIdx >= 0 -> triggerAnomalyIdx
+            activeAnomaly != null -> newestFirst.indices.firstOrNull { idx ->
+                readSanitizedSliceAt(idx)?.first?.contains("- TriggeredAnomaly:") == true
+            } ?: -1
+            else -> -1
+        }
+
+        if (protectedIdx >= 0) {
+            // Reserve space for the incident slice first, then latest state, then immediate before/after context
+            val priorityIndices = linkedSetOf<Int>().apply {
+                add(protectedIdx)
+                add(0)
+                if (protectedIdx + 1 <= newestFirst.lastIndex) add(protectedIdx + 1)
+                if (protectedIdx - 1 >= 0) add(protectedIdx - 1)
+            }
+            for (idx in priorityIndices) {
+                val (sanitized, sanitizedUtf8Bytes) = readSanitizedSliceAt(idx) ?: continue
+                val remaining = maxBytes - usedBytes
+                if (idx == protectedIdx) {
+                    val protectedCap = if (protectedIdx > 0 && newestFirst.size > 1) {
+                        ((remaining * 3) / 4).coerceAtLeast(separatorBytes + 512).coerceAtMost(remaining)
+                    } else {
+                        remaining
+                    }
+                    val (bounded, boundedByteLen) = fitSliceWithinBudget(sanitized, sanitizedUtf8Bytes, protectedCap)
+                    selectedByIndex.add(Triple(idx, newestFirst[idx].name, bounded))
+                    usedBytes += boundedByteLen + separatorBytes
+                } else if (sanitizedUtf8Bytes.size + separatorBytes <= remaining) {
+                    selectedByIndex.add(Triple(idx, newestFirst[idx].name, sanitized))
+                    usedBytes += sanitizedUtf8Bytes.size + separatorBytes
+                } else if (idx == 0 && selectedByIndex.size == 1 && remaining >= separatorBytes + 512) {
+                    val (bounded, boundedByteLen) = fitSliceWithinBudget(sanitized, sanitizedUtf8Bytes, remaining)
+                    selectedByIndex.add(Triple(idx, newestFirst[idx].name, bounded))
+                    usedBytes += boundedByteLen + separatorBytes
+                }
+            }
+            for (idx in newestFirst.indices) {
+                if (idx in priorityIndices) continue
+                val (sanitized, sanitizedUtf8Bytes) = readSanitizedSliceAt(idx) ?: continue
+                if (usedBytes + sanitizedUtf8Bytes.size + separatorBytes > maxBytes) {
+                    break
+                }
+                selectedByIndex.add(Triple(idx, newestFirst[idx].name, sanitized))
+                usedBytes += sanitizedUtf8Bytes.size + separatorBytes
+            }
+        } else {
+            for (idx in newestFirst.indices) {
+                val (sanitized, sanitizedUtf8Bytes) = readSanitizedSliceAt(idx) ?: continue
+                if (selectedByIndex.isNotEmpty() && usedBytes + sanitizedUtf8Bytes.size + separatorBytes > maxBytes) {
+                    break
+                }
+                val (bounded, boundedByteLen) = fitSliceWithinBudget(
+                    sanitized = sanitized,
+                    sanitizedUtf8Bytes = sanitizedUtf8Bytes,
+                    budgetBytesWithSeparator = maxBytes - usedBytes,
+                )
+                selectedByIndex.add(Triple(idx, newestFirst[idx].name, bounded))
+                usedBytes += boundedByteLen + separatorBytes
+            }
+        }
+
+        // Order chronologically (oldest -> newest: higher newestFirst index = older slice) for natural timeline analysis
+        val selectedBodies = selectedByIndex
+            .sortedByDescending { it.first }
+            .map { it.second to it.third }
 
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(nowMs))
         val outFile = File(exportDir, "rustclash-android-diag-$stamp.log")

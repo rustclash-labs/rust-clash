@@ -635,8 +635,8 @@ private fun GeneralSettingsBottomSheet(
             InfoKeyValueRow(
                 "当前物理网络状态",
                 if (state.vpnState == VpnLifecycleState.RUNNING) {
-                    if (state.telemetry.isWifi) "Wi-Fi（已平稳切换 ${state.telemetry.networkTransitions} 次）"
-                    else "移动网络（已平稳切换 ${state.telemetry.networkTransitions} 次）"
+                    if (state.telemetry.isWifi) "Wi-Fi（检测到 ${state.telemetry.networkTransitions} 次切换）"
+                    else "移动网络（检测到 ${state.telemetry.networkTransitions} 次切换）"
                 } else {
                     "待连接"
                 },

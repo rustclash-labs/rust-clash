@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.rustclashlabs.rustclash"
         minSdk = 26
         targetSdk = 35
-        versionCode = 31
-        versionName = "0.5.2"
+        versionCode = 32
+        versionName = "0.5.3"
     }
 
     splits {

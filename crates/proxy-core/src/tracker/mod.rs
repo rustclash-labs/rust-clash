@@ -1058,6 +1058,11 @@ impl TelemetryHub {
         self.history.lock().iter().copied().collect()
     }
 
+    /// Returns the most recent 1-second traffic rate sample without cloning the 120-point ring buffer.
+    pub fn latest_traffic_point(&self) -> Option<TrafficPoint> {
+        self.history.lock().back().copied()
+    }
+
     pub fn subscribe_traffic(&self) -> broadcast::Receiver<TrafficPoint> {
         self.traffic_tx.subscribe()
     }
@@ -1757,5 +1762,30 @@ mod tests {
         let diags = hub.diagnostics_snapshot(20);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].coalesced_count, 4);
+    }
+
+    #[test]
+    fn latest_traffic_point_returns_newest_sample_without_cloning_history() {
+        let hub = TelemetryHub::new();
+        assert!(hub.latest_traffic_point().is_none());
+        hub.total_upload.fetch_add(1024, Ordering::Release);
+        hub.total_download.fetch_add(4096, Ordering::Release);
+        let first = hub.sample_tick();
+        assert_eq!(first.up, 1024);
+        assert_eq!(first.down, 4096);
+        assert_eq!(
+            hub.latest_traffic_point().map(|p| (p.up, p.down)),
+            Some((1024, 4096))
+        );
+
+        hub.total_upload.fetch_add(512, Ordering::Release);
+        hub.total_download.fetch_add(2048, Ordering::Release);
+        let second = hub.sample_tick();
+        assert_eq!(second.up, 512);
+        assert_eq!(second.down, 2048);
+        assert_eq!(
+            hub.latest_traffic_point().map(|p| (p.up, p.down)),
+            hub.traffic_history().last().map(|p| (p.up, p.down))
+        );
     }
 }
