@@ -22,6 +22,7 @@ import {
   SunIcon,
   ToolboxIcon,
 } from "./components/Icons";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import {
   loadInitialTheme,
   saveThemePreference,
@@ -993,92 +994,94 @@ export const App: React.FC = () => {
             </form>
           )}
 
-          {tab === "dashboard" && (
-            <DashboardView
-              online={online}
-              config={config}
-              profilesSnapshot={profilesSnapshot}
-              proxies={proxies}
-              rules={rules}
-              connections={connections}
-              trafficHistory={trafficHistory}
-              latestTraffic={latestTraffic}
-              onRefreshAll={refreshCore}
-              onOpenProfiles={() => setTab("profiles")}
-              onOpenProxies={(groupName) => {
-                setFocusGroup(groupName ?? null);
-                setTab("proxies");
-              }}
-              onOpenTools={() => {
-                setToolsSubTab("settings");
-                setTab("tools");
-              }}
-              onOpenSiteDoctor={(target) => {
-                setSiteDoctorTarget(target ?? "chatgpt.com");
-                setToolsSubTab("diagnostics");
-                setTab("tools");
-              }}
-            />
-          )}
+          <ErrorBoundary resetKey={tab} scope={tab}>
+            {tab === "dashboard" && (
+              <DashboardView
+                online={online}
+                config={config}
+                profilesSnapshot={profilesSnapshot}
+                proxies={proxies}
+                rules={rules}
+                connections={connections}
+                trafficHistory={trafficHistory}
+                latestTraffic={latestTraffic}
+                onRefreshAll={refreshCore}
+                onOpenProfiles={() => setTab("profiles")}
+                onOpenProxies={(groupName) => {
+                  setFocusGroup(groupName ?? null);
+                  setTab("proxies");
+                }}
+                onOpenTools={() => {
+                  setToolsSubTab("settings");
+                  setTab("tools");
+                }}
+                onOpenSiteDoctor={(target) => {
+                  setSiteDoctorTarget(target ?? "chatgpt.com");
+                  setToolsSubTab("diagnostics");
+                  setTab("tools");
+                }}
+              />
+            )}
 
-          {tab === "proxies" && (
-            <ProxiesView
-              config={config}
-              proxies={proxies}
-              onRefreshProxies={refreshCore}
-              focusGroup={focusGroup}
-              onOpenProfiles={() => setTab("profiles")}
-            />
-          )}
+            {tab === "proxies" && (
+              <ProxiesView
+                config={config}
+                proxies={proxies}
+                onRefreshProxies={refreshCore}
+                focusGroup={focusGroup}
+                onOpenProfiles={() => setTab("profiles")}
+              />
+            )}
 
-          {tab === "profiles" && (
-            <ProfilesView
-              profilesSnapshot={profilesSnapshot}
-              onReloaded={refreshCore}
-            />
-          )}
+            {tab === "profiles" && (
+              <ProfilesView
+                profilesSnapshot={profilesSnapshot}
+                onReloaded={refreshCore}
+              />
+            )}
 
-          {tab === "connections" && (
-            <ConnectionsView
-              connections={connections}
-              latestTraffic={latestTraffic}
-              onRefresh={async () => {
-                try {
-                  const c = await clashApi.getConnections();
-                  setConnections(c);
-                  setLoadError(null);
-                } catch (err) {
-                  handleApiError(err);
-                }
-              }}
-            />
-          )}
+            {tab === "connections" && (
+              <ConnectionsView
+                connections={connections}
+                latestTraffic={latestTraffic}
+                onRefresh={async () => {
+                  try {
+                    const c = await clashApi.getConnections();
+                    setConnections(c);
+                    setLoadError(null);
+                  } catch (err) {
+                    handleApiError(err);
+                  }
+                }}
+              />
+            )}
 
-          {tab === "tools" && (
-            <ToolsView
-              version={version}
-              config={config}
-              proxies={proxies}
-              rules={rules}
-              logs={logs}
-              theme={theme}
-              onChangeTheme={handleChangeTheme}
-              onRefreshCore={refreshCore}
-              onClearLogs={() => setLogs([])}
-              onControllerUpdated={() => {
-                setSecretInput(loadControllerSettings().secret);
-                setWsEpoch((n) => n + 1);
-                void refreshCore();
-              }}
-              initialSubTab={toolsSubTab}
-              initialSiteTarget={siteDoctorTarget}
-              onOpenProxies={() => {
-                setFocusGroup(null);
-                setTab("proxies");
-              }}
-              onOpenProfiles={() => setTab("profiles")}
-            />
-          )}
+            {tab === "tools" && (
+              <ToolsView
+                version={version}
+                config={config}
+                proxies={proxies}
+                rules={rules}
+                logs={logs}
+                theme={theme}
+                onChangeTheme={handleChangeTheme}
+                onRefreshCore={refreshCore}
+                onClearLogs={() => setLogs([])}
+                onControllerUpdated={() => {
+                  setSecretInput(loadControllerSettings().secret);
+                  setWsEpoch((n) => n + 1);
+                  void refreshCore();
+                }}
+                initialSubTab={toolsSubTab}
+                initialSiteTarget={siteDoctorTarget}
+                onOpenProxies={() => {
+                  setFocusGroup(null);
+                  setTab("proxies");
+                }}
+                onOpenProfiles={() => setTab("profiles")}
+              />
+            )}
+          </ErrorBoundary>
         </main>
 
         <nav

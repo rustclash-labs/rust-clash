@@ -103,8 +103,8 @@ This guide provides step-by-step, non-destructive verification procedures for te
    ```
 2. Launch **RustClash**.
 3. **Import Encrypted Profile & Inspect Report**:
-   - Tap **配置 (Profiles) -> 导入/订阅**, paste your Clash YAML, `ss://` / `vless://` / `trojan://` / `anytls://` URI, or `https://` subscription URL, and submit (stored via Android Keystore).
-   - Verify the **导入结果报告** card clearly separates `成功导入`, `重复跳过`, and `暂不支持` (with protocol breakdown such as `VMess` / `Hysteria2` if present).
+   - Tap **配置 (Profiles) -> 导入/订阅**, paste your Clash YAML, `ss://` / `vless://` / `vmess://` / `trojan://` / `hy2://` / `tuic://` / `anytls://` URI, or `https://` subscription URL, and submit (secrets stored in the Rust `SecretVault` whose 32-byte master key is hardware-wrapped via Android Keystore AES-256-GCM).
+   - Verify the **导入结果报告** card clearly separates `成功导入`, `重复跳过`, and `暂不支持` (with protocol breakdown such as `WireGuard` / `Snell` if present).
 4. **Connect & Consent**:
    - Tap the hero connect button on **首页 (Home)** and approve the Android system *Connection request* dialog.
    - Verify the Android VPN key icon + foreground notification appear, and confirm switching to `全局直连 (Direct)` explicitly displays `已连接（全局直连） · 当前为 Direct 模式 · 流量不经过代理节点`.

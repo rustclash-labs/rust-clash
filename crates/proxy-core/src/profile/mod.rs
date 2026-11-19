@@ -3325,7 +3325,45 @@ fn is_loopback_host(host: &str) -> bool {
         return true;
     }
     let clean = host.trim_start_matches('[').trim_end_matches(']');
-    clean.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    clean.parse::<IpAddr>().is_ok_and(|ip| match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    })
+}
+
+/// Rejects link-local/cloud-metadata (`169.254.0.0/16`, `fe80::/10`), unspecified (`0.0.0.0`, `::`),
+/// multicast, and loopback destinations for remote (non-loopback) subscription hosts to prevent
+/// SSRF and DNS-rebinding attacks against local Control APIs or instance metadata services.
+fn is_disallowed_remote_subscription_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback()
+                    || mapped.is_link_local()
+                    || mapped.is_unspecified()
+                    || mapped.is_multicast();
+            }
+            v6.is_loopback()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
+    }
+}
+
+fn validate_subscription_resolved_ip(host: &str, ip: IpAddr) -> Result<()> {
+    if !is_loopback_host(host) && is_disallowed_remote_subscription_ip(ip) {
+        return Err(ProxyError::Config(
+            "refusing subscription connection to disallowed local, link-local, or metadata IP address"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn connect_protected_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
@@ -3338,6 +3376,7 @@ async fn connect_protected_tcp(host: &str, port: u16) -> Result<tokio::net::TcpS
 
     let mut last_err = None;
     for target in addrs {
+        validate_subscription_resolved_ip(host, target.ip())?;
         let domain = if target.is_ipv6() {
             socket2::Domain::IPV6
         } else {
@@ -3419,6 +3458,11 @@ pub async fn fetch_subscription_http_with_proxy(
                 )));
             }
         };
+
+        let clean_literal = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(literal_ip) = clean_literal.parse::<IpAddr>() {
+            validate_subscription_resolved_ip(&host, literal_ip)?;
+        }
 
         let port = current
             .port_or_known_default()
@@ -3516,6 +3560,11 @@ pub async fn fetch_subscription_http_with_proxy(
             if is_https && next_url.scheme().eq_ignore_ascii_case("http") {
                 return Err(ProxyError::Config(
                     "refusing HTTPS-to-HTTP downgrade redirect on subscription URL".into(),
+                ));
+            }
+            if !is_loopback_host(&host) && next_url.host_str().is_some_and(is_loopback_host) {
+                return Err(ProxyError::Config(
+                    "refusing remote subscription redirect to local loopback host".into(),
                 ));
             }
             current = next_url;
@@ -5145,5 +5194,55 @@ rules:
         assert!(meta_after.match_only_fallback_target.is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subscription_ssrf_guard_blocks_metadata_link_local_and_rebinding_loopback() {
+        // Explicit loopback hosts stay allowed for local converters & hermetic tests.
+        assert!(
+            validate_subscription_resolved_ip("127.0.0.1", "127.0.0.1".parse().unwrap()).is_ok()
+        );
+        assert!(validate_subscription_resolved_ip("localhost", "::1".parse().unwrap()).is_ok());
+        assert!(validate_subscription_resolved_ip("[::1]", "::1".parse().unwrap()).is_ok());
+
+        // Public IPs stay allowed for remote hosts.
+        assert!(
+            validate_subscription_resolved_ip("sub.example.com", "93.184.216.34".parse().unwrap())
+                .is_ok()
+        );
+        assert!(
+            validate_subscription_resolved_ip(
+                "sub.example.com",
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+            )
+            .is_ok()
+        );
+
+        // Cloud metadata, link-local, unspecified, multicast, IPv4-mapped metadata, and DNS-rebound
+        // loopback destinations MUST be rejected for remote subscription hosts.
+        for bad_ip in [
+            "169.254.169.254",
+            "::ffff:169.254.169.254",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "fe80::1",
+            "224.0.0.1",
+        ] {
+            let parsed: IpAddr = bad_ip.parse().unwrap();
+            assert!(
+                validate_subscription_resolved_ip("evil.example.com", parsed).is_err(),
+                "expected remote subscription to reject {bad_ip}"
+            );
+        }
+        assert!(
+            validate_subscription_resolved_ip(
+                "169.254.169.254",
+                "169.254.169.254".parse().unwrap()
+            )
+            .is_err()
+        );
     }
 }

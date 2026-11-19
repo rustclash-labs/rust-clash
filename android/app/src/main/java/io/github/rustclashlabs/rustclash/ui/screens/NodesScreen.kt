@@ -82,11 +82,17 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -672,13 +678,18 @@ private fun NodeRowCard(
     onDelete: () -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
+    val haptic = LocalHapticFeedback.current
+    val accentBarColor = extColors.emeraldBright
     var menuExpanded by remember { mutableStateOf(false) }
 
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = onSelect),
+            .clickable {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onSelect()
+            },
         shape = RoundedCornerShape(16.dp),
         color = if (isSelected) extColors.selectedCardBg else extColors.cardSurface,
         border = BorderStroke(
@@ -687,7 +698,23 @@ private fun NodeRowCard(
         ),
     ) {
         Column(
-            modifier = Modifier.padding(start = 8.dp, end = 12.dp, top = 8.dp, bottom = 9.dp),
+            modifier = Modifier
+                .drawBehind {
+                    if (isSelected) {
+                        val barWidth = 3.5.dp.toPx()
+                        val insetY = 10.dp.toPx()
+                        val barHeight = (size.height - insetY * 2f).coerceAtLeast(0f)
+                        if (barHeight > 0f) {
+                            drawRoundRect(
+                                color = accentBarColor,
+                                topLeft = Offset(0f, insetY),
+                                size = Size(barWidth, barHeight),
+                                cornerRadius = CornerRadius(barWidth, barWidth),
+                            )
+                        }
+                    }
+                }
+                .padding(start = 10.dp, end = 12.dp, top = 8.dp, bottom = 9.dp),
         ) {
             // Top Row: Star IconButton (36dp touch target) + Node Name + (Checkmark if selected, else LatencyPill)
             Row(

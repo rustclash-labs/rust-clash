@@ -1,5 +1,7 @@
 package io.github.rustclashlabs.rustclash.vpn
 
+import io.github.rustclashlabs.rustclash.security.AndroidKeystoreVault
+
 /**
  * JNI bridge to `libproxy_ffi.so` (`crates/proxy-ffi/src/android_jni.rs`).
  *
@@ -26,8 +28,13 @@ object NativeBridge {
             false
         }
         loadedState = loaded
+        if (loaded && AndroidKeystoreVault.isKeystoreAvailable()) {
+            runCatching { nativeRegisterVaultKeyWrapper(AndroidKeystoreVault) }
+        }
         return loaded
     }
+
+    external fun nativeRegisterVaultKeyWrapper(vaultHelper: Any): Boolean
 
     external fun nativeStartVpn(
         vpnService: Any,

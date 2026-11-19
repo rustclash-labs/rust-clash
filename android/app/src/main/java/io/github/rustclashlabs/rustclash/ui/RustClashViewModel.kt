@@ -286,7 +286,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 return@withContext null
             }
             val statusJson = if (state == VpnLifecycleState.RUNNING) {
-                NativeBridge.nativeGetStatusJson()
+                NativeBridge.nativeGetStatusJson().also { fresh ->
+                    RustClashVpnService.publishFreshStatusSnapshot(fresh)
+                }
             } else {
                 RustClashVpnService.latestStatusJson
             }

@@ -151,3 +151,65 @@ test("summarizeSkippedUnsupported groups protocols by count with sample names", 
   assert.equal(summary.groups[1].count, 1);
   assert.match(summary.protocolsSummaryZh, /VMess \(2\)/);
 });
+
+test("deriveThreeLayerStatus handles offline core, demo sandbox, and probing states", () => {
+  const offline = deriveThreeLayerStatus({
+    online: false,
+    sysproxyEnabled: false,
+    tunEnabled: false,
+    mode: "rule",
+  });
+  assert.equal(offline.core.state, "offline");
+  assert.equal(offline.hero.pillClass, "offline");
+
+  const demo = deriveThreeLayerStatus({
+    online: true,
+    sysproxyEnabled: false,
+    tunEnabled: false,
+    demoEnabled: true,
+    mode: "rule",
+  });
+  assert.equal(demo.core.state, "online");
+  assert.equal(demo.takeover.active, false);
+
+  const probing = deriveThreeLayerStatus({
+    online: true,
+    sysproxyEnabled: true,
+    tunEnabled: false,
+    probing: true,
+    mode: "rule",
+  });
+  assert.equal(probing.connectivity.state, "checking");
+  assert.equal(probing.hero.pillClass, "checking");
+});
+
+test("planMasterToggle handles TUN-only takeover and sysproxy-unsupported fallback", () => {
+  const pauseTunOnly = planMasterToggle(
+    { sysproxyEnabled: false, tunEnabled: true, sysproxySupported: false },
+    null,
+  );
+  assert.equal(pauseTunOnly.action, "disable");
+  assert.deepEqual(pauseTunOnly.nextSavedPref, { sysproxy: false, tun: true });
+
+  const resumeTunOnly = planMasterToggle(
+    { sysproxyEnabled: false, tunEnabled: false, sysproxySupported: false },
+    pauseTunOnly.nextSavedPref,
+  );
+  assert.equal(resumeTunOnly.action, "enable");
+  assert.equal(resumeTunOnly.targetSysproxy, false);
+  assert.equal(resumeTunOnly.targetTun, true);
+});
+
+test("deriveMemoryDisplay computes proportional core and UI heap shares and summarizeSkippedUnsupported handles empty input", () => {
+  const both = deriveMemoryDisplay(30 * 1024 * 1024, 10 * 1024 * 1024);
+  assert.equal(both.available, true);
+  assert.equal(both.totalBytes, 40 * 1024 * 1024);
+  assert.equal(both.corePct, 75);
+  assert.equal(both.uiPct, 25);
+
+  const emptySkipped = summarizeSkippedUnsupported([]);
+  assert.equal(emptySkipped.total, 0);
+  assert.deepEqual(emptySkipped.groups, []);
+  assert.equal(emptySkipped.protocolsSummaryZh, "");
+  assert.equal(emptySkipped.protocolsSummaryEn, "");
+});

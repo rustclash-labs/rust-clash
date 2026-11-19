@@ -9,6 +9,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -34,11 +35,13 @@ import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Clear
+import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Route
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Tune
@@ -68,7 +71,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -78,6 +86,7 @@ import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LatencyPill
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
+import io.github.rustclashlabs.rustclash.ui.theme.RustClashBrandIcon
 import io.github.rustclashlabs.rustclash.ui.theme.TrafficWaveformGraph
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 
@@ -113,13 +122,15 @@ fun HomeScreen(
             .verticalScroll(rememberScrollState())
             .padding(start = 20.dp, top = 6.dp, end = 20.dp, bottom = 20.dp),
     ) {
-        // Top Brand Bar (matching design reference: clean "RustClash" left + overflow menu right)
+        // Top Brand Bar: Geometric brand emblem + title + live protection pill + overflow menu
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            RustClashBrandIcon(size = 28.dp)
+            Spacer(modifier = Modifier.width(10.dp))
             Text(
                 text = "RustClash",
                 style = MaterialTheme.typography.headlineMedium,
@@ -136,9 +147,35 @@ fun HomeScreen(
                     Text(
                         text = "沙盒模式",
                         style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
                         color = extColors.onAmberContainer,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
                     )
+                }
+            } else if (isConnected) {
+                Surface(
+                    shape = CircleShape,
+                    color = extColors.emeraldContainer,
+                    modifier = Modifier.padding(end = 4.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(extColors.emeraldBright),
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = "已保护",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = extColors.onEmeraldContainer,
+                        )
+                    }
                 }
             }
 
@@ -393,11 +430,38 @@ fun HomeScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+
+            if (isConnected) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val networkText = if (state.telemetry.isWifi) "Wi-Fi" else "移动网络"
+                    HomeMetaChip(
+                        text = networkText,
+                        containerColor = extColors.emeraldContainer.copy(alpha = 0.72f),
+                        contentColor = extColors.onEmeraldContainer,
+                    )
+                    HomeMetaChip(
+                        text = "${state.telemetry.activeConnections} 活跃连接",
+                        containerColor = extColors.cardSubtle,
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (state.enableIpv6) {
+                        HomeMetaChip(
+                            text = "IPv6",
+                            containerColor = extColors.violetContainer.copy(alpha = 0.78f),
+                            contentColor = extColors.onVioletContainer,
+                        )
+                    }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Live Speed & Waveform Card (matching design reference)
+        // Live Speed & Waveform Card
         Surface(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp),
@@ -416,13 +480,32 @@ fun HomeScreen(
                         arrow = "↓",
                         label = "下载",
                         rateText = UiJsonParsers.formatRate(if (isConnected) state.telemetry.downRate else 0L),
+                        accentColor = extColors.emerald,
                         modifier = Modifier.weight(1f),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .height(34.dp)
+                            .background(extColors.hairline),
                     )
                     SpeedColumnItem(
                         arrow = "↑",
                         label = "上传",
                         rateText = UiJsonParsers.formatRate(if (isConnected) state.telemetry.upRate else 0L),
+                        accentColor = extColors.sky,
                         modifier = Modifier.weight(1f),
+                    )
+                }
+
+                if (isConnected && (state.telemetry.downTotal > 0L || state.telemetry.upTotal > 0L)) {
+                    Text(
+                        text = "本次累计 ↓ ${UiJsonParsers.formatBytes(state.telemetry.downTotal)}  ·  ↑ ${UiJsonParsers.formatBytes(state.telemetry.upTotal)}",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
                     )
                 }
 
@@ -431,7 +514,7 @@ fun HomeScreen(
                     isConnected = isConnected,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(46.dp)
+                        .height(48.dp)
                         .clip(RoundedCornerShape(bottomStart = 18.dp, bottomEnd = 18.dp)),
                 )
             }
@@ -452,9 +535,15 @@ fun HomeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { showRoutingSheet = true }
-                        .padding(horizontal = 18.dp, vertical = 13.dp),
+                        .padding(horizontal = 16.dp, vertical = 13.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    HomeRowIconBadge(
+                        icon = Icons.Rounded.Route,
+                        tint = extColors.emerald,
+                        containerColor = extColors.emeraldContainer,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "路由模式",
@@ -480,7 +569,7 @@ fun HomeScreen(
                 }
 
                 HorizontalDivider(
-                    modifier = Modifier.padding(horizontal = 18.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp),
                     thickness = 0.8.dp,
                     color = extColors.hairline,
                 )
@@ -501,9 +590,15 @@ fun HomeScreen(
                                 onNavigateToNodes()
                             }
                         }
-                        .padding(horizontal = 18.dp, vertical = 13.dp),
+                        .padding(horizontal = 16.dp, vertical = 13.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    HomeRowIconBadge(
+                        icon = Icons.Rounded.Dns,
+                        tint = extColors.sky,
+                        containerColor = extColors.skyContainer,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "当前节点",
@@ -561,7 +656,7 @@ fun HomeScreen(
                 // Optional Row 3 when VPN is running or diagnostics exist: 实时分流概览
                 if (isConnected || state.diagnostics.isNotEmpty()) {
                     HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 18.dp),
+                        modifier = Modifier.padding(horizontal = 16.dp),
                         thickness = 0.8.dp,
                         color = extColors.hairline,
                     )
@@ -569,7 +664,7 @@ fun HomeScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { onNavigateToRules(1) }
-                            .padding(horizontal = 18.dp, vertical = 11.dp),
+                            .padding(horizontal = 16.dp, vertical = 11.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         val baseSummary =
@@ -607,7 +702,7 @@ fun HomeScreen(
                 }
 
                 HorizontalDivider(
-                    modifier = Modifier.padding(horizontal = 18.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp),
                     thickness = 0.8.dp,
                     color = extColors.hairline,
                 )
@@ -617,9 +712,15 @@ fun HomeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { onNavigateToRules(2) }
-                        .padding(horizontal = 18.dp, vertical = 12.dp),
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    HomeRowIconBadge(
+                        icon = Icons.Rounded.Public,
+                        tint = extColors.violet,
+                        containerColor = extColors.violetContainer,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "诊断连接问题",
@@ -758,6 +859,50 @@ fun HomeScreen(
 }
 
 @Composable
+private fun HomeMetaChip(
+    text: String,
+    containerColor: Color,
+    contentColor: Color,
+) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = containerColor,
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+            fontWeight = FontWeight.Medium,
+            color = contentColor,
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp),
+        )
+    }
+}
+
+@Composable
+private fun HomeRowIconBadge(
+    icon: ImageVector,
+    tint: Color,
+    containerColor: Color,
+) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(containerColor),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = tint,
+            modifier = Modifier.size(18.dp),
+        )
+    }
+}
+
+@Composable
 private fun HeroConnectButton(
     isConnected: Boolean,
     isTransitioning: Boolean,
@@ -765,8 +910,9 @@ private fun HeroConnectButton(
     onClick: () -> Unit,
 ) {
     val extColors = LocalRustClashColors.current
+    val haptic = LocalHapticFeedback.current
     // Only animate during active connect/disconnect transitions; steady-state connected aura stays
-    // static to avoid continuous 60-120 Hz idle redraws.
+    // static (0 Hz) to avoid continuous 60-120 Hz idle redraws.
     val haloScale = if (isTransitioning) {
         val pulseTransition = rememberInfiniteTransition(label = "vpnTransitionHalo")
         val animatedScale by pulseTransition.animateFloat(
@@ -794,20 +940,20 @@ private fun HeroConnectButton(
     )
 
     val glowCenterColor = when {
-        isConnected -> extColors.emeraldBright.copy(alpha = if (extColors.isDark) 0.36f else 0.28f)
-        isErrorState -> extColors.danger.copy(alpha = 0.22f)
-        isTransitioning -> extColors.amber.copy(alpha = 0.22f)
-        else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)
+        isConnected -> extColors.emeraldBright.copy(alpha = if (extColors.isDark) 0.40f else 0.30f)
+        isErrorState -> extColors.danger.copy(alpha = 0.24f)
+        isTransitioning -> extColors.amber.copy(alpha = 0.24f)
+        else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
     }
 
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier.size(120.dp),
+        modifier = Modifier.size(128.dp),
     ) {
-        // Soft radial emerald aura halo matching the UI design mockup
+        // Multi-layer static-at-idle Neon radial aura + precision dashed orbit ring
         Canvas(
             modifier = Modifier
-                .size(120.dp)
+                .size(128.dp)
                 .then(
                     if (haloScale != 1.0f) {
                         Modifier.graphicsLayer {
@@ -823,23 +969,52 @@ private fun HeroConnectButton(
                 brush = Brush.radialGradient(
                     colors = listOf(
                         glowCenterColor,
-                        glowCenterColor.copy(alpha = glowCenterColor.alpha * 0.45f),
+                        glowCenterColor.copy(alpha = glowCenterColor.alpha * 0.42f),
                         Color.Transparent,
                     ),
                 ),
                 radius = size.minDimension / 2f,
             )
+            drawCircle(
+                color = ringColor.copy(alpha = if (isConnected) 0.42f else 0.18f),
+                radius = size.minDimension / 2f - 10.dp.toPx(),
+                style = Stroke(
+                    width = 1.25.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(9f, 9f), 0f),
+                ),
+            )
         }
 
         Surface(
-            onClick = onClick,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onClick()
+            },
             shape = CircleShape,
-            color = extColors.cardSurface,
-            border = BorderStroke(width = 2.6.dp, color = ringColor),
-            shadowElevation = if (isConnected) 6.dp else 1.dp,
-            modifier = Modifier.size(84.dp),
+            color = if (isConnected) extColors.emerald else extColors.cardSurface,
+            border = BorderStroke(
+                width = if (isConnected) 2.dp else 2.5.dp,
+                color = if (isConnected) Color.White.copy(alpha = 0.32f) else ringColor,
+            ),
+            shadowElevation = if (isConnected) 10.dp else 2.dp,
+            modifier = Modifier.size(86.dp),
         ) {
-            Box(contentAlignment = Alignment.Center) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (isConnected) {
+                            Modifier.background(
+                                Brush.linearGradient(
+                                    colors = listOf(extColors.emeraldBright, extColors.emerald),
+                                ),
+                            )
+                        } else {
+                            Modifier
+                        },
+                    ),
+            ) {
                 if (isTransitioning) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(32.dp),
@@ -850,10 +1025,10 @@ private fun HeroConnectButton(
                     Icon(
                         imageVector = Icons.Rounded.PowerSettingsNew,
                         contentDescription = if (isConnected) "断开 VPN" else "连接 VPN",
-                        tint = if (isConnected || isErrorState) {
-                            ringColor
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
+                        tint = when {
+                            isConnected -> Color.White
+                            isErrorState -> ringColor
+                            else -> MaterialTheme.colorScheme.onSurface
                         },
                         modifier = Modifier.size(36.dp),
                     )
@@ -868,21 +1043,37 @@ private fun SpeedColumnItem(
     arrow: String,
     label: String,
     rateText: String,
+    accentColor: Color,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier) {
-        Text(
-            text = "$arrow $label",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = arrow,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = accentColor,
+                maxLines = 1,
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = rateText,
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                fontFeatureSettings = "tnum",
+            ),
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,

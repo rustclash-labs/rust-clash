@@ -1,7 +1,9 @@
 use std::{
+    fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use aws_lc_rs::{
@@ -9,26 +11,65 @@ use aws_lc_rs::{
     digest::{SHA256, digest},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use parking_lot::RwLock;
 use rand::RngCore;
 use zeroize::Zeroize;
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 const KEYCHAIN_SERVICE: &str = "io.github.rustclashlabs.rust-clash";
 const MASTER_KEY_FILE: &str = "vault.master.key";
+const WRAPPED_MASTER_KEY_FILE: &str = "vault.master.key.wrapped";
+
+/// Platform hardware-backed key-wrapping bridge (for example, Android `AndroidKeyStore`
+/// AES-256-GCM wrapping the 32-byte `SecretVault` master key so raw key material never sits
+/// in plaintext alongside `item_*.enc` blobs on disk).
+pub trait VaultMasterKeyWrapper: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+    fn wrap_master_key(&self, plaintext_key: &[u8]) -> io::Result<Vec<u8>>;
+    fn unwrap_master_key(&self, wrapped_key: &[u8]) -> io::Result<Vec<u8>>;
+}
+
+static GLOBAL_MASTER_KEY_WRAPPER: RwLock<Option<Arc<dyn VaultMasterKeyWrapper>>> =
+    RwLock::new(None);
+
+/// Register a process-global hardware master-key wrapper (used by Android JNI to bridge
+/// `SecretVault` directly to `AndroidKeyStore`).
+pub fn register_vault_master_key_wrapper(wrapper: Arc<dyn VaultMasterKeyWrapper>) {
+    *GLOBAL_MASTER_KEY_WRAPPER.write() = Some(wrapper);
+}
+
+/// Clear any process-global hardware master-key wrapper.
+pub fn clear_vault_master_key_wrapper() {
+    *GLOBAL_MASTER_KEY_WRAPPER.write() = None;
+}
 
 /// Cross-platform OS-backed secret storage for subscription tokens, credentials, and sensitive URIs.
 ///
 /// Backends:
+/// - **Android**: `AndroidKeyStore` hardware-backed AES-256-GCM master-key wrapping (`vault.master.key.wrapped`)
+///   protecting `0600` AES-256-GCM secret blobs in `state_dir/vault/`, with zero-data-loss automatic
+///   migration from legacy plaintext `vault.master.key` files.
 /// - **Windows**: Win32 DPAPI (`CryptProtectData` / `CryptUnprotectData` with `CRYPTPROTECT_UI_FORBIDDEN`),
 ///   cryptographically bound to the current Windows user logon credential.
 /// - **macOS**: macOS Security Keychain (`/usr/bin/security` generic-password) when available and unlocked,
 ///   with automatic fallback to an `0600` AES-256-GCM authenticated vault in `state_dir/vault/`.
 /// - **Linux / Unix**: Freedesktop Secret Service (`secret-tool` / `libsecret`) when a session DBus is active,
 ///   with automatic fallback to an `0600` AES-256-GCM authenticated vault in `state_dir/vault/`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SecretVault {
     vault_dir: PathBuf,
     force_file_backend: bool,
+    wrapper_override: Option<Arc<dyn VaultMasterKeyWrapper>>,
+}
+
+impl fmt::Debug for SecretVault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretVault")
+            .field("vault_dir", &self.vault_dir)
+            .field("force_file_backend", &self.force_file_backend)
+            .field("backend", &self.backend_name())
+            .finish()
+    }
 }
 
 impl SecretVault {
@@ -39,6 +80,7 @@ impl SecretVault {
         Self {
             vault_dir: state_dir.join("vault"),
             force_file_backend: force_file,
+            wrapper_override: None,
         }
     }
 
@@ -46,12 +88,38 @@ impl SecretVault {
         Self {
             vault_dir: state_dir.join("vault"),
             force_file_backend: true,
+            wrapper_override: None,
         }
+    }
+
+    /// Construct a vault backed by an explicit `VaultMasterKeyWrapper` (useful for tests or
+    /// scoped platform integrations without mutating process-global state).
+    pub fn new_with_master_key_wrapper(
+        state_dir: &Path,
+        wrapper: Arc<dyn VaultMasterKeyWrapper>,
+    ) -> Self {
+        Self {
+            vault_dir: state_dir.join("vault"),
+            force_file_backend: false,
+            wrapper_override: Some(wrapper),
+        }
+    }
+
+    fn active_wrapper(&self) -> Option<Arc<dyn VaultMasterKeyWrapper>> {
+        if self.force_file_backend {
+            return None;
+        }
+        self.wrapper_override
+            .clone()
+            .or_else(|| GLOBAL_MASTER_KEY_WRAPPER.read().clone())
     }
 
     pub fn backend_name(&self) -> &'static str {
         if self.force_file_backend {
             return "aes-256-gcm-0600-file-vault";
+        }
+        if let Some(wrapper) = self.active_wrapper() {
+            return wrapper.backend_name();
         }
         #[cfg(windows)]
         {
@@ -83,7 +151,7 @@ impl SecretVault {
             ));
         }
 
-        if !self.force_file_backend {
+        if !self.force_file_backend && self.wrapper_override.is_none() {
             #[cfg(windows)]
             {
                 return self.put_windows_dpapi(key_id, plaintext.as_bytes());
@@ -117,7 +185,7 @@ impl SecretVault {
             return Ok(None);
         }
 
-        if !self.force_file_backend {
+        if !self.force_file_backend && self.wrapper_override.is_none() {
             #[cfg(windows)]
             {
                 return match self.get_windows_dpapi(key_id)? {
@@ -162,7 +230,7 @@ impl SecretVault {
     }
 
     pub fn delete_secret(&self, key_id: &str) -> io::Result<()> {
-        if !self.force_file_backend {
+        if !self.force_file_backend && self.wrapper_override.is_none() {
             #[cfg(windows)]
             {
                 let p = self.entry_path(key_id, "dpapi");
@@ -322,14 +390,235 @@ impl SecretVault {
         }
     }
 
+    fn read_and_unwrap_master_key(
+        wrapped_path: &Path,
+        wrapper: &dyn VaultMasterKeyWrapper,
+    ) -> io::Result<[u8; 32]> {
+        for attempt in 0..10 {
+            let blob = fs::read(wrapped_path)?;
+            if !blob.is_empty() {
+                let mut raw = wrapper.unwrap_master_key(&blob)?;
+                if raw.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&raw);
+                    raw.zeroize();
+                    return Ok(key);
+                }
+                raw.zeroize();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unwrapped vault master key '{}' has invalid length (expected 32 bytes)",
+                        wrapped_path.display()
+                    ),
+                ));
+            }
+            if attempt == 9 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "corrupt wrapped vault master key '{}' (empty file)",
+                wrapped_path.display()
+            ),
+        ))
+    }
+
+    fn publish_wrapped_master_key_atomic(
+        vault_dir: &Path,
+        wrapped_path: &Path,
+        wrapped_blob: &[u8],
+        mut candidate: [u8; 32],
+        wrapper: &dyn VaultMasterKeyWrapper,
+    ) -> io::Result<[u8; 32]> {
+        let nonce = rand::rng().next_u64();
+        let tmp_path = vault_dir.join(format!(
+            "{WRAPPED_MASTER_KEY_FILE}.tmp.{}.{nonce:016x}",
+            std::process::id()
+        ));
+        let write_tmp = (|| -> io::Result<()> {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(wrapped_blob)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_tmp {
+            let _ = fs::remove_file(&tmp_path);
+            candidate.zeroize();
+            return Err(err);
+        }
+
+        let link_res = fs::hard_link(&tmp_path, wrapped_path);
+        let _ = fs::remove_file(&tmp_path);
+
+        match link_res {
+            Ok(()) => Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                candidate.zeroize();
+                Self::read_and_unwrap_master_key(wrapped_path, wrapper)
+            }
+            Err(_) => {
+                let mut opts = OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                match opts.open(wrapped_path) {
+                    Ok(mut f) => {
+                        let direct_res = (|| -> io::Result<()> {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                f.set_permissions(fs::Permissions::from_mode(0o600))?;
+                            }
+                            f.write_all(wrapped_blob)?;
+                            f.sync_all()?;
+                            Ok(())
+                        })();
+                        if let Err(err) = direct_res {
+                            drop(f);
+                            let _ = fs::remove_file(wrapped_path);
+                            candidate.zeroize();
+                            return Err(err);
+                        }
+                        Ok(candidate)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        candidate.zeroize();
+                        Self::read_and_unwrap_master_key(wrapped_path, wrapper)
+                    }
+                    Err(e) => {
+                        candidate.zeroize();
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    fn secure_wipe_and_remove(path: &Path) {
+        if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
+            let zeros = [0u8; 32];
+            let _ = f.write_all(&zeros);
+            let _ = f.sync_all();
+        }
+        let _ = fs::remove_file(path);
+    }
+
     fn load_or_create_master_key(&self) -> io::Result<[u8; 32]> {
         static MASTER_KEY_INIT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _guard = MASTER_KEY_INIT_LOCK.lock();
 
         self.ensure_vault_dir()?;
         let key_path = self.vault_dir.join(MASTER_KEY_FILE);
+        let wrapped_path = self.vault_dir.join(WRAPPED_MASTER_KEY_FILE);
+
+        if let Some(wrapper) = self.active_wrapper() {
+            if wrapped_path.exists() {
+                let key = Self::read_and_unwrap_master_key(&wrapped_path, wrapper.as_ref())?;
+                if key_path.exists() {
+                    Self::secure_wipe_and_remove(&key_path);
+                }
+                return Ok(key);
+            }
+
+            if key_path.exists() {
+                let legacy_key = Self::read_existing_master_key(&key_path)?;
+                match wrapper.wrap_master_key(&legacy_key) {
+                    Ok(wrapped) if !wrapped.is_empty() => {
+                        match Self::publish_wrapped_master_key_atomic(
+                            &self.vault_dir,
+                            &wrapped_path,
+                            &wrapped,
+                            legacy_key,
+                            wrapper.as_ref(),
+                        ) {
+                            Ok(migrated_key) => {
+                                Self::secure_wipe_and_remove(&key_path);
+                                tracing::info!(
+                                    "Migrated vault master key to wrapped backend '{}'",
+                                    wrapper.backend_name()
+                                );
+                                return Ok(migrated_key);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed persisting wrapped vault master key during migration; keeping legacy key intact: {err}"
+                                );
+                                return Ok(legacy_key);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "Vault key wrapper '{}' returned empty ciphertext; keeping legacy key intact",
+                            wrapper.backend_name()
+                        );
+                        return Ok(legacy_key);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Vault key wrapper '{}' failed migrating legacy key; keeping legacy key intact: {err}",
+                            wrapper.backend_name()
+                        );
+                        return Ok(legacy_key);
+                    }
+                }
+            }
+
+            let mut candidate = [0u8; 32];
+            rand::rng().fill_bytes(&mut candidate);
+            match wrapper.wrap_master_key(&candidate) {
+                Ok(wrapped) if !wrapped.is_empty() => {
+                    return Self::publish_wrapped_master_key_atomic(
+                        &self.vault_dir,
+                        &wrapped_path,
+                        &wrapped,
+                        candidate,
+                        wrapper.as_ref(),
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "Vault key wrapper '{}' returned empty ciphertext; falling back to 0600 file master key",
+                        wrapper.backend_name()
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Vault key wrapper '{}' failed wrapping new master key; falling back to 0600 file master key: {err}",
+                        wrapper.backend_name()
+                    );
+                }
+            }
+            return Self::publish_master_key_atomic(&self.vault_dir, &key_path, candidate);
+        }
+
         if key_path.exists() {
             return Self::read_existing_master_key(&key_path);
+        }
+        if wrapped_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "vault master key is hardware-wrapped; platform keystore wrapper unavailable",
+            ));
         }
 
         let mut candidate = [0u8; 32];
@@ -829,5 +1118,153 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&mp_dir);
+    }
+
+    struct MockAeadWrapper {
+        kek: [u8; 32],
+    }
+
+    impl VaultMasterKeyWrapper for MockAeadWrapper {
+        fn backend_name(&self) -> &'static str {
+            "mock-android-keystore-aes-256-gcm"
+        }
+
+        fn wrap_master_key(&self, raw_key: &[u8]) -> io::Result<Vec<u8>> {
+            let unbound = UnboundKey::new(&AES_256_GCM, &self.kek)
+                .map_err(|_| io::Error::other("mock wrap init failed"))?;
+            let aead = LessSafeKey::new(unbound);
+            let mut nonce_bytes = [0u8; 12];
+            rand::rng().fill_bytes(&mut nonce_bytes);
+            let mut buf = raw_key.to_vec();
+            aead.seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::empty(),
+                &mut buf,
+            )
+            .map_err(|_| io::Error::other("mock wrap seal failed"))?;
+            let mut out = Vec::with_capacity(12 + buf.len());
+            out.extend_from_slice(&nonce_bytes);
+            out.extend_from_slice(&buf);
+            Ok(out)
+        }
+
+        fn unwrap_master_key(&self, wrapped: &[u8]) -> io::Result<Vec<u8>> {
+            if wrapped.len() < 12 + 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated wrapped master key",
+                ));
+            }
+            let unbound = UnboundKey::new(&AES_256_GCM, &self.kek)
+                .map_err(|_| io::Error::other("mock unwrap init failed"))?;
+            let aead = LessSafeKey::new(unbound);
+            let mut nonce_bytes = [0u8; 12];
+            nonce_bytes.copy_from_slice(&wrapped[..12]);
+            let mut buf = wrapped[12..].to_vec();
+            let plain = aead
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce_bytes),
+                    Aad::empty(),
+                    &mut buf,
+                )
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "wrapped master key tag verification failed",
+                    )
+                })?;
+            Ok(plain.to_vec())
+        }
+    }
+
+    #[test]
+    fn wrapped_master_key_roundtrip_and_tamper_rejection() {
+        let dir =
+            std::env::temp_dir().join(format!("rc-vault-wrapped-test-{}", uuid::Uuid::new_v4()));
+        let wrapper: Arc<dyn VaultMasterKeyWrapper> = Arc::new(MockAeadWrapper { kek: [0xA7; 32] });
+        let vault = SecretVault::new_with_master_key_wrapper(&dir, Arc::clone(&wrapper));
+        assert_eq!(vault.backend_name(), "mock-android-keystore-aes-256-gcm");
+
+        vault
+            .put_secret("sub:hw", "https://sub.example/token=hw-wrapped-99")
+            .unwrap();
+        assert_eq!(
+            vault.get_secret("sub:hw").unwrap().as_deref(),
+            Some("https://sub.example/token=hw-wrapped-99")
+        );
+
+        let wrapped_path = dir.join("vault").join(WRAPPED_MASTER_KEY_FILE);
+        let legacy_path = dir.join("vault").join(MASTER_KEY_FILE);
+        assert!(wrapped_path.exists(), "wrapped master key file must exist");
+        assert!(
+            !legacy_path.exists(),
+            "plaintext legacy master key must never be created when wrapper succeeds"
+        );
+
+        // Opening the wrapped vault without a wrapper must fail cleanly rather than overwriting.
+        let unwrapped_vault = SecretVault::new_file_backed(&dir);
+        assert_eq!(
+            unwrapped_vault.get_secret("sub:hw").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        // Tampering with wrapped master key blob must fail authentication.
+        let mut blob = fs::read(&wrapped_path).unwrap();
+        let last = blob.len() - 1;
+        blob[last] ^= 0xFF;
+        fs::write(&wrapped_path, &blob).unwrap();
+        assert_eq!(
+            vault.get_secret("sub:hw").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_master_key_migrates_seamlessly_to_wrapped() {
+        let dir =
+            std::env::temp_dir().join(format!("rc-vault-migrate-test-{}", uuid::Uuid::new_v4()));
+
+        // 1. Seed legacy plaintext vault.master.key + encrypted secret entry
+        let legacy_vault = SecretVault::new_file_backed(&dir);
+        legacy_vault
+            .put_secret("sub:legacy", "https://legacy.example/sub?token=keep-me")
+            .unwrap();
+        let legacy_path = dir.join("vault").join(MASTER_KEY_FILE);
+        let wrapped_path = dir.join("vault").join(WRAPPED_MASTER_KEY_FILE);
+        assert!(legacy_path.exists());
+        assert!(!wrapped_path.exists());
+
+        // 2. Open same directory with hardware wrapper -> automatic zero-data-loss migration!
+        let wrapper: Arc<dyn VaultMasterKeyWrapper> = Arc::new(MockAeadWrapper { kek: [0x5C; 32] });
+        let upgraded_vault = SecretVault::new_with_master_key_wrapper(&dir, wrapper);
+        assert_eq!(
+            upgraded_vault.get_secret("sub:legacy").unwrap().as_deref(),
+            Some("https://legacy.example/sub?token=keep-me")
+        );
+        assert!(
+            wrapped_path.exists(),
+            "migration must publish vault.master.key.wrapped"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "migration must securely remove legacy plaintext vault.master.key"
+        );
+
+        // 3. Subsequent writes and reads continue working seamlessly under the migrated key.
+        upgraded_vault
+            .put_secret("sub:new", "https://new.example/sub?token=after-migration")
+            .unwrap();
+        assert_eq!(
+            upgraded_vault.get_secret("sub:legacy").unwrap().as_deref(),
+            Some("https://legacy.example/sub?token=keep-me")
+        );
+        assert_eq!(
+            upgraded_vault.get_secret("sub:new").unwrap().as_deref(),
+            Some("https://new.example/sub?token=after-migration")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

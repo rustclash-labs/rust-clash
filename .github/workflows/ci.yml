@@ -203,6 +203,11 @@ jobs:
           npm test
           npm run build
 
+      - name: Advisory Production Dependency Audit (Non-Blocking)
+        working-directory: ui
+        run: |
+          npm audit --omit=dev --audit-level=high || echo "::warning::npm audit reported high/critical advisory in ui production dependencies"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ui-dist

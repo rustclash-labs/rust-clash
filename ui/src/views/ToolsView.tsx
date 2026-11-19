@@ -710,7 +710,11 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
 
         {version && (
           <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
-            RustClash {version.version}
+            RustClash {version.version} ·{" "}
+            {tr(
+              "AI 编写：Gemini Argon · Carbon · Neon (GPT 审核)",
+              "AI: Gemini Argon · Carbon · Neon (GPT Reviewed)",
+            )}
           </span>
         )}
       </div>

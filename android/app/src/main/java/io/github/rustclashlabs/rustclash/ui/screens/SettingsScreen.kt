@@ -641,7 +641,7 @@ private fun GeneralSettingsBottomSheet(
                     "待连接"
                 },
             )
-            InfoKeyValueRow("配置与节点持久化", "SharedPreferences + 敏感凭据加密存储")
+            InfoKeyValueRow("配置与节点持久化", "Android Keystore 硬件包裹主密钥 + 沙箱 0600 存储")
 
             Spacer(modifier = Modifier.height(20.dp))
         }
@@ -1055,7 +1055,18 @@ private fun AboutRustClashBottomSheet(
                 if (state.nativeLoaded) "libproxy_ffi.so 已加载" else "待加载",
             )
             InfoKeyValueRow("用户态网络栈", "smoltcp + Tokio 异步多路复用")
-            InfoKeyValueRow("支持出站协议", "Shadowsocks / VLESS (+WS) / AnyTLS / Trojan (+WS) / SOCKS5 / HTTP")
+            InfoKeyValueRow(
+                "凭据与密钥保护",
+                "Android Keystore AES-256-GCM 硬件包裹主密钥",
+            )
+            InfoKeyValueRow(
+                "支持出站协议",
+                "VLESS (REALITY / WS) / VMess / Shadowsocks (2022) / Trojan / Hysteria2 / TUIC v5 / AnyTLS / SOCKS5 / HTTP",
+            )
+            InfoKeyValueRow(
+                "AI 协作编写",
+                "Gemini Argon · Carbon · Neon (GPT 审核)",
+            )
 
             Spacer(modifier = Modifier.height(20.dp))
         }

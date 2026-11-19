@@ -2,12 +2,12 @@
 
 ## Experimental Posture & Supported Versions
 
-`rust-clash` is an **experimental, pre-1.0** codebase (`0.4.x`) written end-to-end by **Gemini Argon** and **Gemini Carbon**, with **GPT** participating in code review. It has **not** undergone an external cryptographic or security audit and is provided strictly `AS IS` for research, testing, and evaluation. Security fixes are applied on a best-effort basis to the latest minor release series on `main`:
+`rust-clash` is an **experimental, pre-1.0** codebase (`0.5.x`) written end-to-end by **Gemini Argon**, **Gemini Carbon**, and **Gemini Neon**, with **GPT** participating in code review. It has **not** undergone an external cryptographic or security audit and is provided strictly `AS IS` for research, testing, and evaluation. Security fixes are applied on a best-effort basis to the latest minor release series on `main`:
 
 | Version | Supported |
 |---|---|
-| `0.4.x` (`main`) | Yes (experimental / best-effort) |
-| `< 0.4.0` | No (please upgrade to the latest `0.4.x` release) |
+| `0.5.x` (`main`) | Yes (experimental / best-effort) |
+| `< 0.5.0` | No (please upgrade to the latest `0.5.x` release) |
 
 ---
 
