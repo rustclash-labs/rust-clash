@@ -4003,6 +4003,10 @@ impl ProxyEngine {
         auto_update_interval_secs: Option<u64>,
     ) -> Result<crate::profile::NodeMutationReport> {
         let mgr = self.ensure_profile_manager()?;
+        let prev_snap = mgr.snapshot();
+        let prev_active_id = prev_snap.active_profile_id;
+        let prev_ids: std::collections::HashSet<String> =
+            prev_snap.profiles.into_iter().map(|p| p.id).collect();
         let checkpoint = mgr.capture_checkpoint();
         let report = match mgr
             .import_unified_input_with_options(
@@ -4020,12 +4024,19 @@ impl ProxyEngine {
                 return Err(err);
             }
         };
-        if let Err(err) = self
-            .activate_profile_config_with_selections(
-                report.config.clone(),
-                Some(&report.selected_groups),
-            )
-            .await
+        let after_snap = mgr.snapshot();
+        let created_inactive_profile = after_snap.active_profile_id == prev_active_id
+            && after_snap
+                .profiles
+                .iter()
+                .any(|p| !prev_ids.contains(&p.id));
+        if !created_inactive_profile
+            && let Err(err) = self
+                .activate_profile_config_with_selections(
+                    report.config.clone(),
+                    Some(&report.selected_groups),
+                )
+                .await
         {
             mgr.restore_checkpoint(checkpoint);
             return Err(err);

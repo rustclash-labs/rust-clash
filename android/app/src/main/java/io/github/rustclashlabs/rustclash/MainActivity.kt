@@ -1,6 +1,7 @@
 package io.github.rustclashlabs.rustclash
 
 import android.Manifest
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -225,11 +226,14 @@ class MainActivity : AppCompatActivity() {
                     }.getOrNull()
                 }
                 if (!text.isNullOrBlank()) {
+                    val autoSelect = viewModel.shouldAutoSelectOnImport()
                     viewModel.importUnifiedPayload(
                         rawPayload = text,
                         deduplicate = true,
-                        autoSelect = true,
-                        onSuccess = ::exitDemoModeIfActive,
+                        autoSelect = autoSelect,
+                        onSuccess = {
+                            if (autoSelect) exitDemoModeIfActive() else reconcileDemoModeAfterAsyncMutation()
+                        },
                     )
                 } else {
                     viewModel.emitUiMessage("所选 YAML 配置文件为空或无法读取")
@@ -367,6 +371,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     },
                     onOpenBatteryOptimizationSettings = ::openBatteryOptimizationSettings,
+                    onCopyExitIp = ::copyExitIpToClipboard,
                     onExitDemoModeSync = ::exitDemoModeIfActive,
                     onReconcileAsyncMutationDemoExit = ::reconcileDemoModeAfterAsyncMutation,
                 )
@@ -556,6 +561,18 @@ class MainActivity : AppCompatActivity() {
         return clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
     }
 
+    private fun copyExitIpToClipboard(ip: String) {
+        val cleaned = ip.trim()
+        if (cleaned.isEmpty()) return
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        if (cm != null) {
+            cm.setPrimaryClip(ClipData.newPlainText("Exit IP", cleaned))
+            viewModel.emitUiMessage("已复制落地 IP：$cleaned")
+        } else {
+            viewModel.emitUiMessage("无法访问系统剪贴板")
+        }
+    }
+
     private fun decodeQrBitmapAndImport(rawBitmap: Bitmap) {
         lifecycleScope.launch {
             val decodedText = withContext(Dispatchers.Default) {
@@ -577,11 +594,14 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (!decodedText.isNullOrBlank()) {
+                val autoSelect = viewModel.shouldAutoSelectOnImport()
                 viewModel.importUnifiedPayload(
                     rawPayload = decodedText,
                     deduplicate = true,
-                    autoSelect = true,
-                    onSuccess = ::exitDemoModeIfActive,
+                    autoSelect = autoSelect,
+                    onSuccess = {
+                        if (autoSelect) exitDemoModeIfActive() else reconcileDemoModeAfterAsyncMutation()
+                    },
                 )
             } else {
                 viewModel.emitUiMessage("未识别到有效的二维码，请对准清晰的节点或订阅二维码重试")
@@ -645,6 +665,7 @@ internal fun RustClashAppScaffold(
     onShareDebugReport: () -> Unit = {},
     onSaveDebugReportToFile: () -> Unit = {},
     onOpenBatteryOptimizationSettings: () -> Unit = {},
+    onCopyExitIp: (String) -> Unit = {},
     onExitDemoModeSync: () -> Unit = {},
     onReconcileAsyncMutationDemoExit: () -> Unit = {},
 ) {
@@ -777,6 +798,8 @@ internal fun RustClashAppScaffold(
                         onDismissError = viewModel::clearLastError,
                         onShareDebugReport = onShareDebugReport,
                         onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
+                        onRefreshExitIp = { viewModel.probeExitIp(forceRefresh = true) },
+                        onCopyExitIp = onCopyExitIp,
                     )
 
                     MainDestination.NODES -> NodesScreen(
@@ -795,11 +818,14 @@ internal fun RustClashAppScaffold(
                         onImportClipboardDirect = {
                             val clip = onReadClipboard()
                             if (!clip.isNullOrBlank()) {
+                                val autoSelect = viewModel.shouldAutoSelectOnImport()
                                 viewModel.importUnifiedPayload(
                                     rawPayload = clip,
                                     deduplicate = true,
-                                    autoSelect = true,
-                                    onSuccess = onExitDemoModeSync,
+                                    autoSelect = autoSelect,
+                                    onSuccess = {
+                                        if (autoSelect) onExitDemoModeSync() else onReconcileAsyncMutationDemoExit()
+                                    },
                                 )
                             } else {
                                 viewModel.clearModalError()
@@ -910,6 +936,7 @@ internal fun RustClashAppScaffold(
             errorMessage = state.modalError,
             onClearError = viewModel::clearModalError,
             defaultSubAutoUpdateSecs = state.defaultSubAutoUpdateSecs,
+            defaultAutoSelect = viewModel.shouldAutoSelectOnImport(),
             onDismiss = {
                 viewModel.cancelImportAndClearModalError()
                 showImportSheet = false
@@ -929,7 +956,7 @@ internal fun RustClashAppScaffold(
                     autoSelect = autoSel,
                     subscriptionAutoUpdateSecs = subSecs,
                     onSuccess = {
-                        onExitDemoModeSync()
+                        if (autoSel) onExitDemoModeSync() else onReconcileAsyncMutationDemoExit()
                         viewModel.clearModalError()
                         showImportSheet = false
                     },
@@ -944,6 +971,7 @@ internal fun RustClashAppScaffold(
             isSaving = state.isSavingModal,
             backendError = state.modalError,
             onClearBackendError = viewModel::clearModalError,
+            defaultAutoSelect = editingNode == null && viewModel.shouldAutoSelectOnImport(),
             onDismiss = {
                 if (!state.isSavingModal) {
                     viewModel.clearModalError()
@@ -956,7 +984,7 @@ internal fun RustClashAppScaffold(
                     nodeJson = nodeJson,
                     autoSelect = autoSelect,
                     onSuccess = {
-                        onExitDemoModeSync()
+                        if (autoSelect) onExitDemoModeSync() else onReconcileAsyncMutationDemoExit()
                         viewModel.clearModalError()
                         showNodeEditor = false
                     },

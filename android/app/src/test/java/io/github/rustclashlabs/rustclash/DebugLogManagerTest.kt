@@ -1377,4 +1377,139 @@ class DebugLogManagerTest {
             exportDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun deviceIdleDozeTransitionsRecordEnterExitWithDurationAndDeduplicate() {
+        DebugLogManager.resetTimelineStateForTest(initialDoze = false)
+        val t0 = 1_795_000_000_000L
+        // Redundant non-doze broadcast must be ignored
+        DebugLogManager.onDeviceIdleModeChangedAt(isDoze = false, interactive = false, nowMs = t0)
+        assertTrue(DebugLogManager.snapshotTimelineEventsForTest().isEmpty())
+
+        // Enter Doze, ignore duplicate enter, then exit Doze after 1800s
+        DebugLogManager.onDeviceIdleModeChangedAt(isDoze = true, interactive = false, nowMs = t0 + 10_000L)
+        DebugLogManager.onDeviceIdleModeChangedAt(isDoze = true, interactive = false, nowMs = t0 + 20_000L)
+        DebugLogManager.onDeviceIdleModeChangedAt(isDoze = false, interactive = true, nowMs = t0 + 1_810_000L)
+        DebugLogManager.onDeviceIdleModeChangedAt(isDoze = false, interactive = true, nowMs = t0 + 1_820_000L)
+
+        val events = DebugLogManager.snapshotTimelineEventsForTest()
+        assertEquals(2, events.size)
+        assertEquals("DOZE_ENTER", events[0].category)
+        assertEquals("doze=true interactive=false", events[0].detail)
+        assertEquals("DOZE_EXIT", events[1].category)
+        assertEquals("doze=false interactive=true durationMs=1800000", events[1].detail)
+    }
+
+    @Test
+    fun formatSliceReportDisplaysCancelledDialsAndTruncatedWindowSamplingHeader() {
+        val t0 = 1_795_000_000_000L
+        val t1 = t0 + 1_800_000L
+        val window = DebugLogManager.WindowTelemetryState(
+            windowStartMs = t0,
+            capturedAtMs = t1,
+            sessionStartMs = t0 - 3_600_000L,
+            screenOnMs = 900_000L,
+            screenOffMs = 900_000L,
+            startBatteryPct = 80,
+            events = emptyList(),
+        )
+        val sysMeta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "HONOR",
+            deviceModel = "BVL-AN00",
+            androidRelease = "17",
+            sdkInt = 37,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.5.5",
+            appVersionCode = 34,
+            battery = DebugLogManager.BatterySnapshot(77, false, 35.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 12L * 1024L * 1024L,
+            jvmMaxBytes = 384L * 1024L * 1024L,
+            nativeHeapBytes = 40L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+        val truncatedJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 5400,
+              "mode": "rule",
+              "routingPreset": "smart-cn",
+              "effectiveOutbound": "SG-01",
+              "effectiveProtocol": "VLESS",
+              "effectiveDelayMs": 105,
+              "traffic": {
+                "upTotal": 10485760,
+                "downTotal": 524288000,
+                "activeConnections": 3,
+                "totalConnections": 5000,
+                "establishedConnections": 4910,
+                "failedConnections": 56,
+                "cancelledConnections": 31,
+                "zeroRxClosedConnections": 14
+              },
+              "windowSummary": {
+                "connections": 3000,
+                "tcpConnections": 2600,
+                "udpConnections": 400,
+                "failedConnections": 12,
+                "cancelledConnections": 19,
+                "zeroRxClosedConnections": 5,
+                "fakeIpRestoredConnections": 2500,
+                "sampledSnapshots": 3000,
+                "ringCapacity": 3000,
+                "truncated": true,
+                "ringEvictedInWindow": true
+              },
+              "outboundStats": [
+                {
+                  "outbound": "DIRECT",
+                  "protocol": "Direct",
+                  "exitType": "DIRECT",
+                  "connections": 2800,
+                  "failures": 12,
+                  "cancelled": 19,
+                  "zeroRxCount": 5,
+                  "handshakeSamples": 2400,
+                  "handshakeP50Ms": 62,
+                  "handshakeP95Ms": 210,
+                  "handshakeMaxMs": 1400,
+                  "uploadBytes": 4000000,
+                  "downloadBytes": 150000000
+                }
+              ]
+            }
+        """.trimIndent()
+
+        // With previousTotalConnections = 1200, expected delta in window is 3800 conns vs 3000 sampled
+        val reportWithDelta = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = truncatedJson,
+            crashBreadcrumb = null,
+            previousTotalConnections = 1200L,
+        )
+        assertTrue(reportWithDelta.contains("established=`4910` failed=`56` cancelled=`31` zeroRxClosed=`14`"))
+        assertTrue(reportWithDelta.contains("#### Outbound Node Performance (Window, sampled 3000/3800 conns, cap=3000)"))
+        assertTrue(reportWithDelta.contains("zeroRx=`5` cancelled=`19` probe=`N/A`"))
+
+        // Without previousTotalConnections, still reports explicit truncation at ring cap
+        val reportWithoutDelta = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = truncatedJson,
+            crashBreadcrumb = null,
+            previousTotalConnections = null,
+        )
+        assertTrue(reportWithoutDelta.contains("#### Outbound Node Performance (Window, truncated, cap=3000, sampled 3000 newest conns)"))
+    }
 }

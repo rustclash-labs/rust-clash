@@ -278,6 +278,81 @@ data class SiteDiagnosisUi(
     val vpnRunning: Boolean,
 )
 
+data class ExitIpUi(
+    val verified: Boolean = false,
+    val ip: String = "",
+    val country: String = "",
+    val countryCode: String = "",
+    val isp: String = "",
+    val asn: String = "",
+    val ipType: String = "",
+    val latencyMs: Long? = null,
+    val outbound: String = "",
+    val protocol: String = "",
+    val mode: String = "",
+    val vpnRunning: Boolean = false,
+    val demoMode: Boolean = false,
+    val checkedAtMs: Long = 0L,
+    val cached: Boolean = false,
+    val error: String? = null,
+) {
+    val flagEmoji: String
+        get() {
+            val code = countryCode.trim().uppercase(Locale.ROOT)
+            if (code.length != 2 || !code.all { it in 'A'..'Z' }) return ""
+            val first = Character.toChars(0x1F1E6 + (code[0].code - 'A'.code))
+            val second = Character.toChars(0x1F1E6 + (code[1].code - 'A'.code))
+            return String(first) + String(second)
+        }
+
+    val countryDisplayZh: String
+        get() {
+            if (demoMode) return "新加坡（沙盒）"
+            val code = countryCode.trim().uppercase(Locale.ROOT)
+            if (code.length == 2 && code.all { it in 'A'..'Z' }) {
+                val localized = runCatching {
+                    Locale.Builder().setRegion(code).build().getDisplayCountry(Locale.SIMPLIFIED_CHINESE).trim()
+                }.getOrDefault("")
+                if (localized.isNotEmpty() && !localized.equals(code, ignoreCase = true)) {
+                    return localized
+                }
+            }
+            val raw = country.trim()
+            if (raw.isNotEmpty() &&
+                !raw.equals("Unknown", ignoreCase = true) &&
+                !raw.equals("Offline", ignoreCase = true)
+            ) {
+                return raw
+            }
+            return if (code.isNotEmpty()) code else "未知地区"
+        }
+
+    val countryWithFlag: String
+        get() {
+            val flag = flagEmoji
+            val name = countryDisplayZh
+            return if (flag.isNotEmpty()) "$flag $name" else name
+        }
+
+    val ipTypeDisplayZh: String
+        get() = when (ipType.trim().lowercase(Locale.ROOT)) {
+            "datacenter / hosting", "datacenter", "hosting" -> "数据中心 / 机房 IP"
+            "isp / broadband", "isp", "residential" -> "运营商 / 宽带 IP"
+            "mobile / cellular", "mobile" -> "移动网络 IP"
+            "sandbox" -> "本地沙盒演示"
+            "blocked" -> "已拦截 (REJECT)"
+            "", "unknown" -> "未知"
+            else -> ipType.trim()
+        }
+
+    val compactPillText: String
+        get() = if (verified && ip.isNotBlank() && ip != "--") {
+            "$countryWithFlag · $ip"
+        } else {
+            "落地 IP 检测失败 · 点击重试"
+        }
+}
+
 data class SkippedProtocolGroupUi(
     val protocolLabel: String,
     val count: Int,
@@ -396,6 +471,8 @@ data class AppUiState(
     val isUpdatingGeoData: Boolean = false,
     val isExplaining: Boolean = false,
     val isDiagnosingSite: Boolean = false,
+    val exitIp: ExitIpUi? = null,
+    val isProbingExitIp: Boolean = false,
     val lastProfileOpSummary: ProfileOpSummaryUi? = null,
     val refreshingProfileId: String? = null,
     val activeYamlRedacted: String = "",
@@ -1151,6 +1228,48 @@ object UiJsonParsers {
             auditScore = auditScore,
             newlyInsecureCount = newlyInsecure,
             manualProtectedCount = manualCount,
+        )
+    }
+
+    fun parseExitIpResponse(rawJson: String): ExitIpUi? {
+        val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: return null
+        if (!obj.optBoolean("ok", false)) {
+            val err = formatCleanBackendError(obj.optString("error"), "落地 IP 查询失败")
+            return ExitIpUi(verified = false, error = err)
+        }
+        val lat = when {
+            obj.has("latencyMs") && !obj.isNull("latencyMs") ->
+                obj.optLong("latencyMs", -1L).takeIf { it >= 0L }
+            obj.has("latency_ms") && !obj.isNull("latency_ms") ->
+                obj.optLong("latency_ms", -1L).takeIf { it >= 0L }
+            else -> null
+        }
+        val errRaw = if (obj.has("error") && !obj.isNull("error")) {
+            obj.optString("error").trim().takeIf { it.isNotEmpty() }?.let {
+                formatCleanBackendError(it, it)
+            }
+        } else {
+            null
+        }
+        val ip = obj.optString("ip", "").trim()
+        val verified = obj.optBoolean("verified", ip.isNotEmpty() && ip != "--")
+        return ExitIpUi(
+            verified = verified,
+            ip = ip,
+            country = obj.optString("country", "").trim(),
+            countryCode = obj.optString("countryCode", obj.optString("country_code", "")).trim(),
+            isp = obj.optString("isp", obj.optString("organization", "")).trim(),
+            asn = obj.optString("asn", "").trim(),
+            ipType = obj.optString("ipType", obj.optString("ip_type", "")).trim(),
+            latencyMs = lat,
+            outbound = obj.optString("outbound", "").trim(),
+            protocol = obj.optString("protocol", "").trim(),
+            mode = obj.optString("mode", "").trim(),
+            vpnRunning = obj.optBoolean("vpnRunning", false),
+            demoMode = obj.optBoolean("demoMode", false),
+            checkedAtMs = obj.optLong("checkedAtMs", obj.optLong("checked_at_ms", 0L)),
+            cached = obj.optBoolean("cached", false),
+            error = errRaw,
         )
     }
 }

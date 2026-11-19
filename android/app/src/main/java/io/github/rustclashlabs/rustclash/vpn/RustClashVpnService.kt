@@ -580,12 +580,19 @@ class RustClashVpnService : VpnService() {
                             }
                         }
                     }
+                    PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
+                        val pm = getSystemService(PowerManager::class.java)
+                        val isDoze = pm?.isDeviceIdleMode ?: false
+                        val interactive = pm?.isInteractive ?: isScreenInteractive
+                        DebugLogManager.onDeviceIdleModeChanged(isDoze = isDoze, interactive = interactive)
+                    }
                 }
             }
         }
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
+            addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
         }
         runCatching {
             ContextCompat.registerReceiver(

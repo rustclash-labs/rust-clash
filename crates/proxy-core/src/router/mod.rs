@@ -140,6 +140,7 @@ pub struct Router {
     epoch: AtomicU64,
     unified_delay: AtomicBool,
     tun_dns_hijack: AtomicBool,
+    low_power_mode: AtomicBool,
     outbounds: HashMap<String, DynOutbound>,
     groups: HashMap<String, Arc<ProxyGroup>>,
     group_order: Vec<String>,
@@ -273,6 +274,7 @@ impl Router {
             epoch: AtomicU64::new(ROUTER_EPOCH_SEQ.fetch_add(1, Ordering::Relaxed)),
             unified_delay: AtomicBool::new(true),
             tun_dns_hijack: AtomicBool::new(true),
+            low_power_mode: AtomicBool::new(false),
             outbounds,
             groups,
             group_order,
@@ -305,6 +307,12 @@ impl Router {
     }
 
     pub fn record_passive_delay_if_stale(&self, name: &str, rtt_ms: u64, max_age_ms: u64) {
+        // Screen-off background push heartbeats (e.g. FCM/mtalk) dial from cellular RRC-IDLE
+        // and systematically incur +150–350ms radio paging overhead. Preserve the existing
+        // interactive baseline while low_power_mode is active; interactive dials refresh it.
+        if max_age_ms > 0 && self.is_low_power_mode() && self.delays.latest_delay(name).is_some() {
+            return;
+        }
         self.delays
             .record_passive_if_stale(name, rtt_ms, max_age_ms);
     }
@@ -334,7 +342,12 @@ impl Router {
         self.tun_dns_hijack.store(enabled, Ordering::Relaxed);
     }
 
+    pub fn is_low_power_mode(&self) -> bool {
+        self.low_power_mode.load(Ordering::Acquire)
+    }
+
     pub fn set_low_power_mode(&self, enabled: bool) {
+        self.low_power_mode.store(enabled, Ordering::Release);
         for ob in self.outbounds.values() {
             ob.set_low_power_mode(enabled);
         }
@@ -1665,6 +1678,24 @@ mod tests {
         assert_eq!(router.delays().latest_delay("DIRECT"), Some(42));
         router.record_passive_delay_if_stale("DIRECT", 21, 0);
         assert_eq!(router.delays().latest_delay("DIRECT"), Some(21));
+
+        // Screen-off low_power_mode preserves an existing node delay against RRC-idle heartbeat spikes,
+        // while still allowing an unseeded node to record its first measurement and resuming normal
+        // passive refreshes once interactive again.
+        router.delays().record("SG-01", 105);
+        router.set_low_power_mode(true);
+        assert!(router.is_low_power_mode());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        router.record_passive_delay_if_stale("SG-01", 456, 1);
+        assert_eq!(router.delays().latest_delay("SG-01"), Some(105));
+        router.record_passive_delay_if_stale("SG-UNSEEDED", 180, 1);
+        assert_eq!(router.delays().latest_delay("SG-UNSEEDED"), Some(180));
+
+        router.set_low_power_mode(false);
+        assert!(!router.is_low_power_mode());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        router.record_passive_delay_if_stale("SG-01", 112, 1);
+        assert_eq!(router.delays().latest_delay("SG-01"), Some(112));
     }
 
     struct MockProbeOutbound {

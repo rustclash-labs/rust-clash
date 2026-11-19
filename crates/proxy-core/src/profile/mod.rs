@@ -1913,28 +1913,29 @@ impl ProfileManager {
                     cfg.proxies.iter().map(|n| n.name().to_string()).collect();
 
                 let active_id = self.active_profile_id();
-                let active_is_subscription_fallback_name = if effective_name_hint.is_none() {
+                let (was_empty_starter, active_is_subscription) = {
                     let idx = self.index.lock();
-                    if idx
-                        .profiles
-                        .iter()
-                        .find(|p| p.id == active_id)
-                        .is_some_and(|p| p.kind == ProfileKind::Subscription)
-                    {
-                        let mut n = 1usize;
-                        loop {
-                            let candidate = if n == 1 {
-                                "Local YAML".to_string()
-                            } else {
-                                format!("Local YAML ({n})")
-                            };
-                            if !idx.profiles.iter().any(|p| p.name == candidate) {
-                                break Some(candidate);
-                            }
-                            n += 1;
+                    let active_meta = idx.profiles.iter().find(|p| p.id == active_id);
+                    (
+                        active_meta.is_some_and(|p| p.proxy_count == 0),
+                        active_meta.is_some_and(|p| p.kind == ProfileKind::Subscription),
+                    )
+                };
+                let new_profile_fallback_name = if effective_name_hint.is_none()
+                    && (active_is_subscription || (!auto_select && !was_empty_starter))
+                {
+                    let idx = self.index.lock();
+                    let mut n = 1usize;
+                    loop {
+                        let candidate = if n == 1 {
+                            "Local YAML".to_string()
+                        } else {
+                            format!("Local YAML ({n})")
+                        };
+                        if !idx.profiles.iter().any(|p| p.name == candidate) {
+                            break Some(candidate);
                         }
-                    } else {
-                        None
+                        n += 1;
                     }
                 } else {
                     None
@@ -1942,8 +1943,9 @@ impl ProfileManager {
 
                 if let Some(name_to_create) = effective_name_hint
                     .map(ToOwned::to_owned)
-                    .or(active_is_subscription_fallback_name)
+                    .or(new_profile_fallback_name)
                 {
+                    let should_activate = auto_select || was_empty_starter;
                     let yaml_out = cfg.to_yaml_string()?;
                     let (mut meta, _, _) = self
                         .create_profile_detailed(CreateProfileSpec {
@@ -1952,7 +1954,7 @@ impl ProfileManager {
                             uris: None,
                             subscription_url: None,
                             auto_update_interval_secs: None,
-                            activate: true,
+                            activate: should_activate,
                         })
                         .await?;
                     if !skipped_unsupported.is_empty()
@@ -1975,6 +1977,14 @@ impl ProfileManager {
                             }
                         }
                     }
+                    let (report_cfg, report_sel) = if should_activate {
+                        (cfg, meta.selected_groups)
+                    } else {
+                        let active_cfg = self.load_active_config().map(|(c, _)| c).unwrap_or(cfg);
+                        let active_sel = self.active_selected_groups();
+                        (active_cfg, active_sel)
+                    };
+                    let total_nodes = report_cfg.proxies.len();
                     return Ok(NodeMutationReport {
                         input_kind: Some(ImportInputKind::ClashYaml),
                         added_nodes,
@@ -1983,19 +1993,12 @@ impl ProfileManager {
                         skipped_duplicates,
                         skipped_unsupported,
                         rule_sanitization: Some(rule_report),
-                        total_nodes: cfg.proxies.len(),
-                        selected_groups: meta.selected_groups,
-                        config: cfg,
+                        total_nodes,
+                        selected_groups: report_sel,
+                        config: report_cfg,
                     });
                 }
 
-                let was_empty_starter = {
-                    let idx = self.index.lock();
-                    idx.profiles
-                        .iter()
-                        .find(|p| p.id == active_id)
-                        .is_some_and(|p| p.proxy_count == 0)
-                };
                 let prev_sel = if auto_select || was_empty_starter {
                     HashMap::new()
                 } else {
@@ -2074,6 +2077,15 @@ impl ProfileManager {
                     Some(0) => None,
                     Some(secs) => Some(secs.max(60)),
                 };
+                let active_id = self.active_profile_id();
+                let was_empty_starter = {
+                    let idx = self.index.lock();
+                    idx.profiles
+                        .iter()
+                        .find(|p| p.id == active_id)
+                        .is_some_and(|p| p.proxy_count == 0)
+                };
+                let should_activate = auto_select || was_empty_starter;
 
                 let (meta, activated_cfg, skipped_unsupported, rule_sanitization) = self
                     .create_profile_full(CreateProfileSpec {
@@ -2082,7 +2094,7 @@ impl ProfileManager {
                         uris: None,
                         subscription_url: Some(normalized.clone()),
                         auto_update_interval_secs: effective_interval,
-                        activate: true,
+                        activate: should_activate,
                     })
                     .await
                     .map_err(|e| {
@@ -2091,9 +2103,30 @@ impl ProfileManager {
                         ProxyError::config_clean(safe)
                     })?;
 
-                let cfg = activated_cfg.unwrap_or_else(|| self.load_active_config().unwrap().0);
-                let added_nodes: Vec<String> =
-                    cfg.proxies.iter().map(|n| n.name().to_string()).collect();
+                let (added_nodes, cfg, selected_groups) = if let Some(new_cfg) = activated_cfg {
+                    let added: Vec<String> = new_cfg
+                        .proxies
+                        .iter()
+                        .map(|n| n.name().to_string())
+                        .collect();
+                    (added, new_cfg, meta.selected_groups)
+                } else {
+                    let imported_cfg = std::fs::read_to_string(self.profile_yaml_path(&meta.id))
+                        .ok()
+                        .and_then(|y| ClashConfig::from_yaml_str(&y).ok());
+                    let added: Vec<String> = imported_cfg
+                        .as_ref()
+                        .map(|c| c.proxies.iter().map(|n| n.name().to_string()).collect())
+                        .unwrap_or_default();
+                    let active_cfg = self.load_active_config().map(|(c, _)| c).or_else(|_| {
+                        imported_cfg.ok_or_else(|| {
+                            ProxyError::Config("failed to reload active profile config".into())
+                        })
+                    })?;
+                    let active_sel = self.active_selected_groups();
+                    (added, active_cfg, active_sel)
+                };
+                let total_nodes = cfg.proxies.len();
                 Ok(NodeMutationReport {
                     input_kind: Some(ImportInputKind::HttpsSubscriptionUrl),
                     added_nodes,
@@ -2102,8 +2135,8 @@ impl ProfileManager {
                     skipped_duplicates: 0,
                     skipped_unsupported,
                     rule_sanitization,
-                    total_nodes: cfg.proxies.len(),
-                    selected_groups: meta.selected_groups,
+                    total_nodes,
+                    selected_groups,
                     config: cfg,
                 })
             }
@@ -5244,5 +5277,95 @@ rules:
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn import_unified_auto_select_false_preserves_active_node_and_profile() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustclash-import-preserve-active-{}",
+            Uuid::new_v4()
+        ));
+        let mgr = ProfileManager::open_or_init(&dir).unwrap();
+        let starter_id = mgr.active_profile_id();
+
+        // 1. Importing into an empty starter profile with auto_select = false MUST still select the first node.
+        let uri1 = "ss://YWVzLTEyOC1nY206cGFzczE=@198.51.100.10:8388#Node-Initial";
+        let rep1 = mgr
+            .import_unified_input(uri1, None, true, false)
+            .await
+            .unwrap();
+        assert_eq!(rep1.added_nodes, vec!["Node-Initial".to_string()]);
+        assert_eq!(
+            rep1.selected_groups.get("PROXY").map(String::as_str),
+            Some("Node-Initial")
+        );
+
+        // 2. Importing a second URI with auto_select = false MUST add it without switching away from Node-Initial.
+        let uri2 = "ss://YWVzLTEyOC1nY206cGFzczI=@198.51.100.11:8388#Node-Second";
+        let rep2 = mgr
+            .import_unified_input(uri2, None, true, false)
+            .await
+            .unwrap();
+        assert_eq!(rep2.added_nodes, vec!["Node-Second".to_string()]);
+        assert_eq!(rep2.total_nodes, 2);
+        assert_eq!(
+            rep2.selected_groups.get("PROXY").map(String::as_str),
+            Some("Node-Initial"),
+            "active selection must stay on Node-Initial when auto_select = false"
+        );
+        assert_eq!(
+            mgr.active_selected_groups()
+                .get("PROXY")
+                .map(String::as_str),
+            Some("Node-Initial")
+        );
+
+        // 3. Importing a full Clash YAML with auto_select = false when the active profile already has nodes
+        //    MUST create a new inactive profile and leave active_profile_id & Node-Initial untouched.
+        let yaml_payload = r#"
+proxies:
+  - name: "YAML-HK-01"
+    type: ss
+    server: 198.51.100.20
+    port: 8388
+    cipher: aes-128-gcm
+    password: "pass"
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["YAML-HK-01", "DIRECT"]
+rules:
+  - "MATCH,PROXY"
+"#;
+        let rep3 = mgr
+            .import_unified_input(yaml_payload, None, true, false)
+            .await
+            .unwrap();
+        assert_eq!(rep3.added_nodes, vec!["YAML-HK-01".to_string()]);
+        assert_eq!(
+            mgr.active_profile_id(),
+            starter_id,
+            "active profile must remain unchanged when importing Clash YAML with auto_select = false"
+        );
+        assert_eq!(
+            mgr.active_selected_groups()
+                .get("PROXY")
+                .map(String::as_str),
+            Some("Node-Initial")
+        );
+        assert_eq!(mgr.snapshot().profiles.len(), 2);
+
+        // 4. Importing with auto_select = true explicitly switches to the new node.
+        let uri3 = "ss://YWVzLTEyOC1nY206cGFzczM=@198.51.100.12:8388#Node-ExplicitSwitch";
+        let rep4 = mgr
+            .import_unified_input(uri3, None, true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            rep4.selected_groups.get("PROXY").map(String::as_str),
+            Some("Node-ExplicitSwitch")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
