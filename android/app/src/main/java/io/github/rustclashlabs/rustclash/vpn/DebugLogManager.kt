@@ -288,9 +288,6 @@ object DebugLogManager {
         }
     }
 
-    internal fun snapshotTimelineEventsForTest(): List<MobileTimelineEvent> =
-        synchronized(lock) { timelineEvents.toList() }
-
     fun onNetworkCandidateObserved(
         eventType: String,
         networkHandle: Long,
@@ -1381,6 +1378,7 @@ object DebugLogManager {
         }
         lastNetStateFingerprint = ""
         lastCumulativeRuleHits = emptyMap()
+        lastCumulativeTotalConnections = null
         if (vpnState != VpnLifecycleState.DISCONNECTED) {
             pushEventLocked(
                 nowMs,
