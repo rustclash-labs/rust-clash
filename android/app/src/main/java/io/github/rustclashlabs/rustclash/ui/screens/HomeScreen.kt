@@ -373,7 +373,7 @@ fun HomeScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Hero Connect Section
         Column(
@@ -387,7 +387,7 @@ fun HomeScreen(
                 onClick = onToggleVpn,
             )
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
             val statusTitle = when (state.vpnState) {
                 VpnLifecycleState.RUNNING -> if (state.routingPreset == RoutingPresetUi.DIRECT) {
@@ -404,12 +404,12 @@ fun HomeScreen(
             }
             Text(
                 text = statusTitle,
-                fontSize = 23.sp,
+                fontSize = 22.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground,
             )
 
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(3.dp))
 
             val noSavedNodes = state.nodes.isEmpty() && !state.demoMode
             val isDirectConnected = isConnected && state.routingPreset == RoutingPresetUi.DIRECT
@@ -432,7 +432,7 @@ fun HomeScreen(
             )
 
             if (isConnected) {
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(6.dp))
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
                     verticalAlignment = Alignment.CenterVertically,
@@ -459,7 +459,7 @@ fun HomeScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Live Speed & Waveform Card
         Surface(
@@ -472,7 +472,7 @@ fun HomeScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 20.dp, end = 20.dp, top = 13.dp, bottom = 4.dp),
+                        .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 3.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -486,7 +486,7 @@ fun HomeScreen(
                     Box(
                         modifier = Modifier
                             .width(1.dp)
-                            .height(34.dp)
+                            .height(32.dp)
                             .background(extColors.hairline),
                     )
                     SpeedColumnItem(
@@ -505,7 +505,7 @@ fun HomeScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 1.dp),
                     )
                 }
 
@@ -514,7 +514,7 @@ fun HomeScreen(
                     isConnected = isConnected,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(48.dp)
+                        .height(42.dp)
                         .clip(RoundedCornerShape(bottomStart = 18.dp, bottomEnd = 18.dp)),
                 )
             }
@@ -522,7 +522,7 @@ fun HomeScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Primary Summary Card: Routing Mode & Active Node
+        // Primary Summary Card: Routing Mode, Active Node & Unified Diagnostics
         Surface(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp),
@@ -535,7 +535,7 @@ fun HomeScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { showRoutingSheet = true }
-                        .padding(horizontal = 16.dp, vertical = 13.dp),
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     HomeRowIconBadge(
@@ -550,7 +550,7 @@ fun HomeScreen(
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
-                        Spacer(modifier = Modifier.height(3.dp))
+                        Spacer(modifier = Modifier.height(2.dp))
                         Text(
                             text = "${state.routingPreset.homeBadge} · ${state.routingPreset.homeSubtitle}",
                             style = MaterialTheme.typography.bodySmall,
@@ -590,7 +590,7 @@ fun HomeScreen(
                                 onNavigateToNodes()
                             }
                         }
-                        .padding(horizontal = 16.dp, vertical = 13.dp),
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     HomeRowIconBadge(
@@ -600,12 +600,33 @@ fun HomeScreen(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "当前节点",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                        Spacer(modifier = Modifier.height(3.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "当前节点",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (canTestActiveNode) {
+                                Spacer(modifier = Modifier.width(8.dp))
+                                LatencyPill(
+                                    delayMs = delayMs,
+                                    isProbing = isProbing,
+                                    isSelected = true,
+                                    onClick = onTestActiveLatency,
+                                )
+                            } else if (isProbing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(15.dp),
+                                    strokeWidth = 2.dp,
+                                    color = extColors.emerald,
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
 
                         if (state.nodes.isEmpty() && !state.demoMode) {
                             Text(
@@ -626,25 +647,7 @@ fun HomeScreen(
                         }
                     }
 
-                    if (canTestActiveNode) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        LatencyPill(
-                            delayMs = delayMs,
-                            isProbing = isProbing,
-                            isSelected = true,
-                            onClick = onTestActiveLatency,
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                    } else if (isProbing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier
-                                .padding(end = 6.dp)
-                                .size(15.dp),
-                            strokeWidth = 2.dp,
-                            color = extColors.emerald,
-                        )
-                    }
-
+                    Spacer(modifier = Modifier.width(6.dp))
                     Icon(
                         imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
                         contentDescription = "查看节点列表",
@@ -653,65 +656,18 @@ fun HomeScreen(
                     )
                 }
 
-                // Optional Row 3 when VPN is running or diagnostics exist: 实时分流概览
-                if (isConnected || state.diagnostics.isNotEmpty()) {
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 16.dp),
-                        thickness = 0.8.dp,
-                        color = extColors.hairline,
-                    )
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onNavigateToRules(1) }
-                            .padding(horizontal = 16.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val baseSummary =
-                            "分流：直连 ${state.directDiagnosticCount} · 代理 ${state.proxyDiagnosticCount}"
-                        val fullSummary = if (state.failedDiagnosticCount > 0) {
-                            "$baseSummary · 异常 ${state.failedDiagnosticCount}"
-                        } else {
-                            baseSummary
-                        }
-                        Text(
-                            text = fullSummary,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = "诊断明细",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = extColors.emerald,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                        Spacer(modifier = Modifier.width(2.dp))
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                            contentDescription = null,
-                            tint = extColors.emerald,
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                }
-
                 HorizontalDivider(
                     modifier = Modifier.padding(horizontal = 16.dp),
                     thickness = 0.8.dp,
                     color = extColors.hairline,
                 )
 
-                // Row 4: 诊断连接问题（为什么某网站打不开？）
+                // Row 3: Unified 分流诊断（点击查看诊断明细，右上角「网站排障」直达一键排障）
+                val hasLiveDiagnostics = isConnected || state.diagnostics.isNotEmpty()
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onNavigateToRules(2) }
+                        .clickable { onNavigateToRules(if (hasLiveDiagnostics) 1 else 2) }
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -722,26 +678,59 @@ fun HomeScreen(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "诊断连接问题",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "分流诊断",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Surface(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { onNavigateToRules(2) },
+                                shape = RoundedCornerShape(8.dp),
+                                color = extColors.violetContainer,
+                            ) {
+                                Text(
+                                    text = "网站排障",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = extColors.onVioletContainer,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                )
+                            }
+                        }
                         Spacer(modifier = Modifier.height(2.dp))
+                        val diagSubtitle = if (hasLiveDiagnostics) {
+                            val base = "直连 ${state.directDiagnosticCount} · 代理 ${state.proxyDiagnosticCount}"
+                            if (state.failedDiagnosticCount > 0) {
+                                "$base · 异常 ${state.failedDiagnosticCount}"
+                            } else {
+                                base
+                            }
+                        } else {
+                            "查看实时分流明细 · 一键排查网站连通性"
+                        }
                         Text(
-                            text = "网站打不开？一键实测分流路径 · DNS · 隧道 · TLS",
-                            style = MaterialTheme.typography.bodySmall,
+                            text = diagSubtitle,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFeatureSettings = "tnum"),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Icon(
                         imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                        contentDescription = "打开网站排障",
-                        tint = extColors.emerald,
+                        contentDescription = if (hasLiveDiagnostics) "查看诊断明细" else "打开网站排障",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(20.dp),
                     )
                 }
@@ -948,12 +937,12 @@ private fun HeroConnectButton(
 
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier.size(128.dp),
+        modifier = Modifier.size(118.dp),
     ) {
         // Multi-layer static-at-idle Neon radial aura + precision dashed orbit ring
         Canvas(
             modifier = Modifier
-                .size(128.dp)
+                .size(118.dp)
                 .then(
                     if (haloScale != 1.0f) {
                         Modifier.graphicsLayer {
@@ -977,7 +966,7 @@ private fun HeroConnectButton(
             )
             drawCircle(
                 color = ringColor.copy(alpha = if (isConnected) 0.42f else 0.18f),
-                radius = size.minDimension / 2f - 10.dp.toPx(),
+                radius = size.minDimension / 2f - 8.dp.toPx(),
                 style = Stroke(
                     width = 1.25.dp.toPx(),
                     pathEffect = PathEffect.dashPathEffect(floatArrayOf(9f, 9f), 0f),
@@ -997,7 +986,7 @@ private fun HeroConnectButton(
                 color = if (isConnected) Color.White.copy(alpha = 0.32f) else ringColor,
             ),
             shadowElevation = if (isConnected) 10.dp else 2.dp,
-            modifier = Modifier.size(86.dp),
+            modifier = Modifier.size(82.dp),
         ) {
             Box(
                 contentAlignment = Alignment.Center,
@@ -1017,7 +1006,7 @@ private fun HeroConnectButton(
             ) {
                 if (isTransitioning) {
                     CircularProgressIndicator(
-                        modifier = Modifier.size(32.dp),
+                        modifier = Modifier.size(30.dp),
                         strokeWidth = 2.8.dp,
                         color = ringColor,
                     )
@@ -1030,7 +1019,7 @@ private fun HeroConnectButton(
                             isErrorState -> ringColor
                             else -> MaterialTheme.colorScheme.onSurface
                         },
-                        modifier = Modifier.size(36.dp),
+                        modifier = Modifier.size(34.dp),
                     )
                 }
             }

@@ -202,10 +202,10 @@ fun TrafficWaveformGraph(
             strokeWidth = guideStroke,
         )
 
-        // Build normalized points in [0.14 .. 0.86] of canvas height (0 = top, 1 = bottom)
+        // Build normalized points in [0.16 .. 0.76] of canvas height (0 = top, 1 = bottom)
         var hasLiveTraffic = false
         val rawPoints: List<Float> = if (!isConnected) {
-            listOf(0.82f, 0.80f, 0.82f, 0.79f, 0.82f, 0.81f, 0.82f, 0.80f)
+            listOf(0.76f, 0.74f, 0.76f, 0.73f, 0.76f, 0.75f, 0.76f, 0.74f)
         } else {
             val padded = if (samples.size >= 10) {
                 samples.takeLast(12)
@@ -217,11 +217,11 @@ fun TrafficWaveformGraph(
             hasLiveTraffic = hasNonZero
             if (!hasNonZero) {
                 // Honest flat baseline when 0 B/s
-                List(10) { 0.82f }
+                List(10) { 0.76f }
             } else {
                 padded.map { v ->
                     val ratio = (v.toFloat() / maxVal).coerceIn(0f, 1f)
-                    0.82f - (ratio * 0.64f)
+                    0.76f - (ratio * 0.60f)
                 }
             }
         }
@@ -285,18 +285,22 @@ fun TrafficWaveformGraph(
             ),
         )
 
-        if (isConnected && hasLiveTraffic) {
-            val endPt = coords.last()
-            val dotX = (endPt.x - 4.dp.toPx()).coerceAtLeast(4.dp.toPx())
+        if (isConnected && hasLiveTraffic && coords.size >= 2) {
+            val p0 = coords[coords.size - 2]
+            val p1 = coords.last()
+            val dotX = (w - 10.dp.toPx()).coerceIn(p0.x, p1.x)
+            val t = if (p1.x > p0.x) ((dotX - p0.x) / (p1.x - p0.x)).coerceIn(0f, 1f) else 1f
+            val st = t * t * (3f - 2f * t)
+            val dotY = p0.y + (p1.y - p0.y) * st
             drawCircle(
                 color = extColors.sky.copy(alpha = 0.28f),
                 radius = 5.5.dp.toPx(),
-                center = Offset(dotX, endPt.y),
+                center = Offset(dotX, dotY),
             )
             drawCircle(
                 color = extColors.sky,
                 radius = 2.6.dp.toPx(),
-                center = Offset(dotX, endPt.y),
+                center = Offset(dotX, dotY),
             )
         }
     }

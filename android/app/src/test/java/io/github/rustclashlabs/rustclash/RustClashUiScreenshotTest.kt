@@ -1259,5 +1259,124 @@ class RustClashUiScreenshotTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithText("发现异常").performScrollTo().assertIsDisplayed()
     }
+
+    @Test
+    fun homeScreenConnectedRendersUnifiedDiagnosticsWithoutClipping() {
+        val fontFamily = buildCjkFontFamily()
+        val navigatedTabs = mutableListOf<Int>()
+        val diagItems = listOf(
+            io.github.rustclashlabs.rustclash.ui.model.DiagnosticEntryUi(
+                id = "d-1",
+                network = "tcp",
+                inboundType = "tun",
+                host = "qq.com",
+                destinationIp = "1.2.3.4",
+                destinationPort = 443,
+                fakeIpRestored = null,
+                rule = "GEOSITE",
+                rulePayload = "cn",
+                chains = listOf("DIRECT"),
+                effectiveOutbound = "DIRECT",
+                effectiveProtocol = "DIRECT",
+                exitType = "DIRECT",
+                remoteEndpoint = "1.2.3.4:443",
+                status = "closed",
+                error = null,
+                uploadBytes = 512L,
+                downloadBytes = 2048L,
+                startEpochMs = 1_794_906_000_000L,
+            ),
+            io.github.rustclashlabs.rustclash.ui.model.DiagnosticEntryUi(
+                id = "d-2",
+                network = "tcp",
+                inboundType = "tun",
+                host = "github.com",
+                destinationIp = "140.82.121.4",
+                destinationPort = 443,
+                fakeIpRestored = null,
+                rule = "MATCH",
+                rulePayload = "",
+                chains = listOf("PROXY", "香港-IPLC-01"),
+                effectiveOutbound = "香港-IPLC-01",
+                effectiveProtocol = "VLESS",
+                exitType = "PROXY",
+                remoteEndpoint = "hk01.example.com:443",
+                status = "active",
+                error = null,
+                uploadBytes = 1024L,
+                downloadBytes = 4096L,
+                startEpochMs = 1_794_906_001_000L,
+            ),
+            io.github.rustclashlabs.rustclash.ui.model.DiagnosticEntryUi(
+                id = "d-3",
+                network = "tcp",
+                inboundType = "tun",
+                host = "timeout.example.com",
+                destinationIp = "198.51.100.1",
+                destinationPort = 443,
+                fakeIpRestored = null,
+                rule = "MATCH",
+                rulePayload = "",
+                chains = listOf("PROXY", "香港-IPLC-01"),
+                effectiveOutbound = "香港-IPLC-01",
+                effectiveProtocol = "VLESS",
+                exitType = "PROXY",
+                remoteEndpoint = "hk01.example.com:443",
+                status = "failed",
+                error = "connect timeout",
+                uploadBytes = 0L,
+                downloadBytes = 0L,
+                startEpochMs = 1_794_906_002_000L,
+            ),
+        )
+        val uiState = sampleShowcaseState(ThemePreference.LIGHT).copy(
+            diagnostics = diagItems,
+        )
+
+        composeRule.setContent {
+            RustClashTheme(themePreference = ThemePreference.LIGHT, fontFamily = fontFamily) {
+                Scaffold(
+                    modifier = Modifier.fillMaxSize(),
+                    containerColor = MaterialTheme.colorScheme.background,
+                    bottomBar = {
+                        NavigationBar {
+                            NavigationBarItem(
+                                selected = true,
+                                onClick = {},
+                                icon = { Icon(Icons.Rounded.Home, contentDescription = null) },
+                                label = { Text("首页") },
+                            )
+                        }
+                    },
+                ) { innerPadding ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding),
+                    ) {
+                        HomeScreen(
+                            state = uiState,
+                            onToggleVpn = {},
+                            onOpenQuickImport = {},
+                            onSelectRoutingPreset = {},
+                            onNavigateToNodes = {},
+                            onNavigateToRules = { navigatedTabs.add(it) },
+                            onTestActiveLatency = {},
+                        )
+                    }
+                }
+            }
+        }
+
+        // All summary rows including unified diagnostics & quick troubleshoot pill must be visible without scrolling
+        composeRule.onNodeWithText("分流诊断").assertIsDisplayed()
+        composeRule.onNodeWithText("直连 1 · 代理 2 · 异常 1").assertIsDisplayed()
+        composeRule.onNodeWithText("网站排障").assertIsDisplayed()
+
+        composeRule.onNodeWithText("直连 1 · 代理 2 · 异常 1").performClick()
+        composeRule.onNodeWithText("网站排障").performClick()
+        assertTrue(navigatedTabs == listOf(1, 2))
+    }
 }
+
 
