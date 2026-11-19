@@ -56,6 +56,8 @@ import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onLast
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -66,6 +68,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
+import io.github.rustclashlabs.rustclash.ui.model.DiagnosticEntryUi
 import io.github.rustclashlabs.rustclash.ui.model.ExitIpUi
 import io.github.rustclashlabs.rustclash.ui.model.GeoDataUiStatus
 import io.github.rustclashlabs.rustclash.ui.model.InstalledAppUi
@@ -87,6 +90,7 @@ import io.github.rustclashlabs.rustclash.ui.screens.PerAppPickerBottomSheet
 import io.github.rustclashlabs.rustclash.ui.screens.ProfilesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.RulesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.SettingsScreen
+import io.github.rustclashlabs.rustclash.ui.screens.homeAmbientGlow
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashBrandIcon
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashTheme
@@ -280,6 +284,127 @@ class RustClashUiScreenshotTest {
                 10_800_000L,
                 13_600_000L,
             ),
+            exitIp = ExitIpUi(
+                verified = true,
+                ip = "203.0.113.42",
+                country = "Hong Kong",
+                countryCode = "HK",
+                isp = "IPLC Edge HK",
+                asn = "AS64512",
+                ipType = "Datacenter / Hosting",
+                latencyMs = 28L,
+                outbound = "香港-IPLC-01",
+                protocol = "vless",
+                vpnRunning = true,
+                checkedAtMs = 1_778_382_600_000L,
+            ),
+            diagnostics = listOf(
+                DiagnosticEntryUi(
+                    id = "showcase-d1",
+                    network = "tcp",
+                    inboundType = "tun",
+                    host = "weixin.qq.com",
+                    destinationIp = "101.226.103.106",
+                    destinationPort = 443,
+                    fakeIpRestored = null,
+                    rule = "GEOSITE",
+                    rulePayload = "cn",
+                    chains = listOf("DIRECT"),
+                    effectiveOutbound = "DIRECT",
+                    effectiveProtocol = "DIRECT",
+                    exitType = "DIRECT",
+                    remoteEndpoint = "101.226.103.106:443",
+                    status = "closed",
+                    error = null,
+                    uploadBytes = 1024L,
+                    downloadBytes = 4096L,
+                    startEpochMs = 1_778_382_590_000L,
+                ),
+                DiagnosticEntryUi(
+                    id = "showcase-d2",
+                    network = "tcp",
+                    inboundType = "tun",
+                    host = "bilibili.com",
+                    destinationIp = "119.29.29.29",
+                    destinationPort = 443,
+                    fakeIpRestored = null,
+                    rule = "GEOSITE",
+                    rulePayload = "cn",
+                    chains = listOf("DIRECT"),
+                    effectiveOutbound = "DIRECT",
+                    effectiveProtocol = "DIRECT",
+                    exitType = "DIRECT",
+                    remoteEndpoint = "119.29.29.29:443",
+                    status = "active",
+                    error = null,
+                    uploadBytes = 2048L,
+                    downloadBytes = 16384L,
+                    startEpochMs = 1_778_382_592_000L,
+                ),
+                DiagnosticEntryUi(
+                    id = "showcase-p1",
+                    network = "tcp",
+                    inboundType = "tun",
+                    host = "github.com",
+                    destinationIp = "140.82.121.4",
+                    destinationPort = 443,
+                    fakeIpRestored = null,
+                    rule = "MATCH",
+                    rulePayload = "",
+                    chains = listOf("PROXY", "香港-IPLC-01"),
+                    effectiveOutbound = "香港-IPLC-01",
+                    effectiveProtocol = "VLESS",
+                    exitType = "PROXY",
+                    remoteEndpoint = "hk01.example.com:443",
+                    status = "active",
+                    error = null,
+                    uploadBytes = 4096L,
+                    downloadBytes = 32768L,
+                    startEpochMs = 1_778_382_595_000L,
+                ),
+                DiagnosticEntryUi(
+                    id = "showcase-p2",
+                    network = "tcp",
+                    inboundType = "tun",
+                    host = "api.openai.com",
+                    destinationIp = "198.51.100.24",
+                    destinationPort = 443,
+                    fakeIpRestored = null,
+                    rule = "MATCH",
+                    rulePayload = "",
+                    chains = listOf("PROXY", "香港-IPLC-01"),
+                    effectiveOutbound = "香港-IPLC-01",
+                    effectiveProtocol = "VLESS",
+                    exitType = "PROXY",
+                    remoteEndpoint = "hk01.example.com:443",
+                    status = "active",
+                    error = null,
+                    uploadBytes = 3072L,
+                    downloadBytes = 24576L,
+                    startEpochMs = 1_778_382_597_000L,
+                ),
+                DiagnosticEntryUi(
+                    id = "showcase-p3",
+                    network = "tcp",
+                    inboundType = "tun",
+                    host = "youtube.com",
+                    destinationIp = "198.51.100.88",
+                    destinationPort = 443,
+                    fakeIpRestored = null,
+                    rule = "MATCH",
+                    rulePayload = "",
+                    chains = listOf("PROXY", "香港-IPLC-01"),
+                    effectiveOutbound = "香港-IPLC-01",
+                    effectiveProtocol = "VLESS",
+                    exitType = "PROXY",
+                    remoteEndpoint = "hk01.example.com:443",
+                    status = "active",
+                    error = null,
+                    uploadBytes = 8192L,
+                    downloadBytes = 131072L,
+                    startEpochMs = 1_778_382_599_000L,
+                ),
+            ),
         )
     }
 
@@ -289,158 +414,171 @@ class RustClashUiScreenshotTest {
         destination: MainDestination,
     ) {
         val extColors = LocalRustClashColors.current
-        Scaffold(
-            modifier = Modifier.fillMaxSize(),
-            containerColor = MaterialTheme.colorScheme.background,
-            topBar = {
-                // Realistic Android status bar with VPN notification icon
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 18.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = "09:41",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onBackground,
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Icon(
-                        painter = painterResource(id = R.drawable.ic_stat_rustclash_vpn),
-                        contentDescription = null,
-                        tint = extColors.emerald,
-                        modifier = Modifier.size(14.dp),
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    Icon(
-                        imageVector = Icons.Rounded.SignalCellular4Bar,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier.size(14.dp),
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Icon(
-                        imageVector = Icons.Rounded.Wifi,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier.size(14.dp),
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Icon(
-                        imageVector = Icons.Rounded.BatteryFull,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier.size(14.dp),
-                    )
-                }
-            },
-            bottomBar = {
-                Column {
-                    HorizontalDivider(thickness = 1.dp, color = extColors.hairline)
-                    NavigationBar(
-                        containerColor = extColors.cardSurface,
-                        tonalElevation = 0.dp,
+        val showHomeGlow = destination == MainDestination.HOME && state.vpnState == VpnLifecycleState.RUNNING
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .homeAmbientGlow(extColors = extColors, alpha = if (showHomeGlow) 1f else 0f),
+        ) {
+            Scaffold(
+                modifier = Modifier.fillMaxSize(),
+                containerColor = Color.Transparent,
+                topBar = {
+                    // Realistic Android status bar with VPN notification icon
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 18.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        MainDestination.entries.forEach { dest ->
-                            val selected = destination == dest
-                            NavigationBarItem(
-                                selected = selected,
-                                onClick = {},
-                                icon = {
-                                    val icon = when (dest) {
-                                        MainDestination.HOME -> if (selected) Icons.Rounded.Home else Icons.Outlined.Home
-                                        MainDestination.NODES -> if (selected) Icons.Rounded.Dns else Icons.Outlined.Dns
-                                        MainDestination.RULES -> if (selected) Icons.Rounded.Route else Icons.Outlined.Route
-                                        MainDestination.PROFILES -> if (selected) Icons.Rounded.Description else Icons.Outlined.Description
-                                        MainDestination.SETTINGS -> if (selected) Icons.Rounded.Settings else Icons.Outlined.Settings
-                                    }
-                                    Icon(imageVector = icon, contentDescription = dest.label)
-                                },
-                                label = {
-                                    Text(
-                                        text = dest.label,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                    )
-                                },
-                                colors = NavigationBarItemDefaults.colors(
-                                    selectedIconColor = extColors.emerald,
-                                    selectedTextColor = extColors.emerald,
-                                    indicatorColor = extColors.emeraldContainer.copy(alpha = 0.65f),
-                                    unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                ),
-                            )
+                        Text(
+                            text = "09:41",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onBackground,
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_stat_rustclash_vpn),
+                            contentDescription = null,
+                            tint = extColors.emerald,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        Icon(
+                            imageVector = Icons.Rounded.SignalCellular4Bar,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onBackground,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            imageVector = Icons.Rounded.Wifi,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onBackground,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            imageVector = Icons.Rounded.BatteryFull,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onBackground,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                },
+                bottomBar = {
+                    Column {
+                        HorizontalDivider(
+                            thickness = 0.8.dp,
+                            color = extColors.hairline.copy(alpha = if (extColors.isDark) 0.7f else 0.75f),
+                        )
+                        NavigationBar(
+                            containerColor = extColors.navBarSurface,
+                            tonalElevation = 0.dp,
+                        ) {
+                            MainDestination.entries.forEach { dest ->
+                                val selected = destination == dest
+                                NavigationBarItem(
+                                    selected = selected,
+                                    onClick = {},
+                                    icon = {
+                                        val icon = when (dest) {
+                                            MainDestination.HOME -> if (selected) Icons.Rounded.Home else Icons.Outlined.Home
+                                            MainDestination.NODES -> if (selected) Icons.Rounded.Dns else Icons.Outlined.Dns
+                                            MainDestination.RULES -> if (selected) Icons.Rounded.Route else Icons.Outlined.Route
+                                            MainDestination.PROFILES -> if (selected) Icons.Rounded.Description else Icons.Outlined.Description
+                                            MainDestination.SETTINGS -> if (selected) Icons.Rounded.Settings else Icons.Outlined.Settings
+                                        }
+                                        Icon(imageVector = icon, contentDescription = dest.label)
+                                    },
+                                    label = {
+                                        Text(
+                                            text = dest.label,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                        )
+                                    },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        selectedIconColor = extColors.onNavSelected,
+                                        selectedTextColor = extColors.onNavSelected,
+                                        indicatorColor = extColors.navIndicator,
+                                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    ),
+                                )
+                            }
                         }
                     }
-                }
-            },
-        ) { innerPadding ->
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-            ) {
-                when (destination) {
-                    MainDestination.HOME -> HomeScreen(
-                        state = state,
-                        onToggleVpn = {},
-                        onOpenQuickImport = {},
-                        onSelectRoutingPreset = {},
-                        onNavigateToNodes = {},
-                        onNavigateToRules = {},
-                        onTestActiveLatency = {},
-                    )
-                    MainDestination.NODES -> NodesScreen(
-                        state = state,
-                        onSearchQueryChange = {},
-                        onToggleSortByDelay = {},
-                        onSelectGroupTab = {},
-                        onSelectProxyInGroup = { _, _ -> },
-                        onToggleFavorite = {},
-                        onTestAllDelays = {},
-                        onTestSingleDelay = {},
-                        onOpenImportSheet = {},
-                        onImportClipboardDirect = {},
-                        onOpenQrCamera = {},
-                        onOpenManualCreate = {},
-                        onOpenNodeEdit = {},
-                        onDeleteNode = {},
-                        onDeduplicateNodes = {},
-                    )
-                    MainDestination.RULES -> RulesScreen(
-                        state = state,
-                        requestedSubTab = 0,
-                        onSelectRoutingPreset = {},
-                        onUpdateGeoData = {},
-                        onOpenCustomRuleEditor = {},
-                        onSetDiagnosticsFilter = {},
-                        onClearDiagnostics = {},
-                        onExplainTarget = {},
-                        onRuleSearchChange = {},
-                    )
-                    MainDestination.PROFILES -> ProfilesScreen(
-                        state = state,
-                        onOpenImportSheet = {},
-                        onActivateProfile = {},
-                        onRefreshProfile = {},
-                        onDeleteProfile = {},
-                        onRenameProfile = { _, _ -> },
-                        onOpenCustomRulesEditor = {},
-                        onOpenYamlEditor = {},
-                    )
-                    MainDestination.SETTINGS -> SettingsScreen(
-                        state = state,
-                        onSetThemePreference = {},
-                        onRequestInstalledApps = {},
-                        onSavePerAppPolicy = { _, _ -> },
-                        onSetEnableIpv6 = {},
-                        onSetDemoMode = {},
-                        onFlushDns = {},
-                    )
+                },
+            ) { innerPadding ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                ) {
+                    when (destination) {
+                        MainDestination.HOME -> HomeScreen(
+                            state = state,
+                            onToggleVpn = {},
+                            onOpenQuickImport = {},
+                            onSelectRoutingPreset = {},
+                            onNavigateToNodes = {},
+                            onNavigateToRules = {},
+                            onTestActiveLatency = {},
+                            drawAmbientGlow = false,
+                        )
+                        MainDestination.NODES -> NodesScreen(
+                            state = state,
+                            onSearchQueryChange = {},
+                            onToggleSortByDelay = {},
+                            onSelectGroupTab = {},
+                            onSelectProxyInGroup = { _, _ -> },
+                            onToggleFavorite = {},
+                            onTestAllDelays = {},
+                            onTestSingleDelay = {},
+                            onOpenImportSheet = {},
+                            onImportClipboardDirect = {},
+                            onOpenQrCamera = {},
+                            onOpenManualCreate = {},
+                            onOpenNodeEdit = {},
+                            onDeleteNode = {},
+                            onDeduplicateNodes = {},
+                        )
+                        MainDestination.RULES -> RulesScreen(
+                            state = state,
+                            requestedSubTab = 0,
+                            onSelectRoutingPreset = {},
+                            onUpdateGeoData = {},
+                            onOpenCustomRuleEditor = {},
+                            onSetDiagnosticsFilter = {},
+                            onClearDiagnostics = {},
+                            onExplainTarget = {},
+                            onRuleSearchChange = {},
+                        )
+                        MainDestination.PROFILES -> ProfilesScreen(
+                            state = state,
+                            onOpenImportSheet = {},
+                            onActivateProfile = {},
+                            onRefreshProfile = {},
+                            onDeleteProfile = {},
+                            onRenameProfile = { _, _ -> },
+                            onOpenCustomRulesEditor = {},
+                            onOpenYamlEditor = {},
+                        )
+                        MainDestination.SETTINGS -> SettingsScreen(
+                            state = state,
+                            onSetThemePreference = {},
+                            onRequestInstalledApps = {},
+                            onSavePerAppPolicy = { _, _ -> },
+                            onSetEnableIpv6 = {},
+                            onSetDemoMode = {},
+                            onFlushDns = {},
+                        )
+                    }
                 }
             }
         }
@@ -1369,18 +1507,27 @@ class RustClashUiScreenshotTest {
             }
         }
 
-        // All summary rows including unified diagnostics & quick troubleshoot pill must be visible without scrolling
-        composeRule.onNodeWithText("分流诊断").assertIsDisplayed()
-        composeRule.onNodeWithText("直连 1 · 代理 2 · 异常 1").assertIsDisplayed()
-        composeRule.onNodeWithText("网站排障").assertIsDisplayed()
+        // Layout A keeps Home focused (Throughput + Latency + panoramic Exit IP Landmark card)
+        // and moves Routing Diagnostics cleanly into the top-right overflow menu.
+        composeRule.onNodeWithText("实时速率").assertIsDisplayed()
+        composeRule.onNodeWithText("节点延迟").assertIsDisplayed()
+        composeRule.onNodeWithText("落地出口").assertIsDisplayed()
+        assertTrue(composeRule.onAllNodesWithText("分流诊断").fetchSemanticsNodes().isEmpty())
 
-        composeRule.onNodeWithText("直连 1 · 代理 2 · 异常 1").performClick()
-        composeRule.onNodeWithText("网站排障").performClick()
+        composeRule.onNodeWithContentDescription("快捷菜单").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("实时分流诊断").performClick()
+
+        composeRule.onNodeWithContentDescription("快捷菜单").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("诊断网站连接问题").performClick()
         assertTrue(navigatedTabs == listOf(1, 2))
     }
 
     @Test
     fun homeScreenExitIpPillOpensDetailSheetAndKeepsDiagnosticsAboveFold() {
+        val outDir = File("build/outputs/screenshots")
+        outDir.mkdirs()
         val fontFamily = buildCjkFontFamily()
         var refreshCount = 0
         var copiedIp: String? = null
@@ -1438,22 +1585,77 @@ class RustClashUiScreenshotTest {
             }
         }
 
-        // Exit IP compact pill and unified diagnostics row must both stay above the fold
-        composeRule.onNodeWithText("🇯🇵 日本 · 203.0.113.88").assertIsDisplayed()
-        composeRule.onNodeWithText("分流诊断").assertIsDisplayed()
+        // Full-width panoramic Exit IP Landmark card (region + IP + skyline caption) must stay above the fold
+        composeRule.onNodeWithText("🇯🇵 日本").assertIsDisplayed()
+        composeRule.onNodeWithText("203.0.113.88").assertIsDisplayed()
+        composeRule.onNodeWithText("富士山 · 东京塔").assertIsDisplayed()
+        saveBitmap(captureDecorBitmap(), File(outDir, "light_1_home_jp.png"))
 
-        // Tapping verified pill opens Exit IP detail sheet with ISP/ASN/copy/refresh actions
-        composeRule.onNodeWithText("🇯🇵 日本 · 203.0.113.88").performClick()
+        // Tapping verified Exit IP landmark card opens detail sheet with ISP/ASN/copy/refresh actions
+        composeRule.onNodeWithText("203.0.113.88").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithText("当前落地 IP").assertIsDisplayed()
-        composeRule.onNodeWithText("203.0.113.88").assertIsDisplayed()
-        composeRule.onNodeWithText("Example Cloud JP").assertIsDisplayed()
+        composeRule.onAllNodesWithText("203.0.113.88").onLast().assertIsDisplayed()
+        composeRule.onAllNodesWithText("Example Cloud JP").onLast().assertIsDisplayed()
         composeRule.onNodeWithText("AS64500").assertIsDisplayed()
 
         composeRule.onNodeWithText("复制 IP").performClick()
         composeRule.onNodeWithText("重新检测").performClick()
         assertTrue(copiedIp == "203.0.113.88")
         assertTrue(refreshCount == 1)
+    }
+
+    @Test
+    fun homeScreenRendersSingaporeLandmarkSkylineInLightAndDark() {
+        val outDir = File("build/outputs/screenshots")
+        outDir.mkdirs()
+        val fontFamily = buildCjkFontFamily()
+        val themeState = androidx.compose.runtime.mutableStateOf(ThemePreference.LIGHT)
+
+        composeRule.setContent {
+            val theme = themeState.value
+            val sgState = sampleShowcaseState(theme).copy(
+                effectiveOutbound = "新加坡-BGP-02",
+                effectiveProtocol = "AnyTLS",
+                telemetry = sampleShowcaseState(theme).telemetry.copy(
+                    effectiveOutbound = "新加坡-BGP-02",
+                    effectiveProtocol = "AnyTLS",
+                    effectiveDelayMs = 42L,
+                ),
+                exitIp = ExitIpUi(
+                    verified = true,
+                    ip = "77.93.91.109",
+                    country = "Singapore",
+                    countryCode = "SG",
+                    isp = "Equinix SG",
+                    asn = "AS64518",
+                    ipType = "Datacenter / Hosting",
+                    latencyMs = 42L,
+                    outbound = "新加坡-BGP-02",
+                    protocol = "anytls",
+                    vpnRunning = true,
+                    checkedAtMs = 1_778_382_600_000L,
+                ),
+            )
+            RustClashTheme(themePreference = theme, fontFamily = fontFamily) {
+                SimulatedPhoneFrame(
+                    state = sgState,
+                    destination = MainDestination.HOME,
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("🇸🇬 新加坡").assertIsDisplayed()
+        composeRule.onNodeWithText("滨海湾金沙 · 摩天轮").assertIsDisplayed()
+        val lightSg = File(outDir, "light_1_home_sg.png")
+        saveBitmap(captureDecorBitmap(), lightSg)
+        assertTrue(lightSg.isFile && lightSg.length() > 1024)
+
+        themeState.value = ThemePreference.DARK
+        composeRule.waitForIdle()
+        val darkSg = File(outDir, "dark_1_home_sg.png")
+        saveBitmap(captureDecorBitmap(), darkSg)
+        assertTrue(darkSg.isFile && darkSg.length() > 1024)
     }
 }
 
