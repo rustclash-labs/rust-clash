@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -40,6 +41,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -171,7 +173,8 @@ fun RustClashBrandIcon(
 }
 
 /**
- * Smooth Emerald cubic Bezier waveform area chart for real-time traffic visualization on the Home screen.
+ * Smooth single-hue Emerald cubic Bezier waveform area chart for real-time traffic visualization.
+ * When idle (0 B/s or disconnected), displays a quiet micro-dashed baseline instead of a solid bar.
  */
 @Composable
 fun TrafficWaveformGraph(
@@ -180,127 +183,121 @@ fun TrafficWaveformGraph(
     modifier: Modifier = Modifier,
 ) {
     val extColors = LocalRustClashColors.current
+    val mutedColor = MaterialTheme.colorScheme.onSurfaceVariant
 
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        if (w <= 4f || h <= 4f) return@Canvas
-
-        // Subtle horizontal telemetry guide lines
-        val guideColor = extColors.hairline.copy(alpha = if (extColors.isDark) 0.55f else 0.7f)
-        val guideStroke = 0.8.dp.toPx()
-        drawLine(
-            color = guideColor,
-            start = Offset(0f, h * 0.34f),
-            end = Offset(w, h * 0.34f),
-            strokeWidth = guideStroke,
-        )
-        drawLine(
-            color = guideColor,
-            start = Offset(0f, h * 0.68f),
-            end = Offset(w, h * 0.68f),
-            strokeWidth = guideStroke,
-        )
-
-        // Build normalized points in [0.16 .. 0.76] of canvas height (0 = top, 1 = bottom)
-        var hasLiveTraffic = false
-        val rawPoints: List<Float> = if (!isConnected) {
-            listOf(0.76f, 0.74f, 0.76f, 0.73f, 0.76f, 0.75f, 0.76f, 0.74f)
+    val recentSamples = if (isConnected) {
+        if (samples.size >= 10) {
+            samples.takeLast(12)
         } else {
-            val padded = if (samples.size >= 10) {
-                samples.takeLast(12)
-            } else {
-                List(10 - samples.size) { 0L } + samples
+            List(10 - samples.size) { 0L } + samples
+        }
+    } else {
+        emptyList()
+    }
+    val hasLiveTraffic = isConnected && recentSamples.any { it > 0L }
+
+    Box(modifier = modifier) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            if (w <= 4f || h <= 4f) return@Canvas
+
+            if (!hasLiveTraffic) {
+                val baseY = (h - 10.dp.toPx()).coerceAtLeast(h * 0.5f)
+                drawLine(
+                    color = mutedColor.copy(alpha = if (extColors.isDark) 0.25f else 0.22f),
+                    start = Offset(0f, baseY),
+                    end = Offset(w, baseY),
+                    strokeWidth = 1.4.dp.toPx(),
+                    cap = StrokeCap.Round,
+                    pathEffect = PathEffect.dashPathEffect(
+                        floatArrayOf(3.5.dp.toPx(), 5.5.dp.toPx()),
+                        0f,
+                    ),
+                )
+                return@Canvas
             }
-            val maxVal = (padded.maxOrNull() ?: 0L).coerceAtLeast(8_192L).toFloat()
-            val hasNonZero = padded.any { it > 0L }
-            hasLiveTraffic = hasNonZero
-            if (!hasNonZero) {
-                // Honest flat baseline when 0 B/s
-                List(10) { 0.76f }
-            } else {
-                padded.map { v ->
-                    val ratio = (v.toFloat() / maxVal).coerceIn(0f, 1f)
-                    0.76f - (ratio * 0.60f)
+
+            val maxVal = (recentSamples.maxOrNull() ?: 0L).coerceAtLeast(8_192L).toFloat()
+            val rawPoints = recentSamples.map { v ->
+                val ratio = (v.toFloat() / maxVal).coerceIn(0f, 1f)
+                0.84f - (ratio * 0.68f)
+            }
+
+            val count = rawPoints.size
+            val stepX = w / (count - 1).coerceAtLeast(1)
+            val coords = rawPoints.mapIndexed { idx, ny ->
+                Offset(x = idx * stepX, y = ny * h)
+            }
+
+            val strokePath = Path().apply {
+                moveTo(coords.first().x, coords.first().y)
+                for (i in 0 until coords.size - 1) {
+                    val p0 = coords[i]
+                    val p1 = coords[i + 1]
+                    val cx = (p0.x + p1.x) * 0.5f
+                    cubicTo(cx, p0.y, cx, p1.y, p1.x, p1.y)
                 }
             }
-        }
 
-        val count = rawPoints.size
-        val stepX = w / (count - 1).coerceAtLeast(1)
-        val coords = rawPoints.mapIndexed { idx, ny ->
-            Offset(x = idx * stepX, y = ny * h)
-        }
+            val fillPath = Path().apply {
+                addPath(strokePath)
+                lineTo(w, h)
+                lineTo(0f, h)
+                close()
+            }
 
-        val strokePath = Path().apply {
-            moveTo(coords.first().x, coords.first().y)
-            for (i in 0 until coords.size - 1) {
-                val p0 = coords[i]
-                val p1 = coords[i + 1]
-                val cx = (p0.x + p1.x) * 0.5f
-                cubicTo(cx, p0.y, cx, p1.y, p1.x, p1.y)
+            drawPath(
+                path = fillPath,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        extColors.waveformFillTop,
+                        extColors.waveformFillBottom,
+                    ),
+                    startY = 0f,
+                    endY = h,
+                ),
+            )
+
+            drawPath(
+                path = strokePath,
+                color = extColors.waveformStroke,
+                style = Stroke(
+                    width = 2.2.dp.toPx(),
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round,
+                ),
+            )
+
+            if (coords.size >= 2) {
+                val p0 = coords[coords.size - 2]
+                val p1 = coords.last()
+                val dotX = (w - 6.dp.toPx()).coerceIn(p0.x, p1.x)
+                val t = if (p1.x > p0.x) ((dotX - p0.x) / (p1.x - p0.x)).coerceIn(0f, 1f) else 1f
+                val st = t * t * (3f - 2f * t)
+                val dotY = p0.y + (p1.y - p0.y) * st
+                drawCircle(
+                    color = extColors.waveformStroke.copy(alpha = 0.22f),
+                    radius = 5.5.dp.toPx(),
+                    center = Offset(dotX, dotY),
+                )
+                drawCircle(
+                    color = extColors.waveformStroke,
+                    radius = 2.6.dp.toPx(),
+                    center = Offset(dotX, dotY),
+                )
             }
         }
 
-        val fillPath = Path().apply {
-            addPath(strokePath)
-            lineTo(w, h)
-            lineTo(0f, h)
-            close()
-        }
-
-        val activeAlpha = if (isConnected) 1f else 0.35f
-        drawPath(
-            path = fillPath,
-            brush = Brush.verticalGradient(
-                colors = listOf(
-                    extColors.waveformFillTop.copy(alpha = extColors.waveformFillTop.alpha * activeAlpha),
-                    extColors.waveformFillBottom,
-                ),
-                startY = 0f,
-                endY = h,
-            ),
-        )
-
-        drawPath(
-            path = strokePath,
-            brush = Brush.horizontalGradient(
-                colors = if (isConnected) {
-                    listOf(
-                        extColors.emerald.copy(alpha = 0.82f),
-                        extColors.waveformStroke,
-                        extColors.sky.copy(alpha = 0.92f),
-                    )
-                } else {
-                    listOf(
-                        extColors.waveformStroke.copy(alpha = 0.4f),
-                        extColors.waveformStroke.copy(alpha = 0.4f),
-                    )
-                },
-            ),
-            style = Stroke(
-                width = 2.2.dp.toPx(),
-                cap = StrokeCap.Round,
-                join = StrokeJoin.Round,
-            ),
-        )
-
-        if (isConnected && hasLiveTraffic && coords.size >= 2) {
-            val p0 = coords[coords.size - 2]
-            val p1 = coords.last()
-            val dotX = (w - 10.dp.toPx()).coerceIn(p0.x, p1.x)
-            val t = if (p1.x > p0.x) ((dotX - p0.x) / (p1.x - p0.x)).coerceIn(0f, 1f) else 1f
-            val st = t * t * (3f - 2f * t)
-            val dotY = p0.y + (p1.y - p0.y) * st
-            drawCircle(
-                color = extColors.sky.copy(alpha = 0.28f),
-                radius = 5.5.dp.toPx(),
-                center = Offset(dotX, dotY),
-            )
-            drawCircle(
-                color = extColors.sky,
-                radius = 2.6.dp.toPx(),
-                center = Offset(dotX, dotY),
+        if (!hasLiveTraffic) {
+            Text(
+                text = if (isConnected) "通道空闲 · 待传输" else "隧道未连接",
+                style = MaterialTheme.typography.labelSmall,
+                color = mutedColor.copy(alpha = 0.72f),
+                maxLines = 1,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(bottom = 16.dp),
             )
         }
     }
@@ -441,9 +438,8 @@ fun <T> SegmentedSelectorRow(
 
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, extColors.hairline),
+        shape = RoundedCornerShape(16.dp),
+        color = extColors.tonalTrack,
     ) {
         Row(
             modifier = Modifier
@@ -454,34 +450,39 @@ fun <T> SegmentedSelectorRow(
             items.forEach { item ->
                 val selected = item == selectedItem
                 val itemBg by animateColorAsState(
-                    targetValue = if (selected) extColors.emerald else Color.Transparent,
+                    targetValue = if (selected) extColors.tonalThumb else Color.Transparent,
                     animationSpec = tween(180),
                     label = "segBg",
                 )
                 val itemFg by animateColorAsState(
-                    targetValue = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                    targetValue = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                     animationSpec = tween(180),
                     label = "segFg",
                 )
 
-                Box(
-                    contentAlignment = Alignment.Center,
+                Surface(
                     modifier = Modifier
                         .weight(1f)
-                        .clip(RoundedCornerShape(9.dp))
-                        .background(itemBg)
-                        .clickable { onSelect(item) }
-                        .padding(horizontal = 6.dp, vertical = 8.dp),
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { onSelect(item) },
+                    shape = RoundedCornerShape(12.dp),
+                    color = itemBg,
+                    shadowElevation = if (selected && !extColors.isDark) 2.dp else 0.dp,
                 ) {
-                    Text(
-                        text = labelOf(item),
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                        color = itemFg,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.Center,
-                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+                    ) {
+                        Text(
+                            text = labelOf(item),
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                            color = itemFg,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
             }
         }
@@ -496,9 +497,9 @@ fun SettingsGroupContainer(
     val extColors = LocalRustClashColors.current
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(22.dp),
         color = extColors.cardSurface,
-        border = BorderStroke(1.dp, extColors.hairline),
+        shadowElevation = if (extColors.isDark) 0.dp else 1.5.dp,
     ) {
         Column(
             modifier = Modifier.fillMaxWidth(),
@@ -511,9 +512,9 @@ fun SettingsGroupContainer(
 fun SettingsGroupDivider() {
     val extColors = LocalRustClashColors.current
     HorizontalDivider(
-        modifier = Modifier.padding(start = 64.dp, end = 16.dp),
+        modifier = Modifier.padding(start = 66.dp, end = 16.dp),
         thickness = 0.8.dp,
-        color = extColors.hairline,
+        color = extColors.hairline.copy(alpha = if (extColors.isDark) 0.7f else 0.8f),
     )
 }
 
@@ -535,7 +536,7 @@ fun SettingsRowItem(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Surface(
-            shape = RoundedCornerShape(11.dp),
+            shape = RoundedCornerShape(12.dp),
             color = extColors.iconBadgeBg,
             modifier = Modifier.size(38.dp),
         ) {
@@ -574,7 +575,7 @@ fun SettingsRowItem(
             Text(
                 text = trailingBadge,
                 style = MaterialTheme.typography.labelMedium,
-                color = extColors.emerald,
+                color = if (extColors.isDark) extColors.emeraldBright else extColors.emerald,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
             )
@@ -584,7 +585,7 @@ fun SettingsRowItem(
         Icon(
             imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
             modifier = Modifier.size(20.dp),
         )
     }

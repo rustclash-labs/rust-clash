@@ -18,8 +18,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -70,6 +72,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontFamily
@@ -92,6 +95,7 @@ import io.github.rustclashlabs.rustclash.ui.screens.NodesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.ProfilesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.RulesScreen
 import io.github.rustclashlabs.rustclash.ui.screens.SettingsScreen
+import io.github.rustclashlabs.rustclash.ui.screens.homeAmbientGlow
 import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashTheme
 import io.github.rustclashlabs.rustclash.vpn.DebugLogManager
@@ -696,235 +700,252 @@ internal fun RustClashAppScaffold(
     }
 
     val haptic = LocalHapticFeedback.current
+    val rootHomeGlowAlpha by animateFloatAsState(
+        targetValue = if (currentDestination == MainDestination.HOME && state.vpnState == VpnLifecycleState.RUNNING) 1f else 0f,
+        animationSpec = tween(durationMillis = 320),
+        label = "rootHomeAmbientGlow",
+    )
 
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
-        containerColor = MaterialTheme.colorScheme.background,
-        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
-        bottomBar = {
-            androidx.compose.foundation.layout.Column {
-                HorizontalDivider(thickness = 1.dp, color = extColors.hairline)
-                NavigationBar(
-                    containerColor = extColors.cardSurface,
-                    tonalElevation = 0.dp,
-                ) {
-                    MainDestination.entries.forEach { dest ->
-                        val selected = currentDestination == dest
-                        NavigationBarItem(
-                            selected = selected,
-                            onClick = {
-                                if (currentDestination != dest) {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    currentDestination = dest
-                                }
-                            },
-                            icon = {
-                                val icon = when (dest) {
-                                    MainDestination.HOME -> if (selected) Icons.Rounded.Home else Icons.Outlined.Home
-                                    MainDestination.NODES -> if (selected) Icons.Rounded.Dns else Icons.Outlined.Dns
-                                    MainDestination.RULES -> if (selected) Icons.Rounded.Route else Icons.Outlined.Route
-                                    MainDestination.PROFILES -> if (selected) Icons.Rounded.Description else Icons.Outlined.Description
-                                    MainDestination.SETTINGS -> if (selected) Icons.Rounded.Settings else Icons.Outlined.Settings
-                                }
-                                Icon(imageVector = icon, contentDescription = dest.label)
-                            },
-                            label = {
-                                Text(
-                                    text = dest.label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                )
-                            },
-                            colors = NavigationBarItemDefaults.colors(
-                                selectedIconColor = extColors.emerald,
-                                selectedTextColor = extColors.emerald,
-                                indicatorColor = extColors.emeraldContainer.copy(alpha = 0.65f),
-                                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                            ),
-                        )
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .homeAmbientGlow(extColors = extColors, alpha = rootHomeGlowAlpha),
+    ) {
+        Scaffold(
+            modifier = Modifier.fillMaxSize(),
+            containerColor = Color.Transparent,
+            snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+            bottomBar = {
+                androidx.compose.foundation.layout.Column {
+                    HorizontalDivider(
+                        thickness = 0.8.dp,
+                        color = extColors.hairline.copy(alpha = if (extColors.isDark) 0.7f else 0.75f),
+                    )
+                    NavigationBar(
+                        containerColor = extColors.navBarSurface,
+                        tonalElevation = 0.dp,
+                    ) {
+                        MainDestination.entries.forEach { dest ->
+                            val selected = currentDestination == dest
+                            NavigationBarItem(
+                                selected = selected,
+                                onClick = {
+                                    if (currentDestination != dest) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        currentDestination = dest
+                                    }
+                                },
+                                icon = {
+                                    val icon = when (dest) {
+                                        MainDestination.HOME -> if (selected) Icons.Rounded.Home else Icons.Outlined.Home
+                                        MainDestination.NODES -> if (selected) Icons.Rounded.Dns else Icons.Outlined.Dns
+                                        MainDestination.RULES -> if (selected) Icons.Rounded.Route else Icons.Outlined.Route
+                                        MainDestination.PROFILES -> if (selected) Icons.Rounded.Description else Icons.Outlined.Description
+                                        MainDestination.SETTINGS -> if (selected) Icons.Rounded.Settings else Icons.Outlined.Settings
+                                    }
+                                    Icon(imageVector = icon, contentDescription = dest.label)
+                                },
+                                label = {
+                                    Text(
+                                        text = dest.label,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                    )
+                                },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = extColors.onNavSelected,
+                                    selectedTextColor = extColors.onNavSelected,
+                                    indicatorColor = extColors.navIndicator,
+                                    unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                ),
+                            )
+                        }
                     }
                 }
-            }
-        },
-    ) { innerPadding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding),
-        ) {
-            Crossfade(
-                targetState = currentDestination,
-                animationSpec = tween(durationMillis = 140),
-                label = "mainDestination",
-            ) { destination ->
-                when (destination) {
-                    MainDestination.HOME -> HomeScreen(
-                        state = state,
-                        onToggleVpn = {
-                            if (state.vpnState in setOf(
-                                    VpnLifecycleState.DISCONNECTED,
-                                    VpnLifecycleState.ERROR,
-                                    VpnLifecycleState.REVOKED,
-                                ) &&
-                                state.nodes.isEmpty() &&
-                                !state.demoMode &&
-                                state.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
-                            ) {
+            },
+        ) { innerPadding ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+            ) {
+                Crossfade(
+                    targetState = currentDestination,
+                    animationSpec = tween(durationMillis = 140),
+                    label = "mainDestination",
+                ) { destination ->
+                    when (destination) {
+                        MainDestination.HOME -> HomeScreen(
+                            state = state,
+                            onToggleVpn = {
+                                if (state.vpnState in setOf(
+                                        VpnLifecycleState.DISCONNECTED,
+                                        VpnLifecycleState.ERROR,
+                                        VpnLifecycleState.REVOKED,
+                                    ) &&
+                                    state.nodes.isEmpty() &&
+                                    !state.demoMode &&
+                                    state.routingPreset != io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi.DIRECT
+                                ) {
+                                    viewModel.clearModalError()
+                                    showImportSheet = true
+                                } else {
+                                    onToggleVpn()
+                                }
+                            },
+                            onOpenQuickImport = {
                                 viewModel.clearModalError()
                                 showImportSheet = true
-                            } else {
-                                onToggleVpn()
-                            }
-                        },
-                        onOpenQuickImport = {
-                            viewModel.clearModalError()
-                            showImportSheet = true
-                        },
-                        onSelectRoutingPreset = viewModel::setRoutingPreset,
-                        onNavigateToNodes = { currentDestination = MainDestination.NODES },
-                        onNavigateToRules = { tab ->
-                            rulesInitialTab = tab
-                            currentDestination = MainDestination.RULES
-                        },
-                        onTestActiveLatency = {
-                            if (state.effectiveOutbound != "DIRECT" && state.effectiveOutbound != "REJECT") {
-                                viewModel.testLatency(state.effectiveOutbound)
-                            } else {
-                                viewModel.testLatency(null)
-                            }
-                        },
-                        onDismissError = viewModel::clearLastError,
-                        onShareDebugReport = onShareDebugReport,
-                        onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
-                        onRefreshExitIp = { viewModel.probeExitIp(forceRefresh = true) },
-                        onCopyExitIp = onCopyExitIp,
-                    )
+                            },
+                            onSelectRoutingPreset = viewModel::setRoutingPreset,
+                            onNavigateToNodes = { currentDestination = MainDestination.NODES },
+                            onNavigateToRules = { tab ->
+                                rulesInitialTab = tab
+                                currentDestination = MainDestination.RULES
+                            },
+                            onTestActiveLatency = {
+                                if (state.effectiveOutbound != "DIRECT" && state.effectiveOutbound != "REJECT") {
+                                    viewModel.testLatency(state.effectiveOutbound)
+                                } else {
+                                    viewModel.testLatency(null)
+                                }
+                            },
+                            onDismissError = viewModel::clearLastError,
+                            onShareDebugReport = onShareDebugReport,
+                            onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
+                            onRefreshExitIp = { viewModel.probeExitIp(forceRefresh = true) },
+                            onCopyExitIp = onCopyExitIp,
+                            drawAmbientGlow = false,
+                        )
 
-                    MainDestination.NODES -> NodesScreen(
-                        state = state,
-                        onSearchQueryChange = viewModel::setNodeSearchQuery,
-                        onToggleSortByDelay = viewModel::toggleSortNodesByDelay,
-                        onSelectGroupTab = viewModel::selectGroupTab,
-                        onSelectProxyInGroup = viewModel::selectProxyInGroup,
-                        onToggleFavorite = viewModel::toggleFavoriteNode,
-                        onTestAllDelays = { viewModel.testLatency(null) },
-                        onTestSingleDelay = { name -> viewModel.testLatency(name) },
-                        onOpenImportSheet = {
-                            viewModel.clearModalError()
-                            showImportSheet = true
-                        },
-                        onImportClipboardDirect = {
-                            val clip = onReadClipboard()
-                            if (!clip.isNullOrBlank()) {
-                                val autoSelect = viewModel.shouldAutoSelectOnImport()
-                                viewModel.importUnifiedPayload(
-                                    rawPayload = clip,
-                                    deduplicate = true,
-                                    autoSelect = autoSelect,
-                                    onSuccess = {
-                                        if (autoSelect) onExitDemoModeSync() else onReconcileAsyncMutationDemoExit()
-                                    },
-                                )
-                            } else {
+                        MainDestination.NODES -> NodesScreen(
+                            state = state,
+                            onSearchQueryChange = viewModel::setNodeSearchQuery,
+                            onToggleSortByDelay = viewModel::toggleSortNodesByDelay,
+                            onSelectGroupTab = viewModel::selectGroupTab,
+                            onSelectProxyInGroup = viewModel::selectProxyInGroup,
+                            onToggleFavorite = viewModel::toggleFavoriteNode,
+                            onTestAllDelays = { viewModel.testLatency(null) },
+                            onTestSingleDelay = { name -> viewModel.testLatency(name) },
+                            onOpenImportSheet = {
                                 viewModel.clearModalError()
                                 showImportSheet = true
-                                viewModel.emitUiMessage("剪贴板为空，请粘贴节点链接或订阅地址")
-                            }
-                        },
-                        onOpenQrCamera = onLaunchCameraQr,
-                        onOpenManualCreate = {
-                            viewModel.clearModalError()
-                            editingNode = null
-                            showNodeEditor = true
-                        },
-                        onOpenNodeEdit = { item ->
-                            viewModel.clearModalError()
-                            editingNode = item
-                            showNodeEditor = true
-                        },
-                        onDeleteNode = { nodeName ->
-                            viewModel.deleteNode(nodeName)
-                            onReconcileAsyncMutationDemoExit()
-                        },
-                        onDeduplicateNodes = {
-                            viewModel.deduplicateNodes()
-                            onReconcileAsyncMutationDemoExit()
-                        },
-                    )
-
-                    MainDestination.RULES -> RulesScreen(
-                        state = state,
-                        requestedSubTab = rulesInitialTab,
-                        onSelectRoutingPreset = viewModel::setRoutingPreset,
-                        onUpdateGeoData = viewModel::updateGeoDataNow,
-                        onOpenCustomRuleEditor = {
-                            viewModel.loadActiveYamlAndRules {
+                            },
+                            onImportClipboardDirect = {
+                                val clip = onReadClipboard()
+                                if (!clip.isNullOrBlank()) {
+                                    val autoSelect = viewModel.shouldAutoSelectOnImport()
+                                    viewModel.importUnifiedPayload(
+                                        rawPayload = clip,
+                                        deduplicate = true,
+                                        autoSelect = autoSelect,
+                                        onSuccess = {
+                                            if (autoSelect) onExitDemoModeSync() else onReconcileAsyncMutationDemoExit()
+                                        },
+                                    )
+                                } else {
+                                    viewModel.clearModalError()
+                                    showImportSheet = true
+                                    viewModel.emitUiMessage("剪贴板为空，请粘贴节点链接或订阅地址")
+                                }
+                            },
+                            onOpenQrCamera = onLaunchCameraQr,
+                            onOpenManualCreate = {
                                 viewModel.clearModalError()
-                                showCustomRulesDialog = true
-                            }
-                        },
-                        onSetDiagnosticsFilter = viewModel::setDiagnosticsFilter,
-                        onClearDiagnostics = viewModel::clearDiagnostics,
-                        onExplainTarget = viewModel::explainTargetRule,
-                        onDiagnoseSite = viewModel::diagnoseSite,
-                        onNavigateToNodes = { currentDestination = MainDestination.NODES },
-                        onRuleSearchChange = viewModel::setRuleSearchQuery,
-                    )
-
-                    MainDestination.PROFILES -> ProfilesScreen(
-                        state = state,
-                        onOpenImportSheet = {
-                            viewModel.clearModalError()
-                            showImportSheet = true
-                        },
-                        onActivateProfile = { profileId ->
-                            viewModel.activateProfile(profileId)
-                            onReconcileAsyncMutationDemoExit()
-                        },
-                        onRefreshProfile = viewModel::refreshProfileSubscription,
-                        onDeleteProfile = viewModel::deleteProfile,
-                        onRenameProfile = viewModel::renameProfile,
-                        onUpdateProfileAutoUpdate = viewModel::updateProfileAutoUpdate,
-                        onDismissOpSummary = viewModel::dismissProfileOpSummary,
-                        onOpenCustomRulesEditor = {
-                            viewModel.loadActiveYamlAndRules {
+                                editingNode = null
+                                showNodeEditor = true
+                            },
+                            onOpenNodeEdit = { item ->
                                 viewModel.clearModalError()
-                                showCustomRulesDialog = true
-                            }
-                        },
-                        onOpenYamlEditor = {
-                            viewModel.loadActiveYamlAndRules {
-                                viewModel.clearModalError()
-                                showYamlEditorDialog = true
-                            }
-                        },
-                        onImportYamlFile = onImportYamlFile,
-                        onExportYamlFile = onExportYamlFile,
-                    )
+                                editingNode = item
+                                showNodeEditor = true
+                            },
+                            onDeleteNode = { nodeName ->
+                                viewModel.deleteNode(nodeName)
+                                onReconcileAsyncMutationDemoExit()
+                            },
+                            onDeduplicateNodes = {
+                                viewModel.deduplicateNodes()
+                                onReconcileAsyncMutationDemoExit()
+                            },
+                        )
 
-                    MainDestination.SETTINGS -> SettingsScreen(
-                        state = state,
-                        onSetThemePreference = viewModel::setThemePreference,
-                        onRequestInstalledApps = viewModel::loadInstalledAppsIfNeeded,
-                        onSavePerAppPolicy = viewModel::savePerAppPolicy,
-                        onSetEnableIpv6 = viewModel::setEnableIpv6,
-                        onSetDemoMode = viewModel::setDemoMode,
-                        onFlushDns = viewModel::flushDnsCache,
-                        onSetShowSystemApps = viewModel::setShowSystemApps,
-                        onSetDefaultSubAutoUpdateSecs = viewModel::setDefaultSubAutoUpdateSecs,
-                        onClearSettingsNotice = viewModel::clearSettingsSheetNotice,
-                        onSetDebugLogEnabled = viewModel::setDebugLogEnabled,
-                        onSetDebugSliceIntervalSecs = viewModel::setDebugSliceIntervalSecs,
-                        onCaptureDebugSliceNow = viewModel::captureDebugSliceNow,
-                        onShareDebugReport = onShareDebugReport,
-                        onSaveDebugReportToFile = onSaveDebugReportToFile,
-                        onClearDebugLogs = viewModel::clearAllDebugLogs,
-                        onRefreshDebugSummary = viewModel::refreshDebugLogSummary,
-                        onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
-                        onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
-                    )
+                        MainDestination.RULES -> RulesScreen(
+                            state = state,
+                            requestedSubTab = rulesInitialTab,
+                            onSelectRoutingPreset = viewModel::setRoutingPreset,
+                            onUpdateGeoData = viewModel::updateGeoDataNow,
+                            onOpenCustomRuleEditor = {
+                                viewModel.loadActiveYamlAndRules {
+                                    viewModel.clearModalError()
+                                    showCustomRulesDialog = true
+                                }
+                            },
+                            onSetDiagnosticsFilter = viewModel::setDiagnosticsFilter,
+                            onClearDiagnostics = viewModel::clearDiagnostics,
+                            onExplainTarget = viewModel::explainTargetRule,
+                            onDiagnoseSite = viewModel::diagnoseSite,
+                            onNavigateToNodes = { currentDestination = MainDestination.NODES },
+                            onRuleSearchChange = viewModel::setRuleSearchQuery,
+                        )
+
+                        MainDestination.PROFILES -> ProfilesScreen(
+                            state = state,
+                            onOpenImportSheet = {
+                                viewModel.clearModalError()
+                                showImportSheet = true
+                            },
+                            onActivateProfile = { profileId ->
+                                viewModel.activateProfile(profileId)
+                                onReconcileAsyncMutationDemoExit()
+                            },
+                            onRefreshProfile = viewModel::refreshProfileSubscription,
+                            onDeleteProfile = viewModel::deleteProfile,
+                            onRenameProfile = viewModel::renameProfile,
+                            onUpdateProfileAutoUpdate = viewModel::updateProfileAutoUpdate,
+                            onDismissOpSummary = viewModel::dismissProfileOpSummary,
+                            onOpenCustomRulesEditor = {
+                                viewModel.loadActiveYamlAndRules {
+                                    viewModel.clearModalError()
+                                    showCustomRulesDialog = true
+                                }
+                            },
+                            onOpenYamlEditor = {
+                                viewModel.loadActiveYamlAndRules {
+                                    viewModel.clearModalError()
+                                    showYamlEditorDialog = true
+                                }
+                            },
+                            onImportYamlFile = onImportYamlFile,
+                            onExportYamlFile = onExportYamlFile,
+                        )
+
+                        MainDestination.SETTINGS -> SettingsScreen(
+                            state = state,
+                            onSetThemePreference = viewModel::setThemePreference,
+                            onRequestInstalledApps = viewModel::loadInstalledAppsIfNeeded,
+                            onSavePerAppPolicy = viewModel::savePerAppPolicy,
+                            onSetEnableIpv6 = viewModel::setEnableIpv6,
+                            onSetDemoMode = viewModel::setDemoMode,
+                            onFlushDns = viewModel::flushDnsCache,
+                            onSetShowSystemApps = viewModel::setShowSystemApps,
+                            onSetDefaultSubAutoUpdateSecs = viewModel::setDefaultSubAutoUpdateSecs,
+                            onClearSettingsNotice = viewModel::clearSettingsSheetNotice,
+                            onSetDebugLogEnabled = viewModel::setDebugLogEnabled,
+                            onSetDebugSliceIntervalSecs = viewModel::setDebugSliceIntervalSecs,
+                            onCaptureDebugSliceNow = viewModel::captureDebugSliceNow,
+                            onShareDebugReport = onShareDebugReport,
+                            onSaveDebugReportToFile = onSaveDebugReportToFile,
+                            onClearDebugLogs = viewModel::clearAllDebugLogs,
+                            onRefreshDebugSummary = viewModel::refreshDebugLogSummary,
+                            onDismissDebugAnomaly = viewModel::dismissDebugAnomaly,
+                            onOpenBatteryOptimizationSettings = onOpenBatteryOptimizationSettings,
+                        )
+                    }
                 }
             }
         }

@@ -159,7 +159,7 @@ fun NodesScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 20.dp, vertical = 10.dp),
+            .padding(horizontal = 18.dp, vertical = 10.dp),
     ) {
         // Header Row (matching design reference: 节点 + Search, Filter/Sort, Add, More)
         Row(
@@ -685,29 +685,34 @@ private fun NodeRowCard(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(20.dp))
             .clickable {
                 haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                 onSelect()
             },
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(20.dp),
         color = if (isSelected) extColors.selectedCardBg else extColors.cardSurface,
-        border = BorderStroke(
-            width = if (isSelected) 1.5.dp else 1.dp,
-            color = if (isSelected) extColors.selectedCardBorder else extColors.hairline,
-        ),
+        shadowElevation = if (!isSelected && !extColors.isDark) 1.5.dp else 0.dp,
+        border = if (isSelected) {
+            BorderStroke(
+                width = 1.dp,
+                color = extColors.selectedCardBorder.copy(alpha = if (extColors.isDark) 0.5f else 0.35f),
+            )
+        } else {
+            null
+        },
     ) {
         Column(
             modifier = Modifier
                 .drawBehind {
                     if (isSelected) {
-                        val barWidth = 3.5.dp.toPx()
-                        val insetY = 10.dp.toPx()
+                        val barWidth = 3.dp.toPx()
+                        val insetY = 16.dp.toPx()
                         val barHeight = (size.height - insetY * 2f).coerceAtLeast(0f)
                         if (barHeight > 0f) {
                             drawRoundRect(
                                 color = accentBarColor,
-                                topLeft = Offset(0f, insetY),
+                                topLeft = Offset(1.5.dp.toPx(), insetY),
                                 size = Size(barWidth, barHeight),
                                 cornerRadius = CornerRadius(barWidth, barWidth),
                             )

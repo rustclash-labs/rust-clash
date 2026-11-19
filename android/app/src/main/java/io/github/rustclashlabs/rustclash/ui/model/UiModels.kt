@@ -310,6 +310,11 @@ data class ExitIpUi(
             if (demoMode) return "新加坡（沙盒）"
             val code = countryCode.trim().uppercase(Locale.ROOT)
             if (code.length == 2 && code.all { it in 'A'..'Z' }) {
+                when (code) {
+                    "HK" -> return "中国香港"
+                    "MO" -> return "中国澳门"
+                    "AE" -> return "阿联酋"
+                }
                 val localized = runCatching {
                     Locale.Builder().setRegion(code).build().getDisplayCountry(Locale.SIMPLIFIED_CHINESE).trim()
                 }.getOrDefault("")
