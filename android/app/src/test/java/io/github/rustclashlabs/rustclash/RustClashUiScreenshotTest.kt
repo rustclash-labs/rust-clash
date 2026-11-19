@@ -66,6 +66,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
+import io.github.rustclashlabs.rustclash.ui.model.ExitIpUi
 import io.github.rustclashlabs.rustclash.ui.model.GeoDataUiStatus
 import io.github.rustclashlabs.rustclash.ui.model.InstalledAppUi
 import io.github.rustclashlabs.rustclash.ui.model.LiveTelemetryUi
@@ -1376,6 +1377,83 @@ class RustClashUiScreenshotTest {
         composeRule.onNodeWithText("直连 1 · 代理 2 · 异常 1").performClick()
         composeRule.onNodeWithText("网站排障").performClick()
         assertTrue(navigatedTabs == listOf(1, 2))
+    }
+
+    @Test
+    fun homeScreenExitIpPillOpensDetailSheetAndKeepsDiagnosticsAboveFold() {
+        val fontFamily = buildCjkFontFamily()
+        var refreshCount = 0
+        var copiedIp: String? = null
+        val uiState = sampleShowcaseState(ThemePreference.LIGHT).copy(
+            exitIp = ExitIpUi(
+                verified = true,
+                ip = "203.0.113.88",
+                country = "Japan",
+                countryCode = "JP",
+                isp = "Example Cloud JP",
+                asn = "AS64500",
+                ipType = "Datacenter / Hosting",
+                latencyMs = 95L,
+                outbound = "香港-IPLC-01",
+                protocol = "vless",
+                vpnRunning = true,
+                checkedAtMs = 1_700_000_000_000L,
+            ),
+        )
+
+        composeRule.setContent {
+            RustClashTheme(themePreference = ThemePreference.LIGHT, fontFamily = fontFamily) {
+                Scaffold(
+                    modifier = Modifier.fillMaxSize(),
+                    containerColor = MaterialTheme.colorScheme.background,
+                    bottomBar = {
+                        NavigationBar {
+                            NavigationBarItem(
+                                selected = true,
+                                onClick = {},
+                                icon = { Icon(Icons.Rounded.Home, contentDescription = null) },
+                                label = { Text("首页") },
+                            )
+                        }
+                    },
+                ) { innerPadding ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding),
+                    ) {
+                        HomeScreen(
+                            state = uiState,
+                            onToggleVpn = {},
+                            onOpenQuickImport = {},
+                            onSelectRoutingPreset = {},
+                            onNavigateToNodes = {},
+                            onNavigateToRules = {},
+                            onTestActiveLatency = {},
+                            onRefreshExitIp = { refreshCount++ },
+                            onCopyExitIp = { copiedIp = it },
+                        )
+                    }
+                }
+            }
+        }
+
+        // Exit IP compact pill and unified diagnostics row must both stay above the fold
+        composeRule.onNodeWithText("🇯🇵 日本 · 203.0.113.88").assertIsDisplayed()
+        composeRule.onNodeWithText("分流诊断").assertIsDisplayed()
+
+        // Tapping verified pill opens Exit IP detail sheet with ISP/ASN/copy/refresh actions
+        composeRule.onNodeWithText("🇯🇵 日本 · 203.0.113.88").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("当前落地 IP").assertIsDisplayed()
+        composeRule.onNodeWithText("203.0.113.88").assertIsDisplayed()
+        composeRule.onNodeWithText("Example Cloud JP").assertIsDisplayed()
+        composeRule.onNodeWithText("AS64500").assertIsDisplayed()
+
+        composeRule.onNodeWithText("复制 IP").performClick()
+        composeRule.onNodeWithText("重新检测").performClick()
+        assertTrue(copiedIp == "203.0.113.88")
+        assertTrue(refreshCount == 1)
     }
 }
 

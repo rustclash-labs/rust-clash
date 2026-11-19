@@ -868,6 +868,7 @@ fun ImportPayloadBottomSheet(
     errorMessage: String? = null,
     onClearError: () -> Unit = {},
     defaultSubAutoUpdateSecs: Long = 86400L,
+    defaultAutoSelect: Boolean = false,
     onDismiss: () -> Unit,
     onReadClipboard: () -> String?,
     onLaunchCameraQr: () -> Unit,
@@ -882,7 +883,7 @@ fun ImportPayloadBottomSheet(
     val focusManager = LocalFocusManager.current
     var payloadText by remember { mutableStateOf("") }
     var deduplicate by remember { mutableStateOf(true) }
-    var autoSelect by remember { mutableStateOf(true) }
+    var autoSelect by remember(defaultAutoSelect) { mutableStateOf(defaultAutoSelect) }
     var enableSubAutoUpdate by remember(defaultSubAutoUpdateSecs) { mutableStateOf(defaultSubAutoUpdateSecs > 0L) }
     var clipboardHint by remember { mutableStateOf<String?>(null) }
 
@@ -1046,11 +1047,18 @@ fun ImportPayloadBottomSheet(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = "导入后立即选中该节点",
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.weight(1f),
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "导入后立即切换为新节点",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text(
+                        text = "关闭时保留当前正在使用的节点，不中断现有连接",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
                 Switch(
                     checked = autoSelect,
                     enabled = !isImporting,
@@ -1137,6 +1145,7 @@ fun NodeEditorDialog(
     isSaving: Boolean = false,
     backendError: String? = null,
     onClearBackendError: () -> Unit = {},
+    defaultAutoSelect: Boolean = false,
     onDismiss: () -> Unit,
     onSave: (originalName: String?, nodeJson: JSONObject, autoSelect: Boolean) -> Unit,
 ) {
@@ -1258,7 +1267,7 @@ fun NodeEditorDialog(
         )
     }
     var skipCertVerify by remember(existingNode) { mutableStateOf(existingNode?.skipCertVerify ?: false) }
-    var autoSelect by remember(existingNode) { mutableStateOf(!isEditing) }
+    var autoSelect by remember(existingNode, defaultAutoSelect) { mutableStateOf(!isEditing && defaultAutoSelect) }
     var validationError by remember(existingNode) { mutableStateOf<String?>(null) }
 
     val clearErrors = {

@@ -41,6 +41,7 @@ const MIN_POSITIVE_TTL_SECS: u64 = 5;
 const MAX_POSITIVE_TTL_SECS: u64 = 3600;
 const MIN_NEGATIVE_TTL_SECS: u64 = 5;
 const MAX_NEGATIVE_TTL_SECS: u64 = 60;
+const MIN_NXDOMAIN_TTL_SECS: u64 = 60;
 const DEFAULT_NXDOMAIN_TTL_SECS: u64 = 180;
 const MAX_NXDOMAIN_TTL_SECS: u64 = 600;
 const SERVFAIL_NEGATIVE_TTL_SECS: u64 = 2;
@@ -56,7 +57,7 @@ fn compute_negative_ttl_secs(min_neg_ttl: Option<u64>, nxdomain: bool) -> u64 {
     if nxdomain {
         min_neg_ttl
             .unwrap_or(DEFAULT_NXDOMAIN_TTL_SECS)
-            .clamp(MIN_NEGATIVE_TTL_SECS, MAX_NXDOMAIN_TTL_SECS)
+            .clamp(MIN_NXDOMAIN_TTL_SECS, MAX_NXDOMAIN_TTL_SECS)
     } else {
         min_neg_ttl
             .unwrap_or(5)
@@ -2152,7 +2153,7 @@ impl FakeIpDnsEngine {
                     let neg_t = if t == 0 {
                         0
                     } else {
-                        u64::from(t).clamp(MIN_NEGATIVE_TTL_SECS, MAX_NXDOMAIN_TTL_SECS)
+                        u64::from(t).clamp(MIN_NXDOMAIN_TTL_SECS, MAX_NXDOMAIN_TTL_SECS)
                     };
                     min_neg_ttl = Some(min_neg_ttl.map_or(neg_t, |c| c.min(neg_t)));
                 }
@@ -3885,8 +3886,11 @@ mod tests {
                     "nx-soa-900.example.test" => {
                         build_negative_response_with_optional_soa(req, 3, Some(900))
                     }
-                    "nx-soa-30.example.test" => {
-                        build_negative_response_with_optional_soa(req, 3, Some(30))
+                    "nx-soa-10.example.test" => {
+                        build_negative_response_with_optional_soa(req, 3, Some(10))
+                    }
+                    "nx-soa-120.example.test" => {
+                        build_negative_response_with_optional_soa(req, 3, Some(120))
                     }
                     "nodata-no-soa.example.test" => {
                         build_negative_response_with_optional_soa(req, 0, None)
@@ -3974,21 +3978,40 @@ mod tests {
             true,
         );
 
-        // 3. NXDOMAIN with SOA TTL 30s -> honors 30s SOA TTL within [5, 600]
+        // 3a. NXDOMAIN with ultra-short SOA TTL 10s (e.g. telemetry/SDK retry domains)
+        //     -> clamped up to 60s (MIN_NXDOMAIN_TTL_SECS) to suppress upstream NXDOMAIN storms
         let before = Instant::now();
         assert!(
             engine
-                .resolve_real_ips("nx-soa-30.example.test")
+                .resolve_direct_ips("nx-soa-10.example.test")
+                .await
+                .is_err()
+        );
+        let after = Instant::now();
+        assert_neg_ttl(
+            &engine.direct_ip_cache,
+            "nx-soa-10.example.test",
+            before,
+            after,
+            60,
+            true,
+        );
+
+        // 3b. NXDOMAIN with SOA TTL 120s -> honors 120s SOA TTL within [60, 600]
+        let before = Instant::now();
+        assert!(
+            engine
+                .resolve_real_ips("nx-soa-120.example.test")
                 .await
                 .is_err()
         );
         let after = Instant::now();
         assert_neg_ttl(
             &engine.real_ip_cache,
-            "nx-soa-30.example.test",
+            "nx-soa-120.example.test",
             before,
             after,
-            30,
+            120,
             true,
         );
 
@@ -4028,7 +4051,7 @@ mod tests {
             false,
         );
 
-        // 6. Wire packet_cache in normal mode also honors 180s / 600s NXDOMAIN vs <= 60s NODATA
+        // 6. Wire packet_cache in normal mode also honors 60s..600s NXDOMAIN vs 5s..60s NODATA
         let normal_cfg = DnsConfig {
             enhanced_mode: "normal".to_string(),
             ..cfg
@@ -4036,6 +4059,7 @@ mod tests {
         let normal_engine = FakeIpDnsEngine::new(&normal_cfg).unwrap();
         for (domain, expected_secs) in [
             ("nx-no-soa.example.test", 180u64),
+            ("nx-soa-10.example.test", 60u64),
             ("nx-soa-900.example.test", 600u64),
             ("nodata-soa-900.example.test", 60u64),
         ] {

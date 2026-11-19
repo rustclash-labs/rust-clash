@@ -2,6 +2,7 @@ package io.github.rustclashlabs.rustclash
 
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.DiagnosticsFilter
+import io.github.rustclashlabs.rustclash.ui.model.ExitIpUi
 import io.github.rustclashlabs.rustclash.ui.model.ProxyNodeItem
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.ThemePreference
@@ -1768,5 +1769,89 @@ class VpnConfigAndLifecycleTest {
         RustClashVpnService.clearFreshStatusSnapshot()
         assertEquals("{\"running\":false}", RustClashVpnService.latestStatusJson)
         assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+    }
+
+    @Test
+    fun exitIpParserAndDisplayHelpersHandleVerifiedDemoFailedAndSnakeCase() {
+        val verifiedJson = """
+            {
+              "ok": true,
+              "verified": true,
+              "demoMode": false,
+              "ip": "203.0.113.42",
+              "country": "Singapore",
+              "countryCode": "SG",
+              "isp": "DigitalOcean LLC",
+              "asn": "AS14061",
+              "ipType": "Datacenter / Hosting",
+              "latencyMs": 124,
+              "outbound": "SG-Edge-01",
+              "protocol": "vless",
+              "mode": "rule",
+              "vpnRunning": true,
+              "checkedAtMs": 1700000000000,
+              "cached": false,
+              "error": null
+            }
+        """.trimIndent()
+        val verified = UiJsonParsers.parseExitIpResponse(verifiedJson)
+        assertNotNull(verified)
+        assertTrue(verified!!.verified)
+        assertEquals("203.0.113.42", verified.ip)
+        assertEquals("🇸🇬", verified.flagEmoji)
+        assertEquals("新加坡", verified.countryDisplayZh)
+        assertEquals("🇸🇬 新加坡", verified.countryWithFlag)
+        assertEquals("数据中心 / 机房 IP", verified.ipTypeDisplayZh)
+        assertEquals("🇸🇬 新加坡 · 203.0.113.42", verified.compactPillText)
+        assertEquals(124L, verified.latencyMs)
+        assertEquals("AS14061", verified.asn)
+        assertNull(verified.error)
+
+        val demoJson = """
+            {
+              "ok": true,
+              "verified": true,
+              "demoMode": true,
+              "ip": "198.51.100.42",
+              "country": "Demo Sandbox",
+              "countryCode": "SG",
+              "ipType": "Sandbox",
+              "latencyMs": 18
+            }
+        """.trimIndent()
+        val demo = UiJsonParsers.parseExitIpResponse(demoJson)
+        assertNotNull(demo)
+        assertTrue(demo!!.demoMode)
+        assertEquals("新加坡（沙盒）", demo.countryDisplayZh)
+        assertEquals("本地沙盒演示", demo.ipTypeDisplayZh)
+        assertEquals("🇸🇬 新加坡（沙盒） · 198.51.100.42", demo.compactPillText)
+
+        val snakeFailedJson = """
+            {
+              "ok": true,
+              "verified": false,
+              "ip": "--",
+              "country_code": "jp",
+              "ip_type": "blocked",
+              "latency_ms": null,
+              "error": "Outbound 'REJECT' blocks egress traffic"
+            }
+        """.trimIndent()
+        val failed = UiJsonParsers.parseExitIpResponse(snakeFailedJson)
+        assertNotNull(failed)
+        assertFalse(failed!!.verified)
+        assertEquals("🇯🇵", failed.flagEmoji)
+        assertEquals("已拦截 (REJECT)", failed.ipTypeDisplayZh)
+        assertEquals("落地 IP 检测失败 · 点击重试", failed.compactPillText)
+        assertNotNull(failed.error)
+
+        val errObj = UiJsonParsers.parseExitIpResponse("""{"ok":false,"error":"probe timeout"}""")
+        assertNotNull(errObj)
+        assertFalse(errObj!!.verified)
+        assertEquals("probe timeout", errObj.error)
+
+        val directManual = ExitIpUi(verified = true, ip = "198.51.100.9", country = "Japan", countryCode = "JP", ipType = "ISP / Broadband")
+        assertEquals("运营商 / 宽带 IP", directManual.ipTypeDisplayZh)
+        assertEquals("🇯🇵 日本 · 198.51.100.9", directManual.compactPillText)
     }
 }

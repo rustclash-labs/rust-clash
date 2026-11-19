@@ -2220,6 +2220,260 @@ pub async fn diagnose_site(
     })
 }
 
+/// Verified egress IP, country, ASN/ISP, and IP classification returned by probing
+/// an outbound handler over HTTPS (`api.ip.sb/geoip` with Cloudflare trace fallbacks).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitIpProbeData {
+    pub ip: String,
+    pub country: String,
+    pub country_code: String,
+    pub isp: String,
+    pub asn: String,
+    pub ip_type: String,
+}
+
+pub fn classify_exit_ip_type(hosting_flag: Option<bool>, isp: &str, asn: &str) -> &'static str {
+    if hosting_flag == Some(true) {
+        return "Datacenter / Hosting";
+    }
+    let hay = format!("{isp} {asn}").to_ascii_lowercase();
+    const HOSTING_KEYWORDS: &[&str] = &[
+        "cloudflare",
+        "amazon",
+        "aws",
+        "google",
+        "microsoft",
+        "azure",
+        "digitalocean",
+        "vultr",
+        "linode",
+        "akamai",
+        "hetzner",
+        "oracle",
+        "ovh",
+        "choopa",
+        "alibaba",
+        "aliyun",
+        "tencent",
+        "datacamp",
+        "packethub",
+        "cogent",
+        "leaseweb",
+        "contabo",
+        "zenlayer",
+        "dmit",
+        "bandwagon",
+    ];
+    if HOSTING_KEYWORDS.iter().any(|kw| hay.contains(kw)) {
+        "Datacenter / Hosting"
+    } else if isp.is_empty() && asn.is_empty() {
+        "Unknown"
+    } else {
+        "ISP / Broadband"
+    }
+}
+
+pub(crate) fn extract_http_response_body_str(raw: &[u8]) -> Option<String> {
+    let hdr_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&raw[..hdr_end]).ok()?;
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let is_chunked = head.lines().any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    let body_raw = &raw[hdr_end + 4..];
+    if is_chunked {
+        crate::config::decode_http_chunked_body(body_raw, 1024 * 1024)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+    } else {
+        String::from_utf8(body_raw.to_vec()).ok()
+    }
+}
+
+async fn fetch_via_outbound_https_text(
+    outbound: &dyn crate::outbound::OutboundHandler,
+    target: &TargetAddr,
+    tls_sni: &str,
+    host_header: &str,
+    path_and_query: &str,
+    extra_ca_der: &[CertificateDer<'static>],
+) -> Option<String> {
+    let stream = outbound.connect_tcp(target).await.ok()?;
+    let req = format!(
+        "GET {path_and_query} HTTP/1.0\r\nHost: {host_header}\r\nUser-Agent: curl/8.7.1\r\nAccept: application/json, text/plain\r\nConnection: close\r\n\r\n"
+    );
+    let mut raw_buf = Vec::with_capacity(2048);
+    let tls_cfg = build_tls_client_config(false, extra_ca_der, &[b"http/1.1".to_vec()]).ok()?;
+    let connector = TlsConnector::from(tls_cfg);
+    let server_name = rustls::pki_types::ServerName::try_from(tls_sni.to_string()).ok()?;
+    let mut tls_stream = connector.connect(server_name, stream).await.ok()?;
+    tls_stream.write_all(req.as_bytes()).await.ok()?;
+    tls_stream.flush().await.ok()?;
+    let _ = (&mut tls_stream)
+        .take(65_536)
+        .read_to_end(&mut raw_buf)
+        .await;
+    extract_http_response_body_str(&raw_buf)
+}
+
+pub fn parse_ip_sb_geoip_exit_ip(body: &str) -> Option<ExitIpProbeData> {
+    let val = serde_json::from_str::<serde_json::Value>(body.trim()).ok()?;
+    let ip = val
+        .get("ip")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let country = val
+        .get("country")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Unknown")
+        .to_string();
+    let country_code = val
+        .get("country_code")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    let isp = val
+        .get("isp")
+        .or_else(|| val.get("organization"))
+        .or_else(|| val.get("asn_organization"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let asn = match val.get("asn") {
+        Some(serde_json::Value::Number(n)) => format!("AS{n}"),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+            let trimmed = s.trim();
+            if trimmed.starts_with("AS") {
+                trimmed.to_string()
+            } else {
+                format!("AS{trimmed}")
+            }
+        }
+        _ => String::new(),
+    };
+    let ip_type = classify_exit_ip_type(None, &isp, &asn).to_string();
+    Some(ExitIpProbeData {
+        ip: ip.to_string(),
+        country,
+        country_code,
+        isp,
+        asn,
+        ip_type,
+    })
+}
+
+pub fn parse_cloudflare_trace_exit_ip(body: &str) -> Option<ExitIpProbeData> {
+    let mut ip = None;
+    let mut loc = String::new();
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("ip=") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                ip = Some(trimmed.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("loc=") {
+            loc = v.trim().to_ascii_uppercase();
+        }
+    }
+    let found_ip = ip?;
+    Some(ExitIpProbeData {
+        ip: found_ip,
+        country: if loc.is_empty() {
+            "Unknown".to_string()
+        } else {
+            loc.clone()
+        },
+        country_code: loc,
+        isp: String::new(),
+        asn: String::new(),
+        ip_type: "Unknown".to_string(),
+    })
+}
+
+/// Probes real egress IP and country/ISP metadata by routing HTTPS requests directly
+/// through `outbound` (`api.ip.sb/geoip`, falling back to `1.1.1.1` and `www.cloudflare.com` trace).
+pub async fn probe_exit_ip_via_outbound(
+    outbound: &dyn crate::outbound::OutboundHandler,
+    extra_ca_der: &[CertificateDer<'static>],
+) -> Option<ExitIpProbeData> {
+    let step_timeout = Duration::from_millis(2400);
+
+    // 1. Primary (HTTPS :443): https://api.ip.sb/geoip
+    if let Ok(target) = TargetAddr::new_domain("api.ip.sb", 443)
+        && let Ok(Some(body)) = tokio::time::timeout(
+            step_timeout,
+            fetch_via_outbound_https_text(
+                outbound,
+                &target,
+                "api.ip.sb",
+                "api.ip.sb",
+                "/geoip",
+                extra_ca_der,
+            ),
+        )
+        .await
+        && let Some(data) = parse_ip_sb_geoip_exit_ip(&body)
+    {
+        return Some(data);
+    }
+
+    // 2. Fallback #1 (HTTPS :443 IP literal): https://1.1.1.1/cdn-cgi/trace
+    let cf_target = TargetAddr::new_ip(IpAddr::from([1, 1, 1, 1]), 443);
+    if let Ok(Some(body)) = tokio::time::timeout(
+        step_timeout,
+        fetch_via_outbound_https_text(
+            outbound,
+            &cf_target,
+            "cloudflare-dns.com",
+            "1.1.1.1",
+            "/cdn-cgi/trace",
+            extra_ca_der,
+        ),
+    )
+    .await
+        && let Some(data) = parse_cloudflare_trace_exit_ip(&body)
+    {
+        return Some(data);
+    }
+
+    // 3. Fallback #2 (HTTPS :443 domain): https://www.cloudflare.com/cdn-cgi/trace
+    if let Ok(cf_dom) = TargetAddr::new_domain("www.cloudflare.com", 443)
+        && let Ok(Some(body)) = tokio::time::timeout(
+            step_timeout,
+            fetch_via_outbound_https_text(
+                outbound,
+                &cf_dom,
+                "www.cloudflare.com",
+                "www.cloudflare.com",
+                "/cdn-cgi/trace",
+                extra_ca_der,
+            ),
+        )
+        .await
+        && let Some(data) = parse_cloudflare_trace_exit_ip(&body)
+    {
+        return Some(data);
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2942,5 +3196,45 @@ mod tests {
                 "expected `{expected_host_line:?}` in HTTP request for {url}, got: {req:?}"
             );
         }
+    }
+
+    #[test]
+    fn exit_ip_parsers_extract_ip_country_isp_and_classify_type() {
+        let ip_sb_json = r#"{
+            "ip": "203.0.113.42",
+            "country": "Singapore",
+            "country_code": "sg",
+            "isp": "DigitalOcean, LLC",
+            "asn": 14061
+        }"#;
+        let parsed = parse_ip_sb_geoip_exit_ip(ip_sb_json).expect("parse ip.sb geoip");
+        assert_eq!(parsed.ip, "203.0.113.42");
+        assert_eq!(parsed.country, "Singapore");
+        assert_eq!(parsed.country_code, "SG");
+        assert_eq!(parsed.isp, "DigitalOcean, LLC");
+        assert_eq!(parsed.asn, "AS14061");
+        assert_eq!(parsed.ip_type, "Datacenter / Hosting");
+
+        let broadband_json = r#"{
+            "ip": "198.51.100.7",
+            "country": "Japan",
+            "country_code": "JP",
+            "organization": "NTT Communications",
+            "asn": "AS2914"
+        }"#;
+        let broadband = parse_ip_sb_geoip_exit_ip(broadband_json).expect("parse broadband");
+        assert_eq!(broadband.country_code, "JP");
+        assert_eq!(broadband.asn, "AS2914");
+        assert_eq!(broadband.ip_type, "ISP / Broadband");
+
+        let cf_trace = "fl=29f12\nh=1.1.1.1\nip=2001:db8::99\nts=1795000000\nloc=jp\ntls=TLSv1.3\n";
+        let cf = parse_cloudflare_trace_exit_ip(cf_trace).expect("parse cf trace");
+        assert_eq!(cf.ip, "2001:db8::99");
+        assert_eq!(cf.country_code, "JP");
+        assert_eq!(cf.country, "JP");
+        assert_eq!(cf.ip_type, "Unknown");
+
+        assert!(parse_ip_sb_geoip_exit_ip(r#"{"country":"SG"}"#).is_none());
+        assert!(parse_cloudflare_trace_exit_ip("loc=US\n").is_none());
     }
 }

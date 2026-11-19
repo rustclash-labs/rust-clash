@@ -129,23 +129,25 @@ impl DelayStore {
             Some((last_time, last_delay)) => {
                 if now_ms.saturating_sub(last_time) >= max_age_ms {
                     // Dampen single-connection RRC-wakeup / bootstrap outliers when refreshing a
-                    // previously healthy node so one slow handshake does not pin a multi-second badge.
-                    let effective_ms = if rtt_ms > last_delay.saturating_mul(2)
-                        && rtt_ms.saturating_sub(last_delay) >= 200
+                    // previously healthy node so moderate (+50% and >= +60ms) or severe spikes
+                    // cannot ratchet the displayed delay badge upward in a single sample.
+                    let effective_ms = if rtt_ms.saturating_mul(2) >= last_delay.saturating_mul(3)
+                        && rtt_ms.saturating_sub(last_delay) >= 60
                     {
-                        ((last_delay.saturating_mul(2) + rtt_ms) / 3)
-                            .min(last_delay.saturating_mul(3))
+                        ((last_delay.saturating_mul(3) + rtt_ms) / 4)
+                            .min(last_delay.saturating_mul(2))
                     } else {
                         rtt_ms
                     };
                     self.record(name, effective_ms.max(1));
-                } else if last_delay >= 250
-                    && rtt_ms.saturating_mul(2) <= last_delay
-                    && last_delay.saturating_sub(rtt_ms) >= 150
+                } else if last_delay >= 180
+                    && rtt_ms.saturating_mul(3) <= last_delay.saturating_mul(2)
+                    && last_delay.saturating_sub(rtt_ms) >= 80
                 {
                     // Fast downward outlier recovery: if an initial cold-start / radio-wake dial
-                    // recorded an inflated RTT (e.g. 3094ms or 467ms) and a subsequent connection
-                    // completes in <= half that time (e.g. 105ms), immediately correct it downward.
+                    // recorded an inflated RTT (e.g. 3094ms, 456ms, or 217ms) and a subsequent
+                    // connection completes >= 33% and >= 80ms faster (e.g. 105ms–112ms), immediately
+                    // correct it downward without waiting for max_age_ms.
                     self.record(name, rtt_ms);
                 }
             }
@@ -540,17 +542,34 @@ mod tests {
         store.record_passive_if_stale("sg-vless", 128, 180_000);
         assert_eq!(store.latest_delay("sg-vless"), Some(128));
 
-        // 3. Stale refresh with a 3094ms single-connection outlier is dampened (<= 3x prior 128ms)
+        // 3. Stale refresh with a 3094ms single-connection outlier is dampened (<= 2x prior 128ms)
         store.record_passive_if_stale("sg-vless", 3094, 1);
         std::thread::sleep(std::time::Duration::from_millis(2));
         store.record_passive_if_stale("sg-vless", 3094, 1);
         let dampened = store.latest_delay("sg-vless").unwrap();
         assert!(
-            dampened <= 128 * 3 * 3,
-            "expected dampened spike <= 1152ms, got {dampened}ms"
+            dampened <= 128 * 2 * 2,
+            "expected dampened spike <= 512ms, got {dampened}ms"
         );
         // Next normal 105ms connection brings it right back down without waiting 3 minutes
         store.record_passive_if_stale("sg-vless", 105, 180_000);
         assert_eq!(store.latest_delay("sg-vless"), Some(105));
+
+        // 4. Moderate cellular RRC wake spike (105ms -> 277ms on stale refresh) is dampened
+        //    to (3*105 + 277)/4 = 148ms instead of ratcheting directly to 277ms -> 335ms -> 456ms.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_passive_if_stale("sg-vless", 277, 1);
+        assert_eq!(store.latest_delay("sg-vless"), Some(148));
+
+        // 5. Moderate stale spike (108ms -> 217ms) is dampened to (3*108 + 217)/4 = 135ms;
+        //    and if an initial cold-start recorded 217ms, a subsequent 112ms dial recovers immediately.
+        store.record("sg-mod", 108);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store.record_passive_if_stale("sg-mod", 217, 1);
+        assert_eq!(store.latest_delay("sg-mod"), Some(135));
+
+        store.record("sg-cold", 217);
+        store.record_passive_if_stale("sg-cold", 112, 180_000);
+        assert_eq!(store.latest_delay("sg-cold"), Some(112));
     }
 }

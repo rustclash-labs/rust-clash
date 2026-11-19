@@ -23,7 +23,7 @@ use tokio::{
 use crate::{addr::TargetAddr, config::uri::redact_sensitive_text, outbound::OutboundHandler};
 
 const MAX_RECENT_DIAGNOSTICS: usize = 200;
-const MAX_DEBUG_DIAGNOSTICS: usize = 1_500;
+pub const MAX_DEBUG_DIAGNOSTICS: usize = 3_000;
 const MAX_FAILED_DIAGNOSTICS: usize = 300;
 const MAX_RECENT_LOGS: usize = 300;
 const MAX_DEBUG_LOGS: usize = 1_500;
@@ -286,13 +286,25 @@ impl ActiveConnection {
     }
 }
 
+/// Result of querying diagnostics in a time window, including ring/limit truncation metadata.
+#[derive(Debug, Clone)]
+pub struct WindowDiagnosticsResult {
+    pub entries: Vec<DiagnosticEntry>,
+    pub ring_capacity: usize,
+    pub ring_evicted_in_window: bool,
+    pub limit_truncated: bool,
+    pub truncated: bool,
+}
+
 /// Central telemetry, connection manager, and structured log hub.
 pub struct TelemetryHub {
     started_at_ms: u64,
     total_connections: AtomicU64,
     established_connections_total: AtomicU64,
     failed_connections_total: AtomicU64,
+    cancelled_connections_total: AtomicU64,
     zero_rx_closed_total: AtomicU64,
+    last_evicted_recent_epoch_ms: AtomicU64,
     total_upload: AtomicU64,
     total_download: AtomicU64,
     last_sampled_up: AtomicU64,
@@ -332,7 +344,9 @@ impl TelemetryHub {
             total_connections: AtomicU64::new(0),
             established_connections_total: AtomicU64::new(0),
             failed_connections_total: AtomicU64::new(0),
+            cancelled_connections_total: AtomicU64::new(0),
             zero_rx_closed_total: AtomicU64::new(0),
+            last_evicted_recent_epoch_ms: AtomicU64::new(0),
             total_upload: AtomicU64::new(0),
             total_download: AtomicU64::new(0),
             last_sampled_up: AtomicU64::new(0),
@@ -374,6 +388,10 @@ impl TelemetryHub {
         self.failed_connections_total.load(Ordering::Relaxed)
     }
 
+    pub fn cancelled_connections_total(&self) -> u64 {
+        self.cancelled_connections_total.load(Ordering::Relaxed)
+    }
+
     pub fn zero_rx_closed_total(&self) -> u64 {
         self.zero_rx_closed_total.load(Ordering::Relaxed)
     }
@@ -393,7 +411,11 @@ impl TelemetryHub {
             {
                 let mut ring = self.recent_diagnostics.lock();
                 while ring.len() > MAX_RECENT_DIAGNOSTICS {
-                    ring.pop_front();
+                    if let Some(evicted) = ring.pop_front() {
+                        let ts = evicted.end_epoch_ms.unwrap_or(evicted.start_epoch_ms);
+                        self.last_evicted_recent_epoch_ms
+                            .fetch_max(ts, Ordering::Relaxed);
+                    }
                 }
             }
             {
@@ -617,7 +639,7 @@ impl TelemetryHub {
         ring: &mut VecDeque<ConnectionSnapshot>,
         snap: ConnectionSnapshot,
         max_cap: usize,
-    ) {
+    ) -> Option<u64> {
         let is_unmapped_fake_ip = snap.effective_outbound == "UNMAPPED-FAKE-IP";
         let coalesce_window_ms = if is_unmapped_fake_ip { 10_000 } else { 1_000 };
         if snap.status == "failed"
@@ -636,12 +658,17 @@ impl TelemetryHub {
             existing.coalesced_count = existing
                 .coalesced_count
                 .saturating_add(snap.coalesced_count.max(1));
-            return;
+            return None;
         }
+        let mut max_evicted_ts: Option<u64> = None;
         while ring.len() >= max_cap {
-            ring.pop_front();
+            if let Some(evicted) = ring.pop_front() {
+                let ts = evicted.end_epoch_ms.unwrap_or(evicted.start_epoch_ms);
+                max_evicted_ts = Some(max_evicted_ts.map_or(ts, |prev| prev.max(ts)));
+            }
         }
         ring.push_back(snap);
+        max_evicted_ts
     }
 
     fn archive_diagnostic(&self, snap: ConnectionSnapshot) {
@@ -655,6 +682,9 @@ impl TelemetryHub {
             if snap.download == 0 && snap.upload > 0 {
                 self.zero_rx_closed_total.fetch_add(1, Ordering::Relaxed);
             }
+        } else {
+            self.cancelled_connections_total
+                .fetch_add(1, Ordering::Relaxed);
         }
         let max_cap = if self.is_debug_mode() {
             MAX_DEBUG_DIAGNOSTICS
@@ -670,7 +700,10 @@ impl TelemetryHub {
             );
         }
         let mut ring = self.recent_diagnostics.lock();
-        Self::push_or_coalesce_diagnostic(&mut ring, snap, max_cap);
+        if let Some(evicted_ts) = Self::push_or_coalesce_diagnostic(&mut ring, snap, max_cap) {
+            self.last_evicted_recent_epoch_ms
+                .fetch_max(evicted_ts, Ordering::Relaxed);
+        }
     }
 
     pub fn record_connection_failed(&self, id: &str, raw_reason: &str) {
@@ -955,8 +988,31 @@ impl TelemetryHub {
         until_epoch_ms: u64,
         limit: usize,
     ) -> Vec<DiagnosticEntry> {
+        self.diagnostics_in_window_with_meta(since_epoch_ms, until_epoch_ms, limit)
+            .entries
+    }
+
+    /// Like [`Self::diagnostics_in_window`], additionally returning exact ring-eviction and
+    /// query-cap truncation flags so diagnostic exporters never silently under-report high-volume windows.
+    pub fn diagnostics_in_window_with_meta(
+        &self,
+        since_epoch_ms: u64,
+        until_epoch_ms: u64,
+        limit: usize,
+    ) -> WindowDiagnosticsResult {
+        let ring_capacity = if self.is_debug_mode() {
+            MAX_DEBUG_DIAGNOSTICS
+        } else {
+            MAX_RECENT_DIAGNOSTICS
+        };
         if since_epoch_ms > until_epoch_ms {
-            return Vec::new();
+            return WindowDiagnosticsResult {
+                entries: Vec::new(),
+                ring_capacity,
+                ring_evicted_in_window: false,
+                limit_truncated: false,
+                truncated: false,
+            };
         }
         let cap = limit.clamp(1, MAX_DEBUG_DIAGNOSTICS);
         let matches_window = |s: &ConnectionSnapshot| -> bool {
@@ -966,16 +1022,22 @@ impl TelemetryHub {
         };
 
         let mut seen_ids = HashSet::new();
+        let mut limit_truncated = false;
         let mut selected: Vec<DiagnosticEntry> = {
             let failed_ring = self.failed_diagnostics.lock();
-            failed_ring
-                .iter()
-                .rev()
-                .filter(|s| matches_window(s))
-                .take(cap)
-                .filter(|s| seen_ids.insert(s.id.clone()))
-                .cloned()
-                .collect()
+            let mut failed_selected = Vec::new();
+            for s in failed_ring.iter().rev().filter(|s| matches_window(s)) {
+                if !seen_ids.insert(s.id.clone()) {
+                    continue;
+                }
+                if failed_selected.len() < cap {
+                    failed_selected.push(s.clone());
+                } else {
+                    limit_truncated = true;
+                    break;
+                }
+            }
+            failed_selected
         };
 
         let remaining = cap.saturating_sub(selected.len());
@@ -996,18 +1058,45 @@ impl TelemetryHub {
             }
             others.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
             if others.len() > remaining {
+                limit_truncated = true;
                 others.truncate(remaining);
             }
             selected.extend(others);
+        } else if !limit_truncated {
+            let has_extra_active = self.connections.iter().any(|entry| {
+                let s = entry.value().snapshot();
+                matches_window(&s) && !seen_ids.contains(&s.id)
+            });
+            let has_extra_recent = if has_extra_active {
+                true
+            } else {
+                let ring = self.recent_diagnostics.lock();
+                ring.iter()
+                    .any(|s| matches_window(s) && !seen_ids.contains(&s.id))
+            };
+            if has_extra_recent {
+                limit_truncated = true;
+            }
         }
 
+        let last_evicted = self.last_evicted_recent_epoch_ms.load(Ordering::Relaxed);
+        let ring_evicted_in_window = last_evicted > 0 && last_evicted >= since_epoch_ms;
+
         selected.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
-        selected
+        WindowDiagnosticsResult {
+            entries: selected,
+            ring_capacity,
+            ring_evicted_in_window,
+            limit_truncated,
+            truncated: ring_evicted_in_window || limit_truncated,
+        }
     }
 
     pub fn clear_diagnostics(&self) {
         self.recent_diagnostics.lock().clear();
         self.failed_diagnostics.lock().clear();
+        self.last_evicted_recent_epoch_ms
+            .store(0, Ordering::Relaxed);
     }
 
     pub fn totals(&self) -> (u64, u64) {
@@ -1686,7 +1775,7 @@ mod tests {
                 coalesced_count: 1,
             };
 
-        // Record 2 failed connections early in the 30-minute slice, followed by 1,800 routine closed connections
+        // Record 2 failed connections early in the 30-minute slice, followed by > MAX_DEBUG_DIAGNOSTICS routine closed connections
         hub.archive_diagnostic(make_snap(
             "early-fail-1",
             "failed",
@@ -1699,7 +1788,8 @@ mod tests {
             2_500,
             Some("direct-nameserver DNS resolution failed"),
         ));
-        for i in 0..1_800u64 {
+        let overflow_count = MAX_DEBUG_DIAGNOSTICS as u64 + 300;
+        for i in 0..overflow_count {
             hub.archive_diagnostic(make_snap(
                 &format!("closed-{i}"),
                 "closed",
@@ -1708,7 +1798,12 @@ mod tests {
             ));
         }
 
-        let window = hub.diagnostics_in_window(500, 50_000, MAX_DEBUG_DIAGNOSTICS);
+        let until_ms = 10_000 + overflow_count * 10 + 1_000;
+        let meta = hub.diagnostics_in_window_with_meta(500, until_ms, MAX_DEBUG_DIAGNOSTICS);
+        assert_eq!(meta.ring_capacity, MAX_DEBUG_DIAGNOSTICS);
+        assert!(meta.ring_evicted_in_window);
+        assert!(meta.truncated);
+        let window = meta.entries;
         assert_eq!(window.len(), MAX_DEBUG_DIAGNOSTICS);
         let failed_in_window: Vec<&ConnectionSnapshot> =
             window.iter().filter(|s| s.status == "failed").collect();
@@ -1729,8 +1824,91 @@ mod tests {
             assert!(seen.insert(&s.id), "duplicate snapshot id {}", s.id);
         }
 
+        // Subsequent non-overlapping future window must NOT be marked ring-evicted
+        let future_meta =
+            hub.diagnostics_in_window_with_meta(until_ms + 10_000, until_ms + 20_000, 100);
+        assert!(!future_meta.ring_evicted_in_window);
+        assert!(!future_meta.truncated);
+
         hub.clear_diagnostics();
-        assert!(hub.diagnostics_in_window(0, u64::MAX, 100).is_empty());
+        let after_clear = hub.diagnostics_in_window_with_meta(0, u64::MAX, 100);
+        assert!(after_clear.entries.is_empty());
+        assert!(!after_clear.truncated);
+    }
+
+    #[test]
+    fn cancelled_pre_handshake_dials_close_connection_accounting_gap() {
+        let hub = Arc::new(TelemetryHub::new());
+        let target = TargetAddr::new_domain("example.com", 443).unwrap();
+
+        // 1. Pre-handshake drop (e.g. client closed SYN/RST while outbound dial was in flight)
+        {
+            let _cancelled = hub.register_connection_guard(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &target,
+                None,
+                "MATCH",
+                "",
+                vec!["DIRECT".to_string()],
+            );
+        }
+
+        // 2. Established and later closed normally
+        {
+            let established = hub.register_connection_guard(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &target,
+                None,
+                "MATCH",
+                "",
+                vec!["DIRECT".to_string()],
+            );
+            established.mark_established();
+        }
+
+        // 3. Explicit dial failure
+        {
+            let failed = hub.register_connection_guard(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &target,
+                None,
+                "MATCH",
+                "",
+                vec!["DIRECT".to_string()],
+            );
+            failed.record_failed("connect timeout");
+        }
+
+        // 4. Still active (mid-handshake)
+        let _active = hub.register_connection_guard(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &target,
+            None,
+            "MATCH",
+            "",
+            vec!["DIRECT".to_string()],
+        );
+
+        assert_eq!(hub.total_connections(), 4);
+        assert_eq!(hub.active_connection_count(), 1);
+        assert_eq!(hub.established_connections_total(), 1);
+        assert_eq!(hub.failed_connections_total(), 1);
+        assert_eq!(hub.cancelled_connections_total(), 1);
+        assert_eq!(
+            hub.active_connection_count() as u64
+                + hub.established_connections_total()
+                + hub.failed_connections_total()
+                + hub.cancelled_connections_total(),
+            hub.total_connections()
+        );
     }
 
     #[test]

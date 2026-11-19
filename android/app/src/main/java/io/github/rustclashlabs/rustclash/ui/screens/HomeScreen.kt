@@ -35,12 +35,15 @@ import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Clear
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Route
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Speed
@@ -57,6 +60,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -77,11 +81,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
+import io.github.rustclashlabs.rustclash.ui.model.ExitIpUi
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
 import io.github.rustclashlabs.rustclash.ui.theme.LatencyPill
@@ -89,6 +95,7 @@ import io.github.rustclashlabs.rustclash.ui.theme.LocalRustClashColors
 import io.github.rustclashlabs.rustclash.ui.theme.RustClashBrandIcon
 import io.github.rustclashlabs.rustclash.ui.theme.TrafficWaveformGraph
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -103,10 +110,13 @@ fun HomeScreen(
     onDismissError: () -> Unit = {},
     onShareDebugReport: () -> Unit = {},
     onDismissDebugAnomaly: () -> Unit = {},
+    onRefreshExitIp: () -> Unit = {},
+    onCopyExitIp: (String) -> Unit = {},
 ) {
     val extColors = LocalRustClashColors.current
     var showRoutingSheet by remember { mutableStateOf(false) }
     var showTopMenu by remember { mutableStateOf(false) }
+    var showExitIpSheet by remember { mutableStateOf(false) }
 
     val isConnected = state.vpnState == VpnLifecycleState.RUNNING
     val isTransitioning = state.vpnState == VpnLifecycleState.PREPARING ||
@@ -213,6 +223,17 @@ fun HomeScreen(
                         onClick = {
                             showTopMenu = false
                             onTestActiveLatency()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("查询当前落地 IP") },
+                        leadingIcon = { Icon(Icons.Rounded.Language, contentDescription = null) },
+                        onClick = {
+                            showTopMenu = false
+                            showExitIpSheet = true
+                            if (!state.isProbingExitIp && (state.exitIp == null || !state.exitIp.verified)) {
+                                onRefreshExitIp()
+                            }
                         },
                     )
                     DropdownMenuItem(
@@ -645,6 +666,21 @@ fun HomeScreen(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
+
+                        if (isConnected || state.nodes.isNotEmpty() || state.demoMode || state.exitIp != null || state.isProbingExitIp) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            ExitIpCompactPill(
+                                exitIp = state.exitIp,
+                                isProbing = state.isProbingExitIp,
+                                onClick = {
+                                    showExitIpSheet = true
+                                    val current = state.exitIp
+                                    if (!state.isProbingExitIp && (current == null || !current.verified)) {
+                                        onRefreshExitIp()
+                                    }
+                                },
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.width(6.dp))
@@ -843,6 +879,387 @@ fun HomeScreen(
                 }
                 Spacer(modifier = Modifier.height(16.dp))
             }
+        }
+    }
+
+    if (showExitIpSheet) {
+        ExitIpDetailBottomSheet(
+            state = state,
+            onDismiss = { showExitIpSheet = false },
+            onRefresh = onRefreshExitIp,
+            onCopyIp = onCopyExitIp,
+        )
+    }
+}
+
+@Composable
+private fun ExitIpCompactPill(
+    exitIp: ExitIpUi?,
+    isProbing: Boolean,
+    onClick: () -> Unit,
+) {
+    val extColors = LocalRustClashColors.current
+    val verifiedIp = exitIp?.takeIf { it.verified && it.ip.isNotBlank() && it.ip != "--" }
+    val isFailed = exitIp != null && verifiedIp == null && !isProbing
+    val containerColor = when {
+        isProbing -> extColors.cardSubtle
+        verifiedIp != null && verifiedIp.demoMode -> extColors.amberContainer.copy(alpha = 0.72f)
+        verifiedIp != null -> extColors.emeraldContainer.copy(alpha = 0.62f)
+        isFailed -> extColors.amberContainer.copy(alpha = 0.72f)
+        else -> extColors.cardSubtle
+    }
+    val contentColor = when {
+        isProbing -> MaterialTheme.colorScheme.onSurfaceVariant
+        verifiedIp != null && verifiedIp.demoMode -> extColors.onAmberContainer
+        verifiedIp != null -> extColors.onEmeraldContainer
+        isFailed -> extColors.onAmberContainer
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val labelText = when {
+        isProbing -> "正在查询落地 IP…"
+        verifiedIp != null -> verifiedIp.compactPillText
+        isFailed -> "落地 IP 检测失败 · 点击重试"
+        else -> "落地 IP · 点击查询"
+    }
+
+    Surface(
+        modifier = Modifier
+            .clip(RoundedCornerShape(7.dp))
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(7.dp),
+        color = containerColor,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+        ) {
+            if (isProbing) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(11.dp),
+                    strokeWidth = 1.6.dp,
+                    color = extColors.emerald,
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Rounded.Language,
+                    contentDescription = null,
+                    tint = contentColor,
+                    modifier = Modifier.size(12.dp),
+                )
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = labelText,
+                style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                fontWeight = if (verifiedIp != null) FontWeight.SemiBold else FontWeight.Medium,
+                color = contentColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ExitIpDetailBottomSheet(
+    state: AppUiState,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit,
+    onCopyIp: (String) -> Unit,
+) {
+    val extColors = LocalRustClashColors.current
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val exitIp = state.exitIp
+    val verifiedIp = exitIp?.takeIf { it.verified && it.ip.isNotBlank() && it.ip != "--" }
+    val isProbing = state.isProbingExitIp
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+        ) {
+            Text(
+                text = "当前落地 IP",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "通过当前出口实时探测的公网 IP 与归属地",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Hero IP & Country Surface
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = extColors.cardSubtle,
+                border = BorderStroke(1.dp, extColors.hairline),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = when {
+                                verifiedIp != null -> verifiedIp.countryWithFlag
+                                isProbing -> "正在检测出口 IP…"
+                                else -> "未获取到落地 IP"
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (verifiedIp != null && verifiedIp.ipTypeDisplayZh != "未知") {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (verifiedIp.demoMode) extColors.amberContainer else extColors.emeraldContainer,
+                            ) {
+                                Text(
+                                    text = verifiedIp.ipTypeDisplayZh,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (verifiedIp.demoMode) extColors.onAmberContainer else extColors.onEmeraldContainer,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (isProbing && verifiedIp == null) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = extColors.emerald,
+                            )
+                            Text(
+                                text = "正在通过当前出口查询…",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = verifiedIp?.ip ?: "--",
+                            style = MaterialTheme.typography.headlineSmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontFeatureSettings = "tnum",
+                            ),
+                            color = if (verifiedIp != null) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+
+                    val errText = exitIp?.takeIf { !it.verified }?.error
+                    if (!errText.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            color = extColors.amberContainer,
+                        ) {
+                            Text(
+                                text = errText,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = extColors.onAmberContainer,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Detail rows card
+            val outboundName = exitIp?.outbound?.takeIf { it.isNotBlank() } ?: state.effectiveOutbound
+            val protocolLabel = exitIp?.protocol?.takeIf { it.isNotBlank() } ?: state.effectiveProtocolDisplay
+            val countryDetail = if (verifiedIp != null) {
+                val cc = verifiedIp.countryCode.trim().uppercase(Locale.ROOT)
+                if (cc.isNotEmpty() && !verifiedIp.demoMode) {
+                    "${verifiedIp.countryWithFlag} ($cc)"
+                } else {
+                    verifiedIp.countryWithFlag
+                }
+            } else {
+                "--"
+            }
+            val latencyText = exitIp?.latencyMs?.let { ms ->
+                if (exitIp.cached) "$ms ms（缓存）" else "$ms ms"
+            } ?: "--"
+            val checkedAtText = exitIp?.checkedAtMs?.takeIf { it > 0L }
+                ?.let(UiJsonParsers::formatEpochTime) ?: "--"
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = extColors.cardSurface,
+                border = BorderStroke(1.dp, extColors.hairline),
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    ExitIpInfoRow(label = "出口节点", value = "$outboundName · $protocolLabel")
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        thickness = 0.8.dp,
+                        color = extColors.hairline,
+                    )
+                    ExitIpInfoRow(label = "国家 / 地区", value = countryDetail)
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        thickness = 0.8.dp,
+                        color = extColors.hairline,
+                    )
+                    ExitIpInfoRow(
+                        label = "运营商 (ISP)",
+                        value = exitIp?.isp?.takeIf { it.isNotBlank() } ?: "--",
+                    )
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        thickness = 0.8.dp,
+                        color = extColors.hairline,
+                    )
+                    ExitIpInfoRow(
+                        label = "ASN",
+                        value = exitIp?.asn?.takeIf { it.isNotBlank() } ?: "--",
+                        monospace = true,
+                    )
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        thickness = 0.8.dp,
+                        color = extColors.hairline,
+                    )
+                    ExitIpInfoRow(label = "探测耗时", value = latencyText, monospace = true)
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        thickness = 0.8.dp,
+                        color = extColors.hairline,
+                    )
+                    ExitIpInfoRow(label = "查询时间", value = checkedAtText, monospace = true)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        if (verifiedIp != null) {
+                            onCopyIp(verifiedIp.ip)
+                        }
+                    },
+                    enabled = verifiedIp != null,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.ContentCopy,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("复制 IP")
+                }
+                Button(
+                    onClick = onRefresh,
+                    enabled = !isProbing,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    if (isProbing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Rounded.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(if (isProbing) "检测中…" else "重新检测")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+@Composable
+private fun ExitIpInfoRow(
+    label: String,
+    value: String,
+    monospace: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Box(
+            modifier = Modifier.weight(1f),
+            contentAlignment = Alignment.CenterEnd,
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontFamily = if (monospace) FontFamily.Monospace else FontFamily.Default,
+                    fontWeight = FontWeight.Medium,
+                    fontFeatureSettings = "tnum",
+                ),
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

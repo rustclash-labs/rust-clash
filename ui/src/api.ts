@@ -575,10 +575,10 @@ export async function importProfile(
       input,
       name: cleanName,
       profile_name: cleanName,
-      apply: activate,
+      apply: true,
       activate,
       deduplicate: true,
-      auto_select: true,
+      auto_select: activate,
       auto_update_interval_secs: autoUpdateIntervalSecs,
     }),
   });

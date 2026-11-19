@@ -187,4 +187,9 @@ object NativeBridge {
         stateDir: String,
         target: String,
     ): String
+
+    external fun nativeProbeExitIpJson(
+        stateDir: String,
+        forceRefresh: Boolean,
+    ): String
 }

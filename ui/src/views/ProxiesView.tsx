@@ -108,7 +108,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   // Paste tab
   const [pasteInput, setPasteInput] = useState("");
   const [dedupOnImport, setDedupOnImport] = useState(true);
-  const [autoSelectOnImport, setAutoSelectOnImport] = useState(true);
+  const [autoSelectOnImport, setAutoSelectOnImport] = useState(false);
 
   // Form tab
   const [proto, setProto] = useState<NodeProto>("vless");
@@ -116,7 +116,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [serverHost, setServerHost] = useState("");
   const [serverPort, setServerPort] = useState("443");
   const [udpEnabled, setUdpEnabled] = useState(true);
-  const [autoSelectManual, setAutoSelectManual] = useState(true);
+  const [autoSelectManual, setAutoSelectManual] = useState(false);
 
   // Protocol-specific fields
   const [ssCipher, setSsCipher] = useState("aes-256-gcm");
@@ -271,7 +271,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setServerHost("");
     setServerPort("443");
     setUdpEnabled(true);
-    setAutoSelectManual(true);
+    setAutoSelectManual(false);
     setSsCipher("aes-256-gcm");
     setSsPassword("");
     setVlessUuid("");
@@ -337,11 +337,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const openCreateModal = useCallback(
     (initialTab: ModalMode = "paste") => {
       resetManualForm();
+      const shouldAutoSelect = activeNodes.length === 0;
+      setAutoSelectOnImport(shouldAutoSelect);
+      setAutoSelectManual(shouldAutoSelect);
       setModalError(null);
       setModalMode(initialTab);
       setModalOpen(true);
     },
-    [resetManualForm],
+    [activeNodes.length, resetManualForm],
   );
 
   useEffect(() => {

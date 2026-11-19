@@ -137,10 +137,14 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
     try {
       const requestedName = profileName.trim();
       const intervalArg = autoIntervalSecs > 0 ? autoIntervalSecs : null;
+      const activeProfile = profilesSnapshot?.profiles.find(
+        (p) => p.id === profilesSnapshot.active_profile_id,
+      );
+      const shouldAutoSelect = !activeProfile || activeProfile.proxy_count === 0;
       const res = await importProfile(
         trimmed,
         requestedName || undefined,
-        true,
+        shouldAutoSelect,
         intervalArg,
       );
       setProfileName("");

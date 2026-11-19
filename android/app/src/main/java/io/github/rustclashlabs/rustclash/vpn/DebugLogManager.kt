@@ -115,6 +115,9 @@ object DebugLogManager {
     private var lastNetworkLostMs: Long = 0L
     private var lastNetStateFingerprint: String = ""
     private var lastCumulativeRuleHits: Map<String, Long> = emptyMap()
+    private var lastCumulativeTotalConnections: Long? = null
+    private var currentDeviceIdleDoze: Boolean? = null
+    private var dozeEnteredAtMs: Long = 0L
     private var lastAutoAnomalyCaptureMs: Long = 0L
     private val timelineEvents = ArrayDeque<MobileTimelineEvent>(MAX_TIMELINE_EVENTS)
 
@@ -201,6 +204,9 @@ object DebugLogManager {
     fun onVpnSessionStarted(context: Context, isInteractive: Boolean, demoMode: Boolean, enableIpv6: Boolean) {
         val now = System.currentTimeMillis()
         val battery = readBatterySnapshot(context)
+        val initialDoze = runCatching {
+            context.getSystemService(PowerManager::class.java)?.isDeviceIdleMode
+        }.getOrNull() ?: false
         synchronized(lock) {
             sessionStartMs = now
             windowStartMs = now
@@ -212,6 +218,9 @@ object DebugLogManager {
             lastNetworkLostMs = 0L
             lastNetStateFingerprint = ""
             lastCumulativeRuleHits = emptyMap()
+            lastCumulativeTotalConnections = null
+            currentDeviceIdleDoze = initialDoze
+            dozeEnteredAtMs = if (initialDoze) now else 0L
             pushEventLocked(
                 now,
                 "VPN_START",
@@ -242,6 +251,40 @@ object DebugLogManager {
             flushScreenDurationLocked(now)
             currentScreenInteractive = interactive
             pushEventLocked(now, if (interactive) "SCREEN_ON" else "SCREEN_OFF", "interactive=$interactive")
+        }
+    }
+
+    fun onDeviceIdleModeChanged(isDoze: Boolean, interactive: Boolean) {
+        onDeviceIdleModeChangedAt(isDoze = isDoze, interactive = interactive, nowMs = System.currentTimeMillis())
+    }
+
+    internal fun onDeviceIdleModeChangedAt(isDoze: Boolean, interactive: Boolean, nowMs: Long) {
+        synchronized(lock) {
+            if (currentDeviceIdleDoze == isDoze) {
+                return
+            }
+            currentDeviceIdleDoze = isDoze
+            if (isDoze) {
+                dozeEnteredAtMs = nowMs
+                pushEventLocked(nowMs, "DOZE_ENTER", "doze=true interactive=$interactive")
+            } else {
+                val enteredAt = dozeEnteredAtMs
+                dozeEnteredAtMs = 0L
+                val durationPart = if (enteredAt > 0L) {
+                    " durationMs=${(nowMs - enteredAt).coerceAtLeast(0L)}"
+                } else {
+                    ""
+                }
+                pushEventLocked(nowMs, "DOZE_EXIT", "doze=false interactive=$interactive$durationPart")
+            }
+        }
+    }
+
+    internal fun resetTimelineStateForTest(initialDoze: Boolean? = null) {
+        synchronized(lock) {
+            timelineEvents.clear()
+            currentDeviceIdleDoze = initialDoze
+            dozeEnteredAtMs = 0L
         }
     }
 
@@ -956,10 +999,16 @@ object DebugLogManager {
         val batteryEnd = readBatterySnapshot(context)
         val systemMeta = collectSystemMetadata(context, batteryEnd)
 
-        val (windowSnap, prevRuleHitsSnap, capturedSessionStartMs) = synchronized(lock) {
+        var prevRuleHitsSnap: Map<String, Long>
+        var prevTotalConnsSnap: Long?
+        var capturedSessionStartMs: Long
+        val windowSnap = synchronized(lock) {
             val now = System.currentTimeMillis()
             flushScreenDurationLocked(now)
-            val snap = WindowTelemetryState(
+            prevRuleHitsSnap = lastCumulativeRuleHits
+            prevTotalConnsSnap = lastCumulativeTotalConnections
+            capturedSessionStartMs = sessionStartMs
+            WindowTelemetryState(
                 windowStartMs = windowStartMs,
                 capturedAtMs = now,
                 sessionStartMs = sessionStartMs,
@@ -968,7 +1017,6 @@ object DebugLogManager {
                 startBatteryPct = windowStartBatteryPct,
                 events = timelineEvents.filter { it.timestampMs >= windowStartMs },
             )
-            Triple(snap, lastCumulativeRuleHits, sessionStartMs)
         }
 
         val nativeJsonStr = if (NativeBridge.ensureLoaded()) {
@@ -984,6 +1032,7 @@ object DebugLogManager {
         }
 
         val latestRuleHits = extractCumulativeRuleHits(nativeJsonStr)
+        val latestTotalConns = extractCumulativeTotalConnections(nativeJsonStr)
 
         val dir = File(context.filesDir, DEBUG_DIR_NAME).apply { mkdirs() }
         val crashBreadcrumb = File(dir, CRASH_BREADCRUMB_FILE)
@@ -1013,6 +1062,7 @@ object DebugLogManager {
             crashBreadcrumb = crashBreadcrumb,
             previousRuleHits = prevRuleHitsSnap,
             detectedAnomaly = evaluatedAnomaly,
+            previousTotalConnections = prevTotalConnsSnap,
         )
 
         val safeTrigger = trigger.lowercase(Locale.ROOT)
@@ -1041,6 +1091,9 @@ object DebugLogManager {
                     windowStartBatteryPct = batteryEnd.levelPct
                     if (latestRuleHits != null) {
                         lastCumulativeRuleHits = latestRuleHits
+                    }
+                    if (latestTotalConns != null) {
+                        lastCumulativeTotalConnections = latestTotalConns
                     }
                 }
             }
@@ -1274,6 +1327,14 @@ object DebugLogManager {
         return map
     }
 
+    private fun extractCumulativeTotalConnections(nativeSnapshotRawJson: String): Long? {
+        val obj = runCatching { JSONObject(nativeSnapshotRawJson) }.getOrNull() ?: return null
+        if (!obj.optBoolean("ok", false)) return null
+        val tr = obj.optJSONObject("traffic") ?: return null
+        if (!tr.has("totalConnections") || tr.isNull("totalConnections")) return null
+        return tr.optLong("totalConnections", -1L).takeIf { it >= 0L }
+    }
+
     fun clearAllLogs(context: Context) {
         synchronized(sliceWriteLock) {
             lastAutoAnomalyCaptureMs = 0L
@@ -1317,6 +1378,7 @@ object DebugLogManager {
         }
         lastNetStateFingerprint = ""
         lastCumulativeRuleHits = emptyMap()
+        lastCumulativeTotalConnections = null
         if (vpnState != VpnLifecycleState.DISCONNECTED) {
             pushEventLocked(
                 nowMs,
@@ -1552,6 +1614,7 @@ object DebugLogManager {
         crashBreadcrumb: String?,
         previousRuleHits: Map<String, Long> = emptyMap(),
         detectedAnomaly: DebugAnomalyAlertUi? = null,
+        previousTotalConnections: Long? = null,
     ): String {
         val windowDurationSecs = ((window.capturedAtMs - window.windowStartMs).coerceAtLeast(0L)) / 1000L
         val nativeObj = runCatching { JSONObject(nativeSnapshotRawJson) }.getOrNull()
@@ -1655,7 +1718,20 @@ object DebugLogManager {
                 )
             }
 
+            var expectedWindowNewConns: Long? = null
             nativeObj.optJSONObject("traffic")?.let { tr ->
+                val totalConns = tr.optLong("totalConnections", 0L)
+                expectedWindowNewConns = when {
+                    previousTotalConnections != null && totalConns >= previousTotalConnections ->
+                        totalConns - previousTotalConnections
+                    previousTotalConnections == null &&
+                        window.sessionStartMs > 0L &&
+                        window.windowStartMs == window.sessionStartMs &&
+                        totalConns > 0L -> totalConns
+                    else -> null
+                }
+                val cancelledConns = tr.optLong("cancelledConnections", 0L)
+                val cancelledPart = if (cancelledConns > 0L) " cancelled=`$cancelledConns`" else ""
                 val carryOverActive = tr.optLong("carryOverActiveConnections", 0L)
                 val carryOverTotal = tr.optLong("carryOverStreams", 0L)
                 val carryOverPart = when {
@@ -1666,8 +1742,9 @@ object DebugLogManager {
                 sb.appendLine(
                     "- Session Traffic & Conns: upTotal=`${formatBytesCompact(tr.optLong("upTotal"))}` " +
                         "downTotal=`${formatBytesCompact(tr.optLong("downTotal"))}` " +
-                        "activeConns=`${tr.optInt("activeConnections")}` totalConns=`${tr.optLong("totalConnections")}` " +
-                        "established=`${tr.optLong("establishedConnections")}` failed=`${tr.optLong("failedConnections")}` " +
+                        "activeConns=`${tr.optInt("activeConnections")}` totalConns=`$totalConns` " +
+                        "established=`${tr.optLong("establishedConnections")}` failed=`${tr.optLong("failedConnections")}`" +
+                        "$cancelledPart " +
                         "zeroRxClosed=`${tr.optLong("zeroRxClosedConnections")}`$carryOverPart",
                 )
             }
@@ -1707,7 +1784,12 @@ object DebugLogManager {
                 )
             }
 
-            appendOutboundStatsSection(sb, nativeObj.optJSONArray("outboundStats"))
+            appendOutboundStatsSection(
+                sb = sb,
+                arr = nativeObj.optJSONArray("outboundStats"),
+                windowSummary = nativeObj.optJSONObject("windowSummary"),
+                expectedWindowNewConns = expectedWindowNewConns,
+            )
             appendTopRulesSection(sb, nativeObj.optJSONArray("topRules"), previousRuleHits)
             appendTopDomainsSection(sb, nativeObj.optJSONArray("topDomains"))
             appendCarryOverConnectionsSection(sb, nativeObj.optJSONArray("carryOverConnections"))
@@ -1732,10 +1814,29 @@ object DebugLogManager {
         return NodeImportSupport.redactSecretsForUi(sb.toString())
     }
 
-    private fun appendOutboundStatsSection(sb: StringBuilder, arr: JSONArray?) {
+    private fun appendOutboundStatsSection(
+        sb: StringBuilder,
+        arr: JSONArray?,
+        windowSummary: JSONObject? = null,
+        expectedWindowNewConns: Long? = null,
+    ) {
         if (arr == null || arr.length() == 0) return
         sb.appendLine()
-        sb.appendLine("#### Outbound Node Performance (Window)")
+        val truncated = windowSummary?.optBoolean("truncated", false) == true
+        if (truncated) {
+            val sampledConns = windowSummary?.optLong("connections", 0L)?.takeIf { it > 0L }
+                ?: (0 until arr.length()).sumOf { i -> arr.optJSONObject(i)?.optLong("connections", 0L) ?: 0L }
+            val ringCap = windowSummary?.optInt("ringCapacity", 0) ?: 0
+            val capPart = if (ringCap > 0) ", cap=$ringCap" else ""
+            val ratioPart = if (expectedWindowNewConns != null && expectedWindowNewConns > sampledConns) {
+                "sampled $sampledConns/$expectedWindowNewConns conns$capPart"
+            } else {
+                "truncated$capPart, sampled $sampledConns newest conns"
+            }
+            sb.appendLine("#### Outbound Node Performance (Window, $ratioPart)")
+        } else {
+            sb.appendLine("#### Outbound Node Performance (Window)")
+        }
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val name = o.optString("outbound")
@@ -1745,9 +1846,11 @@ object DebugLogManager {
             val p50 = if (o.isNull("handshakeP50Ms")) "-" else "${o.optLong("handshakeP50Ms")}ms"
             val p95 = if (o.isNull("handshakeP95Ms")) "-" else "${o.optLong("handshakeP95Ms")}ms"
             val maxHs = if (o.isNull("handshakeMaxMs")) "-" else "${o.optLong("handshakeMaxMs")}ms"
+            val cancelled = o.optInt("cancelled", 0)
+            val cancelledPart = if (cancelled > 0) " cancelled=`$cancelled`" else ""
             sb.appendLine(
                 "- `$name` ($proto): conns=`${o.optInt("connections")}` fail=`${o.optInt("failures")}` " +
-                    "zeroRx=`${o.optInt("zeroRxCount")}` probe=`$probe` handshake(p50/p95/max)=`$p50 / $p95 / $maxHs` " +
+                    "zeroRx=`${o.optInt("zeroRxCount")}`$cancelledPart probe=`$probe` handshake(p50/p95/max)=`$p50 / $p95 / $maxHs` " +
                     "up=`${formatBytesCompact(o.optLong("uploadBytes"))}` down=`${formatBytesCompact(o.optLong("downloadBytes"))}`",
             )
         }

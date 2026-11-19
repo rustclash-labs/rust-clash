@@ -12,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.DiagnosticsFilter
+import io.github.rustclashlabs.rustclash.ui.model.ExitIpUi
 import io.github.rustclashlabs.rustclash.ui.model.InstalledAppUi
 import io.github.rustclashlabs.rustclash.ui.model.MainDestination
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
@@ -59,7 +60,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     private var refreshJob: Job? = null
     private var importJob: Job? = null
     private var installedAppsJob: Job? = null
+    private var exitIpJob: Job? = null
     private var importGeneration: Long = 0L
+    private var exitIpGeneration: Long = 0L
     private var previousVpnRunning: Boolean = false
     private var lastSyncedRouterEpoch: Long = -1L
     private var lastSyncedDelaysRevision: Long = -1L
@@ -68,6 +71,69 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         DebugLogManager.installCrashBreadcrumbHook(appContext)
         refreshAll()
+    }
+
+    /**
+     * Preserve the currently connected/active node whenever the user already has saved nodes;
+     * only default to immediate switch when importing into an empty starter profile or Demo Sandbox.
+     */
+    fun shouldAutoSelectOnImport(): Boolean =
+        _uiState.value.nodes.isEmpty() || _uiState.value.demoMode
+
+    fun probeExitIp(forceRefresh: Boolean = false) {
+        if (!NativeBridge.ensureLoaded()) return
+        if (!forceRefresh && _uiState.value.isProbingExitIp) return
+        val gen = ++exitIpGeneration
+        exitIpJob?.cancel()
+        exitIpJob = viewModelScope.launch {
+            _uiState.update { it.copy(isProbingExitIp = true) }
+            try {
+                val raw = withContext(Dispatchers.IO) {
+                    NativeBridge.nativeProbeExitIpJson(stateDir, forceRefresh)
+                }
+                if (gen != exitIpGeneration) return@launch
+                val parsed = UiJsonParsers.parseExitIpResponse(raw)
+                if (parsed != null) {
+                    _uiState.update { it.copy(exitIp = parsed) }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                if (gen == exitIpGeneration) {
+                    _uiState.update { prev ->
+                        prev.copy(
+                            exitIp = ExitIpUi(
+                                verified = false,
+                                outbound = prev.effectiveOutbound,
+                                protocol = prev.effectiveProtocol,
+                                vpnRunning = prev.vpnState == VpnLifecycleState.RUNNING,
+                                error = "落地 IP 查询异常，请点击重试",
+                            ),
+                        )
+                    }
+                }
+            } finally {
+                if (gen == exitIpGeneration) {
+                    _uiState.update { it.copy(isProbingExitIp = false) }
+                }
+            }
+        }
+    }
+
+    private fun clearExitIpState() {
+        exitIpGeneration++
+        exitIpJob?.cancel()
+        exitIpJob = null
+        if (_uiState.value.exitIp != null || _uiState.value.isProbingExitIp) {
+            _uiState.update { it.copy(exitIp = null, isProbingExitIp = false) }
+        }
+    }
+
+    private fun refreshExitIpIfConnected() {
+        clearExitIpState()
+        if (previousVpnRunning || _uiState.value.vpnState == VpnLifecycleState.RUNNING) {
+            probeExitIp(forceRefresh = true)
+        }
     }
 
     private fun queryIsBatteryOptimizationIgnored(): Boolean = runCatching {
@@ -315,7 +381,12 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val (telemetry, diagnostics) = result
 
+        val prevTelemetry = _uiState.value.telemetry
         val transitioned = previousVpnRunning != telemetry.running
+        val networkHandedOff = !transitioned &&
+            telemetry.running &&
+            prevTelemetry.running &&
+            telemetry.networkTransitions != prevTelemetry.networkTransitions
         previousVpnRunning = telemetry.running
         if (!telemetry.running) {
             lastSyncedRouterEpoch = -1L
@@ -346,6 +417,13 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         if (transitioned) {
             syncSnapshotQuietly()
             refreshProfilesQuietly()
+            if (telemetry.running) {
+                probeExitIp(forceRefresh = false)
+            } else {
+                clearExitIpState()
+            }
+        } else if (networkHandedOff) {
+            probeExitIp(forceRefresh = true)
         }
     }
 
@@ -489,6 +567,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             }
             if (lastObj != null && lastObj.optBoolean("ok", false)) {
                 applyNodeManagerSnapshot(lastRaw)
+                refreshExitIpIfConnected()
                 emitMessage("已切换节点：$proxyName")
             } else {
                 emitMessage(lastObj?.optString("error") ?: "切换节点失败")
@@ -546,7 +625,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     fun importUnifiedPayload(
         rawPayload: String,
         deduplicate: Boolean = true,
-        autoSelect: Boolean = true,
+        autoSelect: Boolean = shouldAutoSelectOnImport(),
         subscriptionAutoUpdateSecs: Long? = null,
         fromExternalIntent: Boolean = false,
         externalConfirmed: Boolean = false,
@@ -567,6 +646,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             reportActionError("Rust 核心库未加载", isModal)
             return
         }
+        val prevOutbound = _uiState.value.effectiveOutbound
+        val prevProfileId = _uiState.value.activeProfileId
         val gen = ++importGeneration
         importJob = viewModelScope.launch {
             _uiState.update { it.copy(isImporting = true, modalError = null) }
@@ -620,12 +701,27 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 clearModalError()
                 syncSnapshotQuietly()
                 refreshProfilesQuietly()
+                if (eff != prevOutbound || (activeProfId.isNotEmpty() && activeProfId != prevProfileId)) {
+                    refreshExitIpIfConnected()
+                }
                 val notes = buildList {
                     if (skipped > 0) add("跳过重复 $skipped 个")
                     if (skippedUnsupported > 0) add("已忽略不兼容节点 $skippedUnsupported 个")
                 }
                 val suffixNote = if (notes.isNotEmpty()) "（${notes.joinToString("，")}）" else ""
-                emitMessage("成功导入 $added 个节点$suffixNote · 共 $total 个 · 当前出口：$eff")
+                val preservedCurrent = !autoSelect && eff == prevOutbound && eff != "DIRECT"
+                val createdInactiveProfile = importedProfId.isNotEmpty() &&
+                    activeProfId.isNotEmpty() &&
+                    importedProfId != activeProfId
+                val message = when {
+                    createdInactiveProfile ->
+                        "已导入新配置（$added 个节点）$suffixNote · 当前仍使用：$eff"
+                    preservedCurrent ->
+                        "成功导入 $added 个节点$suffixNote · 共 $total 个 · 保持当前节点：$eff"
+                    else ->
+                        "成功导入 $added 个节点$suffixNote · 共 $total 个 · 当前出口：$eff"
+                }
+                emitMessage(message)
                 onSuccess?.invoke()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -657,6 +753,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             reportActionError("Rust 核心库未加载", isModal)
             return
         }
+        val prevOutbound = _uiState.value.effectiveOutbound
         if (isModal) clearModalError()
         viewModelScope.launch {
             _uiState.update { it.copy(isSavingModal = true) }
@@ -683,7 +780,17 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                     clearModalError()
                     syncSnapshotQuietly()
                     refreshProfilesQuietly()
-                    emitMessage(if (originalName != null) "已保存节点：$name" else "已添加节点：$name")
+                    val nextOutbound = _uiState.value.effectiveOutbound
+                    if (nextOutbound != prevOutbound) {
+                        refreshExitIpIfConnected()
+                    }
+                    val message = when {
+                        originalName != null -> "已保存节点：$name"
+                        !autoSelect && prevOutbound != "DIRECT" && nextOutbound == prevOutbound ->
+                            "已添加节点：$name · 保持当前节点：$prevOutbound"
+                        else -> "已添加节点：$name"
+                    }
+                    emitMessage(message)
                     onSuccess?.invoke()
                 } else {
                     val detail = UiJsonParsers.formatCleanBackendError(
@@ -700,6 +807,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteNode(nodeName: String) {
         if (!NativeBridge.ensureLoaded()) return
+        val prevOutbound = _uiState.value.effectiveOutbound
         viewModelScope.launch {
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeDeleteNodePersisted(stateDir, nodeName)
@@ -711,6 +819,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 syncSnapshotQuietly()
                 refreshProfilesQuietly()
+                if (_uiState.value.effectiveOutbound != prevOutbound) {
+                    refreshExitIpIfConnected()
+                }
                 emitMessage("已删除节点：$nodeName")
             } else {
                 emitMessage(resp?.optString("error") ?: "删除节点失败")
@@ -807,6 +918,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             if (resp != null && resp.optBoolean("ok", false)) {
                 applyNodeManagerSnapshot(raw)
                 refreshProfilesQuietly()
+                refreshExitIpIfConnected()
                 emitMessage("路由模式已切换为：${preset.title}（${preset.homeSubtitle}）")
             } else {
                 emitMessage(resp?.optString("error") ?: "切换路由模式失败")
@@ -920,6 +1032,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             if (parsed != null) {
                 _uiState.update { it.copy(activeProfileId = parsed.first, profiles = parsed.second) }
                 syncSnapshotQuietly()
+                refreshExitIpIfConnected()
                 emitMessage("已启用配置：${_uiState.value.activeProfileName}")
             } else {
                 val err = runCatching { JSONObject(raw).optString("error") }.getOrNull()
@@ -930,6 +1043,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun refreshProfileSubscription(profileId: String) {
         if (!NativeBridge.ensureLoaded() || _uiState.value.refreshingProfileId != null) return
+        val prevOutbound = _uiState.value.effectiveOutbound
         val fallbackName = _uiState.value.profiles
             .firstOrNull { it.id == profileId }
             ?.let { _uiState.value.resolveProfileDisplayName(it) }
@@ -951,6 +1065,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
                     syncSnapshotQuietly()
+                    if (_uiState.value.effectiveOutbound != prevOutbound) {
+                        refreshExitIpIfConnected()
+                    }
                     val msg = if (summary != null) {
                         val gradePart = summary.auditGrade?.let { g -> " · 安全评级 $g" } ?: ""
                         "订阅更新完成：共 ${summary.totalNodes} 节点（+${summary.diffAddedCount} / -${summary.diffRemovedCount}）$gradePart"
@@ -1084,6 +1201,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                     clearModalError()
                     applyNodeManagerSnapshot(raw)
                     refreshProfilesQuietly()
+                    refreshExitIpIfConnected()
                     emitMessage("YAML 配置已验证并生效")
                     onSuccess?.invoke()
                 } else {
@@ -1207,7 +1325,10 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                     NativeBridge.nativeSetDemoSandboxJson(enabled)
                 }
                 syncSnapshotQuietly()
+                refreshExitIpIfConnected()
             }
+        } else {
+            clearExitIpState()
         }
     }
 

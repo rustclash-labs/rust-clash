@@ -8,7 +8,7 @@ use std::{
         Arc, LazyLock, Once,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -71,6 +71,14 @@ impl Drop for CachedOfflineRouter {
 
 static OFFLINE_ROUTER_CACHE: LazyLock<Mutex<Option<CachedOfflineRouter>>> =
     LazyLock::new(|| Mutex::new(None));
+
+type CachedExitIpEntry = (String, Instant, serde_json::Value);
+static ANDROID_EXIT_IP_CACHE: LazyLock<Mutex<Option<CachedExitIpEntry>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn clear_android_exit_ip_cache() {
+    *ANDROID_EXIT_IP_CACHE.lock() = None;
+}
 
 fn clear_offline_router_cache() {
     let prev = OFFLINE_ROUTER_CACHE.lock().take();
@@ -1186,6 +1194,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
 /// Pure-Rust core implementation of `nativeStopVpn` (used by user stop, `onRevoke()`, and `onDestroy()`).
 pub fn stop_android_vpn_core() -> bool {
     STOP_GENERATION.fetch_add(1, Ordering::AcqRel);
+    clear_android_exit_ip_cache();
     let _lifecycle_guard = LIFECYCLE_LOCK.lock();
     let prev = ANDROID_RUNTIME.lock().take();
     if let Some(rt) = prev {
@@ -1265,6 +1274,7 @@ pub fn notify_android_network_changed_with_caps_core(
     match state {
         HandoffState::Offline => {
             clear_offline_router_cache();
+            clear_android_exit_ip_cache();
             proxy_core::dns::upstream::clear_dns_upstream_pools();
             None
         }
@@ -1291,6 +1301,7 @@ pub fn notify_android_network_changed_with_caps_core(
             })
         }
         HandoffState::Changed(engine, prev_handle) => {
+            clear_android_exit_ip_cache();
             let report = engine.notify_network_change();
             engine.hub().push_log(
                 "info",
@@ -1533,6 +1544,11 @@ pub fn android_import_unified_core(
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let prev_snap = mgr.snapshot();
         let prev_active_id = prev_snap.active_profile_id;
+        let prev_active_was_empty = prev_snap
+            .profiles
+            .iter()
+            .find(|p| p.id == prev_active_id)
+            .is_some_and(|p| p.proxy_count == 0);
         let prev_ids: std::collections::HashSet<String> =
             prev_snap.profiles.into_iter().map(|p| p.id).collect();
         let mut report = handle
@@ -1567,6 +1583,7 @@ pub fn android_import_unified_core(
             enforce_android_local_only_config(&mut report.config);
         }
         if !auto_select
+            && !prev_active_was_empty
             && mgr.active_profile_id() != prev_active_id
             && prev_ids.contains(&prev_active_id)
             && let Ok(mut prev_cfg) = mgr.set_active_profile(&prev_active_id)
@@ -1595,6 +1612,11 @@ pub fn android_import_unified_core(
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     let prev_snap = mgr.snapshot();
     let prev_active_id = prev_snap.active_profile_id;
+    let prev_active_was_empty = prev_snap
+        .profiles
+        .iter()
+        .find(|p| p.id == prev_active_id)
+        .is_some_and(|p| p.proxy_count == 0);
     let prev_ids: std::collections::HashSet<String> =
         prev_snap.profiles.into_iter().map(|p| p.id).collect();
     let temp_rt = tokio::runtime::Builder::new_current_thread()
@@ -1620,6 +1642,7 @@ pub fn android_import_unified_core(
         enforce_android_local_only_config(&mut report.config);
     }
     if !auto_select
+        && !prev_active_was_empty
         && mgr.active_profile_id() != prev_active_id
         && prev_ids.contains(&prev_active_id)
         && let Ok(mut prev_cfg) = mgr.set_active_profile(&prev_active_id)
@@ -3331,6 +3354,7 @@ struct WindowDiagnosticSections {
     window_tcp: usize,
     window_udp: usize,
     window_failed: usize,
+    window_cancelled: usize,
     window_zero_rx: usize,
     window_fake_ip_restored: usize,
     outbound_stats_json: Vec<serde_json::Value>,
@@ -3410,6 +3434,7 @@ fn build_window_diagnostic_sections(
     let mut window_tcp = 0usize;
     let mut window_udp = 0usize;
     let mut window_failed = 0usize;
+    let mut window_cancelled = 0usize;
     let mut window_zero_rx = 0usize;
     let mut window_fake_ip_restored = 0usize;
 
@@ -3419,6 +3444,7 @@ fn build_window_diagnostic_sections(
         exit_type: String,
         connections: usize,
         failures: usize,
+        cancelled: usize,
         zero_rx_count: usize,
         upload_bytes: u64,
         download_bytes: u64,
@@ -3450,6 +3476,10 @@ fn build_window_diagnostic_sections(
         if is_failed {
             window_failed = window_failed.saturating_add(weight);
         }
+        let is_cancelled = !is_failed && c.status == "closed" && c.connect_duration_ms.is_none();
+        if is_cancelled {
+            window_cancelled = window_cancelled.saturating_add(weight);
+        }
         let is_zero_rx = c.status == "closed" && c.download == 0 && c.upload > 0;
         if is_zero_rx {
             window_zero_rx += 1;
@@ -3466,6 +3496,9 @@ fn build_window_diagnostic_sections(
         ob_entry.connections = ob_entry.connections.saturating_add(weight);
         if is_failed {
             ob_entry.failures = ob_entry.failures.saturating_add(weight);
+        }
+        if is_cancelled {
+            ob_entry.cancelled = ob_entry.cancelled.saturating_add(weight);
         }
         if is_zero_rx {
             ob_entry.zero_rx_count += 1;
@@ -3518,6 +3551,7 @@ fn build_window_diagnostic_sections(
                     "latestProbeDelayMs": probe_delay,
                     "connections": agg.connections,
                     "failures": agg.failures,
+                    "cancelled": agg.cancelled,
                     "zeroRxCount": agg.zero_rx_count,
                     "handshakeSamples": agg.handshakes.len(),
                     "handshakeP50Ms": p50,
@@ -3680,6 +3714,7 @@ fn build_window_diagnostic_sections(
         window_tcp,
         window_udp,
         window_failed,
+        window_cancelled,
         window_zero_rx,
         window_fake_ip_restored,
         outbound_stats_json,
@@ -3796,9 +3831,17 @@ pub fn android_collect_debug_snapshot_window_core(
         }
         let geodata = engine.geodata_status();
 
-        let conns = hub.diagnostics_in_window(since_epoch_ms, until_epoch_ms, 1_500);
-        let sections =
-            build_window_diagnostic_sections(&conns, since_epoch_ms, until_epoch_ms, &delays_map);
+        let conns_meta = hub.diagnostics_in_window_with_meta(
+            since_epoch_ms,
+            until_epoch_ms,
+            proxy_core::tracker::MAX_DEBUG_DIAGNOSTICS,
+        );
+        let sections = build_window_diagnostic_sections(
+            &conns_meta.entries,
+            since_epoch_ms,
+            until_epoch_ms,
+            &delays_map,
+        );
 
         let mut rules_with_hits: Vec<_> = router
             .rules_snapshot()
@@ -3866,6 +3909,7 @@ pub fn android_collect_debug_snapshot_window_core(
                 "totalConnections": hub.total_connections(),
                 "establishedConnections": hub.established_connections_total(),
                 "failedConnections": hub.failed_connections_total(),
+                "cancelledConnections": hub.cancelled_connections_total(),
                 "zeroRxClosedConnections": hub.zero_rx_closed_total(),
             },
             "windowSummary": {
@@ -3873,8 +3917,13 @@ pub fn android_collect_debug_snapshot_window_core(
                 "tcpConnections": sections.window_tcp,
                 "udpConnections": sections.window_udp,
                 "failedConnections": sections.window_failed,
+                "cancelledConnections": sections.window_cancelled,
                 "zeroRxClosedConnections": sections.window_zero_rx,
                 "fakeIpRestoredConnections": sections.window_fake_ip_restored,
+                "sampledSnapshots": conns_meta.entries.len(),
+                "ringCapacity": conns_meta.ring_capacity,
+                "truncated": conns_meta.truncated,
+                "ringEvictedInWindow": conns_meta.ring_evicted_in_window,
             },
             "tun": {
                 "rxPackets": rx_pkts,
@@ -4096,6 +4145,225 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
     })
 }
 
+/// Offline + Live verified Exit IP & GeoIP probe for the currently active outbound on Android.
+/// Routes HTTPS egress checks (`api.ip.sb/geoip`, falling back to `1.1.1.1` / `www.cloudflare.com`
+/// trace) directly through the active proxy outbound (or `DIRECT` in Direct/empty mode) with a
+/// 30-second per-outbound cache.
+pub fn android_probe_exit_ip_core(
+    state_dir: &Path,
+    force_refresh: bool,
+) -> Result<serde_json::Value, String> {
+    record_state_dir(state_dir);
+
+    enum ProbeRunner {
+        Live(tokio::runtime::Handle),
+        Offline(Arc<tokio::runtime::Runtime>),
+    }
+
+    let (router, mode_str, vpn_running, demo_enabled, extra_ca, runner) =
+        if let Some((handle, engine)) = live_handle_and_engine() {
+            let router = engine.router();
+            let mode_str = router.mode().as_str().to_string();
+            let demo_enabled = engine.demo_info().enabled;
+            let extra_ca = engine.extra_ca_der();
+            (
+                router,
+                mode_str,
+                true,
+                demo_enabled,
+                extra_ca,
+                ProbeRunner::Live(handle),
+            )
+        } else {
+            let mgr = ProfileManager::open_or_init(state_dir)
+                .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+            let (cfg, _) = mgr
+                .load_active_config()
+                .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+            let saved_sel = mgr.active_selected_groups();
+            let mode_str = cfg.mode.as_str().to_string();
+            let (router, _, runtime) =
+                get_or_build_offline_router(&cfg, &saved_sel, Some(state_dir))?;
+            (
+                router,
+                mode_str,
+                false,
+                false,
+                Vec::new(),
+                ProbeRunner::Offline(runtime),
+            )
+        };
+
+    let now_ms = proxy_core::tracker::TelemetryHub::now_ms();
+    let eff = router.effective_primary_outbound();
+
+    if demo_enabled {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "verified": true,
+            "demoMode": true,
+            "ip": "198.51.100.42",
+            "country": "Demo Sandbox",
+            "countryCode": "SG",
+            "isp": "RustClash Loopback Sandbox",
+            "asn": "AS64512",
+            "ipType": "Sandbox",
+            "latencyMs": 18,
+            "outbound": eff.effective_outbound,
+            "protocol": eff.effective_protocol,
+            "mode": mode_str,
+            "vpnRunning": vpn_running,
+            "checkedAtMs": now_ms,
+            "cached": false,
+            "error": serde_json::Value::Null,
+        }));
+    }
+
+    if eff.effective_outbound.eq_ignore_ascii_case("REJECT")
+        || eff.effective_outbound.starts_with("ERROR")
+    {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "verified": false,
+            "demoMode": false,
+            "ip": "--",
+            "country": "Blocked",
+            "countryCode": "",
+            "isp": "",
+            "asn": "",
+            "ipType": "Blocked",
+            "latencyMs": serde_json::Value::Null,
+            "outbound": eff.effective_outbound,
+            "protocol": eff.effective_protocol,
+            "mode": mode_str,
+            "vpnRunning": vpn_running,
+            "checkedAtMs": now_ms,
+            "cached": false,
+            "error": format!("Outbound '{}' blocks egress traffic", eff.effective_outbound),
+        }));
+    }
+
+    let outbound_opt = router.concrete_outbound(&eff.effective_outbound);
+    let probe_ref = proxy_core::addr::TargetAddr::new_ip(std::net::IpAddr::from([1, 1, 1, 1]), 443);
+    let outbound_ep = outbound_opt
+        .as_ref()
+        .map(|ob| ob.remote_endpoint(&probe_ref))
+        .unwrap_or_default();
+    let cache_key = format!(
+        "{}:{}:{}:{}",
+        vpn_running, mode_str, eff.effective_outbound, outbound_ep
+    );
+    if !force_refresh
+        && let Some((cached_key, ts, mut cached_val)) = ANDROID_EXIT_IP_CACHE.lock().clone()
+        && cached_key == cache_key
+        && ts.elapsed() < Duration::from_secs(30)
+    {
+        if let Some(obj) = cached_val.as_object_mut() {
+            obj.insert("cached".to_string(), serde_json::Value::Bool(true));
+        }
+        return Ok(cached_val);
+    }
+
+    let Some(outbound) = outbound_opt else {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "verified": false,
+            "demoMode": false,
+            "ip": "--",
+            "country": "",
+            "countryCode": "",
+            "isp": "",
+            "asn": "",
+            "ipType": "Unknown",
+            "latencyMs": serde_json::Value::Null,
+            "outbound": eff.effective_outbound,
+            "protocol": eff.effective_protocol,
+            "mode": mode_str,
+            "vpnRunning": vpn_running,
+            "checkedAtMs": now_ms,
+            "cached": false,
+            "error": format!("Outbound '{}' is not available", eff.effective_outbound),
+        }));
+    };
+
+    let probe_start = Instant::now();
+    let probe_fut = async {
+        tokio::time::timeout(
+            Duration::from_millis(6500),
+            proxy_core::probe::probe_exit_ip_via_outbound(outbound.as_ref(), &extra_ca),
+        )
+        .await
+        .ok()
+        .flatten()
+    };
+    let probe_res = match runner {
+        ProbeRunner::Live(handle) => handle.block_on(probe_fut),
+        ProbeRunner::Offline(runtime) => runtime.block_on(probe_fut),
+    };
+
+    if let Some(probe) = probe_res {
+        let latency_ms = probe_start.elapsed().as_millis() as u64;
+        let fresh_now = proxy_core::tracker::TelemetryHub::now_ms();
+        let payload = serde_json::json!({
+            "ok": true,
+            "verified": true,
+            "demoMode": false,
+            "ip": probe.ip,
+            "country": probe.country,
+            "countryCode": probe.country_code,
+            "isp": probe.isp,
+            "asn": probe.asn,
+            "ipType": probe.ip_type,
+            "latencyMs": latency_ms,
+            "outbound": eff.effective_outbound,
+            "protocol": eff.effective_protocol,
+            "mode": mode_str,
+            "vpnRunning": vpn_running,
+            "checkedAtMs": fresh_now,
+            "cached": false,
+            "error": serde_json::Value::Null,
+        });
+        *ANDROID_EXIT_IP_CACHE.lock() = Some((cache_key, Instant::now(), payload.clone()));
+        return Ok(payload);
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "verified": false,
+        "demoMode": false,
+        "ip": "--",
+        "country": "",
+        "countryCode": "",
+        "isp": "",
+        "asn": "",
+        "ipType": "Unknown",
+        "latencyMs": serde_json::Value::Null,
+        "outbound": eff.effective_outbound,
+        "protocol": eff.effective_protocol,
+        "mode": mode_str,
+        "vpnRunning": vpn_running,
+        "checkedAtMs": proxy_core::tracker::TelemetryHub::now_ms(),
+        "cached": false,
+        "error": "Exit IP probe timed out or destination unreachable",
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeProbeExitIpJson<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    state_dir_jstr: JString<'local>,
+    force_refresh: jboolean,
+) -> jstring {
+    jni_json_guarded(env, |env| {
+        ensure_tracing_initialized();
+        let dir = jstring_to_rust(env, &state_dir_jstr)?;
+        android_probe_exit_ip_core(Path::new(dir.trim()), force_refresh == JNI_TRUE)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4210,6 +4478,20 @@ mod tests {
                 None,
             ),
             sample_conn(
+                "win-cancelled",
+                "tcp",
+                "aborted.example.com",
+                "Node-HK",
+                3_200,
+                Some(3_250),
+                None,
+                0,
+                0,
+                None,
+                "closed",
+                None,
+            ),
+            sample_conn(
                 "after-window",
                 "tcp",
                 "late.example.com",
@@ -4230,9 +4512,10 @@ mod tests {
 
         let sec = build_window_diagnostic_sections(&conns, 2_000, 5_000, &delays);
         assert_eq!(sec.carry_over_count, 2);
-        assert_eq!(sec.window_connections, 2);
-        assert_eq!(sec.window_tcp, 1);
+        assert_eq!(sec.window_connections, 3);
+        assert_eq!(sec.window_tcp, 2);
         assert_eq!(sec.window_udp, 1);
+        assert_eq!(sec.window_cancelled, 1);
         assert_eq!(sec.window_zero_rx, 1);
         assert_eq!(sec.window_fake_ip_restored, 1);
         assert_eq!(sec.window_failed, 1);
@@ -4240,7 +4523,8 @@ mod tests {
         assert_eq!(sec.outbound_stats_json.len(), 1);
         let ob = &sec.outbound_stats_json[0];
         assert_eq!(ob["outbound"], "Node-HK");
-        assert_eq!(ob["connections"], 2);
+        assert_eq!(ob["connections"], 3);
+        assert_eq!(ob["cancelled"], 1);
         assert_eq!(ob["handshakeSamples"], 1);
         assert_eq!(ob["handshakeP50Ms"], 185);
         assert_eq!(ob["handshakeP95Ms"], 185);
@@ -4980,6 +5264,154 @@ mod tests {
         assert!(
             engine.config_snapshot().dns.ipv6,
             "live active YAML save must preserve Android VPN dns.ipv6=true"
+        );
+
+        drop(engine);
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn android_probe_exit_ip_supports_demo_sandbox_and_reject_outbound() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        clear_android_exit_ip_cache();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-exit-ip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        // 1. Live VPN + Demo Sandbox returns deterministic verified sandbox exit IP metadata.
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            false,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+        let demo_on = android_set_demo_sandbox_core(true).expect("enable demo sandbox");
+        assert_eq!(demo_on["ok"], true);
+
+        let demo_ip = android_probe_exit_ip_core(&tmp_dir, false).expect("probe demo exit ip");
+        assert_eq!(demo_ip["ok"], true);
+        assert_eq!(demo_ip["verified"], true);
+        assert_eq!(demo_ip["demoMode"], true);
+        assert_eq!(demo_ip["ip"], "198.51.100.42");
+        assert_eq!(demo_ip["countryCode"], "SG");
+        assert_eq!(demo_ip["asn"], "AS64512");
+        assert_eq!(demo_ip["vpnRunning"], true);
+
+        assert!(stop_android_vpn_core());
+
+        // 2. Offline profile with primary group selecting REJECT reports verified=false & Blocked.
+        let reject_yaml = r#"
+proxies:
+  - name: "Node-A"
+    type: ss
+    server: 198.51.100.9
+    port: 8388
+    cipher: aes-128-gcm
+    password: "secret"
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["REJECT", "Node-A"]
+rules:
+  - "MATCH,PROXY"
+"#;
+        let _ = android_import_unified_core(&tmp_dir, reject_yaml, true, true)
+            .expect("import reject yaml");
+        let _ = android_select_proxy_persisted_core(&tmp_dir, "PROXY", "REJECT")
+            .expect("select REJECT");
+
+        let blocked_ip = android_probe_exit_ip_core(&tmp_dir, true).expect("probe blocked exit ip");
+        assert_eq!(blocked_ip["ok"], true);
+        assert_eq!(blocked_ip["verified"], false);
+        assert_eq!(blocked_ip["ipType"], "Blocked");
+        assert_eq!(blocked_ip["outbound"], "REJECT");
+        assert_eq!(blocked_ip["vpnRunning"], false);
+
+        clear_android_exit_ip_cache();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn live_import_with_auto_select_false_keeps_connected_node_and_profile() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustclash-jni-import-keep-active-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            false,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        // 1. First import into empty starter auto-selects Node-Active even with auto_select=false.
+        let first = android_import_unified_core(
+            &tmp_dir,
+            "ss://YWVzLTEyOC1nY206cGFzczE=@198.51.100.30:8388#Node-Active",
+            true,
+            false,
+        )
+        .expect("first import");
+        assert_eq!(first["effectiveOutbound"], "Node-Active");
+        let initial_profile_id = first["activeProfileId"].as_str().unwrap().to_string();
+
+        // 2. Importing another URI with auto_select=false keeps Node-Active selected live.
+        let second = android_import_unified_core(
+            &tmp_dir,
+            "ss://YWVzLTEyOC1nY206cGFzczI=@198.51.100.31:8388#Node-Extra",
+            true,
+            false,
+        )
+        .expect("second import");
+        assert_eq!(second["effectiveOutbound"], "Node-Active");
+        assert_eq!(second["count"], 1);
+        assert_eq!(second["totalNodes"], 2);
+
+        // 3. Importing a Clash YAML with auto_select=false does NOT bump live router epoch or switch away.
+        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let epoch_before = engine.router().epoch();
+        let yaml = r#"
+proxies:
+  - name: "YAML-NewNode"
+    type: ss
+    server: 198.51.100.32
+    port: 8388
+    cipher: aes-128-gcm
+    password: "pass"
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["YAML-NewNode", "DIRECT"]
+rules:
+  - "MATCH,PROXY"
+"#;
+        let third =
+            android_import_unified_core(&tmp_dir, yaml, true, false).expect("third yaml import");
+        assert_eq!(third["effectiveOutbound"], "Node-Active");
+        assert_eq!(third["activeProfileId"], initial_profile_id);
+        assert_ne!(third["importedProfileId"], initial_profile_id);
+        assert_eq!(
+            engine.router().epoch(),
+            epoch_before,
+            "inactive YAML import must not reload the live router or disrupt active connections"
         );
 
         drop(engine);
