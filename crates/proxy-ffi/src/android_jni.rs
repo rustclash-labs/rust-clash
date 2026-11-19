@@ -1,5 +1,8 @@
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::{
     collections::HashMap,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Once,
@@ -7,21 +10,14 @@ use std::{
     },
     time::Duration,
 };
-#[cfg(unix)]
-use std::{
-    io,
-    os::fd::{FromRawFd, OwnedFd},
-};
 
+#[cfg(unix)]
+use jni::signature::Primitive;
 use jni::{
     JNIEnv, JavaVM,
-    objects::{GlobalRef, JClass, JObject, JString},
-    sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring},
-};
-#[cfg(unix)]
-use jni::{
-    signature::{Primitive, ReturnType},
-    sys::jvalue,
+    objects::{GlobalRef, JByteArray, JClass, JMethodID, JObject, JString},
+    signature::ReturnType,
+    sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring, jvalue},
 };
 use parking_lot::Mutex;
 use proxy_core::{
@@ -32,7 +28,10 @@ use proxy_core::{
     },
     dns::{FakeIpDnsEngine, PositiveDnsCacheSeed},
     engine::{NetworkChangeReport, PreconnectPolicy, ProxyEngine, build_outbounds_with_dns},
-    platform::socket_protect::{clear_global_socket_protector, set_global_socket_protector},
+    platform::{
+        keystore::{VaultMasterKeyWrapper, register_vault_master_key_wrapper},
+        socket_protect::{clear_global_socket_protector, set_global_socket_protector},
+    },
     profile::{
         NodeMutationReport, ProfileManager, RoutingPresetChoice, default_selected_groups_for_config,
     },
@@ -436,6 +435,167 @@ fn build_android_socket_protector(
             false,
         )))
     }
+}
+
+struct JniAndroidKeystoreWrapper {
+    jvm: Arc<JavaVM>,
+    helper_ref: GlobalRef,
+    wrap_mid: JMethodID,
+    unwrap_mid: JMethodID,
+}
+
+impl JniAndroidKeystoreWrapper {
+    fn invoke_byte_array_method(
+        &self,
+        mid: JMethodID,
+        method_name: &str,
+        input: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        let invoke = |jenv: &mut JNIEnv<'_>| -> io::Result<Vec<u8>> {
+            jenv.with_local_frame(8, |env| -> jni::errors::Result<io::Result<Vec<u8>>> {
+                let in_arr = match env.byte_array_from_slice(input) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        clear_pending_jni_exception(env);
+                        return Ok(Err(io::Error::other(format!(
+                            "JNI {method_name} input byte[] alloc failed: {e}"
+                        ))));
+                    }
+                };
+                // SAFETY: `helper_ref` is a live `GlobalRef` to `AndroidKeystoreVault`, `mid` was
+                // resolved on its class with exact signature `([B)[B`, and `in_arr` is a valid
+                // local `jbyteArray` reference for the duration of this call.
+                let call_res = unsafe {
+                    env.call_method_unchecked(
+                        &self.helper_ref,
+                        mid,
+                        ReturnType::Array,
+                        &[jvalue { l: in_arr.as_raw() }],
+                    )
+                };
+                if clear_pending_jni_exception(env) {
+                    return Ok(Err(io::Error::other(format!(
+                        "JNI {method_name} threw a Java exception (cleared)"
+                    ))));
+                }
+                let val = match call_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        clear_pending_jni_exception(env);
+                        return Ok(Err(io::Error::other(format!(
+                            "JNI {method_name} call failed: {e}"
+                        ))));
+                    }
+                };
+                let obj = match val.l() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        clear_pending_jni_exception(env);
+                        return Ok(Err(io::Error::other(format!(
+                            "JNI {method_name} return decode failed: {e}"
+                        ))));
+                    }
+                };
+                if obj.is_null() {
+                    return Ok(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Android Keystore {method_name} returned null"),
+                    )));
+                }
+                let out_arr = JByteArray::from(obj);
+                Ok(env.convert_byte_array(out_arr).map_err(|e| {
+                    clear_pending_jni_exception(env);
+                    io::Error::other(format!("JNI {method_name} output byte[] copy failed: {e}"))
+                }))
+            })
+            .map_err(|e| io::Error::other(format!("JNI {method_name} local frame failed: {e}")))?
+        };
+
+        match self.jvm.get_env() {
+            Ok(mut jenv) => invoke(&mut jenv),
+            Err(_) => {
+                let mut guard = self.jvm.attach_current_thread().map_err(|e| {
+                    io::Error::other(format!(
+                        "JNI attach_current_thread for {method_name} failed: {e}"
+                    ))
+                })?;
+                invoke(&mut guard)
+            }
+        }
+    }
+}
+
+impl VaultMasterKeyWrapper for JniAndroidKeystoreWrapper {
+    fn backend_name(&self) -> &'static str {
+        "android-keystore-wrapped-aes-256-gcm"
+    }
+
+    fn wrap_master_key(&self, raw_key: &[u8]) -> io::Result<Vec<u8>> {
+        let wrapped = self.invoke_byte_array_method(self.wrap_mid, "wrapMasterKey", raw_key)?;
+        if wrapped.len() < 12 + 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Android Keystore wrapMasterKey returned truncated ciphertext",
+            ));
+        }
+        Ok(wrapped)
+    }
+
+    fn unwrap_master_key(&self, wrapped: &[u8]) -> io::Result<Vec<u8>> {
+        let plain = self.invoke_byte_array_method(self.unwrap_mid, "unwrapMasterKey", wrapped)?;
+        if plain.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Android Keystore unwrapMasterKey returned {} bytes (expected 32)",
+                    plain.len()
+                ),
+            ));
+        }
+        Ok(plain)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_nativeRegisterVaultKeyWrapper<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    vault_helper: JObject<'local>,
+) -> jboolean {
+    jni_bool_env_guarded(env, |env| {
+        if vault_helper.is_null() {
+            return false;
+        }
+        let Ok(jvm) = env.get_java_vm() else {
+            clear_pending_jni_exception(env);
+            return false;
+        };
+        let Ok(cls) = env.get_object_class(&vault_helper) else {
+            clear_pending_jni_exception(env);
+            return false;
+        };
+        let Ok(wrap_mid) = env.get_method_id(&cls, "wrapMasterKey", "([B)[B") else {
+            clear_pending_jni_exception(env);
+            return false;
+        };
+        let Ok(unwrap_mid) = env.get_method_id(&cls, "unwrapMasterKey", "([B)[B") else {
+            clear_pending_jni_exception(env);
+            return false;
+        };
+        let Ok(helper_ref) = env.new_global_ref(&vault_helper) else {
+            clear_pending_jni_exception(env);
+            return false;
+        };
+        register_vault_master_key_wrapper(Arc::new(JniAndroidKeystoreWrapper {
+            jvm: Arc::new(jvm),
+            helper_ref,
+            wrap_mid,
+            unwrap_mid,
+        }));
+        true
+    })
 }
 
 fn shutdown_runtime_outside_lock(#[allow(unused_mut)] mut prev: AndroidVpnRuntime) {

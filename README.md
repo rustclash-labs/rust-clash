@@ -11,7 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/rustclash-labs/rust-clash?style=flat-square&label=release&color=10b981)](https://github.com/rustclash-labs/rust-clash/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/rustclash-labs/rust-clash/ci.yml?style=flat-square&label=ci)](https://github.com/rustclash-labs/rust-clash/actions/workflows/ci.yml)
 [![Pure Rust](https://img.shields.io/badge/core-Pure%20Rust-f59e0b?style=flat-square)](crates/proxy-core)
-[![AI Authored](https://img.shields.io/badge/AI%20%E7%BC%96%E5%86%99-Gemini%20Argon%20%26%20Carbon%20%7C%20GPT%20%E5%AE%A1%E6%A0%B8-8b5cf6?style=flat-square)](#状态与文档)
+[![AI Authored](https://img.shields.io/badge/AI%20%E7%BC%96%E5%86%99-Gemini%20Argon%20%C2%B7%20Carbon%20%C2%B7%20Neon%20%7C%20GPT%20%E5%AE%A1%E6%A0%B8-8b5cf6?style=flat-square)](#状态与文档)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-38bdf8?style=flat-square)](LICENSE-MIT)
 
 [下载](#下载) · [功能](#功能) · [使用](#使用) · [从源码构建](#从源码构建) · [文档](#状态与文档)
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> **全量 AI 编写与审核声明**：本项目从底层纯 Rust 代理内核、用户态 `smoltcp` TUN 协议栈、Tauri 2 桌面端、React Web 控制台到 Android 原生客户端，**全部代码全程由 Gemini Argon 与 Gemini Carbon 编写，并由 GPT 参与代码审核**（人工仅负责需求方向与实机回归指导）。当前处于实验性 Pre-1.0 阶段，尚未经过独立第三方密码学安全审计。
+> **全量 AI 编写与审核声明**：本项目从底层纯 Rust 代理内核、用户态 `smoltcp` TUN 协议栈、Tauri 2 桌面端、React Web 控制台到 Android 原生客户端，**全部代码全程由 Gemini Argon、Gemini Carbon 与 Gemini Neon 编写，并由 GPT 参与代码审核**（人工仅负责需求方向与实机回归指导）。当前处于实验性 Pre-1.0 阶段，尚未经过独立第三方密码学安全审计。
 
 <p align="center">
   <img alt="RustClash 仪表盘总览" src="docs/images/dashboard-overview.png" width="92%">
@@ -61,17 +61,17 @@
 - **白盒化网络诊断**：内置“网站打不开”一键排障医生、`DNS → 隧道 → TLS → HTTP TTFB` 分段耗时瀑布图及真实 UDP 连通性校验。
 - **配置安全审计（`Clippy for Clash`）**：静态安全评分（`0–100`）、分流路由模拟与订阅更新安全差异对比。
 - **内置隐私脱敏 `MCP` 服务**：支持 Claude Code、Gemini CLI 与 Cursor 直接排查分流与代理异常，默认不暴露任何凭据或节点 IP。
-- **平台原生体验**：Android 支持快捷设置磁贴、分应用代理与 Wi-Fi/5G 毫秒级平滑切换；桌面端支持系统托盘与系统密钥链加密存储。
+- **平台原生体验**：Android 支持快捷设置磁贴、分应用代理、Android Keystore AES-256-GCM 硬件包裹主密钥与 Wi-Fi/5G 毫秒级平滑切换；桌面端支持系统托盘与系统密钥链加密存储。
 
 ## 下载
 
-从 [`v0.5.3` 最新正式版](https://github.com/rustclash-labs/rust-clash/releases/latest) 获取对应平台安装包（所有构建产物均附带 `SHA256SUMS.txt` 校验文件）。
+从 [`v0.5.4` 最新正式版](https://github.com/rustclash-labs/rust-clash/releases/latest) 获取对应平台安装包（所有构建产物均附带 `SHA256SUMS.txt` 校验文件）。
 
 | 平台 | 安装包 | 说明 |
 | --- | --- | --- |
 | **Android 8.0 及以上** | `arm64-v8a` 与 `universal` 两种 `.apk` | 绝大多数手机选 `arm64-v8a`，已使用项目持久化发布密钥签名。 |
-| **Windows 10 及以上** | 安装版（`.exe` / `.msi`）或 CLI 便携包（`.zip`） | 内置微软签名的 `wintun.dll`；主程序暂未购买商业代码签名证书。 |
-| **macOS 13 及以上** | `Apple Silicon` 与 `Intel` 两种 `.dmg` 及 CLI 包 | 未公证签名，首次打开若遇拦截请在访达中右键选择“打开”。 |
+| **Windows 10 及以上** | 安装版（`.exe` / `.msi`）或 CLI 便携包（`.zip`） | 内置微软签名的 `wintun.dll`；主程序未签商业证书，实机 Wintun TUN 验收状态见[平台矩阵](docs/PLATFORM_SUPPORT.md)。 |
+| **macOS 13 及以上** | `Apple Silicon` 与 `Intel` 两种 `.dmg` 及 CLI 包 | 未公证签名（首次打开请右键“打开”）；实机 `utun` 验收状态见[平台矩阵](docs/PLATFORM_SUPPORT.md)。 |
 | **Linux** | `.deb`、`.rpm` 与 CLI `.tar.gz`（`x64`） | 桌面安装包与 CLI 单文件均已内嵌完整 Web 控制台。 |
 
 ## 使用

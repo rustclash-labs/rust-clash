@@ -1365,8 +1365,7 @@ where
             ));
         };
         let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
-        let expected_cert_sig = hmac::sign(&hmac_key, &ed25519_pub);
-        if cert_sig.as_slice() != expected_cert_sig.as_ref() {
+        if hmac::verify(&hmac_key, &ed25519_pub, cert_sig.as_slice()).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "REALITY certificate HMAC-SHA512 authentication failed (untrusted server or fallback)",
@@ -1441,7 +1440,7 @@ where
     }
     let s_fin_key = hkdf_expand_label(suite.hash, &s_hs_secret, b"finished", &[], suite.hash.len());
     let expected_s_fin = suite.hash.hmac_sign(&s_fin_key, &hash_at_cv);
-    if fin_msg[4..] != expected_s_fin[..] {
+    if aws_lc_rs::constant_time::verify_slices_are_equal(&fin_msg[4..], &expected_s_fin).is_err() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "TLS 1.3 server Finished verify_data mismatch",

@@ -1744,4 +1744,29 @@ class VpnConfigAndLifecycleTest {
         assertEquals("bbr", tuicNode.congestionController)
         assertTrue(tuicNode.zeroRttHandshake)
     }
+
+    @Test
+    fun freshStatusSnapshotReuseWindowPreventsDuplicateForegroundJniPolling() {
+        RustClashVpnService.clearFreshStatusSnapshot()
+        assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+        assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 10_000L, lastUpdatedMs = 0L))
+
+        val sample = "{\"running\":true,\"downRate\":12345,\"upRate\":678}"
+        RustClashVpnService.publishFreshStatusSnapshot(sample, nowMs = 50_000L)
+        assertEquals(sample, RustClashVpnService.latestStatusJson)
+        assertEquals(50_000L, RustClashVpnService.latestStatusUpdatedAtMs)
+
+        // Fresh within 2.5s window -> reuse without duplicate JNI call
+        assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 50_000L, lastUpdatedMs = 50_000L))
+        assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 51_200L, lastUpdatedMs = 50_000L))
+        assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 52_500L, lastUpdatedMs = 50_000L))
+
+        // Expired past 2.5s or backward clock skew -> poll fresh from JNI
+        assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 52_501L, lastUpdatedMs = 50_000L))
+        assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 49_999L, lastUpdatedMs = 50_000L))
+
+        RustClashVpnService.clearFreshStatusSnapshot()
+        assertEquals("{\"running\":false}", RustClashVpnService.latestStatusJson)
+        assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+    }
 }

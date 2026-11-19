@@ -157,8 +157,31 @@ class RustClashVpnService : VpnService() {
             private set
 
         @Volatile
+        var latestStatusUpdatedAtMs: Long = 0L
+            private set
+
+        @Volatile
         var activeOutboundLabel: String = ""
             private set
+
+        fun publishFreshStatusSnapshot(
+            rawJson: String,
+            nowMs: Long = System.currentTimeMillis(),
+        ) {
+            latestStatusJson = rawJson
+            latestStatusUpdatedAtMs = nowMs
+        }
+
+        internal fun clearFreshStatusSnapshot() {
+            latestStatusJson = "{\"running\":false}"
+            latestStatusUpdatedAtMs = 0L
+        }
+
+        internal fun shouldReuseFreshStatus(
+            nowMs: Long,
+            lastUpdatedMs: Long,
+            maxAgeMs: Long = 2_500L,
+        ): Boolean = lastUpdatedMs > 0L && nowMs >= lastUpdatedMs && (nowMs - lastUpdatedMs) <= maxAgeMs
 
         fun formatBytesPerSec(bytes: Long): String =
             when {
@@ -819,8 +842,14 @@ class RustClashVpnService : VpnService() {
                 if (myToken == 0L || activeNativeSessionToken.get() != myToken) {
                     break
                 }
-                val raw = NativeBridge.nativeGetStatusJson()
-                latestStatusJson = raw
+                val nowMs = System.currentTimeMillis()
+                val raw = if (shouldReuseFreshStatus(nowMs, latestStatusUpdatedAtMs)) {
+                    latestStatusJson
+                } else {
+                    NativeBridge.nativeGetStatusJson().also { fresh ->
+                        publishFreshStatusSnapshot(fresh, nowMs)
+                    }
+                }
                 runCatching {
                     val obj = JSONObject(raw)
                     val up = formatBytesPerSec(obj.optLong("upRate", 0L))
@@ -881,7 +910,7 @@ class RustClashVpnService : VpnService() {
         engineRunningNative = false
         if (isCurrentOrIdleGlobalSession(tokenToStop)) {
             activeOutboundLabel = ""
-            latestStatusJson = "{\"running\":false}"
+            clearFreshStatusSnapshot()
             if (stateTracker.state != VpnLifecycleState.REVOKED) {
                 stateTracker.onStopped()
             }
@@ -952,7 +981,7 @@ class RustClashVpnService : VpnService() {
 
         if (isCurrentOrIdleGlobalSession(tokenToStop)) {
             activeOutboundLabel = ""
-            latestStatusJson = "{\"running\":false}"
+            clearFreshStatusSnapshot()
             stateTracker.onStopped()
             RustClashTileService.requestTileSync(this)
         }

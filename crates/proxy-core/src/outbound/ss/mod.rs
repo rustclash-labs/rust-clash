@@ -274,6 +274,18 @@ impl OutboundHandler for ShadowsocksOutbound {
     }
 }
 
+fn copy_fixed_array<const N: usize>(slice: &[u8], label: &str) -> io::Result<[u8; N]> {
+    slice.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid {label} length (expected {N} bytes, got {})",
+                slice.len()
+            ),
+        )
+    })
+}
+
 /// Encode client->server Shadowsocks UDP datagram (both Legacy AEAD and SIP022).
 pub fn encode_ss_udp_client(
     kind: SsCipherKind,
@@ -299,7 +311,8 @@ pub fn encode_ss_udp_client(
 
     let pad_len: usize = rand::rng().random_range(0..=32);
     if kind == SsCipherKind::Ss2022Blake3ChaCha20Poly1305 {
-        let nonce24: [u8; 24] = random_bytes(24)?.try_into().unwrap();
+        let nonce_vec = random_bytes(24)?;
+        let nonce24: [u8; 24] = copy_fixed_array(&nonce_vec, "SS-2022 XChaCha nonce")?;
         let mut body =
             BytesMut::with_capacity(8 + 8 + 1 + 8 + 2 + pad_len + addr_bytes.len() + payload.len());
         body.put_u64(session_id);
@@ -310,7 +323,7 @@ pub fn encode_ss_udp_client(
         body.put_bytes(0, pad_len);
         body.put_slice(&addr_bytes);
         body.put_slice(payload);
-        let key32: [u8; 32] = master_key.try_into().unwrap();
+        let key32: [u8; 32] = copy_fixed_array(master_key, "SS-2022 XChaCha master key")?;
         let ct = xchacha20_poly1305_seal(&key32, &nonce24, &body)?;
         let mut out = Vec::with_capacity(24 + ct.len());
         out.extend_from_slice(&nonce24);
@@ -385,11 +398,17 @@ fn decode_ss_udp_client_with_meta(
                 "short SS-2022 XChaCha UDP",
             ));
         }
-        let nonce24: [u8; 24] = wire[..24].try_into().unwrap();
-        let key32: [u8; 32] = master_key.try_into().unwrap();
+        let nonce24: [u8; 24] = copy_fixed_array(&wire[..24], "SS-2022 XChaCha nonce")?;
+        let key32: [u8; 32] = copy_fixed_array(master_key, "SS-2022 XChaCha master key")?;
         let plain = xchacha20_poly1305_open(&key32, &nonce24, &wire[24..])?;
-        let sid = u64::from_be_bytes(plain[..8].try_into().unwrap());
-        let pid = u64::from_be_bytes(plain[8..16].try_into().unwrap());
+        if plain.len() < 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short SS-2022 XChaCha UDP plaintext header",
+            ));
+        }
+        let sid = u64::from_be_bytes(copy_fixed_array(&plain[..8], "SS-2022 server sid")?);
+        let pid = u64::from_be_bytes(copy_fixed_array(&plain[8..16], "SS-2022 server pid")?);
         (sid, pid, plain[16..].to_vec())
     } else {
         if wire.len() < 16 + TAG_LEN + 20 {
@@ -398,10 +417,10 @@ fn decode_ss_udp_client_with_meta(
                 "short SS-2022 AES UDP",
             ));
         }
-        let enc_hdr: [u8; 16] = wire[..16].try_into().unwrap();
+        let enc_hdr: [u8; 16] = copy_fixed_array(&wire[..16], "SS-2022 AES header")?;
         let sep_hdr = aes_ecb_decrypt_block(master_key, &enc_hdr)?;
-        let sid = u64::from_be_bytes(sep_hdr[..8].try_into().unwrap());
-        let pid = u64::from_be_bytes(sep_hdr[8..16].try_into().unwrap());
+        let sid = u64::from_be_bytes(copy_fixed_array(&sep_hdr[..8], "SS-2022 server sid")?);
+        let pid = u64::from_be_bytes(copy_fixed_array(&sep_hdr[8..16], "SS-2022 server pid")?);
         let cipher = SsAeadCipher::new(kind, master_key, &sep_hdr[..8])?;
         let mut nonce12 = [0u8; 12];
         nonce12.copy_from_slice(&sep_hdr[4..16]);
@@ -416,9 +435,12 @@ fn decode_ss_udp_client_with_meta(
             "invalid SS-2022 UDP response header",
         ));
     }
-    let ts = u64::from_be_bytes(body[1..9].try_into().unwrap());
+    let ts = u64::from_be_bytes(copy_fixed_array(&body[1..9], "SS-2022 UDP timestamp")?);
     validate_ss2022_timestamp(ts)?;
-    let got_client_sid = u64::from_be_bytes(body[9..17].try_into().unwrap());
+    let got_client_sid = u64::from_be_bytes(copy_fixed_array(
+        &body[9..17],
+        "SS-2022 UDP client_session_id",
+    )?);
     if got_client_sid != expected_client_session_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -598,13 +620,16 @@ async fn handle_ss_server_tcp(
         let req_salt = prefix[..salt_len].to_vec();
         let mut dec = SsAeadCipher::new(kind, &master_key, &req_salt)?;
         let fixed_plain = dec.open(&prefix[salt_len..])?;
-        if fixed_plain[0] != 0x00 {
+        if fixed_plain.len() < 11 || fixed_plain[0] != 0x00 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid SS-2022 client request header type",
             ));
         }
-        let ts = u64::from_be_bytes(fixed_plain[1..9].try_into().unwrap());
+        let ts = u64::from_be_bytes(copy_fixed_array::<8>(
+            &fixed_plain[1..9],
+            "SS-2022 TCP request timestamp",
+        )?);
         validate_ss2022_timestamp(ts)?;
 
         {
@@ -669,6 +694,12 @@ async fn handle_ss_server_tcp(
         let req_salt = hdr[..salt_len].to_vec();
         let mut dec = SsAeadCipher::new(kind, &master_key, &req_salt)?;
         let len_plain = dec.open(&hdr[salt_len..])?;
+        if len_plain.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short SS AEAD length header",
+            ));
+        }
         let plen = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
         if plen == 0 || plen > 0x3FFF {
             return Err(io::Error::new(
@@ -723,10 +754,19 @@ fn decode_ss_udp_server(
                 "short SS-2022 XChaCha UDP",
             ));
         }
-        let nonce24: [u8; 24] = wire[..24].try_into().unwrap();
-        let key32: [u8; 32] = master_key.try_into().unwrap();
+        let nonce24 = copy_fixed_array::<24>(&wire[..24], "SS-2022 XChaCha UDP nonce")?;
+        let key32 = copy_fixed_array::<32>(master_key, "SS-2022 XChaCha master key")?;
         let plain = xchacha20_poly1305_open(&key32, &nonce24, &wire[24..])?;
-        let sid = u64::from_be_bytes(plain[..8].try_into().unwrap());
+        if plain.len() < 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short SS-2022 XChaCha UDP body",
+            ));
+        }
+        let sid = u64::from_be_bytes(copy_fixed_array::<8>(
+            &plain[..8],
+            "SS-2022 XChaCha UDP session id",
+        )?);
         (sid, plain[16..].to_vec())
     } else {
         if wire.len() < 16 + TAG_LEN + 18 {
@@ -735,9 +775,12 @@ fn decode_ss_udp_server(
                 "short SS-2022 AES UDP",
             ));
         }
-        let enc_hdr: [u8; 16] = wire[..16].try_into().unwrap();
+        let enc_hdr = copy_fixed_array::<16>(&wire[..16], "SS-2022 AES UDP header")?;
         let sep_hdr = aes_ecb_decrypt_block(master_key, &enc_hdr)?;
-        let sid = u64::from_be_bytes(sep_hdr[..8].try_into().unwrap());
+        let sid = u64::from_be_bytes(copy_fixed_array::<8>(
+            &sep_hdr[..8],
+            "SS-2022 AES UDP session id",
+        )?);
         let cipher = SsAeadCipher::new(kind, master_key, &sep_hdr[..8])?;
         let mut nonce12 = [0u8; 12];
         nonce12.copy_from_slice(&sep_hdr[4..16]);
@@ -751,7 +794,10 @@ fn decode_ss_udp_server(
             "bad SS-2022 UDP req type",
         ));
     }
-    let ts = u64::from_be_bytes(body[1..9].try_into().unwrap());
+    let ts = u64::from_be_bytes(copy_fixed_array::<8>(
+        &body[1..9],
+        "SS-2022 UDP request timestamp",
+    )?);
     validate_ss2022_timestamp(ts)?;
     let pad_len = u16::from_be_bytes([body[9], body[10]]) as usize;
     if body.len() < 11 + pad_len {
@@ -789,7 +835,8 @@ fn encode_ss_udp_server(
     }
 
     if kind == SsCipherKind::Ss2022Blake3ChaCha20Poly1305 {
-        let nonce24: [u8; 24] = random_bytes(24)?.try_into().unwrap();
+        let nonce_raw = random_bytes(24)?;
+        let nonce24 = copy_fixed_array::<24>(&nonce_raw, "SS-2022 XChaCha server UDP nonce")?;
         let mut body = BytesMut::with_capacity(35 + addr_bytes.len() + payload.len());
         body.put_u64(server_sid);
         body.put_u64(packet_id);
@@ -799,7 +846,7 @@ fn encode_ss_udp_server(
         body.put_u16(0); // pad_len = 0
         body.put_slice(&addr_bytes);
         body.put_slice(payload);
-        let key32: [u8; 32] = master_key.try_into().unwrap();
+        let key32 = copy_fixed_array::<32>(master_key, "SS-2022 XChaCha master key")?;
         let ct = xchacha20_poly1305_seal(&key32, &nonce24, &body)?;
         let mut out = Vec::with_capacity(24 + ct.len());
         out.extend_from_slice(&nonce24);
@@ -826,5 +873,71 @@ fn encode_ss_udp_server(
         out.extend_from_slice(&enc_hdr);
         out.extend_from_slice(&ct);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ss2022_udp_codecs_reject_invalid_key_and_truncated_frames_without_panicking() {
+        let target = TargetAddr::new_domain("example.com", 443).unwrap();
+        let short_key = [0x11u8; 16];
+
+        let enc_err = encode_ss_udp_client(
+            SsCipherKind::Ss2022Blake3ChaCha20Poly1305,
+            &short_key,
+            1,
+            1,
+            &target,
+            b"ping",
+        )
+        .expect_err("short XChaCha master key must return Err instead of panicking");
+        assert_eq!(enc_err.kind(), io::ErrorKind::InvalidData);
+
+        let srv_enc_err = encode_ss_udp_server(
+            SsCipherKind::Ss2022Blake3ChaCha20Poly1305,
+            &short_key,
+            2,
+            1,
+            1,
+            &target,
+            b"pong",
+        )
+        .expect_err("short server XChaCha master key must return Err instead of panicking");
+        assert_eq!(srv_enc_err.kind(), io::ErrorKind::InvalidData);
+
+        let oversized_frame = vec![0u8; 128];
+        let cli_dec_err = decode_ss_udp_client_with_meta(
+            SsCipherKind::Ss2022Blake3ChaCha20Poly1305,
+            &short_key,
+            1,
+            &oversized_frame,
+        )
+        .expect_err("short client decode key must return Err instead of panicking");
+        assert_eq!(cli_dec_err.kind(), io::ErrorKind::InvalidData);
+
+        let srv_dec_err = decode_ss_udp_server(
+            SsCipherKind::Ss2022Blake3ChaCha20Poly1305,
+            &short_key,
+            &oversized_frame,
+        )
+        .expect_err("short server decode key must return Err instead of panicking");
+        assert_eq!(srv_dec_err.kind(), io::ErrorKind::InvalidData);
+
+        let truncated_frame = vec![0u8; 10];
+        let valid_key = [0x22u8; 32];
+        assert_eq!(
+            decode_ss_udp_client_with_meta(
+                SsCipherKind::Ss2022Blake3ChaCha20Poly1305,
+                &valid_key,
+                1,
+                &truncated_frame,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

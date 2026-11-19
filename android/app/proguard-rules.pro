@@ -6,4 +6,8 @@
 -keep class io.github.rustclashlabs.rustclash.vpn.RustClashVpnService {
     public boolean protectSocket(int);
 }
+-keep class io.github.rustclashlabs.rustclash.security.AndroidKeystoreVault {
+    public byte[] wrapMasterKey(byte[]);
+    public byte[] unwrapMasterKey(byte[]);
+}
 -dontwarn com.google.zxing.**

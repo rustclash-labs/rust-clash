@@ -11,7 +11,7 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 [![Release](https://img.shields.io/github/v/release/rustclash-labs/rust-clash?style=flat-square&label=release&color=10b981)](https://github.com/rustclash-labs/rust-clash/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/rustclash-labs/rust-clash/ci.yml?style=flat-square&label=ci)](https://github.com/rustclash-labs/rust-clash/actions/workflows/ci.yml)
 [![Pure Rust](https://img.shields.io/badge/core-Pure%20Rust-f59e0b?style=flat-square)](crates/proxy-core)
-[![AI Authored](https://img.shields.io/badge/AI--Authored-Gemini%20Argon%20%26%20Carbon%20%7C%20GPT%20Reviewed-8b5cf6?style=flat-square)](#status--docs)
+[![AI Authored](https://img.shields.io/badge/AI--Authored-Gemini%20Argon%20%C2%B7%20Carbon%20%C2%B7%20Neon%20%7C%20GPT%20Reviewed-8b5cf6?style=flat-square)](#status--docs)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-38bdf8?style=flat-square)](LICENSE-MIT)
 
 [Download](#download) · [Features](#features) · [Usage](#usage) · [Build from source](#build-from-source) · [Docs](#status--docs)
@@ -19,7 +19,7 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 </div>
 
 > [!IMPORTANT]
-> **100% AI-Authored & AI-Reviewed Codebase**: Every line of code in this repository — the pure-Rust proxy kernel, `smoltcp` userspace TUN stack, Tauri 2 desktop client, React Web UI, and native Android app — was **written end-to-end by Gemini Argon and Gemini Carbon, with GPT participating in code review** (humans provided product direction and real-device acceptance feedback only). Experimental Pre-1.0 prototype; not independently security-audited.
+> **100% AI-Authored & AI-Reviewed Codebase**: Every line of code in this repository — the pure-Rust proxy kernel, `smoltcp` userspace TUN stack, Tauri 2 desktop client, React Web UI, and native Android app — was **written end-to-end by Gemini Argon, Gemini Carbon, and Gemini Neon, with GPT participating in code review** (humans provided product direction and real-device acceptance feedback only). Experimental Pre-1.0 prototype; not independently security-audited.
 
 <p align="center">
   <img alt="RustClash Overview Dashboard" src="docs/images/dashboard-overview.png" width="92%">
@@ -61,17 +61,17 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 - **Glass-box diagnostics** — plain-language Site Connectivity Doctor, `DNS → Tunnel → TLS → HTTP TTFB` waterfall probes, and real UDP relay verification.
 - **`Clippy for Clash` security audit** — built-in static config linter (`0–100` score), Split-DNS route simulator, and subscription refresh diffing.
 - **Credential-redacted `MCP` server** — lets Claude Code, Gemini CLI, and Cursor inspect routing and connectivity without exposing node secrets.
-- **Platform touches** — Android Quick Settings tile, per-app VPN, and fast Wi-Fi/5G handoff; desktop system tray and OS keychain storage.
+- **Platform touches** — Android Quick Settings tile, per-app VPN, Android Keystore AES-256-GCM hardware-wrapped vault key, and fast Wi-Fi/5G handoff; desktop system tray and OS keychain storage.
 
 ## Download
 
-Get the latest build from [`v0.5.3` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest) (all artifacts ship with `SHA256SUMS.txt`).
+Get the latest build from [`v0.5.4` Latest Release](https://github.com/rustclash-labs/rust-clash/releases/latest) (all artifacts ship with `SHA256SUMS.txt`).
 
 | Platform | Packages | Notes |
 | --- | --- | --- |
 | **Android 8.0+** | `arm64-v8a` and `universal` `.apk` | Most phones use `arm64-v8a`. Signed with the project release key. |
-| **Windows 10+** | `.exe` installer, `.msi`, or CLI `.zip` (`x64`) | Includes signed `wintun.dll`; installer itself is currently unsigned. |
-| **macOS 13+** | `.dmg` and CLI `.tar.gz` (`Apple Silicon` & `Intel`) | Unsigned `.dmg` (requires right-click Open on first launch). |
+| **Windows 10+** | `.exe` installer, `.msi`, or CLI `.zip` (`x64`) | Includes signed `wintun.dll`; installer is unsigned. See [Platform Matrix](docs/PLATFORM_SUPPORT.md) for live TUN verification status. |
+| **macOS 13+** | `.dmg` and CLI `.tar.gz` (`Apple Silicon` & `Intel`) | Unsigned `.dmg` (right-click Open on first launch). See [Platform Matrix](docs/PLATFORM_SUPPORT.md) for live `utun` status. |
 | **Linux** | `.deb`, `.rpm`, and CLI `.tar.gz` (`x64`) | Embedded Web UI included in both desktop and CLI builds. |
 
 ## Usage

@@ -186,7 +186,24 @@ fun TrafficWaveformGraph(
         val h = size.height
         if (w <= 4f || h <= 4f) return@Canvas
 
+        // Subtle horizontal telemetry guide lines
+        val guideColor = extColors.hairline.copy(alpha = if (extColors.isDark) 0.55f else 0.7f)
+        val guideStroke = 0.8.dp.toPx()
+        drawLine(
+            color = guideColor,
+            start = Offset(0f, h * 0.34f),
+            end = Offset(w, h * 0.34f),
+            strokeWidth = guideStroke,
+        )
+        drawLine(
+            color = guideColor,
+            start = Offset(0f, h * 0.68f),
+            end = Offset(w, h * 0.68f),
+            strokeWidth = guideStroke,
+        )
+
         // Build normalized points in [0.14 .. 0.86] of canvas height (0 = top, 1 = bottom)
+        var hasLiveTraffic = false
         val rawPoints: List<Float> = if (!isConnected) {
             listOf(0.82f, 0.80f, 0.82f, 0.79f, 0.82f, 0.81f, 0.82f, 0.80f)
         } else {
@@ -197,6 +214,7 @@ fun TrafficWaveformGraph(
             }
             val maxVal = (padded.maxOrNull() ?: 0L).coerceAtLeast(8_192L).toFloat()
             val hasNonZero = padded.any { it > 0L }
+            hasLiveTraffic = hasNonZero
             if (!hasNonZero) {
                 // Honest flat baseline when 0 B/s
                 List(10) { 0.82f }
@@ -231,7 +249,7 @@ fun TrafficWaveformGraph(
             close()
         }
 
-        val activeAlpha = if (isConnected) 1f else 0.38f
+        val activeAlpha = if (isConnected) 1f else 0.35f
         drawPath(
             path = fillPath,
             brush = Brush.verticalGradient(
@@ -246,13 +264,41 @@ fun TrafficWaveformGraph(
 
         drawPath(
             path = strokePath,
-            color = extColors.waveformStroke.copy(alpha = if (isConnected) 0.95f else 0.45f),
+            brush = Brush.horizontalGradient(
+                colors = if (isConnected) {
+                    listOf(
+                        extColors.emerald.copy(alpha = 0.82f),
+                        extColors.waveformStroke,
+                        extColors.sky.copy(alpha = 0.92f),
+                    )
+                } else {
+                    listOf(
+                        extColors.waveformStroke.copy(alpha = 0.4f),
+                        extColors.waveformStroke.copy(alpha = 0.4f),
+                    )
+                },
+            ),
             style = Stroke(
                 width = 2.2.dp.toPx(),
                 cap = StrokeCap.Round,
                 join = StrokeJoin.Round,
             ),
         )
+
+        if (isConnected && hasLiveTraffic) {
+            val endPt = coords.last()
+            val dotX = (endPt.x - 4.dp.toPx()).coerceAtLeast(4.dp.toPx())
+            drawCircle(
+                color = extColors.sky.copy(alpha = 0.28f),
+                radius = 5.5.dp.toPx(),
+                center = Offset(dotX, endPt.y),
+            )
+            drawCircle(
+                color = extColors.sky,
+                radius = 2.6.dp.toPx(),
+                center = Offset(dotX, endPt.y),
+            )
+        }
     }
 }
 
@@ -264,6 +310,12 @@ fun LatencyPill(
     onClick: (() -> Unit)? = null,
 ) {
     val extColors = LocalRustClashColors.current
+    val dotColor: Color? = when {
+        isProbing || delayMs == null || delayMs <= 0L -> null
+        delayMs <= 180L -> extColors.emerald
+        delayMs <= 420L -> extColors.amber
+        else -> extColors.danger
+    }
     val (bgColor, fgColor, text) = when {
         isProbing -> Triple(extColors.emeraldContainer, extColors.onEmeraldContainer, "…")
         delayMs != null && delayMs > 0L -> when {
@@ -303,8 +355,9 @@ fun LatencyPill(
         shape = RoundedCornerShape(8.dp),
         color = bgColor,
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
         ) {
             if (isProbing) {
@@ -314,9 +367,18 @@ fun LatencyPill(
                     color = fgColor,
                 )
             } else {
+                if (dotColor != null) {
+                    Box(
+                        modifier = Modifier
+                            .size(5.5.dp)
+                            .clip(CircleShape)
+                            .background(dotColor),
+                    )
+                    Spacer(modifier = Modifier.width(5.dp))
+                }
                 Text(
                     text = text,
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
                     fontWeight = FontWeight.SemiBold,
                     color = fgColor,
                     maxLines = 1,
@@ -332,15 +394,17 @@ fun ProtocolBadge(
     isSelected: Boolean = false,
 ) {
     val extColors = LocalRustClashColors.current
-    val bg = if (isSelected) {
-        extColors.emeraldContainer
-    } else {
-        MaterialTheme.colorScheme.surfaceVariant
-    }
-    val fg = if (isSelected) {
-        extColors.onEmeraldContainer
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
+    val upper = protocol.uppercase(java.util.Locale.ROOT)
+    val (bg, fg) = when {
+        isSelected -> extColors.emeraldContainer to extColors.onEmeraldContainer
+        upper.contains("VLESS") -> extColors.emeraldContainer.copy(alpha = 0.72f) to extColors.onEmeraldContainer
+        upper.contains("HY2") || upper.contains("TUIC") || upper.contains("HYSTERIA") ->
+            extColors.violetContainer to extColors.onVioletContainer
+        upper.contains("TROJAN") || upper.contains("ANYTLS") ->
+            extColors.skyContainer to extColors.onSkyContainer
+        upper.contains("VMESS") || upper.startsWith("SS") ->
+            extColors.amberContainer.copy(alpha = 0.78f) to extColors.onAmberContainer
+        else -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
     }
 
     Surface(
