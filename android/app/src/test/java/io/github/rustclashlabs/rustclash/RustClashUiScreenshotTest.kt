@@ -1228,13 +1228,13 @@ class RustClashUiScreenshotTest {
             }
         }
 
-        // Stage 0: Home error banner + dismiss button + active LatencyPill at 360dp & 1.3f fontScale
+        // Stage 0: Home error banner + dismiss button + bottom-docked Hero & Latency card at 360dp & 1.3f fontScale
         composeRule.onNodeWithText("VPN 连接授权已被取消", substring = true).assertIsDisplayed()
-        composeRule.onNodeWithText("连接异常").assertIsDisplayed()
+        composeRule.onNodeWithText("连接异常").performScrollTo().assertIsDisplayed()
         val homeErrFile = File(outDir, "narrow360_font130_home_error.png")
         saveBitmap(captureDecorBitmap(), homeErrFile)
         assertTrue(homeErrFile.isFile && homeErrFile.length() > 1024)
-        composeRule.onNodeWithContentDescription("关闭错误提示").performClick()
+        composeRule.onNodeWithContentDescription("关闭错误提示").performScrollTo().performClick()
         assertTrue(homeErrorDismissed)
         composeRule.onNodeWithText("31 ms").performScrollTo().assertIsDisplayed()
 
@@ -1611,32 +1611,57 @@ class RustClashUiScreenshotTest {
         outDir.mkdirs()
         val fontFamily = buildCjkFontFamily()
         val themeState = androidx.compose.runtime.mutableStateOf(ThemePreference.LIGHT)
+        val connectedState = androidx.compose.runtime.mutableStateOf(true)
 
         composeRule.setContent {
             val theme = themeState.value
-            val sgState = sampleShowcaseState(theme).copy(
-                effectiveOutbound = "新加坡-BGP-02",
-                effectiveProtocol = "AnyTLS",
-                telemetry = sampleShowcaseState(theme).telemetry.copy(
+            val isConn = connectedState.value
+            val base = sampleShowcaseState(theme)
+            val sgState = if (isConn) {
+                base.copy(
                     effectiveOutbound = "新加坡-BGP-02",
                     effectiveProtocol = "AnyTLS",
-                    effectiveDelayMs = 42L,
-                ),
-                exitIp = ExitIpUi(
-                    verified = true,
-                    ip = "77.93.91.109",
-                    country = "Singapore",
-                    countryCode = "SG",
-                    isp = "Equinix SG",
-                    asn = "AS64518",
-                    ipType = "Datacenter / Hosting",
-                    latencyMs = 42L,
-                    outbound = "新加坡-BGP-02",
-                    protocol = "anytls",
-                    vpnRunning = true,
-                    checkedAtMs = 1_778_382_600_000L,
-                ),
-            )
+                    telemetry = base.telemetry.copy(
+                        effectiveOutbound = "新加坡-BGP-02",
+                        effectiveProtocol = "AnyTLS",
+                        effectiveDelayMs = 42L,
+                    ),
+                    rateHistory = listOf(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 6_000L, 48_000L),
+                    exitIp = ExitIpUi(
+                        verified = true,
+                        ip = "77.93.91.109",
+                        country = "Singapore",
+                        countryCode = "SG",
+                        isp = "Equinix SG",
+                        asn = "AS64518",
+                        ipType = "Datacenter / Hosting",
+                        latencyMs = 42L,
+                        outbound = "新加坡-BGP-02",
+                        protocol = "anytls",
+                        vpnRunning = true,
+                        checkedAtMs = 1_778_382_600_000L,
+                    ),
+                )
+            } else {
+                base.copy(
+                    vpnState = VpnLifecycleState.DISCONNECTED,
+                    effectiveOutbound = "新加坡-BGP-02",
+                    effectiveProtocol = "AnyTLS",
+                    telemetry = base.telemetry.copy(
+                        running = false,
+                        upRate = 0L,
+                        downRate = 0L,
+                        upTotal = 0L,
+                        downTotal = 0L,
+                        activeConnections = 0,
+                        effectiveOutbound = "新加坡-BGP-02",
+                        effectiveProtocol = "AnyTLS",
+                        effectiveDelayMs = 42L,
+                    ),
+                    rateHistory = emptyList(),
+                    exitIp = null,
+                )
+            }
             RustClashTheme(themePreference = theme, fontFamily = fontFamily) {
                 SimulatedPhoneFrame(
                     state = sgState,
@@ -1656,6 +1681,16 @@ class RustClashUiScreenshotTest {
         val darkSg = File(outDir, "dark_1_home_sg.png")
         saveBitmap(captureDecorBitmap(), darkSg)
         assertTrue(darkSg.isFile && darkSg.length() > 1024)
+
+        // Disconnected state must stay calm without a click-baiting "点击查询出口" CTA
+        themeState.value = ThemePreference.LIGHT
+        connectedState.value = false
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("连接后自动识别").assertIsDisplayed()
+        assertTrue(composeRule.onAllNodesWithText("点击查询出口").fetchSemanticsNodes().isEmpty())
+        val lightIdle = File(outDir, "light_1_home_idle.png")
+        saveBitmap(captureDecorBitmap(), lightIdle)
+        assertTrue(lightIdle.isFile && lightIdle.length() > 1024)
     }
 }
 
