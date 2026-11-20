@@ -483,28 +483,20 @@ fun HomeScreen(
                 }
             }
 
-            // Hero Master Control Card: Unified status, active node, tactile power trigger & telemetry footer
-            HeroControlCard(
-                state = state,
+            // Top Panoramic Exit IP & City Landmark Showcase Card (eye-level visual anchor, zero touch clutter)
+            ExitIpLandmarkCard(
+                exitIp = state.exitIp,
+                isProbing = state.isProbingExitIp,
                 isConnected = isConnected,
-                isTransitioning = isTransitioning,
-                isErrorState = isErrorState,
-                noSavedNodes = noSavedNodes,
-                onToggleVpn = onToggleVpn,
-                onNodeAreaClick = {
-                    if (noSavedNodes && state.routingPreset != RoutingPresetUi.DIRECT) {
-                        onOpenQuickImport()
-                    } else {
-                        onNavigateToNodes()
+                targetHeight = landmarkCardHeight,
+                onClick = {
+                    showExitIpSheet = true
+                    val current = state.exitIp
+                    if (!state.isProbingExitIp && (current == null || !current.verified)) {
+                        onRefreshExitIp()
                     }
                 },
-            )
-
-            // Inline 3-Way Routing Mode Switcher (Zero-modal 1-tap switching; tap active first slot for full sheet)
-            InlineRoutingModeSwitcher(
-                currentPreset = state.routingPreset,
-                onSelectPreset = onSelectRoutingPreset,
-                onOpenAllPresetsSheet = { showRoutingSheet = true },
+                modifier = Modifier.fillMaxWidth(),
             )
 
             // Middle Asymmetric Bento Row: Compact Stacked Throughput (1.35f) + Node Latency (1f)
@@ -524,7 +516,7 @@ fun HomeScreen(
                     modifier = Modifier
                         .weight(1.35f)
                         .fillMaxHeight()
-                        .heightIn(min = 166.dp),
+                        .heightIn(min = 160.dp),
                 )
                 LatencyBentoTile(
                     delayMs = state.effectiveNodeDelayMs,
@@ -534,24 +526,32 @@ fun HomeScreen(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .heightIn(min = 166.dp),
+                        .heightIn(min = 160.dp),
                 )
             }
 
-            // Bottom Full-Width Panoramic Exit IP & City Landmark Showcase Card
-            ExitIpLandmarkCard(
-                exitIp = state.exitIp,
-                isProbing = state.isProbingExitIp,
+            // Bottom Thumb Zone: 1-Tap Routing Mode Switcher (effortless one-handed reach)
+            InlineRoutingModeSwitcher(
+                currentPreset = state.routingPreset,
+                onSelectPreset = onSelectRoutingPreset,
+                onOpenAllPresetsSheet = { showRoutingSheet = true },
+            )
+
+            // Bottom Thumb Zone: Hero Master Control Card (node picker + bottom-right 56dp tactile power trigger)
+            HeroControlCard(
+                state = state,
                 isConnected = isConnected,
-                targetHeight = landmarkCardHeight,
-                onClick = {
-                    showExitIpSheet = true
-                    val current = state.exitIp
-                    if (!state.isProbingExitIp && (current == null || !current.verified)) {
-                        onRefreshExitIp()
+                isTransitioning = isTransitioning,
+                isErrorState = isErrorState,
+                noSavedNodes = noSavedNodes,
+                onToggleVpn = onToggleVpn,
+                onNodeAreaClick = {
+                    if (noSavedNodes && state.routingPreset != RoutingPresetUi.DIRECT) {
+                        onOpenQuickImport()
+                    } else {
+                        onNavigateToNodes()
                     }
                 },
-                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
@@ -1054,13 +1054,14 @@ private fun HeroControlCard(
     val powerBtnBg = when {
         isConnected -> Color.White.copy(alpha = 0.96f)
         isErrorState -> extColors.dangerContainer
-        else -> extColors.tonalTrack
+        isTransitioning -> extColors.amberContainer
+        else -> extColors.emerald
     }
     val powerIconTint = when {
         isConnected -> Color(0xFF006B4B)
         isErrorState -> extColors.danger
-        isTransitioning -> extColors.amber
-        else -> MaterialTheme.colorScheme.onSurface
+        isTransitioning -> extColors.onAmberContainer
+        else -> Color.White
     }
 
     Surface(
@@ -1164,11 +1165,15 @@ private fun HeroControlCard(
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         onToggleVpn()
                     },
-                    shape = RoundedCornerShape(19.dp),
+                    shape = RoundedCornerShape(18.dp),
                     color = powerBtnBg,
-                    shadowElevation = if (isConnected) 4.dp else 0.dp,
+                    shadowElevation = when {
+                        isConnected -> 4.dp
+                        !isErrorState && !isTransitioning && !extColors.isDark -> 4.dp
+                        else -> 0.dp
+                    },
                     modifier = Modifier
-                        .size(54.dp)
+                        .size(56.dp)
                         .then(
                             if (transitionScale != 1.0f) {
                                 Modifier.graphicsLayer {
@@ -1192,7 +1197,7 @@ private fun HeroControlCard(
                                 imageVector = Icons.Rounded.PowerSettingsNew,
                                 contentDescription = if (isConnected) "断开 VPN" else "连接 VPN",
                                 tint = powerIconTint,
-                                modifier = Modifier.size(26.dp),
+                                modifier = Modifier.size(27.dp),
                             )
                         }
                     }
@@ -1723,17 +1728,21 @@ private fun ExitIpLandmarkCard(
     val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
     val verifiedIp = exitIp?.takeIf { it.verified && it.ip.isNotBlank() && it.ip != "--" }
     val isFailed = exitIp != null && verifiedIp == null && !isProbing
+    val isIdleUnprobed = !isConnected && exitIp == null && !isProbing
+    val canTapCard = !isIdleUnprobed
 
     val countryCode = verifiedIp?.countryCode?.trim()?.uppercase(Locale.ROOT).orEmpty()
     val countryCodeBadge = when {
         verifiedIp != null -> countryCode.ifEmpty { "IP" }
         isProbing -> "…"
+        isIdleUnprobed -> "待机"
         else -> "--"
     }
     val regionHeadline = when {
         verifiedIp != null -> verifiedIp.countryWithFlag
         isProbing -> "正在检测出口…"
         isFailed -> "出口检测失败"
+        isIdleUnprobed -> "连接后自动识别"
         else -> "点击查询出口"
     }
     val ispSubtitle = when {
@@ -1749,11 +1758,13 @@ private fun ExitIpLandmarkCard(
         }
         isProbing -> "正在通过当前节点探测"
         isFailed -> "点击查看详情或重试"
-        else -> "查看当前公网归属地与 IP 类型"
+        isIdleUnprobed -> "启动代理后展示出口地区与地标"
+        else -> "点击探测当前公网归属地与 IP"
     }
     val ipLine = when {
         verifiedIp != null -> verifiedIp.ip
         isProbing -> "…"
+        isIdleUnprobed -> "本地网络"
         else -> "--"
     }
     val landmarkSubtitle = when {
@@ -1767,7 +1778,7 @@ private fun ExitIpLandmarkCard(
         modifier = modifier
             .heightIn(min = targetHeight)
             .clip(RoundedCornerShape(22.dp))
-            .clickable(onClick = onClick),
+            .then(if (canTapCard) Modifier.clickable(onClick = onClick) else Modifier),
         shape = RoundedCornerShape(22.dp),
         color = extColors.cardSurface,
         shadowElevation = if (extColors.isDark) 0.dp else 1.5.dp,
@@ -1782,7 +1793,7 @@ private fun ExitIpLandmarkCard(
                     .padding(start = 16.dp, end = 14.dp, top = 14.dp, bottom = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                // Header row: 落地出口 + country code badge + quiet detail indicator
+                // Header row: 落地出口 + country code badge + detail indicator (hidden while disconnected/unprobed)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1807,8 +1818,8 @@ private fun ExitIpLandmarkCard(
                                 text = countryCodeBadge,
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontSize = 10.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = if (isIdleUnprobed) FontFamily.Default else FontFamily.Monospace,
+                                    fontWeight = if (isIdleUnprobed) FontWeight.Medium else FontWeight.Bold,
                                 ),
                                 color = onSurfaceVariant,
                                 maxLines = 1,
@@ -1817,17 +1828,17 @@ private fun ExitIpLandmarkCard(
                         }
                     }
 
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(1.dp),
-                    ) {
-                        if (isProbing) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(13.dp),
-                                strokeWidth = 1.8.dp,
-                                color = if (extColors.isDark) extColors.emeraldBright else extColors.emerald,
-                            )
-                        } else {
+                    if (isProbing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(13.dp),
+                            strokeWidth = 1.8.dp,
+                            color = if (extColors.isDark) extColors.emeraldBright else extColors.emerald,
+                        )
+                    } else if (canTapCard) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(1.dp),
+                        ) {
                             Text(
                                 text = "详情",
                                 style = MaterialTheme.typography.labelSmall,
@@ -1854,11 +1865,15 @@ private fun ExitIpLandmarkCard(
                         Text(
                             text = regionHeadline,
                             style = MaterialTheme.typography.titleLarge.copy(
-                                fontSize = 19.sp,
-                                fontWeight = FontWeight.Bold,
+                                fontSize = if (isIdleUnprobed) 17.sp else 19.sp,
+                                fontWeight = if (isIdleUnprobed) FontWeight.SemiBold else FontWeight.Bold,
                                 letterSpacing = (-0.2).sp,
                             ),
-                            color = if (isFailed) extColors.amber else onSurface,
+                            color = when {
+                                isFailed -> extColors.amber
+                                isIdleUnprobed -> onSurface.copy(alpha = 0.66f)
+                                else -> onSurface
+                            },
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -1866,7 +1881,7 @@ private fun ExitIpLandmarkCard(
                         Text(
                             text = ispSubtitle,
                             style = MaterialTheme.typography.labelSmall,
-                            color = onSurfaceVariant,
+                            color = onSurfaceVariant.copy(alpha = if (isIdleUnprobed) 0.82f else 1f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -1876,11 +1891,11 @@ private fun ExitIpLandmarkCard(
                         Text(
                             text = ipLine,
                             style = MaterialTheme.typography.labelMedium.copy(
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = if (isIdleUnprobed) FontFamily.Default else FontFamily.Monospace,
+                                fontWeight = if (isIdleUnprobed) FontWeight.Medium else FontWeight.SemiBold,
                                 fontFeatureSettings = "tnum",
                             ),
-                            color = onSurface.copy(alpha = if (verifiedIp != null) 0.90f else 0.55f),
+                            color = onSurface.copy(alpha = if (verifiedIp != null) 0.90f else 0.50f),
                             maxLines = 1,
                             softWrap = false,
                         )
@@ -1888,7 +1903,7 @@ private fun ExitIpLandmarkCard(
                         Text(
                             text = landmarkSubtitle,
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                            color = onSurfaceVariant.copy(alpha = 0.78f),
+                            color = onSurfaceVariant.copy(alpha = 0.72f),
                             maxLines = 1,
                             softWrap = false,
                         )

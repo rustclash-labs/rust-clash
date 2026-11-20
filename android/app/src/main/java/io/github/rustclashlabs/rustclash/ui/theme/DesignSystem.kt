@@ -225,9 +225,12 @@ fun TrafficWaveformGraph(
             }
 
             val count = rawPoints.size
-            val stepX = w / (count - 1).coerceAtLeast(1)
+            val startX = 2.dp.toPx()
+            val endX = (w - 6.dp.toPx()).coerceAtLeast(startX + 1f)
+            val usableW = endX - startX
+            val stepX = usableW / (count - 1).coerceAtLeast(1)
             val coords = rawPoints.mapIndexed { idx, ny ->
-                Offset(x = idx * stepX, y = ny * h)
+                Offset(x = startX + idx * stepX, y = ny * h)
             }
 
             val strokePath = Path().apply {
@@ -242,8 +245,8 @@ fun TrafficWaveformGraph(
 
             val fillPath = Path().apply {
                 addPath(strokePath)
-                lineTo(w, h)
-                lineTo(0f, h)
+                lineTo(endX, h)
+                lineTo(startX, h)
                 close()
             }
 
@@ -269,22 +272,17 @@ fun TrafficWaveformGraph(
                 ),
             )
 
-            if (coords.size >= 2) {
-                val p0 = coords[coords.size - 2]
-                val p1 = coords.last()
-                val dotX = (w - 6.dp.toPx()).coerceIn(p0.x, p1.x)
-                val t = if (p1.x > p0.x) ((dotX - p0.x) / (p1.x - p0.x)).coerceIn(0f, 1f) else 1f
-                val st = t * t * (3f - 2f * t)
-                val dotY = p0.y + (p1.y - p0.y) * st
+            if (coords.isNotEmpty()) {
+                val tip = coords.last()
                 drawCircle(
                     color = extColors.waveformStroke.copy(alpha = 0.22f),
                     radius = 5.5.dp.toPx(),
-                    center = Offset(dotX, dotY),
+                    center = tip,
                 )
                 drawCircle(
                     color = extColors.waveformStroke,
                     radius = 2.6.dp.toPx(),
-                    center = Offset(dotX, dotY),
+                    center = tip,
                 )
             }
         }
