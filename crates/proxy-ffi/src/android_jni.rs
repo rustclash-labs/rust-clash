@@ -3416,6 +3416,14 @@ fn build_window_diagnostic_sections(
                     redact_sensitive_text(&c.rule_payload)
                 )
             };
+            // Active carry-over streams report live age at the end of the slice, whereas
+            // closed/failed carry-over streams report their actual connection lifetime
+            // (clamped to `age_ref_ms`) instead of inflating to the full slice window span.
+            let duration_end_ms = if c.status == "active" {
+                age_ref_ms
+            } else {
+                c.end_epoch_ms.unwrap_or(age_ref_ms).min(age_ref_ms)
+            };
             serde_json::json!({
                 "host": safe_host,
                 "port": c.metadata.destination_port,
@@ -3425,7 +3433,7 @@ fn build_window_diagnostic_sections(
                 "effectiveOutbound": redact_sensitive_text(&c.effective_outbound),
                 "uploadBytes": c.upload,
                 "downloadBytes": c.download,
-                "ageMs": age_ref_ms.saturating_sub(c.start_epoch_ms),
+                "ageMs": duration_end_ms.saturating_sub(c.start_epoch_ms),
             })
         })
         .collect();
@@ -5064,7 +5072,97 @@ mod tests {
         assert_eq!(second_carry["effectiveOutbound"], "DIRECT");
         assert_eq!(second_carry["uploadBytes"], 15 * 1024 * 1024);
         assert_eq!(second_carry["downloadBytes"], 2 * 1024 * 1024);
-        assert_eq!(second_carry["ageMs"], until_ms - 4_500);
+        assert_eq!(second_carry["ageMs"], (since_ms + 1_200) - 4_500);
+    }
+
+    #[test]
+    fn carry_over_closed_stream_reports_actual_lifetime_and_clamps_to_window_end() {
+        let since_ms = 1_763_600_000_000u64;
+        let until_ms = since_ms + 3_600_000; // 1-hour slice
+
+        let conns = vec![
+            // Short-lived stream that started 200ms before slice start and closed 2s into slice:
+            // must report 2_200ms lifetime, NOT 3_600_200ms (~1h).
+            sample_conn(
+                "carry-short-closed",
+                "tcp",
+                "wetype.weixin.qq.com",
+                "DIRECT",
+                since_ms - 200,
+                Some(since_ms + 2_000),
+                Some(35),
+                3_072,
+                522,
+                None,
+                "closed",
+                None,
+            ),
+            // Closed stream whose recorded end_epoch_ms slightly trails until_ms: clamped to until_ms.
+            sample_conn(
+                "carry-closed-after-until",
+                "udp",
+                "cdn.ldstatic.com",
+                "PROXY",
+                since_ms - 5_000,
+                Some(until_ms + 4_000),
+                Some(80),
+                10_000,
+                20_000,
+                None,
+                "closed",
+                None,
+            ),
+            // Closed stream missing end_epoch_ms safely falls back to until_ms - start_epoch_ms.
+            sample_conn(
+                "carry-closed-no-end",
+                "tcp",
+                "fallback.example.com",
+                "DIRECT",
+                since_ms - 1_000,
+                None,
+                Some(40),
+                1_000,
+                1_000,
+                None,
+                "closed",
+                None,
+            ),
+            // Active stream reports full live age at slice end.
+            sample_conn(
+                "carry-active-long",
+                "tcp",
+                "mtalk.google.com",
+                "PROXY",
+                since_ms - 30_000,
+                None,
+                Some(90),
+                4_000,
+                4_000,
+                None,
+                "active",
+                None,
+            ),
+        ];
+
+        let sec = build_window_diagnostic_sections(&conns, since_ms, until_ms, &HashMap::new());
+        assert_eq!(sec.carry_over_count, 4);
+        assert_eq!(sec.carry_over_active_count, 1);
+
+        let age_for = |host: &str| {
+            sec.carry_over_connections_json
+                .iter()
+                .find(|entry| entry["host"] == host)
+                .and_then(|entry| entry["ageMs"].as_u64())
+                .unwrap_or_else(|| panic!("missing carry-over entry for {host}"))
+        };
+
+        assert_eq!(age_for("wetype.weixin.qq.com"), 2_200);
+        assert_eq!(age_for("cdn.ldstatic.com"), until_ms - (since_ms - 5_000));
+        assert_eq!(
+            age_for("fallback.example.com"),
+            until_ms - (since_ms - 1_000)
+        );
+        assert_eq!(age_for("mtalk.google.com"), until_ms - (since_ms - 30_000));
     }
 
     #[test]
