@@ -90,6 +90,7 @@ export const App: React.FC = () => {
   const [profilesSnapshot, setProfilesSnapshot] =
     useState<ProfilesSnapshot | null>(null);
   const [proxies, setProxies] = useState<Record<string, ProxyInfo>>({});
+  const [proxyGroupOrder, setProxyGroupOrder] = useState<string[]>([]);
   const [rules, setRules] = useState<RuleItem[]>([]);
   const [connections, setConnections] = useState<ConnectionsResponse | null>(
     null,
@@ -137,6 +138,10 @@ export const App: React.FC = () => {
     });
   }, []);
 
+  const clearFocusGroup = useCallback(() => {
+    setFocusGroup(null);
+  }, []);
+
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
@@ -167,6 +172,7 @@ export const App: React.FC = () => {
       setVersion(ver);
       setConfig(cfg);
       setProxies(prx.proxies);
+      setProxyGroupOrder(prx["group-order"] ?? []);
       setRules(rls.rules);
       setConnections(conns);
       setAuthRequired(false);
@@ -179,6 +185,23 @@ export const App: React.FC = () => {
       } catch {
         // optional profile endpoint on read-only/minimal cores
       }
+    } catch (err) {
+      handleApiError(err);
+    }
+  }, [handleApiError]);
+
+  const refreshProxies = useCallback(async () => {
+    try {
+      const [cfg, prx] = await Promise.all([
+        clashApi.getConfigs(),
+        clashApi.getProxies(),
+      ]);
+      setConfig(cfg);
+      setProxies(prx.proxies);
+      setProxyGroupOrder(prx["group-order"] ?? []);
+      setAuthRequired(false);
+      setOnline(true);
+      setLoadError(null);
     } catch (err) {
       handleApiError(err);
     }
@@ -1088,6 +1111,7 @@ export const App: React.FC = () => {
                 config={config}
                 profilesSnapshot={profilesSnapshot}
                 proxies={proxies}
+                groupOrder={proxyGroupOrder}
                 rules={rules}
                 connections={connections}
                 trafficHistory={trafficHistory}
@@ -1114,8 +1138,10 @@ export const App: React.FC = () => {
               <ProxiesView
                 config={config}
                 proxies={proxies}
-                onRefreshProxies={refreshCore}
+                groupOrder={proxyGroupOrder}
+                onRefreshProxies={refreshProxies}
                 focusGroup={focusGroup}
+                onClearFocusGroup={clearFocusGroup}
                 onOpenProfiles={() => setTab("profiles")}
               />
             )}

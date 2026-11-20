@@ -948,10 +948,17 @@ async fn get_raw_yaml(
 
 async fn get_proxies(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
     let router = engine.router();
-    let proxies = router.proxies_snapshot();
+    let ordered = router.proxies_snapshot_ordered();
+    let mut proxies_map = serde_json::Map::with_capacity(ordered.len());
+    for (name, info) in ordered {
+        if let Ok(val) = serde_json::to_value(info) {
+            proxies_map.insert(name, val);
+        }
+    }
     let effective = router.effective_primary_outbound();
     Json(serde_json::json!({
-        "proxies": proxies,
+        "proxies": serde_json::Value::Object(proxies_map),
+        "group-order": router.group_order(),
         "effective-outbound": effective,
     }))
 }

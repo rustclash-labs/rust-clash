@@ -1514,24 +1514,18 @@ impl Router {
         self.bump_epoch();
     }
 
-    pub fn proxies_snapshot(&self) -> HashMap<String, ProxyInfoSnapshot> {
-        let mut map = HashMap::new();
-        for (name, ob) in &self.outbounds {
-            map.insert(
-                name.clone(),
-                ProxyInfoSnapshot {
-                    name: name.clone(),
-                    proxy_type: ob.protocol().to_string(),
-                    udp: ob.udp_supported(),
-                    now: None,
-                    all: None,
-                    effective_outbound: Some(name.clone()),
-                    effective_protocol: Some(ob.protocol().to_string()),
-                    chains: Some(vec![name.clone()]),
-                    history: self.delays.history(name),
-                },
-            );
-        }
+    pub fn group_order(&self) -> &[String] {
+        &self.group_order
+    }
+
+    /// Return proxy groups in exact YAML `group_order`, followed by concrete
+    /// outbounds (`DIRECT`, `REJECT`, then alphabetically sorted nodes) so
+    /// `GET /proxies` with `serde_json`'s `preserve_order` is 100% deterministic
+    /// across requests and never shuffles groups in the UI.
+    pub fn proxies_snapshot_ordered(&self) -> Vec<(String, ProxyInfoSnapshot)> {
+        let mut out = Vec::with_capacity(self.group_order.len() + self.outbounds.len());
+        let mut emitted = HashSet::with_capacity(self.group_order.len() + self.outbounds.len());
+
         for name in &self.group_order {
             if let Some(grp) = self.groups.get(name) {
                 let mut snap = grp.snapshot(&self.delays);
@@ -1540,10 +1534,50 @@ impl Router {
                 snap.effective_outbound = Some(leaf_ob.name().to_string());
                 snap.effective_protocol = Some(leaf_ob.protocol().to_string());
                 snap.chains = Some(chains);
-                map.insert(name.clone(), snap);
+                emitted.insert(name.as_str());
+                out.push((name.clone(), snap));
             }
         }
-        map
+
+        let mut outbound_names: Vec<&String> = self
+            .outbounds
+            .keys()
+            .filter(|name| !emitted.contains(name.as_str()))
+            .collect();
+        outbound_names.sort_by(|a, b| {
+            let rank = |s: &str| match s {
+                "DIRECT" => 0u8,
+                "REJECT" => 1u8,
+                _ => 2u8,
+            };
+            rank(a.as_str())
+                .cmp(&rank(b.as_str()))
+                .then_with(|| a.cmp(b))
+        });
+
+        for name in outbound_names {
+            if let Some(ob) = self.outbounds.get(name) {
+                out.push((
+                    name.clone(),
+                    ProxyInfoSnapshot {
+                        name: name.clone(),
+                        proxy_type: ob.protocol().to_string(),
+                        udp: ob.udp_supported(),
+                        now: None,
+                        all: None,
+                        effective_outbound: Some(name.clone()),
+                        effective_protocol: Some(ob.protocol().to_string()),
+                        chains: Some(vec![name.clone()]),
+                        history: self.delays.history(name),
+                    },
+                ));
+            }
+        }
+        out
+    }
+
+    pub fn proxies_snapshot(&self) -> HashMap<String, ProxyInfoSnapshot> {
+        self.proxies_snapshot_ordered().into_iter().collect()
     }
 
     pub fn rules_snapshot(&self) -> Vec<RuleSnapshot> {
@@ -2039,5 +2073,47 @@ mod tests {
 
         let _ = stop_tx.send(true);
         let _ = origin_jh.await;
+    }
+
+    #[test]
+    fn proxies_snapshot_ordered_preserves_yaml_group_order_deterministically() {
+        let dns = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+        let mk_group = |name: &str, members: &[&str]| ProxyGroupConfig {
+            name: name.to_string(),
+            group_type: ProxyGroupType::Select,
+            proxies: members.iter().map(|s| (*s).to_string()).collect(),
+            url: "http://www.gstatic.com/generate_204".to_string(),
+            interval: 300,
+            tolerance: 50,
+            strategy: None,
+        };
+        let group_cfgs = vec![
+            mk_group("🚀 节点选择", &["DIRECT", "REJECT"]),
+            mk_group("Steam工坊", &["🚀 节点选择", "DIRECT"]),
+            mk_group("电报信息", &["🚀 节点选择", "DIRECT"]),
+            mk_group("Google", &["🚀 节点选择", "DIRECT"]),
+        ];
+        let rules = vec!["MATCH,🚀 节点选择".to_string()];
+        let router = Router::new(RunMode::Rule, HashMap::new(), &group_cfgs, &rules, dns).unwrap();
+
+        let expected_groups = vec![
+            "🚀 节点选择".to_string(),
+            "Steam工坊".to_string(),
+            "电报信息".to_string(),
+            "Google".to_string(),
+            "GLOBAL".to_string(),
+        ];
+        assert_eq!(router.group_order(), expected_groups.as_slice());
+
+        // Verify repeated snapshots never shuffle keys (unlike random-seeded HashMap)
+        for _ in 0..8 {
+            let ordered = router.proxies_snapshot_ordered();
+            let group_keys: Vec<String> = ordered
+                .iter()
+                .filter(|(_, info)| info.all.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+            assert_eq!(group_keys, expected_groups);
+        }
     }
 }

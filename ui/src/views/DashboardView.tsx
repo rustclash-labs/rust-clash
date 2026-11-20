@@ -59,6 +59,7 @@ interface DashboardViewProps {
   config: ConfigSnapshot | null;
   profilesSnapshot: ProfilesSnapshot | null;
   proxies: Record<string, ProxyInfo>;
+  groupOrder?: string[];
   rules: RuleItem[];
   connections: ConnectionsResponse | null;
   trafficHistory: TrafficPoint[];
@@ -121,6 +122,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   config,
   profilesSnapshot,
   proxies,
+  groupOrder = [],
   rules,
   connections,
   trafficHistory,
@@ -176,13 +178,25 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     const list = Object.values(proxies).filter(
       (p) => GROUP_TYPES.has(p.type) && p.all && p.all.length > 0,
     );
+    const orderIndex = new Map<string, number>();
+    groupOrder.forEach((name, idx) => orderIndex.set(name, idx));
+    const configuredPrimary = config?.["effective-outbound"]?.primary_group ?? "";
     list.sort((a, b) => {
       if (a.name === "GLOBAL") return 1;
       if (b.name === "GLOBAL") return -1;
-      return 0;
+      const ia = orderIndex.get(a.name);
+      const ib = orderIndex.get(b.name);
+      if (ia !== undefined && ib !== undefined) return ia - ib;
+      if (ia !== undefined) return -1;
+      if (ib !== undefined) return 1;
+      if (configuredPrimary) {
+        if (a.name === configuredPrimary) return -1;
+        if (b.name === configuredPrimary) return 1;
+      }
+      return a.name.localeCompare(b.name);
     });
     return list;
-  }, [proxies]);
+  }, [proxies, groupOrder, config]);
 
   const concreteNodeCount = useMemo(
     () =>
@@ -195,15 +209,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     [proxies],
   );
 
-  const primaryGroup = useMemo(
-    () =>
+  const primaryGroup = useMemo(() => {
+    const configuredPrimary = config?.["effective-outbound"]?.primary_group;
+    if (configuredPrimary) {
+      const exact = groups.find((g) => g.name === configuredPrimary);
+      if (exact) return exact;
+    }
+    return (
       groups.find(
         (g) =>
           g.type === "Selector" &&
-          (g.name === "PROXY" || g.name === "🚀 Proxy"),
-      ) ?? groups.find((g) => g.type === "Selector" && g.name !== "GLOBAL"),
-    [groups],
-  );
+          (g.name === "PROXY" ||
+            g.name === "🚀 Proxy" ||
+            g.name === "🚀 节点选择" ||
+            g.name === "节点选择"),
+      ) ?? groups.find((g) => g.type === "Selector" && g.name !== "GLOBAL")
+    );
+  }, [groups, config]);
 
   const effectiveOutbound =
     config?.["effective-outbound"]?.effective_outbound ??

@@ -30,9 +30,11 @@ import {
 interface ProxiesViewProps {
   config: ConfigSnapshot | null;
   proxies: Record<string, ProxyInfo>;
+  groupOrder?: string[];
   onRefreshProxies: () => Promise<void>;
   openAddModalSignal?: number;
   focusGroup?: string | null;
+  onClearFocusGroup?: () => void;
   onOpenProfiles?: () => void;
 }
 
@@ -73,9 +75,11 @@ type NodeProto =
 export const ProxiesView: React.FC<ProxiesViewProps> = ({
   config,
   proxies,
+  groupOrder = [],
   onRefreshProxies,
   openAddModalSignal = 0,
   focusGroup = null,
+  onClearFocusGroup,
   onOpenProfiles,
 }) => {
   const { tr } = useI18n();
@@ -200,25 +204,47 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     const list = Object.values(proxies).filter(
       (p) => GROUP_TYPES.has(p.type) && p.all && p.all.length > 0,
     );
+    const orderIndex = new Map<string, number>();
+    groupOrder.forEach((name, idx) => orderIndex.set(name, idx));
+    const configuredPrimary = config?.["effective-outbound"]?.primary_group ?? "";
     list.sort((a, b) => {
       if (a.name === "GLOBAL") return 1;
       if (b.name === "GLOBAL") return -1;
-      return 0;
+      const ia = orderIndex.get(a.name);
+      const ib = orderIndex.get(b.name);
+      if (ia !== undefined && ib !== undefined) return ia - ib;
+      if (ia !== undefined) return -1;
+      if (ib !== undefined) return 1;
+      if (configuredPrimary) {
+        if (a.name === configuredPrimary) return -1;
+        if (b.name === configuredPrimary) return 1;
+      }
+      return a.name.localeCompare(b.name);
     });
     return list;
-  }, [proxies]);
+  }, [proxies, groupOrder, config]);
 
   const primaryGroupName = useMemo(() => {
+    const configuredPrimary = config?.["effective-outbound"]?.primary_group;
+    if (
+      configuredPrimary &&
+      groups.some((g) => g.name === configuredPrimary)
+    ) {
+      return configuredPrimary;
+    }
     const primary =
       groups.find(
         (g) =>
           g.type === "Selector" &&
-          (g.name === "PROXY" || g.name === "🚀 Proxy"),
+          (g.name === "PROXY" ||
+            g.name === "🚀 Proxy" ||
+            g.name === "🚀 节点选择" ||
+            g.name === "节点选择"),
       ) ??
       groups.find((g) => g.type === "Selector" && g.name !== "GLOBAL") ??
       groups[0];
     return primary?.name ?? null;
-  }, [groups]);
+  }, [groups, config]);
 
   // Expand primary group by default
   useEffect(() => {
@@ -229,17 +255,19 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     });
   }, [primaryGroupName]);
 
-  // Expand and scroll when navigated from Dashboard mini-card
+  // Expand and scroll once when navigated from Dashboard mini-card
   useEffect(() => {
     if (!focusGroup) return;
     setExpandedGroups((prev) => ({ ...prev, [focusGroup]: true }));
-    window.setTimeout(() => {
+    const timer = window.setTimeout(() => {
       groupRefs.current[focusGroup]?.scrollIntoView({
         behavior: "smooth",
         block: "start",
       });
+      onClearFocusGroup?.();
     }, 60);
-  }, [focusGroup]);
+    return () => window.clearTimeout(timer);
+  }, [focusGroup, onClearFocusGroup]);
 
   const loadActiveNodes = useCallback(async () => {
     try {
