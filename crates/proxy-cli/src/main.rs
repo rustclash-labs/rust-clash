@@ -355,6 +355,9 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let (api_addr, api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
+            if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
+                tracing::warn!("Failed writing runtime controller discovery file: {err}");
+            }
             let api_base_url = format_api_base_url(api_addr);
 
             let active_secret = engine.config_snapshot().secret;
@@ -429,6 +432,9 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let (api_addr, api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
+            if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
+                tracing::warn!("Failed writing runtime controller discovery file: {err}");
+            }
             let api_base_url = format_api_base_url(api_addr);
             tracing::info!(
                 mixed_listen = %engine.mixed_addr(),

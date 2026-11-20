@@ -1453,6 +1453,7 @@ pub struct ProxyEngine {
     shutting_down: std::sync::atomic::AtomicBool,
     dns_bind_fallback_disabled: std::sync::atomic::AtomicBool,
     ephemeral_secret: RwLock<Option<String>>,
+    controller_discovery: RwLock<Option<(PathBuf, SocketAddr)>>,
     shutdown_tx: watch::Sender<bool>,
     _bg_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -1966,6 +1967,7 @@ impl ProxyEngine {
                 dns_bind_fallback_disabled,
             ),
             ephemeral_secret: RwLock::new(initial_ephemeral_secret),
+            controller_discovery: RwLock::new(None),
             shutdown_tx,
             _bg_tasks: Mutex::new(bg_tasks),
         });
@@ -1973,6 +1975,60 @@ impl ProxyEngine {
         Self::spawn_preconnect_task(&engine);
         Self::spawn_fake_ip_checkpoint_task(&engine);
         Ok(engine)
+    }
+
+    /// Persist runtime loopback controller discovery metadata at
+    /// `state_dir/rust-clash.controller.json`, automatically re-syncing on
+    /// config/profile reloads and cleaning up (PID-guarded) on engine shutdown.
+    pub fn publish_controller_discovery(
+        &self,
+        state_dir: PathBuf,
+        bound_addr: SocketAddr,
+    ) -> std::io::Result<()> {
+        if state_dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let Some(addr) = crate::platform::recovery::normalize_loopback_controller_addr(bound_addr)
+        else {
+            return Ok(());
+        };
+        *self.controller_discovery.write() = Some((state_dir.clone(), bound_addr));
+        let ep = crate::platform::recovery::ControllerRuntimeEndpoint {
+            pid: std::process::id(),
+            addr,
+            secret: self.config_snapshot().secret,
+        };
+        crate::platform::recovery::write_controller_discovery(&state_dir, &ep)
+    }
+
+    /// Re-sync the runtime controller discovery file if one was published for this engine
+    /// (for example after a YAML reload or profile switch rotates the active Bearer secret).
+    pub fn sync_controller_discovery(&self) {
+        let Some((state_dir, bound_addr)) = self.controller_discovery.read().clone() else {
+            return;
+        };
+        let Some(addr) = crate::platform::recovery::normalize_loopback_controller_addr(bound_addr)
+        else {
+            return;
+        };
+        let ep = crate::platform::recovery::ControllerRuntimeEndpoint {
+            pid: std::process::id(),
+            addr,
+            secret: self.config_snapshot().secret,
+        };
+        if let Err(err) = crate::platform::recovery::write_controller_discovery(&state_dir, &ep) {
+            tracing::warn!(
+                error = %err,
+                "Failed synchronizing runtime controller discovery metadata"
+            );
+        }
+    }
+
+    /// Remove the runtime controller discovery file owned by this process PID, if present.
+    pub fn cleanup_controller_discovery(&self) {
+        if let Some((state_dir, _)) = self.controller_discovery.write().take() {
+            crate::platform::recovery::cleanup_controller_discovery(&state_dir, std::process::id());
+        }
     }
 
     fn state_snapshot(&self) -> Arc<EngineStateSnapshot> {
@@ -3934,6 +3990,7 @@ impl ProxyEngine {
         self.hub.set_log_level(&final_log_level);
 
         drop(services);
+        self.sync_controller_discovery();
 
         let valid_ob_set: std::collections::HashSet<&str> =
             valid_outbound_names.iter().map(String::as_str).collect();
@@ -4205,6 +4262,7 @@ impl ProxyEngine {
         if !already_shutting_down {
             self.persist_fake_ip_cache();
         }
+        self.cleanup_controller_discovery();
         *self.virtual_tun.lock() = None;
         let detached_os_tun = self.active_os_tun.write().take();
         let _ = self.hub.reset_udp_nat_sessions();
