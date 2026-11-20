@@ -31,7 +31,7 @@ use tokio::{
 use crate::{
     addr::{HostName, TargetAddr},
     inbound::{
-        sniff::{MAX_SNIFF_BYTES, SniffOutcome, sniff_client_hello_or_http_host},
+        sniff::{MAX_SNIFF_BYTES, SniffOutcomeWithProto, SniffedProtocol, sniff_tcp_protocol},
         udp_nat::UdpNatManager,
     },
     platform::process::SocketTransport,
@@ -1096,19 +1096,36 @@ fn register_syn_flow(
         }
 
         let raw_target = TargetAddr::from(tuple.dst);
+        let is_unmapped_fake = current_router.dns().is_unmapped_fake_ip(&raw_target);
+        let is_fake = current_router.dns().is_fake_ip(tuple.dst.ip());
+        let sniffer_cfg = current_router.sniffer();
         let mut prefetched_first_payload: Option<Vec<u8>> = None;
-        let route_target = if current_router.dns().is_unmapped_fake_ip(&raw_target) {
-            match recover_unmapped_fake_ip_tcp(
-                tuple.dst,
-                &current_router,
+        let mut sniffed_real_ip: Option<(String, SniffedProtocol)> = None;
+
+        let route_target = if is_unmapped_fake {
+            match sniff_tcp_initial_payload(
                 &mut to_remote_rx,
                 &bridge_closed_tx,
+                Duration::from_millis(250),
+                true,
+                true,
             )
             .await
             {
-                UnmappedFakeIpRecovery::BridgeClosed => return,
-                UnmappedFakeIpRecovery::Recovered { domain, payload } => {
-                    prefetched_first_payload = Some(payload);
+                TcpSniffResult::BridgeClosed => return,
+                TcpSniffResult::Sniffed {
+                    domain, payload, ..
+                } => {
+                    if !payload.is_empty() {
+                        prefetched_first_payload = Some(payload);
+                    }
+                    let fake_v4 = match tuple.dst.ip() {
+                        IpAddr::V4(v4) => Some(v4),
+                        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                    };
+                    if let Some(v4) = fake_v4 {
+                        let _ = current_router.dns().recover_unmapped_fake_ip(v4, &domain);
+                    }
                     if !current_router.dns().is_unmapped_fake_ip(&raw_target) {
                         raw_target.clone()
                     } else {
@@ -1116,7 +1133,46 @@ fn register_syn_flow(
                             .unwrap_or_else(|_| raw_target.clone())
                     }
                 }
-                UnmappedFakeIpRecovery::Failed => raw_target.clone(),
+                TcpSniffResult::NoDomain { payload } => {
+                    if !payload.is_empty() {
+                        prefetched_first_payload = Some(payload);
+                    }
+                    raw_target.clone()
+                }
+            }
+        } else if !is_fake && sniffer_cfg.should_sniff_real_ip_tcp(tuple.dst.ip(), tuple.dst.port())
+        {
+            let allow_tls = sniffer_cfg.should_sniff_tls_port(tuple.dst.port());
+            let allow_http = sniffer_cfg.should_sniff_http_port(tuple.dst.port());
+            match sniff_tcp_initial_payload(
+                &mut to_remote_rx,
+                &bridge_closed_tx,
+                Duration::from_millis(150),
+                allow_tls,
+                allow_http,
+            )
+            .await
+            {
+                TcpSniffResult::BridgeClosed => return,
+                TcpSniffResult::Sniffed {
+                    domain,
+                    protocol,
+                    payload,
+                } => {
+                    if !payload.is_empty() {
+                        prefetched_first_payload = Some(payload);
+                    }
+                    let target = TargetAddr::new_domain(domain.clone(), tuple.dst.port())
+                        .unwrap_or_else(|_| raw_target.clone());
+                    sniffed_real_ip = Some((domain, protocol));
+                    target
+                }
+                TcpSniffResult::NoDomain { payload } => {
+                    if !payload.is_empty() {
+                        prefetched_first_payload = Some(payload);
+                    }
+                    raw_target.clone()
+                }
             }
         } else {
             raw_target.clone()
@@ -1137,6 +1193,24 @@ fn register_syn_flow(
                 &route_target,
             ) => d,
         };
+
+        // For real-IP flows whose domain was sniffed via TLS SNI / HTTP Host:
+        // - Always use the sniffed domain for rule matching and connection telemetry.
+        // - Override the remote dial destination with the sniffed domain on PROXY outbounds
+        //   when `override-destination` is enabled and the domain is not in `skip-domain`
+        //   (defeating local poisoned-IP DNS without adding extra DNS lookups on DIRECT).
+        let dial_target = if let Some((ref domain, proto)) = sniffed_real_ip {
+            if decision.outbound.exit_category() == "PROXY"
+                && sniffer_cfg.should_override_destination(proto, domain)
+            {
+                decision.target.clone()
+            } else {
+                raw_target.clone()
+            }
+        } else {
+            decision.target.clone()
+        };
+
         let conn_guard = hub_clone.register_connection_with_outbound_guard(
             "TUN(smoltcp)",
             "tcp",
@@ -1152,10 +1226,11 @@ fn register_syn_flow(
         hub_clone.push_log(
             "info",
             format!(
-                "[TUN] {} -> {} (raw {}) [{}] via {} ({})",
+                "[TUN] {} -> {} (raw {}, dial {}) [{}] via {} ({})",
                 tuple.src,
                 decision.target,
                 tuple.dst,
+                dial_target,
                 decision.rule_type,
                 decision.outbound.name(),
                 decision.outbound.exit_category()
@@ -1173,7 +1248,7 @@ fn register_syn_flow(
                 io::ErrorKind::TimedOut,
                 format!(
                     "outbound dial+handshake to {} via '{}' timed out after {}s",
-                    decision.target,
+                    dial_target,
                     decision.outbound.name(),
                     OUTBOUND_CONNECT_TIMEOUT.as_secs()
                 ),
@@ -1197,7 +1272,7 @@ fn register_syn_flow(
                 }
                 res = tokio::time::timeout(
                     rem_connect_budget,
-                    decision.outbound.connect_tcp(&decision.target),
+                    decision.outbound.connect_tcp(&dial_target),
                 ) => {
                     match res {
                         Ok(inner) => inner,
@@ -1351,52 +1426,56 @@ fn register_syn_flow(
     );
 }
 
-enum UnmappedFakeIpRecovery {
-    Recovered { domain: String, payload: Vec<u8> },
-    Failed,
+enum TcpSniffResult {
+    Sniffed {
+        domain: String,
+        protocol: SniffedProtocol,
+        payload: Vec<u8>,
+    },
+    /// Always returns every byte read from `to_remote_rx` so zero payload bytes are ever lost
+    /// when sniffing times out, sees non-TLS/non-HTTP traffic, or hits `MAX_SNIFF_BYTES`.
+    NoDomain {
+        payload: Vec<u8>,
+    },
     BridgeClosed,
 }
 
-async fn recover_unmapped_fake_ip_tcp(
-    dst: SocketAddr,
-    router: &Router,
+async fn sniff_tcp_initial_payload(
     to_remote_rx: &mut mpsc::Receiver<Vec<u8>>,
     bridge_closed_tx: &watch::Sender<()>,
-) -> UnmappedFakeIpRecovery {
-    const UNMAPPED_SNIFF_TIMEOUT: Duration = Duration::from_millis(250);
+    timeout: Duration,
+    allow_tls: bool,
+    allow_http: bool,
+) -> TcpSniffResult {
     let mut buf = Vec::new();
-    let deadline = tokio::time::Instant::now() + UNMAPPED_SNIFF_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         let chunk_res = tokio::select! {
             biased;
-            _ = bridge_closed_tx.closed() => return UnmappedFakeIpRecovery::BridgeClosed,
-            _ = tokio::time::sleep_until(deadline) => return UnmappedFakeIpRecovery::Failed,
+            _ = bridge_closed_tx.closed() => return TcpSniffResult::BridgeClosed,
+            _ = tokio::time::sleep_until(deadline) => return TcpSniffResult::NoDomain { payload: buf },
             recv = to_remote_rx.recv() => recv,
         };
         let Some(chunk) = chunk_res else {
-            return UnmappedFakeIpRecovery::Failed;
+            return TcpSniffResult::NoDomain { payload: buf };
         };
         buf.extend_from_slice(&chunk);
         let sniff_window = &buf[..buf.len().min(MAX_SNIFF_BYTES)];
-        match sniff_client_hello_or_http_host(sniff_window) {
-            SniffOutcome::Domain(domain) => {
-                let fake_v4 = match dst.ip() {
-                    IpAddr::V4(v4) => Some(v4),
-                    IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-                };
-                if let Some(v4) = fake_v4 {
-                    let _ = router.dns().recover_unmapped_fake_ip(v4, &domain);
-                }
-                return UnmappedFakeIpRecovery::Recovered {
+        match sniff_tcp_protocol(sniff_window, allow_tls, allow_http) {
+            SniffOutcomeWithProto::Domain { domain, protocol } => {
+                return TcpSniffResult::Sniffed {
                     domain,
+                    protocol,
                     payload: buf,
                 };
             }
-            SniffOutcome::NoHostname => return UnmappedFakeIpRecovery::Failed,
-            SniffOutcome::NeedMoreBytes => {
+            SniffOutcomeWithProto::NoHostname => {
+                return TcpSniffResult::NoDomain { payload: buf };
+            }
+            SniffOutcomeWithProto::NeedMoreBytes => {
                 if buf.len() >= MAX_SNIFF_BYTES {
-                    return UnmappedFakeIpRecovery::Failed;
+                    return TcpSniffResult::NoDomain { payload: buf };
                 }
             }
         }
@@ -1632,10 +1711,12 @@ pub fn attach_os_tun(
         strict_route: false,
         enable_ipv6: false,
         auto_detect_interface: true,
+        dns_hijack: true,
         fake_ip_net,
         tun_ipv4_cidr,
         tun_ipv6_cidr,
         bypass_ips,
+        dns_bypass_ips: Vec::new(),
         local_dns_addr: None,
         wintun_dll_path: None,
         state_dir: crate::platform::recovery::default_state_dir(),
@@ -2520,14 +2601,18 @@ mod tests {
         let expected_len = big_req.len();
         tx.send(big_req.clone()).await.unwrap();
 
-        let dst: SocketAddr = "198.18.9.77:80".parse().unwrap();
-        match recover_unmapped_fake_ip_tcp(dst, &router, &mut rx, &closed_tx).await {
-            UnmappedFakeIpRecovery::Recovered { domain, payload } => {
+        let _ = router;
+        match sniff_tcp_initial_payload(&mut rx, &closed_tx, Duration::from_millis(250), true, true)
+            .await
+        {
+            TcpSniffResult::Sniffed {
+                domain, payload, ..
+            } => {
                 assert_eq!(domain, "coalesced.example.com");
                 assert_eq!(payload.len(), expected_len);
                 assert_eq!(payload, big_req);
             }
-            _ => panic!("expected Recovered outcome without truncating coalesced payload"),
+            _ => panic!("expected Sniffed outcome without truncating coalesced payload"),
         }
     }
 
@@ -2698,5 +2783,378 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+    }
+
+    struct CaptureProxyOutbound {
+        name: String,
+        last_target: Arc<parking_lot::Mutex<Option<TargetAddr>>>,
+        captured_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+        expected_len: usize,
+        reply: &'static [u8],
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundHandler for CaptureProxyOutbound {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn protocol(&self) -> &'static str {
+            "mock-proxy"
+        }
+
+        async fn connect_tcp(
+            &self,
+            target: &TargetAddr,
+        ) -> io::Result<crate::outbound::BoxedStream> {
+            *self.last_target.lock() = Some(target.clone());
+            let (client_side, mut server_side) = tokio::io::duplex(64 * 1024);
+            let tx_slot = Arc::clone(&self.captured_tx);
+            let expected_len = self.expected_len;
+            let reply = self.reply;
+            tokio::spawn(async move {
+                let mut received = Vec::with_capacity(expected_len);
+                let mut chunk = [0u8; 4096];
+                while received.len() < expected_len {
+                    match server_side.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => received.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if let Some(tx) = tx_slot.lock().take() {
+                    let _ = tx.send(received);
+                }
+                let _ = server_side.write_all(reply).await;
+                let _ = server_side.shutdown().await;
+            });
+            Ok(Box::new(client_side))
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_real_ip_sniffs_two_segment_pq_client_hello_acks_first_segment_and_overrides_proxy_target()
+     {
+        let pq_hello =
+            crate::inbound::sniff::test_helpers::build_pq_tls_client_hello("linux.do", 1950);
+        assert!(
+            pq_hello.len() > 2000,
+            "simulated Chrome PQ ClientHello must span 2 TCP segments (> 1460B), got {}",
+            pq_hello.len()
+        );
+        let seg1 = &pq_hello[..1460];
+        let seg2 = &pq_hello[1460..];
+        assert!(!seg2.is_empty());
+
+        let last_target = Arc::new(parking_lot::Mutex::new(None));
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let proxy = Arc::new(CaptureProxyOutbound {
+            name: "MOCK-PROXY".to_string(),
+            last_target: Arc::clone(&last_target),
+            captured_tx: Arc::new(parking_lot::Mutex::new(Some(captured_tx))),
+            expected_len: pq_hello.len(),
+            reply: b"SERVER-HELLO-OK",
+        });
+
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert("MOCK-PROXY".to_string(), proxy);
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        // Poisoned real IP `31.13.73.1:443` can ONLY match `DOMAIN-SUFFIX,linux.do,MOCK-PROXY`
+        // if real-IP SNI sniffing succeeds; otherwise `MATCH,REJECT` would drop it!
+        let rules = vec![
+            "DOMAIN-SUFFIX,linux.do,MOCK-PROXY".to_string(),
+            "MATCH,REJECT".to_string(),
+        ];
+        let router = Arc::new(
+            Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, tun_task) =
+            spawn_userspace_tun(1500, router_slot, Arc::clone(&hub), shutdown_rx);
+
+        let client = (Ipv4Addr::new(198, 18, 0, 20), 55443u16);
+        let poisoned_dst = (Ipv4Addr::new(31, 13, 73, 1), 443u16);
+
+        // 1. 3-way TCP handshake to poisoned public IP
+        let syn_pkt = build_ipv4_tcp_packet(
+            client,
+            poisoned_dst,
+            smoltcp::wire::TcpControl::Syn,
+            20_000,
+            None,
+            &[],
+        );
+        vtun.ingress_tx.send(syn_pkt).await.unwrap();
+        let syn_ack_raw = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected SYN-ACK")
+            .expect("egress packet");
+        let ip4_sa = Ipv4Packet::new_checked(&syn_ack_raw).unwrap();
+        let tcp_sa = TcpPacket::new_checked(ip4_sa.payload()).unwrap();
+        assert!(tcp_sa.syn() && tcp_sa.ack());
+        let server_next_seq = tcp_sa.seq_number().0.wrapping_add(1);
+
+        let ack_pkt = build_ipv4_tcp_packet(
+            client,
+            poisoned_dst,
+            smoltcp::wire::TcpControl::None,
+            20_001,
+            Some(server_next_seq),
+            &[],
+        );
+        vtun.ingress_tx.send(ack_pkt).await.unwrap();
+
+        // 2. Send Segment 1 (1460B) ONLY — sniffer returns NeedMoreBytes; verify smoltcp
+        //    still drives the stack and emits an ACK so Chrome can send Segment 2 without deadlock!
+        let pkt1 = build_ipv4_tcp_packet(
+            client,
+            poisoned_dst,
+            smoltcp::wire::TcpControl::None,
+            20_001,
+            Some(server_next_seq),
+            seg1,
+        );
+        vtun.ingress_tx.send(pkt1).await.unwrap();
+
+        let ack1_raw = tokio::time::timeout(Duration::from_millis(500), vtun.egress_rx.recv())
+            .await
+            .expect("smoltcp must ACK segment 1 while sniffer awaits segment 2")
+            .expect("egress ACK packet");
+        let ip4_a1 = Ipv4Packet::new_checked(&ack1_raw).unwrap();
+        let tcp_a1 = TcpPacket::new_checked(ip4_a1.payload()).unwrap();
+        assert!(tcp_a1.ack() && !tcp_a1.rst());
+        assert_eq!(
+            tcp_a1.ack_number().0,
+            20_001 + seg1.len() as i32,
+            "smoltcp ACK must advance past segment 1"
+        );
+
+        // 3. Send Segment 2 (remaining bytes completing the ~2060B PQ ClientHello)
+        let pkt2 = build_ipv4_tcp_packet(
+            client,
+            poisoned_dst,
+            smoltcp::wire::TcpControl::Psh,
+            20_001 + seg1.len() as i32,
+            Some(server_next_seq),
+            seg2,
+        );
+        vtun.ingress_tx.send(pkt2).await.unwrap();
+
+        // 4. Verify outbound dialed `linux.do:443` (overriding poisoned `31.13.73.1:443`)
+        //    and received the complete, unmodified ~2060B ClientHello payload!
+        let captured = tokio::time::timeout(Duration::from_secs(2), captured_rx)
+            .await
+            .expect("proxy outbound must receive full ClientHello")
+            .unwrap();
+        assert_eq!(captured, pq_hello);
+        assert_eq!(
+            last_target.lock().as_ref().map(|t| t.to_string()),
+            Some("linux.do:443".to_string()),
+            "PROXY outbound must receive sniffed SNI domain instead of poisoned real IP"
+        );
+
+        // 5. Verify server reply flows back through smoltcp (download > 0)
+        let mut received_reply = Vec::new();
+        let reply_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while received_reply.len() < b"SERVER-HELLO-OK".len()
+            && tokio::time::Instant::now() < reply_deadline
+        {
+            if let Ok(Some(pkt)) =
+                tokio::time::timeout(Duration::from_millis(400), vtun.egress_rx.recv()).await
+                && let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                && !tcp.payload().is_empty()
+            {
+                received_reply.extend_from_slice(tcp.payload());
+            }
+        }
+        assert_eq!(received_reply, b"SERVER-HELLO-OK");
+
+        let diags = hub.diagnostics_snapshot(10);
+        assert!(
+            diags.iter().any(|d| d.metadata.host == "linux.do"
+                && d.rule == "DomainSuffix"
+                && d.rule_payload == "linux.do"),
+            "TelemetryHub must record sniffed domain and DomainSuffix rule match, got: {diags:?}"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+    }
+
+    #[tokio::test]
+    async fn tun_real_ip_sniff_preserves_non_tls_bytes_and_respects_skip_domain() {
+        // Case A: Non-TLS bytes on port 443 must exit sniff immediately and forward 100% losslessly.
+        let non_tls = b"SSH-2.0-OpenSSH_9.6\r\n";
+        let last_target_a = Arc::new(parking_lot::Mutex::new(None));
+        let (cap_tx_a, cap_rx_a) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let proxy_a = Arc::new(CaptureProxyOutbound {
+            name: "MOCK-PROXY".to_string(),
+            last_target: Arc::clone(&last_target_a),
+            captured_tx: Arc::new(parking_lot::Mutex::new(Some(cap_tx_a))),
+            expected_len: non_tls.len(),
+            reply: b"SSH-OK",
+        });
+        let mut outbounds_a: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds_a.insert("MOCK-PROXY".to_string(), proxy_a);
+        let dns_a = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules_a = vec!["MATCH,MOCK-PROXY".to_string()];
+        let router_a = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds_a,
+                &[],
+                &rules_a,
+                dns_a,
+            )
+            .unwrap(),
+        );
+        let hub_a = Arc::new(TelemetryHub::new());
+        let (sd_tx_a, sd_rx_a) = watch::channel(false);
+        let (mut vtun_a, task_a) =
+            spawn_userspace_tun(1500, Arc::new(RwLock::new(router_a)), hub_a, sd_rx_a);
+
+        let client_a = (Ipv4Addr::new(198, 18, 0, 21), 55444u16);
+        let dst_a = (Ipv4Addr::new(93, 184, 216, 34), 443u16);
+        vtun_a
+            .ingress_tx
+            .send(build_ipv4_tcp_packet(
+                client_a,
+                dst_a,
+                smoltcp::wire::TcpControl::Syn,
+                30_000,
+                None,
+                &[],
+            ))
+            .await
+            .unwrap();
+        let sa_raw = tokio::time::timeout(Duration::from_secs(2), vtun_a.egress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let sseq_a = TcpPacket::new_checked(Ipv4Packet::new_checked(&sa_raw).unwrap().payload())
+            .unwrap()
+            .seq_number()
+            .0
+            .wrapping_add(1);
+        vtun_a
+            .ingress_tx
+            .send(build_ipv4_tcp_packet(
+                client_a,
+                dst_a,
+                smoltcp::wire::TcpControl::Psh,
+                30_001,
+                Some(sseq_a),
+                non_tls,
+            ))
+            .await
+            .unwrap();
+
+        let got_a = tokio::time::timeout(Duration::from_secs(2), cap_rx_a)
+            .await
+            .expect("non-TLS payload must be forwarded losslessly")
+            .unwrap();
+        assert_eq!(got_a, non_tls);
+        assert_eq!(
+            last_target_a.lock().as_ref().map(|t| t.to_string()),
+            Some("93.184.216.34:443".to_string())
+        );
+        let _ = sd_tx_a.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task_a).await;
+
+        // Case B: `skip-domain` still uses sniffed domain for rule matching, but dials raw IP!
+        let hello_b = crate::inbound::sniff::test_helpers::build_tls_client_hello("push.apple.com");
+        let last_target_b = Arc::new(parking_lot::Mutex::new(None));
+        let (cap_tx_b, cap_rx_b) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let proxy_b = Arc::new(CaptureProxyOutbound {
+            name: "MOCK-PROXY".to_string(),
+            last_target: Arc::clone(&last_target_b),
+            captured_tx: Arc::new(parking_lot::Mutex::new(Some(cap_tx_b))),
+            expected_len: hello_b.len(),
+            reply: b"OK",
+        });
+        let mut outbounds_b: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds_b.insert("MOCK-PROXY".to_string(), proxy_b);
+        let dns_b = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules_b = vec![
+            "DOMAIN-SUFFIX,apple.com,MOCK-PROXY".to_string(),
+            "MATCH,REJECT".to_string(),
+        ];
+        let router_b = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds_b,
+                &[],
+                &rules_b,
+                dns_b,
+            )
+            .unwrap(),
+        );
+        let sniffer = crate::config::SnifferConfig {
+            skip_domain: vec!["+.push.apple.com".to_string()],
+            ..Default::default()
+        };
+        router_b.set_sniffer(sniffer);
+
+        let hub_b = Arc::new(TelemetryHub::new());
+        let (sd_tx_b, sd_rx_b) = watch::channel(false);
+        let (mut vtun_b, task_b) =
+            spawn_userspace_tun(1500, Arc::new(RwLock::new(router_b)), hub_b, sd_rx_b);
+
+        let client_b = (Ipv4Addr::new(198, 18, 0, 22), 55445u16);
+        let dst_b = (Ipv4Addr::new(17, 57, 144, 5), 443u16);
+        vtun_b
+            .ingress_tx
+            .send(build_ipv4_tcp_packet(
+                client_b,
+                dst_b,
+                smoltcp::wire::TcpControl::Syn,
+                40_000,
+                None,
+                &[],
+            ))
+            .await
+            .unwrap();
+        let sa_b = tokio::time::timeout(Duration::from_secs(2), vtun_b.egress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let sseq_b = TcpPacket::new_checked(Ipv4Packet::new_checked(&sa_b).unwrap().payload())
+            .unwrap()
+            .seq_number()
+            .0
+            .wrapping_add(1);
+        vtun_b
+            .ingress_tx
+            .send(build_ipv4_tcp_packet(
+                client_b,
+                dst_b,
+                smoltcp::wire::TcpControl::Psh,
+                40_001,
+                Some(sseq_b),
+                &hello_b,
+            ))
+            .await
+            .unwrap();
+
+        let got_b = tokio::time::timeout(Duration::from_secs(2), cap_rx_b)
+            .await
+            .expect("skip-domain TLS payload must still route and forward")
+            .unwrap();
+        assert_eq!(got_b, hello_b);
+        assert_eq!(
+            last_target_b.lock().as_ref().map(|t| t.to_string()),
+            Some("17.57.144.5:443".to_string()),
+            "skip-domain must keep raw IP as dial target while matching DOMAIN-SUFFIX rule"
+        );
+        let _ = sd_tx_b.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task_b).await;
     }
 }

@@ -146,6 +146,9 @@ pub struct ClashConfig {
     #[serde(default)]
     pub tun: TunConfig,
 
+    #[serde(default, skip_serializing_if = "SnifferConfig::is_default_config")]
+    pub sniffer: SnifferConfig,
+
     #[serde(default)]
     pub proxies: Vec<ProxyNodeConfig>,
 
@@ -198,6 +201,7 @@ impl Default for ClashConfig {
             dns: DnsConfig::default(),
             hosts: HashMap::new(),
             tun: TunConfig::default(),
+            sniffer: SnifferConfig::default(),
             proxies: Vec::new(),
             proxy_groups: Vec::new(),
             rule_providers: HashMap::new(),
@@ -3951,6 +3955,232 @@ impl Default for TunConfig {
     }
 }
 
+/// Standard Clash / Mihomo protocol sniffer configuration (`sniffer:`).
+/// Enabled by default for common TLS (`443`, `8443`) and HTTP (`80`, `8080`) ports so real-IP
+/// TCP connections entering TUN (e.g. browser DoH or stale/poisoned local DNS) still match
+/// `DOMAIN` / `GEOSITE` rules and override poisoned destination IPs on proxy outbounds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SnifferConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+
+    #[serde(default = "default_true")]
+    pub override_destination: bool,
+
+    #[serde(default = "default_true")]
+    pub parse_pure_ip: bool,
+
+    /// Per-protocol sniff rules (`TLS`, `HTTP`), compatible with Clash / Mihomo `sniffer.sniff`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sniff: HashMap<String, SniffProtocolConfig>,
+
+    /// Domains excluded from destination override (supports exact match and `+.example.com` / `.example.com` / `*.example.com`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_domain: Vec<String>,
+
+    /// Domains that always allow destination override even if matched by `skip-domain`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub force_domain: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SniffProtocolConfig {
+    /// Port numbers (`443`) or inclusive ranges (`"8080-8880"`).
+    #[serde(default, deserialize_with = "deserialize_port_specs")]
+    pub ports: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_destination: Option<bool>,
+}
+
+fn deserialize_port_specs<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PortItem {
+        Int(u16),
+        Str(String),
+    }
+
+    let items = Option::<Vec<PortItem>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(items
+        .into_iter()
+        .map(|it| match it {
+            PortItem::Int(p) => p.to_string(),
+            PortItem::Str(s) => s.trim().to_string(),
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+impl Default for SnifferConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            override_destination: true,
+            parse_pure_ip: true,
+            sniff: HashMap::new(),
+            skip_domain: Vec::new(),
+            force_domain: Vec::new(),
+        }
+    }
+}
+
+impl SnifferConfig {
+    pub fn is_default_config(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn protocol_entry(&self, target_key: &str) -> Option<&SniffProtocolConfig> {
+        self.sniff
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(target_key))
+            .map(|(_, v)| v)
+    }
+
+    fn port_matches_specs(port: u16, specs: &[String]) -> bool {
+        for raw in specs {
+            let s = raw.trim();
+            if let Some((lo_s, hi_s)) = s.split_once('-') {
+                if let (Ok(lo), Ok(hi)) = (lo_s.trim().parse::<u16>(), hi_s.trim().parse::<u16>())
+                    && lo <= port
+                    && port <= hi
+                {
+                    return true;
+                }
+            } else if let Ok(p) = s.parse::<u16>()
+                && p == port
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if TLS SNI sniffing should run on `port`.
+    pub fn should_sniff_tls_port(&self, port: u16) -> bool {
+        if !self.enable || !self.parse_pure_ip {
+            return false;
+        }
+        if self.sniff.is_empty() {
+            return matches!(port, 443 | 8443);
+        }
+        let Some(entry) = self.protocol_entry("TLS") else {
+            return false;
+        };
+        if entry.ports.is_empty() {
+            matches!(port, 443 | 8443)
+        } else {
+            Self::port_matches_specs(port, &entry.ports)
+        }
+    }
+
+    /// True if HTTP `Host` sniffing should run on `port`.
+    pub fn should_sniff_http_port(&self, port: u16) -> bool {
+        if !self.enable || !self.parse_pure_ip {
+            return false;
+        }
+        if self.sniff.is_empty() {
+            return matches!(port, 80 | 8080);
+        }
+        let Some(entry) = self.protocol_entry("HTTP") else {
+            return false;
+        };
+        if entry.ports.is_empty() {
+            matches!(port, 80 | 8080)
+        } else {
+            Self::port_matches_specs(port, &entry.ports)
+        }
+    }
+
+    /// True if real-IP TCP sniffing should run for `ip:port` (skips loopback, link-local,
+    /// and RFC1918/ULA private LAN targets so LAN `IP-CIDR`/`GEOIP,PRIVATE` rules are preserved).
+    pub fn should_sniff_real_ip_tcp(&self, ip: std::net::IpAddr, port: u16) -> bool {
+        if !self.enable || !self.parse_pure_ip {
+            return false;
+        }
+        let is_non_public = match ip.to_canonical() {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (seg0 & 0xfe00) == 0xfc00
+                    || (seg0 & 0xffc0) == 0xfe80
+            }
+        };
+        if is_non_public {
+            return false;
+        }
+        self.should_sniff_tls_port(port) || self.should_sniff_http_port(port)
+    }
+
+    /// Returns `true` if the sniffed `domain` (extracted via `protocol`) should override the
+    /// raw destination IP for remote proxy dialing.
+    pub fn should_override_destination(
+        &self,
+        protocol: crate::inbound::sniff::SniffedProtocol,
+        domain: &str,
+    ) -> bool {
+        let proto_key = match protocol {
+            crate::inbound::sniff::SniffedProtocol::Tls => "TLS",
+            crate::inbound::sniff::SniffedProtocol::Http => "HTTP",
+        };
+        let base_override = self
+            .protocol_entry(proto_key)
+            .and_then(|e| e.override_destination)
+            .unwrap_or(self.override_destination);
+        if !base_override {
+            return false;
+        }
+        if Self::domain_matches_any(domain, &self.force_domain) {
+            return true;
+        }
+        !Self::domain_matches_any(domain, &self.skip_domain)
+    }
+
+    fn domain_matches_any(domain: &str, patterns: &[String]) -> bool {
+        let norm_domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if norm_domain.is_empty() {
+            return false;
+        }
+        for pat in patterns {
+            let p = pat.trim().trim_end_matches('.').to_ascii_lowercase();
+            if p.is_empty() {
+                continue;
+            }
+            if let Some(suffix) = p
+                .strip_prefix("+.")
+                .or_else(|| p.strip_prefix("*."))
+                .or_else(|| p.strip_prefix('.'))
+            {
+                if norm_domain == suffix
+                    || (norm_domain.len() > suffix.len()
+                        && norm_domain.ends_with(suffix)
+                        && norm_domain.as_bytes()[norm_domain.len() - suffix.len() - 1] == b'.')
+                {
+                    return true;
+                }
+            } else if norm_domain == p {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 fn default_vless_encryption() -> String {
     "none".to_string()
 }
@@ -5482,5 +5712,81 @@ rules:
         let warn3 = rep3.warning_summary(cfg3.mode).unwrap();
         assert!(warn3.contains("Filtered 1 unsupported/invalid rule(s)"));
         assert!(!warn3.contains("only 'MATCH"));
+    }
+
+    #[test]
+    fn sniffer_yaml_parsing_port_ranges_and_skip_force_domains() {
+        // Default config enables TLS (443, 8443) and HTTP (80, 8080) real-IP sniffing on public IPs only.
+        let def = ClashConfig::default();
+        assert!(def.sniffer.enable);
+        assert!(def.sniffer.override_destination);
+        assert!(
+            def.sniffer
+                .should_sniff_real_ip_tcp("31.13.73.1".parse().unwrap(), 443)
+        );
+        assert!(
+            def.sniffer
+                .should_sniff_real_ip_tcp("93.184.216.34".parse().unwrap(), 80)
+        );
+        assert!(
+            !def.sniffer
+                .should_sniff_real_ip_tcp("31.13.73.1".parse().unwrap(), 22)
+        );
+        assert!(
+            !def.sniffer
+                .should_sniff_real_ip_tcp("192.168.1.1".parse().unwrap(), 443),
+            "LAN private IPs must be skipped by real-IP sniffer"
+        );
+        assert!(
+            !def.sniffer
+                .should_sniff_real_ip_tcp("10.0.0.1".parse().unwrap(), 443)
+        );
+
+        let yaml = r#"
+mode: rule
+sniffer:
+  enable: true
+  override-destination: true
+  parse-pure-ip: true
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80, "8080-8880"]
+      override-destination: false
+  skip-domain:
+    - "+.push.apple.com"
+    - "exact.local.test"
+  force-domain:
+    - "override.push.apple.com"
+rules:
+  - MATCH,DIRECT
+"#;
+        let parsed = ClashConfig::from_yaml_str(yaml).unwrap();
+        assert!(parsed.sniffer.should_sniff_tls_port(443));
+        assert!(parsed.sniffer.should_sniff_tls_port(8443));
+        assert!(!parsed.sniffer.should_sniff_tls_port(80));
+        assert!(parsed.sniffer.should_sniff_http_port(80));
+        assert!(parsed.sniffer.should_sniff_http_port(8200));
+        assert!(!parsed.sniffer.should_sniff_http_port(9000));
+
+        assert!(
+            parsed.sniffer.should_override_destination(
+                crate::inbound::sniff::SniffedProtocol::Tls,
+                "linux.do"
+            )
+        );
+        assert!(!parsed.sniffer.should_override_destination(
+            crate::inbound::sniff::SniffedProtocol::Tls,
+            "sub.push.apple.com"
+        ));
+        assert!(parsed.sniffer.should_override_destination(
+            crate::inbound::sniff::SniffedProtocol::Tls,
+            "override.push.apple.com"
+        ));
+        assert!(!parsed.sniffer.should_override_destination(
+            crate::inbound::sniff::SniffedProtocol::Http,
+            "example.com"
+        ));
     }
 }

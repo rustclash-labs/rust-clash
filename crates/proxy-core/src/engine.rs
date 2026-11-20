@@ -652,6 +652,7 @@ impl DemoCluster {
             is_ephemeral_secret: false,
             geodata_mode: false,
             mmdb_path: None,
+            sniffer: Default::default(),
             hosts: HashMap::new(),
             dns: DnsConfig {
                 enable: true,
@@ -973,7 +974,7 @@ fn mixed_listen_spec(cfg: &ClashConfig) -> String {
     format!("{bind_host}:{}", cfg.mixed_port)
 }
 
-fn collect_bypass_ips(cfg: &ClashConfig, dns: &FakeIpDnsEngine) -> Vec<IpAddr> {
+fn collect_proxy_bypass_ips(cfg: &ClashConfig) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     for node in &cfg.proxies {
         let (srv, _) = node.server_port();
@@ -984,8 +985,13 @@ fn collect_bypass_ips(cfg: &ClashConfig, dns: &FakeIpDnsEngine) -> Vec<IpAddr> {
             ips.push(ip);
         }
     }
+    ips
+}
+
+fn collect_dns_bypass_ips(dns: &FakeIpDnsEngine, proxy_ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
     for ns_ip in dns.upstream_bypass_ips() {
-        if !ips.contains(&ns_ip) {
+        if !proxy_ips.contains(&ns_ip) && !ips.contains(&ns_ip) {
             ips.push(ns_ip);
         }
     }
@@ -1292,7 +1298,8 @@ fn start_tun_service(
     );
 
     if cfg.tun.auto_route {
-        let bypass_ips = collect_bypass_ips(cfg, dns);
+        let bypass_ips = collect_proxy_bypass_ips(cfg);
+        let dns_bypass_ips = collect_dns_bypass_ips(dns, &bypass_ips);
         let fake_ip_net = dns.fake_ip_net();
         let gw_v4 = dns.gateway_ipv4();
         let tun_ipv4_cidr =
@@ -1325,10 +1332,12 @@ fn start_tun_service(
             strict_route: cfg.tun.strict_route,
             enable_ipv6,
             auto_detect_interface: cfg.tun.auto_detect_interface,
+            dns_hijack: cfg.tun.dns_hijack,
             fake_ip_net,
             tun_ipv4_cidr,
             tun_ipv6_cidr,
             bypass_ips,
+            dns_bypass_ips,
             local_dns_addr,
             wintun_dll_path: cfg.tun.wintun_path.as_ref().map(PathBuf::from),
             state_dir,
@@ -1565,6 +1574,7 @@ impl ProxyEngine {
         )?;
         router.set_unified_delay(cfg.unified_delay);
         router.set_tun_dns_hijack(cfg.tun.dns_hijack);
+        router.set_sniffer(cfg.sniffer.clone());
         Ok(Arc::new(router))
     }
 
@@ -1658,6 +1668,7 @@ impl ProxyEngine {
         )?);
         initial_router.set_unified_delay(cfg.unified_delay);
         initial_router.set_tun_dns_hijack(cfg.tun.dns_hijack);
+        initial_router.set_sniffer(cfg.sniffer.clone());
         if let Some(ref sel) = initial_selections {
             initial_router.apply_saved_selections(sel);
         }
@@ -3548,6 +3559,7 @@ impl ProxyEngine {
         )?);
         new_router.set_unified_delay(new_cfg.unified_delay);
         new_router.set_tun_dns_hijack(new_cfg.tun.dns_hijack);
+        new_router.set_sniffer(new_cfg.sniffer.clone());
         new_router.set_low_power_mode(self.is_low_power_mode());
         new_router.import_delays_from(&prev_router);
 

@@ -386,6 +386,8 @@ struct ParsedHttpHead {
     status: u16,
     cf_mitigated: bool,
     server: Option<String>,
+    has_www_authenticate: bool,
+    body_snippet: String,
 }
 
 async fn read_http_response_head<S: tokio::io::AsyncRead + Unpin>(
@@ -445,6 +447,7 @@ async fn read_http_response_head<S: tokio::io::AsyncRead + Unpin>(
 
     let mut cf_mitigated = false;
     let mut server = None;
+    let mut has_www_authenticate = false;
     for hdr in lines {
         let trimmed = hdr.trim();
         if trimmed.is_empty() {
@@ -457,9 +460,29 @@ async fn read_http_response_head<S: tokio::io::AsyncRead + Unpin>(
                 cf_mitigated = true;
             } else if kl == "server" && !val.is_empty() {
                 server = Some(val.chars().take(48).collect());
+            } else if kl == "www-authenticate" && !val.is_empty() {
+                has_www_authenticate = true;
             }
         }
     }
+
+    // For `400`/`403`, inspect up to 512 bytes of body so API credential errors (e.g. Google
+    // Gemini `"Method doesn't allow unregistered callers"`) are distinguished from geo/WAF blocks.
+    let mut body_bytes = if matches!(status, 400 | 403) && head_end < buf.len() {
+        let end = (head_end + 512).min(buf.len());
+        buf[head_end..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    if matches!(status, 400 | 403)
+        && body_bytes.is_empty()
+        && let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(150), stream.read(&mut chunk)).await
+        && n > 0
+    {
+        body_bytes.extend_from_slice(&chunk[..n]);
+    }
+    let body_snippet = String::from_utf8_lossy(&body_bytes).to_ascii_lowercase();
 
     Ok((
         ttfb,
@@ -467,8 +490,25 @@ async fn read_http_response_head<S: tokio::io::AsyncRead + Unpin>(
             status,
             cf_mitigated,
             server,
+            has_www_authenticate,
+            body_snippet,
         },
     ))
+}
+
+fn body_indicates_geo_or_waf_block(low_body: &str) -> bool {
+    low_body.contains("location is not supported")
+        || low_body.contains("not available in your country")
+        || low_body.contains("country, region, or territory not supported")
+        || low_body.contains("access denied")
+}
+
+fn body_indicates_missing_api_auth(low_body: &str) -> bool {
+    low_body.contains("unregistered callers")
+        || low_body.contains("missing authentication")
+        || low_body.contains("authentication credentials")
+        || low_body.contains("api key")
+        || low_body.contains("invalid_api_key")
 }
 
 fn classify_http_verdict(head: &ParsedHttpHead) -> (ProbeVerdict, String) {
@@ -499,24 +539,57 @@ fn classify_http_verdict(head: &ParsedHttpHead) -> (ProbeVerdict, String) {
             "HTTP 401 Auth Required — TLS & origin unblocked; API key/account quota requires authenticated call"
                 .to_string(),
         ),
-        400 | 404 | 405 => (
+        400 => {
+            if body_indicates_geo_or_waf_block(&head.body_snippet) {
+                (
+                    ProbeVerdict::BlockedOrChallenged,
+                    "HTTP 400 — upstream reported exit IP region/location is not supported"
+                        .to_string(),
+                )
+            } else {
+                (
+                    ProbeVerdict::AuthRequired,
+                    "HTTP 400 from API origin — TLS & network path unblocked (API auth/parameters required)"
+                        .to_string(),
+                )
+            }
+        }
+        405 => (
             ProbeVerdict::AuthRequired,
-            format!(
-                "HTTP {} from API origin — TLS & network path unblocked (API auth/method required)",
-                head.status
-            ),
+            "HTTP 405 from API origin — TLS & network path unblocked (API auth/method required)"
+                .to_string(),
+        ),
+        404 => (
+            ProbeVerdict::Reachable,
+            "HTTP 404 Not Found — origin reachable over TLS, but the requested path does not exist"
+                .to_string(),
         ),
         429 => (
             ProbeVerdict::RateLimited,
             "HTTP 429 Rate Limited — TLS reached origin, but shared exit IP or endpoint is rate-limited"
                 .to_string(),
         ),
-        403 | 451 => (
+        403 => {
+            if !body_indicates_geo_or_waf_block(&head.body_snippet)
+                && (head.has_www_authenticate
+                    || body_indicates_missing_api_auth(&head.body_snippet))
+            {
+                (
+                    ProbeVerdict::AuthRequired,
+                    "HTTP 403 Auth Required — TLS & origin unblocked; API key/credentials required"
+                        .to_string(),
+                )
+            } else {
+                (
+                    ProbeVerdict::BlockedOrChallenged,
+                    "HTTP 403 — exit IP appears geo-restricted or blocked by upstream WAF"
+                        .to_string(),
+                )
+            }
+        }
+        451 => (
             ProbeVerdict::BlockedOrChallenged,
-            format!(
-                "HTTP {} — exit IP appears geo-restricted or blocked by upstream WAF",
-                head.status
-            ),
+            "HTTP 451 — exit IP appears geo-restricted or legally blocked by upstream".to_string(),
         ),
         500..=599 => (
             ProbeVerdict::ServerError,
@@ -1091,7 +1164,7 @@ pub fn default_matrix_targets(demo_http_origin: Option<&str>) -> Vec<MatrixEndpo
             id: "google-gemini".to_string(),
             label: "Google Gemini API".to_string(),
             category: "ai".to_string(),
-            url: "https://generativelanguage.googleapis.com/".to_string(),
+            url: "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
         },
     ]);
     list
@@ -3236,5 +3309,66 @@ mod tests {
 
         assert!(parse_ip_sb_geoip_exit_ip(r#"{"country":"SG"}"#).is_none());
         assert!(parse_cloudflare_trace_exit_ip("loc=US\n").is_none());
+    }
+
+    #[test]
+    fn probe_http_404_not_auth_required_and_gemini_endpoint_classification() {
+        let defaults = default_matrix_targets(None);
+        let gemini = defaults
+            .iter()
+            .find(|e| e.id == "google-gemini")
+            .expect("google-gemini in default matrix");
+        assert_eq!(
+            gemini.url,
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+
+        let (v404, note404) = classify_http_verdict(&ParsedHttpHead {
+            status: 404,
+            cf_mitigated: false,
+            server: Some("scaffolding".to_string()),
+            has_www_authenticate: false,
+            body_snippet: String::new(),
+        });
+        assert_eq!(v404, ProbeVerdict::Reachable);
+        assert!(note404.contains("404"));
+
+        let (v403_auth, _) = classify_http_verdict(&ParsedHttpHead {
+            status: 403,
+            cf_mitigated: false,
+            server: Some("scaffolding".to_string()),
+            has_www_authenticate: false,
+            body_snippet: r#"{"error":{"code":403,"message":"method doesn't allow unregistered callers (callers without established identity)"}}"#
+                .to_string(),
+        });
+        assert_eq!(v403_auth, ProbeVerdict::AuthRequired);
+
+        let (v403_geo, _) = classify_http_verdict(&ParsedHttpHead {
+            status: 403,
+            cf_mitigated: false,
+            server: Some("scaffolding".to_string()),
+            has_www_authenticate: false,
+            body_snippet: r#"{"error":{"code":403,"message":"user location is not supported for the api use."}}"#
+                .to_string(),
+        });
+        assert_eq!(v403_geo, ProbeVerdict::BlockedOrChallenged);
+
+        let (v403_waf, _) = classify_http_verdict(&ParsedHttpHead {
+            status: 403,
+            cf_mitigated: false,
+            server: Some("cloudflare".to_string()),
+            has_www_authenticate: false,
+            body_snippet: "<html><body>access denied</body></html>".to_string(),
+        });
+        assert_eq!(v403_waf, ProbeVerdict::BlockedOrChallenged);
+
+        let (v400_geo, _) = classify_http_verdict(&ParsedHttpHead {
+            status: 400,
+            cf_mitigated: false,
+            server: None,
+            has_www_authenticate: false,
+            body_snippet: "user location is not supported".to_string(),
+        });
+        assert_eq!(v400_geo, ProbeVerdict::BlockedOrChallenged);
     }
 }
