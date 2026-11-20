@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -19,7 +19,9 @@ use proxy_core::{
     platform::{
         autostart::{AutostartManager, AutostartStatus},
         recovery::{SingleInstanceGuard, default_state_dir, recover_stale_network_state},
-        sysproxy::{SysProxyStatus, disable_system_proxy, query_sysproxy_status},
+        sysproxy::{
+            SysProxyStatus, disable_system_proxy, enable_system_proxy, query_sysproxy_status,
+        },
         tun::preflight_system_tun,
     },
     profile::ProfileManager,
@@ -31,8 +33,14 @@ pub const DESKTOP_IPC_FILENAME: &str = "rust-clash.desktop.ipc";
 pub const DESKTOP_PREFS_FILENAME: &str = "desktop_prefs.json";
 pub const STARTUP_CRASH_LOG_FILENAME: &str = "startup-crash.log";
 
+pub const ARG_DEMO: &str = "--demo";
+pub const ARG_RELAUNCH_ENABLE_TUN: &str = "--relaunch-enable-tun";
+pub const ARG_PRESERVE_SYSPROXY: &str = "--preserve-sysproxy";
+
 const INSTANCE_ACQUIRE_ATTEMPTS: usize = 6;
 const INSTANCE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const RELAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAUNCH_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const IPC_SOCKET_TIMEOUT: Duration = Duration::from_millis(600);
 const IPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -363,6 +371,80 @@ pub fn try_signal_running_instance(state_dir: &Path) -> bool {
     resp.trim() == "OK"
 }
 
+/// Parsed desktop GUI launch options (including elevated TUN relaunch handoff flags).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DesktopLaunchOptions {
+    pub use_demo: bool,
+    pub relaunch_enable_tun: bool,
+    pub preserve_sysproxy: bool,
+}
+
+/// Parse desktop GUI CLI flags (`--demo`, `--relaunch-enable-tun`, `--preserve-sysproxy`).
+pub fn parse_desktop_launch_options<I, S>(args: I, demo_env: bool) -> DesktopLaunchOptions
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut opts = DesktopLaunchOptions {
+        use_demo: demo_env,
+        relaunch_enable_tun: false,
+        preserve_sysproxy: false,
+    };
+    for raw in args {
+        match raw.as_ref() {
+            ARG_DEMO => opts.use_demo = true,
+            ARG_RELAUNCH_ENABLE_TUN => opts.relaunch_enable_tun = true,
+            ARG_PRESERVE_SYSPROXY => opts.preserve_sysproxy = true,
+            _ => {}
+        }
+    }
+    opts
+}
+
+/// Build the strictly allowlisted CLI argument list passed to the elevated relaunch process.
+pub fn build_elevated_relaunch_args(opts: &DesktopLaunchOptions) -> Vec<&'static str> {
+    let mut args = Vec::with_capacity(3);
+    if opts.relaunch_enable_tun {
+        args.push(ARG_RELAUNCH_ENABLE_TUN);
+    }
+    if opts.preserve_sysproxy {
+        args.push(ARG_PRESERVE_SYSPROXY);
+    }
+    if opts.use_demo {
+        args.push(ARG_DEMO);
+    }
+    args
+}
+
+/// Strip Windows extended-length verbatim path prefixes (`\\?\C:\...` -> `C:\...`,
+/// `\\?\UNC\server\share\...` -> `\\server\share\...`) because `ShellExecuteExW` rejects
+/// `\\?\`-prefixed executable paths.
+pub fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc_tail) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_tail}"));
+    }
+    if let Some(drive_tail) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(drive_tail);
+    }
+    path.to_path_buf()
+}
+
+fn is_transient_lock_contention(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::AddrInUse {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, `SingleInstanceGuard::drop` unlinks the lockfile before closing the file
+        // handle, leaving a brief `STATUS_DELETE_PENDING` window reported as `PermissionDenied`.
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            return true;
+        }
+    }
+    false
+}
+
 pub enum InstanceAcquireOutcome {
     Acquired(SingleInstanceGuard),
     SignaledRunning,
@@ -377,8 +459,9 @@ pub fn acquire_or_signal_instance(state_dir: &Path) -> anyhow::Result<InstanceAc
     for attempt in 0..INSTANCE_ACQUIRE_ATTEMPTS {
         match SingleInstanceGuard::acquire(state_dir) {
             Ok(guard) => return Ok(InstanceAcquireOutcome::Acquired(guard)),
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                if try_signal_running_instance(state_dir) {
+            Err(err) if is_transient_lock_contention(&err) => {
+                if err.kind() == io::ErrorKind::AddrInUse && try_signal_running_instance(state_dir)
+                {
                     return Ok(InstanceAcquireOutcome::SignaledRunning);
                 }
                 last_lock_err = Some(err);
@@ -404,6 +487,40 @@ pub fn acquire_or_signal_instance(state_dir: &Path) -> anyhow::Result<InstanceAc
             "RustClash Desktop is already running and did not respond to wakeup IPC: {err}"
         )),
         None => Err(anyhow::anyhow!("RustClash Desktop is already running")),
+    }
+}
+
+/// Acquire the single-instance lock during an elevated TUN relaunch handoff.
+///
+/// Unlike [`acquire_or_signal_instance`], this **never** signals the exiting non-elevated instance
+/// and exits; instead it waits up to `timeout` for the previous instance to tear down its engine
+/// and release `SingleInstanceGuard`.
+pub fn acquire_instance_for_relaunch(
+    state_dir: &Path,
+    timeout: Duration,
+) -> anyhow::Result<SingleInstanceGuard> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match SingleInstanceGuard::acquire(state_dir) {
+            Ok(guard) => return Ok(guard),
+            Err(err) if is_transient_lock_contention(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "Timed out waiting for the previous RustClash Desktop instance to exit before elevated TUN handoff: {err}"
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(remaining.min(RELAUNCH_LOCK_POLL_INTERVAL));
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to acquire RustClash single-instance lock during elevated relaunch in '{}': {err}",
+                    state_dir.display()
+                ));
+            }
+        }
     }
 }
 
@@ -437,6 +554,7 @@ pub struct DesktopAppState {
     instance_guard: Arc<Mutex<Option<SingleInstanceGuard>>>,
     wakeup_server: Arc<Mutex<Option<DesktopWakeupServer>>>,
     ipc_path: Option<PathBuf>,
+    relaunch_in_progress: Arc<AtomicBool>,
     _shutdown_tx: watch::Sender<bool>,
 }
 
@@ -501,12 +619,56 @@ impl DesktopAppState {
                 anyhow::bail!("RustClash Desktop is already running: {detail}");
             }
         };
-        Self::bootstrap_with_guard(state_dir, guard).await
+        Self::bootstrap_with_guard_options(state_dir, guard, DesktopLaunchOptions::default()).await
     }
 
-    async fn bootstrap_with_guard(
+    /// Hermetic production launcher rooted at an explicit `state_dir` with explicit launch options.
+    pub async fn bootstrap_in_state_dir_with_options(
+        state_dir: PathBuf,
+        options: DesktopLaunchOptions,
+    ) -> anyhow::Result<Self> {
+        let guard = if options.relaunch_enable_tun {
+            acquire_instance_for_relaunch(&state_dir, RELAUNCH_LOCK_TIMEOUT)?
+        } else {
+            let mut last_err: Option<io::Error> = None;
+            let mut acquired: Option<SingleInstanceGuard> = None;
+            for attempt in 0..INSTANCE_ACQUIRE_ATTEMPTS {
+                match SingleInstanceGuard::acquire(&state_dir) {
+                    Ok(g) => {
+                        acquired = Some(g);
+                        break;
+                    }
+                    Err(e) if is_transient_lock_contention(&e) => {
+                        last_err = Some(e);
+                        if attempt + 1 < INSTANCE_ACQUIRE_ATTEMPTS {
+                            tokio::time::sleep(INSTANCE_RETRY_DELAY).await;
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to acquire instance lock in '{}': {e}",
+                            state_dir.display()
+                        ));
+                    }
+                }
+            }
+            match acquired {
+                Some(g) => g,
+                None => {
+                    let detail = last_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "lock busy".to_string());
+                    anyhow::bail!("RustClash Desktop is already running: {detail}");
+                }
+            }
+        };
+        Self::bootstrap_with_guard_options(state_dir, guard, options).await
+    }
+
+    async fn bootstrap_with_guard_options(
         state_dir: PathBuf,
         instance_guard: SingleInstanceGuard,
+        options: DesktopLaunchOptions,
     ) -> anyhow::Result<Self> {
         let _ = recover_stale_network_state(&state_dir);
         let prefs = DesktopPrefs::load_from(&state_dir);
@@ -542,6 +704,11 @@ impl DesktopAppState {
             },
             None => (ClashConfig::default(), None),
         };
+
+        if options.relaunch_enable_tun {
+            cfg.tun.enable = true;
+            cfg.tun.auto_route = true;
+        }
 
         // Prevent non-admin / missing-driver TUN configs from crashing desktop startup!
         if cfg.tun.enable && cfg.tun.auto_route {
@@ -616,6 +783,16 @@ impl DesktopAppState {
         if let Some(mgr) = profile_mgr {
             engine.attach_profile_manager(mgr);
         }
+        if options.preserve_sysproxy {
+            let port = engine.mixed_addr().port();
+            let host = resolve_sysproxy_connect_host(&engine.config_snapshot());
+            if let Err(err) = enable_system_proxy(&host, port, &[], &state_dir) {
+                startup_warnings.push(format!(
+                    "Failed restoring OS System Proxy after elevated relaunch ({}).",
+                    redact_sensitive_text(&err.to_string())
+                ));
+            }
+        }
         for warn_msg in startup_warnings {
             tracing::warn!("{warn_msg}");
             engine.hub().push_log("warn", warn_msg);
@@ -641,6 +818,7 @@ impl DesktopAppState {
             instance_guard: Arc::new(Mutex::new(Some(instance_guard))),
             wakeup_server: Arc::new(Mutex::new(wakeup_srv)),
             ipc_path,
+            relaunch_in_progress: Arc::new(AtomicBool::new(false)),
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -649,12 +827,21 @@ impl DesktopAppState {
     pub async fn bootstrap_demo() -> anyhow::Result<Self> {
         let state_dir = default_state_dir();
         let guard = SingleInstanceGuard::acquire(&state_dir).ok();
-        Self::bootstrap_demo_with_guard(state_dir, guard).await
+        Self::bootstrap_demo_with_guard_options(
+            state_dir,
+            guard,
+            DesktopLaunchOptions {
+                use_demo: true,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
-    async fn bootstrap_demo_with_guard(
+    async fn bootstrap_demo_with_guard_options(
         state_dir: PathBuf,
         instance_guard: Option<SingleInstanceGuard>,
+        options: DesktopLaunchOptions,
     ) -> anyhow::Result<Self> {
         let prefs = DesktopPrefs::load_from(&state_dir);
         let wakeup_srv = if instance_guard.is_some() {
@@ -691,6 +878,24 @@ impl DesktopAppState {
         if let Ok(profile_mgr) = ProfileManager::open_or_init(&state_dir) {
             engine.attach_profile_manager(profile_mgr);
         }
+        if options.relaunch_enable_tun
+            && let Err(err) = engine.set_tun_active(true).await
+        {
+            tracing::warn!(
+                "Failed auto-enabling System TUN after elevated demo relaunch: {}",
+                redact_sensitive_text(&err.to_string())
+            );
+        }
+        if options.preserve_sysproxy {
+            let port = engine.mixed_addr().port();
+            let host = resolve_sysproxy_connect_host(&engine.config_snapshot());
+            if let Err(err) = enable_system_proxy(&host, port, &[], &state_dir) {
+                tracing::warn!(
+                    "Failed restoring OS System Proxy after elevated demo relaunch: {}",
+                    redact_sensitive_text(&err.to_string())
+                );
+            }
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (api_addr, _task) = match spawn_api_server(
             "127.0.0.1:9090",
@@ -713,8 +918,19 @@ impl DesktopAppState {
             instance_guard: Arc::new(Mutex::new(instance_guard)),
             wakeup_server: Arc::new(Mutex::new(wakeup_srv)),
             ipc_path,
+            relaunch_in_progress: Arc::new(AtomicBool::new(false)),
             _shutdown_tx: shutdown_tx,
         })
+    }
+
+    pub fn try_begin_elevated_relaunch(&self) -> bool {
+        self.relaunch_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn cancel_elevated_relaunch(&self) {
+        self.relaunch_in_progress.store(false, Ordering::Release);
     }
 
     pub fn prefs(&self) -> DesktopPrefs {
@@ -780,27 +996,255 @@ impl DesktopAppState {
     }
 }
 
+/// Result returned to the desktop UI when requesting an automatic UAC elevated relaunch for TUN.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElevatedRelaunchOutcome {
+    /// One of `"relaunching"`, `"cancelled"`, `"already_elevated"`, or `"unsupported"`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsUacSpawnOutcome {
+    Launched,
+    Cancelled,
+}
+
+#[cfg(windows)]
+fn to_wide_nul(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn spawn_elevated_relaunch_windows(
+    exe_path: &Path,
+    args: &[&str],
+) -> Result<WindowsUacSpawnOutcome, String> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_CANCELLED, GetLastError},
+        System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        },
+        UI::{
+            Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW},
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
+    };
+
+    struct ComInitGuard(bool);
+    impl Drop for ComInitGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: `CoUninitialize` is paired strictly with a preceding `CoInitializeEx`
+                // call on the same dedicated OS thread that returned `S_OK` / `S_FALSE` (`hr >= 0`).
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let clean_exe = strip_windows_verbatim_prefix(exe_path);
+    let verb_w = to_wide_nul("runas");
+    let file_w = to_wide_nul(&clean_exe.to_string_lossy());
+    let params_joined = args.join(" ");
+    let params_w = to_wide_nul(&params_joined);
+    let dir_w = clean_exe
+        .parent()
+        .map(|p| to_wide_nul(&p.to_string_lossy()));
+
+    // SAFETY: Initialize STA COM on this dedicated short-lived thread as recommended by MSDN
+    // before invoking `ShellExecuteExW`; `ComInitGuard` balances `CoUninitialize` on return.
+    let hr = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    let _com_guard = ComInitGuard(hr >= 0);
+
+    // SAFETY: `SHELLEXECUTEINFOW` is zero-initialized with `cbSize` set to its exact size, and
+    // all UTF-16 NUL-terminated string buffers (`verb_w`, `file_w`, `params_w`, `dir_w`) remain
+    // pinned and live for the entire duration of `ShellExecuteExW`.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_FLAG_NO_UI;
+    info.lpVerb = verb_w.as_ptr();
+    info.lpFile = file_w.as_ptr();
+    info.lpParameters = if params_joined.is_empty() {
+        std::ptr::null()
+    } else {
+        params_w.as_ptr()
+    };
+    info.lpDirectory = dir_w.as_ref().map_or(std::ptr::null(), |buf| buf.as_ptr());
+    info.nShow = SW_SHOWNORMAL;
+
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok != 0 {
+        return Ok(WindowsUacSpawnOutcome::Launched);
+    }
+    let err_code = unsafe { GetLastError() };
+    if err_code == ERROR_CANCELLED {
+        return Ok(WindowsUacSpawnOutcome::Cancelled);
+    }
+    Err(format!(
+        "Windows UAC elevation launch failed (Win32 error {err_code})"
+    ))
+}
+
+/// Validates TUN driver/privilege preflight and, on Windows, triggers a UAC `"runas"` relaunch of
+/// the current executable with `--relaunch-enable-tun` (and optional `--preserve-sysproxy`).
+///
+/// Returns `(outcome, should_exit_current_instance)` where `should_exit_current_instance` is
+/// `true` strictly for the single call that spawned the elevated replacement process.
+pub async fn prepare_and_spawn_elevated_tun_relaunch(
+    state: &DesktopAppState,
+    preserve_sysproxy: Option<bool>,
+) -> Result<(ElevatedRelaunchOutcome, bool), String> {
+    let cfg = state.engine.config_snapshot();
+    let pf = preflight_system_tun(cfg.tun.wintun_path.as_deref().map(Path::new));
+    if pf.privilege_ok {
+        return Ok((
+            ElevatedRelaunchOutcome {
+                status: "already_elevated".to_string(),
+                message: None,
+            },
+            false,
+        ));
+    }
+    if !pf.driver_loaded {
+        return Err(pf
+            .privilege_hint
+            .unwrap_or_else(|| "System TUN driver is unavailable".to_string()));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = preserve_sysproxy;
+        Ok((
+            ElevatedRelaunchOutcome {
+                status: "unsupported".to_string(),
+                message: pf.privilege_hint,
+            },
+            false,
+        ))
+    }
+
+    #[cfg(windows)]
+    {
+        if !state.try_begin_elevated_relaunch() {
+            return Ok((
+                ElevatedRelaunchOutcome {
+                    status: "relaunching".to_string(),
+                    message: Some("Administrator relaunch is already in progress".to_string()),
+                },
+                false,
+            ));
+        }
+
+        let keep_sysproxy = preserve_sysproxy
+            .unwrap_or_else(|| query_sysproxy_status(&state.engine.state_dir()).enabled);
+        let opts = DesktopLaunchOptions {
+            use_demo: state.engine.demo_info().enabled,
+            relaunch_enable_tun: true,
+            preserve_sysproxy: keep_sysproxy,
+        };
+        let args = build_elevated_relaunch_args(&opts);
+        let exe_path = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(err) => {
+                state.cancel_elevated_relaunch();
+                return Err(format!("Failed resolving current executable path: {err}"));
+            }
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawn_res = std::thread::Builder::new()
+            .name("rc-uac-relaunch".to_string())
+            .spawn(move || {
+                let res = spawn_elevated_relaunch_windows(&exe_path, &args);
+                let _ = tx.send(res);
+            });
+        if let Err(err) = spawn_res {
+            state.cancel_elevated_relaunch();
+            return Err(format!(
+                "Failed starting UAC elevation worker thread: {err}"
+            ));
+        }
+
+        match rx.await {
+            Ok(Ok(WindowsUacSpawnOutcome::Launched)) => Ok((
+                ElevatedRelaunchOutcome {
+                    status: "relaunching".to_string(),
+                    message: None,
+                },
+                true,
+            )),
+            Ok(Ok(WindowsUacSpawnOutcome::Cancelled)) => {
+                state.cancel_elevated_relaunch();
+                Ok((
+                    ElevatedRelaunchOutcome {
+                        status: "cancelled".to_string(),
+                        message: None,
+                    },
+                    false,
+                ))
+            }
+            Ok(Err(err)) => {
+                state.cancel_elevated_relaunch();
+                Err(err)
+            }
+            Err(_) => {
+                state.cancel_elevated_relaunch();
+                Err("UAC elevation worker thread terminated unexpectedly".to_string())
+            }
+        }
+    }
+}
+
 /// Unified desktop application entry point handling single-instance wakeup IPC (`rust-clash.desktop.ipc`),
 /// close-then-immediately-reopen teardown retries, resilient engine bootstrap, and Tauri / headless execution.
 pub fn run_desktop_app(rt: &tokio::runtime::Runtime, use_demo: bool) -> anyhow::Result<()> {
+    run_desktop_app_with_options(
+        rt,
+        DesktopLaunchOptions {
+            use_demo,
+            ..Default::default()
+        },
+    )
+}
+
+/// Unified desktop application entry point with explicit [`DesktopLaunchOptions`] (including
+/// elevated TUN relaunch handoff `--relaunch-enable-tun` and `--preserve-sysproxy`).
+pub fn run_desktop_app_with_options(
+    rt: &tokio::runtime::Runtime,
+    options: DesktopLaunchOptions,
+) -> anyhow::Result<()> {
     let state_dir = default_state_dir();
-    let guard = match acquire_or_signal_instance(&state_dir)? {
-        InstanceAcquireOutcome::SignaledRunning => {
-            tracing::info!(
-                "Signaled existing RustClash Desktop instance to restore main window; exiting launcher."
-            );
-            return Ok(());
+    let guard = if options.relaunch_enable_tun {
+        acquire_instance_for_relaunch(&state_dir, RELAUNCH_LOCK_TIMEOUT)?
+    } else {
+        match acquire_or_signal_instance(&state_dir)? {
+            InstanceAcquireOutcome::SignaledRunning => {
+                tracing::info!(
+                    "Signaled existing RustClash Desktop instance to restore main window; exiting launcher."
+                );
+                return Ok(());
+            }
+            InstanceAcquireOutcome::Acquired(guard) => guard,
         }
-        InstanceAcquireOutcome::Acquired(guard) => guard,
     };
 
-    let state = if use_demo {
-        rt.block_on(DesktopAppState::bootstrap_demo_with_guard(
+    let state = if options.use_demo {
+        rt.block_on(DesktopAppState::bootstrap_demo_with_guard_options(
             state_dir,
             Some(guard),
+            options,
         ))?
     } else {
-        rt.block_on(DesktopAppState::bootstrap_with_guard(state_dir, guard))?
+        rt.block_on(DesktopAppState::bootstrap_with_guard_options(
+            state_dir, guard, options,
+        ))?
     };
 
     #[cfg(feature = "desktop")]
@@ -977,7 +1421,6 @@ mod desktop_ipc {
     use proxy_core::{
         config::RunMode,
         outbound::vless::encryption::{config::XorMode, generate_vless_encryption_pair},
-        platform::sysproxy::enable_system_proxy,
     };
     use tauri::{
         Emitter, Manager, RunEvent, State, WindowEvent,
@@ -1096,6 +1539,26 @@ mod desktop_ipc {
         Ok(mgr.status())
     }
 
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn relaunch_elevated_for_tun(
+        app: tauri::AppHandle,
+        state: State<'_, DesktopAppState>,
+        preserve_sysproxy: Option<bool>,
+    ) -> Result<ElevatedRelaunchOutcome, String> {
+        let (outcome, should_exit) =
+            prepare_and_spawn_elevated_tun_relaunch(state.inner(), preserve_sysproxy).await?;
+        if should_exit {
+            let exit_state = state.inner().clone();
+            let exit_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                exit_state.shutdown();
+                exit_app.exit(0);
+            });
+        }
+        Ok(outcome)
+    }
+
     pub(crate) fn show_and_focus_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.set_skip_taskbar(false);
@@ -1201,10 +1664,46 @@ mod desktop_ipc {
                     }
                 }
                 "toggle_tun" => {
+                    let tray_state = state.clone();
                     let eng = Arc::clone(&state.engine);
                     let handle_clone = app_handle.clone();
                     let target = !eng.is_tun_active();
                     tauri::async_runtime::spawn(async move {
+                        #[cfg(windows)]
+                        if target {
+                            let cfg = eng.config_snapshot();
+                            let pf =
+                                preflight_system_tun(cfg.tun.wintun_path.as_deref().map(Path::new));
+                            if pf.driver_loaded && !pf.privilege_ok {
+                                match prepare_and_spawn_elevated_tun_relaunch(&tray_state, None)
+                                    .await
+                                {
+                                    Ok((outcome, should_exit)) => {
+                                        if should_exit {
+                                            tokio::time::sleep(Duration::from_millis(120)).await;
+                                            tray_state.shutdown();
+                                            handle_clone.exit(0);
+                                        } else if outcome.status == "cancelled"
+                                            || outcome.status == "relaunching"
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        report_tray_error(
+                                            &handle_clone,
+                                            &eng,
+                                            "System TUN administrator relaunch failed",
+                                            err,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        let _ = &tray_state;
+
                         if let Err(err) = eng.set_tun_active(target).await {
                             report_tray_error(
                                 &handle_clone,
@@ -1322,6 +1821,7 @@ mod desktop_ipc {
                 reload_config_yaml,
                 set_system_proxy,
                 set_start_at_login,
+                relaunch_elevated_for_tun,
             ])
             .build(tauri::generate_context!())
             .map_err(|e| anyhow::anyhow!("Tauri build error: {e}"))?;
@@ -1605,6 +2105,170 @@ mod tests {
         );
         recovered_state.shutdown();
 
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn desktop_launch_options_parses_relaunch_flags_and_builds_allowlisted_args() {
+        use super::{
+            ARG_DEMO, ARG_PRESERVE_SYSPROXY, ARG_RELAUNCH_ENABLE_TUN, DesktopLaunchOptions,
+            build_elevated_relaunch_args, parse_desktop_launch_options,
+        };
+
+        let parsed = parse_desktop_launch_options(
+            [
+                "--relaunch-enable-tun",
+                "--preserve-sysproxy",
+                "--ignored-extra-arg",
+            ],
+            false,
+        );
+        assert_eq!(
+            parsed,
+            DesktopLaunchOptions {
+                use_demo: false,
+                relaunch_enable_tun: true,
+                preserve_sysproxy: true,
+            }
+        );
+        assert_eq!(
+            build_elevated_relaunch_args(&parsed),
+            vec![ARG_RELAUNCH_ENABLE_TUN, ARG_PRESERVE_SYSPROXY]
+        );
+
+        let demo_parsed = parse_desktop_launch_options(["--relaunch-enable-tun"], true);
+        assert!(demo_parsed.use_demo);
+        assert_eq!(
+            build_elevated_relaunch_args(&demo_parsed),
+            vec![ARG_RELAUNCH_ENABLE_TUN, ARG_DEMO]
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_normalizes_drive_and_unc_paths() {
+        use super::strip_windows_verbatim_prefix;
+        use std::path::Path;
+
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(
+                r"\\?\C:\Program Files\RustClash\rust-clash-desktop.exe"
+            )),
+            PathBuf::from(r"C:\Program Files\RustClash\rust-clash-desktop.exe")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\filesrv\share\rust-clash.exe")),
+            PathBuf::from(r"\\filesrv\share\rust-clash.exe")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new("/usr/local/bin/rust-clash-desktop")),
+            PathBuf::from("/usr/local/bin/rust-clash-desktop")
+        );
+    }
+
+    #[test]
+    fn acquire_instance_for_relaunch_waits_for_old_instance_release_without_signaling() {
+        use super::acquire_instance_for_relaunch;
+        use std::time::Duration;
+
+        let temp_dir = unique_temp_dir("relaunch-handoff");
+        let guard = SingleInstanceGuard::acquire(&temp_dir).expect("acquire initial lock");
+        let mut server =
+            DesktopWakeupServer::bind_in_state_dir(&temp_dir).expect("bind wakeup server");
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let wakeups_cb = Arc::clone(&wakeups);
+        server.register_callback(move || {
+            wakeups_cb.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(260));
+            server.stop();
+            drop(guard);
+        });
+
+        let acquired = acquire_instance_for_relaunch(&temp_dir, Duration::from_secs(3))
+            .expect("relaunch handoff must wait for old instance and acquire lock");
+        releaser.join().expect("join releaser thread");
+
+        assert_eq!(
+            wakeups.load(Ordering::SeqCst),
+            0,
+            "relaunch handoff must NEVER wake-and-exit against the shutting-down non-elevated instance"
+        );
+        drop(acquired);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn acquire_instance_for_relaunch_times_out_cleanly_when_lock_stays_held() {
+        use super::acquire_instance_for_relaunch;
+        use std::time::Duration;
+
+        let temp_dir = unique_temp_dir("relaunch-timeout");
+        let _guard = SingleInstanceGuard::acquire(&temp_dir).expect("hold lock");
+
+        let err = match acquire_instance_for_relaunch(&temp_dir, Duration::from_millis(180)) {
+            Ok(_) => panic!("must time out cleanly if previous instance never releases lock"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Timed out waiting"),
+            "unexpected timeout error: {err}"
+        );
+        drop(_guard);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn relaunch_enable_tun_without_privilege_safely_opens_in_userspace_mode() {
+        use super::{DesktopLaunchOptions, prepare_and_spawn_elevated_tun_relaunch};
+
+        let temp_dir = unique_temp_dir("relaunch-unpriv");
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&temp_dir)
+            .expect("init profile manager");
+        fs::write(
+            mgr.active_profile_path(),
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("write profile");
+        drop(mgr);
+
+        let state = DesktopAppState::bootstrap_in_state_dir_with_options(
+            temp_dir.clone(),
+            DesktopLaunchOptions {
+                use_demo: false,
+                relaunch_enable_tun: true,
+                preserve_sysproxy: false,
+            },
+        )
+        .await
+        .expect("relaunch_enable_tun must never crash startup when unprivileged");
+
+        assert!(state.try_begin_elevated_relaunch());
+        assert!(!state.try_begin_elevated_relaunch());
+        state.cancel_elevated_relaunch();
+        assert!(state.try_begin_elevated_relaunch());
+        state.cancel_elevated_relaunch();
+
+        #[cfg(not(windows))]
+        {
+            // On non-Windows CI (e.g. Linux without CAP_NET_ADMIN), helper returns unsupported or already_elevated cleanly.
+            let res = prepare_and_spawn_elevated_tun_relaunch(&state, Some(false)).await;
+            if let Ok((outcome, should_exit)) = res {
+                assert!(!should_exit);
+                assert!(
+                    outcome.status == "unsupported" || outcome.status == "already_elevated",
+                    "unexpected non-Windows status: {:?}",
+                    outcome
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = prepare_and_spawn_elevated_tun_relaunch;
+        }
+
+        state.shutdown();
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

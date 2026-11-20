@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use proxy_core::{config::uri::redact_sensitive_text, platform::recovery::default_state_dir};
 use rust_clash_tauri_lib::{
-    parse_elevated_tun_helper_args, run_desktop_app, run_elevated_tun_helper,
-    write_startup_crash_log,
+    parse_desktop_launch_options, parse_elevated_tun_helper_args, run_desktop_app_with_options,
+    run_elevated_tun_helper, write_startup_crash_log,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -17,10 +17,10 @@ fn run_entry(rt: &tokio::runtime::Runtime, raw_args: &[String]) -> anyhow::Resul
         return rt.block_on(run_elevated_tun_helper(&cfg_path));
     }
 
-    let use_demo = raw_args.iter().any(|a| a == "--demo")
-        || std::env::var("RUST_CLASH_DEMO").as_deref() == Ok("1");
+    let demo_env = std::env::var("RUST_CLASH_DEMO").as_deref() == Ok("1");
+    let options = parse_desktop_launch_options(raw_args, demo_env);
 
-    run_desktop_app(rt, use_demo)
+    run_desktop_app_with_options(rt, options)
 }
 
 fn report_fatal_error(err: &anyhow::Error) {

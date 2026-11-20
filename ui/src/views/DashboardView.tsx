@@ -3,7 +3,9 @@ import {
   ApiHttpError,
   clashApi,
   fetchExitIp,
+  isTauriDesktop,
   patchConfig,
+  relaunchElevatedForTun,
   setSysProxy,
   testProxyDelay,
 } from "../api";
@@ -115,6 +117,17 @@ function isTunPrivilegeFailure(
     return true;
   }
   return privilegeOk === false && err instanceof ApiHttpError;
+}
+
+function canAutoElevateWindowsTun(config: ConfigSnapshot | null): boolean {
+  const h = config?.tun.health;
+  return Boolean(
+    isTauriDesktop() &&
+      h &&
+      h.platform === "windows" &&
+      h.driver_loaded &&
+      !h.privilege_ok,
+  );
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -350,6 +363,51 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
   };
 
+  const tryAutoElevateWindowsTun = async (
+    preserveSysproxy: boolean,
+  ): Promise<"relaunching" | "cancelled" | "fallback" | "error"> => {
+    try {
+      const outcome = await relaunchElevatedForTun(preserveSysproxy);
+      if (outcome.status === "relaunching") {
+        saveTakeoverPref({ sysproxy: preserveSysproxy, tun: true });
+        setTunPrivilegeHint(null);
+        setToast({
+          ok: true,
+          text: tr(
+            "已同意管理员授权，正在提权重启并自动开启 TUN...",
+            "Administrator access granted — restarting elevated and enabling TUN...",
+          ),
+        });
+        return "relaunching";
+      }
+      if (outcome.status === "cancelled") {
+        setToast({
+          ok: true,
+          text: tr(
+            "已取消管理员授权，TUN 未开启（日常上网可直接开启系统代理）",
+            "Administrator prompt cancelled — TUN remains off (use System Proxy for non-admin browsing).",
+          ),
+        });
+        return "cancelled";
+      }
+      return "fallback";
+    } catch (elevErr) {
+      const msg = elevErr instanceof Error ? elevErr.message : String(elevErr);
+      setToast({
+        ok: false,
+        text: tr(
+          `请求管理员提权失败：${msg}`,
+          `Failed to request Administrator elevation: ${msg}`,
+        ),
+      });
+      const hint = config?.tun.health?.privilege_hint;
+      if (hint) {
+        setTunPrivilegeHint(hint);
+      }
+      return "error";
+    }
+  };
+
   const handleMasterToggle = async () => {
     if (busyKey) return;
     if (
@@ -401,6 +459,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           throw stepErr;
         }
       } else {
+        // On non-elevated Windows Desktop with Wintun present, trigger UAC relaunch BEFORE
+        // toggling system proxy so cancelling UAC leaves the current session untouched.
+        if (
+          plan.targetTun &&
+          !tunEnabled &&
+          canAutoElevateWindowsTun(config)
+        ) {
+          const elev = await tryAutoElevateWindowsTun(
+            Boolean(plan.targetSysproxy),
+          );
+          if (elev !== "fallback") {
+            return;
+          }
+        }
+
         // Predictable enable: NEVER mutates `config.mode` (`Rule` / `Global` / `Direct`)
         let sysproxyTurnedOn = false;
         try {
@@ -482,6 +555,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     setToast(null);
     void (async () => {
       try {
+        if (nextEnable && canAutoElevateWindowsTun(config)) {
+          const elev = await tryAutoElevateWindowsTun(sysproxyEnabled);
+          if (elev !== "fallback") {
+            return;
+          }
+        }
         await patchConfig({ tun: { enable: nextEnable } });
         if (sysproxyEnabled || nextEnable) {
           saveTakeoverPref({ sysproxy: sysproxyEnabled, tun: nextEnable });
@@ -751,13 +830,25 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </strong>
             {tunPrivilegeHint}
           </span>
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={() => setTunPrivilegeHint(null)}
-          >
-            {tr("关闭", "Close")}
-          </button>
+          <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+            {canAutoElevateWindowsTun(config) && (
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                disabled={Boolean(busyKey)}
+                onClick={handleTunSwitch}
+              >
+                {tr("提权重启并开启 TUN", "Restart as Admin & Enable TUN")}
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => setTunPrivilegeHint(null)}
+            >
+              {tr("关闭", "Close")}
+            </button>
+          </div>
         </div>
       )}
 
@@ -951,7 +1042,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               />
             </div>
 
-            <div className="hero-takeover-pill">
+            <div
+              className="hero-takeover-pill"
+              title={
+                canAutoElevateWindowsTun(config) && !tunEnabled
+                  ? tr(
+                      "点击后将弹出 Windows 管理员授权（UAC），同意后自动重启并开启 TUN",
+                      "Clicking will prompt Windows Administrator elevation (UAC) and automatically restart with TUN enabled",
+                    )
+                  : undefined
+              }
+            >
               <span className="hero-takeover-label">
                 {tr("TUN 网卡", "TUN Mode")}
               </span>
