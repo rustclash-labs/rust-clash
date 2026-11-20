@@ -629,6 +629,9 @@ impl DesktopAppState {
                 Ok(bound) => bound,
                 Err(_) => spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx).await?,
             };
+        if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
+            tracing::warn!("Failed writing runtime controller discovery file: {err}");
+        }
 
         Ok(Self {
             engine,
@@ -699,6 +702,9 @@ impl DesktopAppState {
             Ok(bound) => bound,
             Err(_) => spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx).await?,
         };
+        if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
+            tracing::warn!("Failed writing runtime controller discovery file (demo): {err}");
+        }
         Ok(Self {
             engine,
             api_addr,
@@ -942,6 +948,9 @@ pub async fn run_elevated_tun_helper(config_path: &std::path::Path) -> anyhow::R
             Ok(bound) => bound,
             Err(_) => spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx).await?,
         };
+    if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
+        tracing::warn!("Failed writing runtime controller discovery file (elevated helper): {err}");
+    }
     let api_base_url = format_http_base_url(api_addr);
     tracing::info!(
         mixed_listen = %engine.mixed_addr(),
@@ -1536,14 +1545,19 @@ mod tests {
 
         assert!(temp_dir.join(DESKTOP_IPC_FILENAME).exists());
         assert!(temp_dir.join("rust-clash.instance.lock").exists());
+        let expected_secret = state
+            .status()
+            .api_secret
+            .clone()
+            .expect("desktop bootstrap must populate ephemeral api_secret");
         assert!(
-            state
-                .status()
-                .api_secret
-                .as_deref()
-                .is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            expected_secret.len() == 64 && expected_secret.chars().all(|c| c.is_ascii_hexdigit()),
             "desktop bootstrap must populate a 256-bit ephemeral api_secret when config omits secret"
         );
+        let disc = proxy_core::platform::recovery::read_controller_discovery(&temp_dir)
+            .expect("desktop bootstrap must publish rust-clash.controller.json");
+        assert_eq!(disc.pid, std::process::id());
+        assert_eq!(disc.secret.as_deref(), Some(expected_secret.as_str()));
         assert!(state.prefs().close_to_tray);
         state
             .set_close_to_tray(false)
@@ -1555,6 +1569,12 @@ mod tests {
         assert!(
             !temp_dir.join(DESKTOP_IPC_FILENAME).exists(),
             "shutdown() must remove rust-clash.desktop.ipc"
+        );
+        assert!(
+            !temp_dir
+                .join(proxy_core::platform::recovery::CONTROLLER_DISCOVERY_FILENAME)
+                .exists(),
+            "shutdown() must remove rust-clash.controller.json"
         );
         assert!(
             !temp_dir.join("rust-clash.instance.lock").exists(),

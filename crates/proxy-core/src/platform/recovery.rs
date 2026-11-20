@@ -1,7 +1,9 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -9,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 const JOURNAL_FILENAME: &str = "network_recovery.json";
 const LOCK_FILENAME: &str = "rust-clash.instance.lock";
+pub const CONTROLLER_DISCOVERY_FILENAME: &str = "rust-clash.controller.json";
+const MAX_CONTROLLER_DISCOVERY_BYTES: u64 = 16 * 1024;
+static DISCOVERY_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Resolve the persistent application state directory used for `network_recovery.json`,
 /// single-instance PID lockfiles, and managed profiles.
@@ -1014,6 +1019,212 @@ fn default_command_runner(program: &str, args: &[String]) -> io::Result<()> {
     }
 }
 
+/// Runtime control-plane discovery metadata written to `state_dir/rust-clash.controller.json`
+/// so local tools such as `rust-clash mcp` can auto-discover the bound loopback port and active
+/// (potentially ephemeral) Bearer secret of a running desktop or CLI daemon.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerRuntimeEndpoint {
+    pub pid: u32,
+    pub addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+fn canonical_discovery_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
+/// Normalize a bound API listener [`SocketAddr`] to a dialable loopback `host:port` string
+/// suitable for local discovery. Returns `None` for explicit non-loopback LAN bind addresses
+/// so discovery metadata is strictly restricted to loopback control planes.
+pub fn normalize_loopback_controller_addr(addr: SocketAddr) -> Option<String> {
+    if addr.port() == 0 {
+        return None;
+    }
+    let ip = canonical_discovery_ip(addr.ip());
+    if ip.is_unspecified() {
+        return match ip {
+            IpAddr::V4(_) => Some(format!("127.0.0.1:{}", addr.port())),
+            IpAddr::V6(_) => Some(format!("[::1]:{}", addr.port())),
+        };
+    }
+    if ip.is_loopback() {
+        return match ip {
+            IpAddr::V4(v4) => Some(format!("{v4}:{}", addr.port())),
+            IpAddr::V6(v6) => Some(format!("[{v6}]:{}", addr.port())),
+        };
+    }
+    None
+}
+
+/// Validate that a raw `host:port` string parses cleanly as a loopback [`SocketAddr`] with a non-zero port.
+pub fn is_loopback_controller_addr(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Ok(sock) = trimmed.parse::<SocketAddr>() else {
+        return false;
+    };
+    sock.port() != 0 && canonical_discovery_ip(sock.ip()).is_loopback()
+}
+
+pub fn controller_discovery_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(CONTROLLER_DISCOVERY_FILENAME)
+}
+
+/// Atomically persist [`ControllerRuntimeEndpoint`] to `state_dir/rust-clash.controller.json`
+/// with strict symlink checks, loopback-only validation, and Unix `0o600` file permissions.
+pub fn write_controller_discovery(
+    state_dir: &Path,
+    endpoint: &ControllerRuntimeEndpoint,
+) -> io::Result<()> {
+    if state_dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if endpoint.pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "controller discovery pid must be non-zero",
+        ));
+    }
+    if !is_loopback_controller_addr(&endpoint.addr) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "controller discovery addr must be a loopback host:port",
+        ));
+    }
+
+    fs::create_dir_all(state_dir)?;
+    let final_path = controller_discovery_path(state_dir);
+    if let Ok(meta) = fs::symlink_metadata(&final_path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to overwrite symlink controller discovery file '{}'",
+                final_path.display()
+            ),
+        ));
+    }
+
+    let normalized = ControllerRuntimeEndpoint {
+        pid: endpoint.pid,
+        addr: endpoint.addr.trim().to_string(),
+        secret: endpoint
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string),
+    };
+    let serialized = serde_json::to_vec_pretty(&normalized).map_err(io::Error::other)?;
+
+    let seq = DISCOVERY_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = state_dir.join(format!(
+        "{CONTROLLER_DISCOVERY_FILENAME}.tmp.{}.{seq}",
+        std::process::id()
+    ));
+
+    let write_res: io::Result<()> = (|| {
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(&serialized)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    // Re-check destination symlink immediately prior to rename.
+    if let Ok(meta) = fs::symlink_metadata(&final_path)
+        && meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to replace symlink controller discovery file '{}'",
+                final_path.display()
+            ),
+        ));
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Read and validate `state_dir/rust-clash.controller.json`, rejecting symlinks, non-files,
+/// oversized payloads, or non-loopback target addresses.
+pub fn read_controller_discovery(state_dir: &Path) -> Option<ControllerRuntimeEndpoint> {
+    if state_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let path = controller_discovery_path(state_dir);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if meta.file_type().is_symlink()
+        || !meta.file_type().is_file()
+        || meta.len() == 0
+        || meta.len() > MAX_CONTROLLER_DISCOVERY_BYTES
+    {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    let mut parsed: ControllerRuntimeEndpoint = serde_json::from_str(&raw).ok()?;
+    if parsed.pid == 0 || !is_loopback_controller_addr(&parsed.addr) {
+        return None;
+    }
+    parsed.addr = parsed.addr.trim().to_string();
+    parsed.secret = parsed
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    Some(parsed)
+}
+
+/// Remove `state_dir/rust-clash.controller.json` strictly when it is a regular file whose
+/// recorded `pid` matches `expected_pid`, avoiding races with a newly launched replacement daemon.
+pub fn cleanup_controller_discovery(state_dir: &Path, expected_pid: u32) {
+    if state_dir.as_os_str().is_empty() || expected_pid == 0 {
+        return;
+    }
+    let path = controller_discovery_path(state_dir);
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return;
+    }
+    if let Some(ep) = read_controller_discovery(state_dir)
+        && ep.pid == expected_pid
+    {
+        let _ = fs::remove_file(&path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,6 +1511,105 @@ mod tests {
         })
         .unwrap();
         assert!(RecoveryJournal::load_from(&dir).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn controller_discovery_roundtrip_permissions_and_pid_guarded_cleanup() {
+        let dir = std::env::temp_dir().join(format!("rc-ctrl-disc-{}", uuid::Uuid::new_v4()));
+        let my_pid = std::process::id();
+        let ep = ControllerRuntimeEndpoint {
+            pid: my_pid,
+            addr: normalize_loopback_controller_addr("0.0.0.0:19090".parse().unwrap()).unwrap(),
+            secret: Some("ephemeral-secret-abc123".to_string()),
+        };
+        assert_eq!(ep.addr, "127.0.0.1:19090");
+        assert_eq!(
+            normalize_loopback_controller_addr("[::]:19091".parse().unwrap()).as_deref(),
+            Some("[::1]:19091")
+        );
+        assert_eq!(
+            normalize_loopback_controller_addr("192.168.1.50:9090".parse().unwrap()),
+            None
+        );
+
+        write_controller_discovery(&dir, &ep).expect("write discovery");
+        let path = controller_discovery_path(&dir);
+        assert!(path.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "controller discovery file must be 0o600 on Unix"
+            );
+        }
+
+        assert_eq!(read_controller_discovery(&dir), Some(ep.clone()));
+
+        // Cleanup with a non-matching PID must preserve the newer instance's file
+        cleanup_controller_discovery(&dir, my_pid.wrapping_add(9999).max(1));
+        assert_eq!(read_controller_discovery(&dir), Some(ep));
+
+        // Cleanup with matching PID removes the file cleanly
+        cleanup_controller_discovery(&dir, my_pid);
+        assert!(!path.exists());
+        assert_eq!(read_controller_discovery(&dir), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn controller_discovery_rejects_non_loopback_and_symlinks() {
+        let dir = std::env::temp_dir().join(format!("rc-ctrl-disc-sec-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let bad_ep = ControllerRuntimeEndpoint {
+            pid: std::process::id(),
+            addr: "203.0.113.10:9090".to_string(),
+            secret: Some("should-never-write".to_string()),
+        };
+        assert!(write_controller_discovery(&dir, &bad_ep).is_err());
+
+        // Manually write a tampered non-loopback JSON file -> reader must reject it
+        let path = controller_discovery_path(&dir);
+        fs::write(
+            &path,
+            r#"{"pid":1234,"addr":"203.0.113.10:9090","secret":"stolen"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_controller_discovery(&dir), None);
+        let _ = fs::remove_file(&path);
+
+        #[cfg(unix)]
+        {
+            let target = dir.join("decoy.json");
+            fs::write(
+                &target,
+                r#"{"pid":1234,"addr":"127.0.0.1:9090","secret":"decoy"}"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+
+            assert_eq!(
+                read_controller_discovery(&dir),
+                None,
+                "symlink discovery file must never be read"
+            );
+            let good_ep = ControllerRuntimeEndpoint {
+                pid: std::process::id(),
+                addr: "127.0.0.1:9090".to_string(),
+                secret: Some("real-secret".to_string()),
+            };
+            assert!(
+                write_controller_discovery(&dir, &good_ep).is_err(),
+                "symlink discovery file must never be overwritten"
+            );
+            assert!(target.exists());
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

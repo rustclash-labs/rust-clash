@@ -128,15 +128,140 @@ impl ControllerClient {
 }
 
 pub fn load_cli_or_profile_config(config_path: Option<&PathBuf>) -> Result<(ClashConfig, String)> {
+    let state_dir = proxy_core::platform::recovery::default_state_dir();
+    load_cli_or_profile_config_in_state_dir(config_path, &state_dir)
+}
+
+fn load_cli_or_profile_config_in_state_dir(
+    config_path: Option<&PathBuf>,
+    state_dir: &std::path::Path,
+) -> Result<(ClashConfig, String)> {
     if let Some(path) = config_path {
         let cfg = ClashConfig::from_file(path)
             .with_context(|| format!("failed to load config '{}'", path.display()))?;
         return Ok((cfg, format!("file:{}", path.display())));
     }
-    let state_dir = proxy_core::platform::recovery::default_state_dir();
-    let mgr = proxy_core::profile::ProfileManager::open_or_init(&state_dir)?;
+    let mgr = proxy_core::profile::ProfileManager::open_or_init(state_dir)?;
     let (cfg, active_path) = mgr.load_active_config()?;
     Ok((cfg, format!("profile:{}", active_path.display())))
+}
+
+fn normalize_controller_host_port(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    if stripped.is_empty() || stripped.contains('/') || stripped.contains('@') {
+        return None;
+    }
+    if let Some(rest) = stripped.strip_prefix("0.0.0.0:") {
+        return Some(format!("127.0.0.1:{rest}"));
+    }
+    if let Some(rest) = stripped.strip_prefix("[::]:") {
+        return Some(format!("[::1]:{rest}"));
+    }
+    if let Some(rest) = stripped.strip_prefix("localhost:") {
+        return Some(format!("127.0.0.1:{rest}"));
+    }
+    Some(stripped.to_string())
+}
+
+fn same_loopback_endpoint(a: &str, b: &str) -> bool {
+    let Some(na) = normalize_controller_host_port(a) else {
+        return false;
+    };
+    let Some(nb) = normalize_controller_host_port(b) else {
+        return false;
+    };
+    let (Ok(sa), Ok(sb)) = (
+        na.parse::<std::net::SocketAddr>(),
+        nb.parse::<std::net::SocketAddr>(),
+    ) else {
+        return false;
+    };
+    if sa.port() != sb.port() {
+        return false;
+    }
+    let canon = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        std::net::IpAddr::V4(v4) => std::net::IpAddr::V4(v4),
+    };
+    let ca = canon(sa.ip());
+    let cb = canon(sb.ip());
+    ca.is_loopback() && cb.is_loopback() && ca == cb
+}
+
+pub fn resolve_controller_clients_in_state_dir(
+    state_dir: &std::path::Path,
+    explicit_controller: Option<&str>,
+    explicit_secret: Option<&str>,
+    fallback_cfg: Option<&ClashConfig>,
+) -> Vec<ControllerClient> {
+    let env_secret = std::env::var("RUST_CLASH_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let explicit_or_env_secret = explicit_secret
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(env_secret);
+    let cfg_secret = fallback_cfg
+        .and_then(|c| c.secret.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let discovery = proxy_core::platform::recovery::read_controller_discovery(state_dir);
+
+    let mut out = Vec::new();
+    let mut push_unique = |host: &str, secret: Option<String>| {
+        if let Ok(client) = ControllerClient::new(host, secret)
+            && !out.iter().any(|existing: &ControllerClient| {
+                existing.host_port == client.host_port && existing.secret == client.secret
+            })
+        {
+            out.push(client);
+        }
+    };
+
+    if let Some(explicit_raw) = explicit_controller.map(str::trim).filter(|s| !s.is_empty()) {
+        let host = normalize_controller_host_port(explicit_raw)
+            .unwrap_or_else(|| explicit_raw.to_string());
+        // Only reuse the local runtime discovery secret when the caller explicitly targets
+        // the exact same loopback endpoint (never leak the local secret to another host/port).
+        let matching_discovery_secret = discovery
+            .as_ref()
+            .filter(|ep| same_loopback_endpoint(&host, &ep.addr))
+            .and_then(|ep| ep.secret.clone());
+        let secret = explicit_or_env_secret
+            .or(matching_discovery_secret)
+            .or(cfg_secret);
+        push_unique(&host, secret);
+        return out;
+    }
+
+    // 1. Live runtime discovery file written by desktop / CLI daemon (handles ephemeral secret & fallback port)
+    if let Some(ep) = discovery {
+        let secret = explicit_or_env_secret.clone().or(ep.secret);
+        push_unique(&ep.addr, secret);
+    }
+
+    // 2. Fallback to active config external-controller or default 127.0.0.1:9090
+    let fallback_raw = fallback_cfg
+        .map(|c| c.external_controller.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("127.0.0.1:9090");
+    let fallback_host = normalize_controller_host_port(fallback_raw)
+        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
+    let fallback_secret = explicit_or_env_secret.or(cfg_secret);
+    push_unique(&fallback_host, fallback_secret);
+
+    out
 }
 
 pub fn resolve_controller_client(
@@ -144,40 +269,74 @@ pub fn resolve_controller_client(
     explicit_secret: Option<&str>,
     fallback_cfg: Option<&ClashConfig>,
 ) -> Option<ControllerClient> {
-    let raw_ctrl = explicit_controller
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            fallback_cfg
-                .map(|c| c.external_controller.trim())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or("127.0.0.1:9090");
+    let state_dir = proxy_core::platform::recovery::default_state_dir();
+    resolve_controller_clients_in_state_dir(
+        &state_dir,
+        explicit_controller,
+        explicit_secret,
+        fallback_cfg,
+    )
+    .into_iter()
+    .next()
+}
 
-    let normalized_host = if let Some(rest) = raw_ctrl.strip_prefix("0.0.0.0:") {
-        format!("127.0.0.1:{rest}")
-    } else if let Some(rest) = raw_ctrl.strip_prefix("[::]:") {
-        format!("[::1]:{rest}")
+enum LiveControllerOutcome {
+    Response {
+        client: ControllerClient,
+        status: u16,
+        body: Value,
+    },
+    AuthRejected {
+        status: u16,
+    },
+    Unreachable,
+}
+
+async fn request_live_controller_json(
+    clients: &[ControllerClient],
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> LiveControllerOutcome {
+    let mut auth_rejected: Option<u16> = None;
+    for client in clients {
+        match client
+            .request_json(method, path_and_query, body, timeout)
+            .await
+        {
+            Ok((status, _)) if matches!(status, 401 | 403) => {
+                if auth_rejected.is_none() {
+                    auth_rejected = Some(status);
+                }
+            }
+            Ok((status, resp)) => {
+                return LiveControllerOutcome::Response {
+                    client: client.clone(),
+                    status,
+                    body: resp,
+                };
+            }
+            Err(_) => {
+                // Stale discovery endpoint or dead port — smoothly try next candidate.
+            }
+        }
+    }
+    match auth_rejected {
+        Some(status) => LiveControllerOutcome::AuthRejected { status },
+        None => LiveControllerOutcome::Unreachable,
+    }
+}
+
+fn auth_rejected_note(status: u16) -> String {
+    let label = if status == 401 {
+        "Unauthorized"
     } else {
-        raw_ctrl.to_string()
+        "Forbidden"
     };
-
-    let secret = explicit_secret
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("RUST_CLASH_SECRET")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            fallback_cfg
-                .and_then(|c| c.secret.clone())
-                .filter(|s| !s.is_empty())
-        });
-
-    ControllerClient::new(&normalized_host, secret).ok()
+    format!(
+        "Live rust-clash controller rejected authentication (HTTP {status} {label}); showing offline profile snapshot. Check --secret / RUST_CLASH_SECRET, or restart rust-clash-desktop to refresh its runtime controller discovery file."
+    )
 }
 
 pub fn url_encode_component(raw: &str) -> String {
@@ -874,11 +1033,19 @@ fn mcp_tool_result(payload: &Value, is_error: bool) -> Value {
     })
 }
 
-async fn pick_default_proxy_name(ctrl: Option<&ControllerClient>, cfg: &ClashConfig) -> String {
-    if let Some(c) = ctrl
-        && let Ok((200, val)) = c
-            .request_json("GET", "/proxies", None, Duration::from_millis(1500))
-            .await
+async fn pick_default_proxy_name(clients: &[ControllerClient], cfg: &ClashConfig) -> String {
+    if let LiveControllerOutcome::Response {
+        status: 200,
+        body: val,
+        ..
+    } = request_live_controller_json(
+        clients,
+        "GET",
+        "/proxies",
+        None,
+        Duration::from_millis(1500),
+    )
+    .await
         && let Some(pg) = val
             .get("effective-outbound")
             .and_then(|e| e.get("primary_group"))
@@ -897,9 +1064,20 @@ async fn pick_default_proxy_name(ctrl: Option<&ControllerClient>, cfg: &ClashCon
 }
 
 async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) -> Value {
-    let loaded = load_cli_or_profile_config(opts.config_path.as_ref());
+    let state_dir = proxy_core::platform::recovery::default_state_dir();
+    execute_tool_call_with_state_dir(name, args, opts, &state_dir).await
+}
+
+async fn execute_tool_call_with_state_dir(
+    name: &str,
+    args: &Value,
+    opts: &McpServerOptions,
+    state_dir: &std::path::Path,
+) -> Value {
+    let loaded = load_cli_or_profile_config_in_state_dir(opts.config_path.as_ref(), state_dir);
     let fallback_cfg = loaded.as_ref().ok().map(|(c, _)| c);
-    let ctrl = resolve_controller_client(
+    let ctrl_clients = resolve_controller_clients_in_state_dir(
+        state_dir,
         opts.controller.as_deref(),
         opts.secret.as_deref(),
         fallback_cfg,
@@ -962,19 +1140,31 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 } else {
                     "/diagnostics/audit"
                 };
-                if let Some(ref c) = ctrl
-                    && let Ok((200, resp)) = c
-                        .request_json("GET", audit_endpoint, None, Duration::from_secs(6))
-                        .await
+                let auth_rejected_status = match request_live_controller_json(
+                    &ctrl_clients,
+                    "GET",
+                    audit_endpoint,
+                    None,
+                    Duration::from_secs(6),
+                )
+                .await
                 {
-                    let mut out = json!({
-                        "source": format!("live_controller:{}", c.host_port),
-                        "controller": c.host_port,
-                        "audit": resp,
-                    });
-                    scrub_audit_payload(&mut out, opts.include_network_metadata);
-                    return mcp_tool_result(&out, false);
-                }
+                    LiveControllerOutcome::Response {
+                        client: c,
+                        status: 200,
+                        body: resp,
+                    } => {
+                        let mut out = json!({
+                            "source": format!("live_controller:{}", c.host_port),
+                            "controller": c.host_port,
+                            "audit": resp,
+                        });
+                        scrub_audit_payload(&mut out, opts.include_network_metadata);
+                        return mcp_tool_result(&out, false);
+                    }
+                    LiveControllerOutcome::AuthRejected { status } => Some(status),
+                    _ => None,
+                };
 
                 match loaded {
                     Ok((cfg, src)) => {
@@ -984,6 +1174,13 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                             "controller": cfg.external_controller,
                             "audit": report,
                         });
+                        if let Some(status) = auth_rejected_status
+                            && let Some(obj) = out.as_object_mut()
+                        {
+                            obj.insert("auth_error".to_string(), json!(true));
+                            obj.insert("http_status".to_string(), json!(status));
+                            obj.insert("note".to_string(), json!(auth_rejected_note(status)));
+                        }
                         scrub_audit_payload(&mut out, opts.include_network_metadata);
                         mcp_tool_result(&out, false)
                     }
@@ -1013,20 +1210,30 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
 
-            if let Some(ref c) = ctrl {
-                let mut pq = format!("/rules/explain?target={}", url_encode_component(raw_target));
-                if let Some(sip) = raw_src {
-                    pq.push_str(&format!("&src_ip={}", url_encode_component(sip)));
-                }
-                if let Ok((status, mut resp)) = c
-                    .request_json("GET", &pq, None, Duration::from_secs(4))
-                    .await
-                    && (200..300).contains(&status)
-                {
+            let mut pq = format!("/rules/explain?target={}", url_encode_component(raw_target));
+            if let Some(sip) = raw_src {
+                pq.push_str(&format!("&src_ip={}", url_encode_component(sip)));
+            }
+            let auth_rejected_status = match request_live_controller_json(
+                &ctrl_clients,
+                "GET",
+                &pq,
+                None,
+                Duration::from_secs(4),
+            )
+            .await
+            {
+                LiveControllerOutcome::Response {
+                    status,
+                    body: mut resp,
+                    ..
+                } if (200..300).contains(&status) => {
                     scrub_explain_payload(&mut resp, opts.include_network_metadata);
                     return mcp_tool_result(&resp, false);
                 }
-            }
+                LiveControllerOutcome::AuthRejected { status } => Some(status),
+                _ => None,
+            };
 
             let (cfg, src_label) = match loaded {
                 Ok(pair) => pair,
@@ -1070,6 +1277,13 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                         "exit_type": decision.outbound.exit_category(),
                         "remote_endpoint": decision.outbound.remote_endpoint(&decision.target),
                     });
+                    if let Some(status) = auth_rejected_status
+                        && let Some(obj) = out.as_object_mut()
+                    {
+                        obj.insert("auth_error".to_string(), json!(true));
+                        obj.insert("http_status".to_string(), json!(status));
+                        obj.insert("note".to_string(), json!(auth_rejected_note(status)));
+                    }
                     scrub_explain_payload(&mut out, opts.include_network_metadata);
                     mcp_tool_result(&out, false)
                 }
@@ -1105,41 +1319,39 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 .filter(|s| !s.is_empty())
             {
                 Some(explicit) => explicit.to_string(),
-                None => pick_default_proxy_name(ctrl.as_ref(), &default_cfg).await,
+                None => pick_default_proxy_name(&ctrl_clients, &default_cfg).await,
             };
             let req_needles = vec![proxy_name.clone(), url.to_string()];
 
-            if let Some(ref c) = ctrl {
-                let path = format!("/proxies/{}/probe", url_encode_component(&proxy_name));
-                if let Ok((status, mut resp)) = c
-                    .request_json(
-                        "POST",
-                        &path,
-                        Some(&json!({
-                            "url": url,
-                            "timeout_ms": timeout_ms,
-                            "check_udp": check_udp,
-                        })),
-                        Duration::from_millis(timeout_ms + 5000),
-                    )
-                    .await
-                {
-                    if (200..300).contains(&status) {
-                        scrub_waterfall_payload(
-                            &mut resp,
-                            opts.include_network_metadata,
-                            &req_needles,
-                        );
-                        return mcp_tool_result(&resp, false);
-                    }
-                    if matches!(status, 400 | 404 | 429) {
-                        scrub_probe_error_payload(
-                            &mut resp,
-                            opts.include_network_metadata,
-                            &req_needles,
-                        );
-                        return mcp_tool_result(&resp, true);
-                    }
+            let path = format!("/proxies/{}/probe", url_encode_component(&proxy_name));
+            if let LiveControllerOutcome::Response {
+                status,
+                body: mut resp,
+                ..
+            } = request_live_controller_json(
+                &ctrl_clients,
+                "POST",
+                &path,
+                Some(&json!({
+                    "url": url,
+                    "timeout_ms": timeout_ms,
+                    "check_udp": check_udp,
+                })),
+                Duration::from_millis(timeout_ms + 5000),
+            )
+            .await
+            {
+                if (200..300).contains(&status) {
+                    scrub_waterfall_payload(&mut resp, opts.include_network_metadata, &req_needles);
+                    return mcp_tool_result(&resp, false);
+                }
+                if matches!(status, 400 | 404 | 429) {
+                    scrub_probe_error_payload(
+                        &mut resp,
+                        opts.include_network_metadata,
+                        &req_needles,
+                    );
+                    return mcp_tool_result(&resp, true);
                 }
             }
 
@@ -1203,37 +1415,35 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                 .filter(|s| !s.is_empty())
             {
                 Some(explicit) => explicit.to_string(),
-                None => pick_default_proxy_name(ctrl.as_ref(), &default_cfg).await,
+                None => pick_default_proxy_name(&ctrl_clients, &default_cfg).await,
             };
             let req_needles = vec![proxy_name.clone()];
 
-            if let Some(ref c) = ctrl {
-                let path = format!("/proxies/{}/matrix", url_encode_component(&proxy_name));
-                if let Ok((status, mut resp)) = c
-                    .request_json(
-                        "POST",
-                        &path,
-                        Some(&json!({ "timeout_ms": timeout_ms })),
-                        Duration::from_millis(timeout_ms * 2 + 6000),
-                    )
-                    .await
-                {
-                    if (200..300).contains(&status) {
-                        scrub_matrix_payload(
-                            &mut resp,
-                            opts.include_network_metadata,
-                            &req_needles,
-                        );
-                        return mcp_tool_result(&resp, false);
-                    }
-                    if matches!(status, 400 | 404 | 429) {
-                        scrub_probe_error_payload(
-                            &mut resp,
-                            opts.include_network_metadata,
-                            &req_needles,
-                        );
-                        return mcp_tool_result(&resp, true);
-                    }
+            let path = format!("/proxies/{}/matrix", url_encode_component(&proxy_name));
+            if let LiveControllerOutcome::Response {
+                status,
+                body: mut resp,
+                ..
+            } = request_live_controller_json(
+                &ctrl_clients,
+                "POST",
+                &path,
+                Some(&json!({ "timeout_ms": timeout_ms })),
+                Duration::from_millis(timeout_ms * 2 + 6000),
+            )
+            .await
+            {
+                if (200..300).contains(&status) {
+                    scrub_matrix_payload(&mut resp, opts.include_network_metadata, &req_needles);
+                    return mcp_tool_result(&resp, false);
+                }
+                if matches!(status, 400 | 404 | 429) {
+                    scrub_probe_error_payload(
+                        &mut resp,
+                        opts.include_network_metadata,
+                        &req_needles,
+                    );
+                    return mcp_tool_result(&resp, true);
                 }
             }
 
@@ -1291,90 +1501,107 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
         }
 
         "get_proxy_status" => {
-            if let Some(ref c) = ctrl
-                && let Ok((200, proxies_val)) = c
-                    .request_json("GET", "/proxies", None, Duration::from_secs(3))
-                    .await
+            let auth_rejected_status = match request_live_controller_json(
+                &ctrl_clients,
+                "GET",
+                "/proxies",
+                None,
+                Duration::from_secs(3),
+            )
+            .await
             {
-                let cfg_val = c
-                    .request_json("GET", "/configs", None, Duration::from_secs(2))
-                    .await
-                    .ok()
-                    .and_then(|(st, v)| (st == 200).then_some(v));
-                let diag_val = c
-                    .request_json(
-                        "GET",
-                        "/connections/diagnostics?limit=15",
-                        None,
-                        Duration::from_secs(2),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|(st, v)| (st == 200).then_some(v));
+                LiveControllerOutcome::Response {
+                    client: c,
+                    status: 200,
+                    body: proxies_val,
+                } => {
+                    let cfg_val = c
+                        .request_json("GET", "/configs", None, Duration::from_secs(2))
+                        .await
+                        .ok()
+                        .and_then(|(st, v)| (st == 200).then_some(v));
+                    let diag_val = c
+                        .request_json(
+                            "GET",
+                            "/connections/diagnostics?limit=15",
+                            None,
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|(st, v)| (st == 200).then_some(v));
 
-                let mut groups_summary = Vec::new();
-                if let Some(map) = proxies_val.get("proxies").and_then(|v| v.as_object()) {
-                    for (k, info) in map {
-                        let ty = info.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if matches!(ty, "Selector" | "URLTest" | "Fallback") {
-                            groups_summary.push(json!({
-                                "name": k,
-                                "type": ty,
-                                "now": info.get("now"),
-                                "effective_outbound": info.get("effective_outbound"),
-                                "effective_protocol": info.get("effective_protocol"),
-                                "member_count": info.get("all").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0),
-                            }));
+                    let mut groups_summary = Vec::new();
+                    if let Some(map) = proxies_val.get("proxies").and_then(|v| v.as_object()) {
+                        for (k, info) in map {
+                            let ty = info.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if matches!(ty, "Selector" | "URLTest" | "Fallback") {
+                                groups_summary.push(json!({
+                                    "name": k,
+                                    "type": ty,
+                                    "now": info.get("now"),
+                                    "effective_outbound": info.get("effective_outbound"),
+                                    "effective_protocol": info.get("effective_protocol"),
+                                    "member_count": info.get("all").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0),
+                                }));
+                            }
                         }
                     }
-                }
 
-                let mut recent_diags = diag_val
-                    .and_then(|d| d.get("diagnostics").cloned())
-                    .unwrap_or_else(|| json!([]));
-                scrub_diagnostic_entries(&mut recent_diags, opts.include_network_metadata);
+                    let mut recent_diags = diag_val
+                        .and_then(|d| d.get("diagnostics").cloned())
+                        .unwrap_or_else(|| json!([]));
+                    scrub_diagnostic_entries(&mut recent_diags, opts.include_network_metadata);
 
-                let mut tun_val = cfg_val.as_ref().and_then(|v| v.get("tun").cloned());
-                if !opts.include_network_metadata
-                    && let Some(health) = tun_val
-                        .as_mut()
-                        .and_then(|t| t.get_mut("health"))
-                        .and_then(|h| h.as_object_mut())
-                {
-                    if health
-                        .get("default_egress_gateway")
-                        .is_some_and(|v| !v.is_null())
+                    let mut tun_val = cfg_val.as_ref().and_then(|v| v.get("tun").cloned());
+                    if !opts.include_network_metadata
+                        && let Some(health) = tun_val
+                            .as_mut()
+                            .and_then(|t| t.get_mut("health"))
+                            .and_then(|h| h.as_object_mut())
                     {
-                        health.insert("default_egress_gateway".to_string(), json!("<redacted>"));
+                        if health
+                            .get("default_egress_gateway")
+                            .is_some_and(|v| !v.is_null())
+                        {
+                            health
+                                .insert("default_egress_gateway".to_string(), json!("<redacted>"));
+                        }
+                        if health
+                            .get("default_egress_iface")
+                            .is_some_and(|v| !v.is_null())
+                        {
+                            health.insert("default_egress_iface".to_string(), json!("<redacted>"));
+                        }
                     }
-                    if health
-                        .get("default_egress_iface")
-                        .is_some_and(|v| !v.is_null())
-                    {
-                        health.insert("default_egress_iface".to_string(), json!("<redacted>"));
-                    }
-                }
 
-                return mcp_tool_result(
-                    &json!({
-                        "daemon_connected": true,
-                        "metadata_privacy_mode": if opts.include_network_metadata { "full" } else { "redacted" },
-                        "controller": if opts.include_network_metadata { json!(c.host_port) } else { json!("<redacted>") },
-                        "mode": cfg_val.as_ref().and_then(|v| v.get("mode")),
-                        "mixed_port": cfg_val.as_ref().and_then(|v| v.get("mixed-port")),
-                        "tun": tun_val,
-                        "effective_outbound": proxies_val.get("effective-outbound"),
-                        "groups": groups_summary,
-                        "recent_failure_diagnostics": recent_diags,
-                    }),
-                    false,
-                );
-            }
+                    return mcp_tool_result(
+                        &json!({
+                            "daemon_connected": true,
+                            "metadata_privacy_mode": if opts.include_network_metadata { "full" } else { "redacted" },
+                            "controller": if opts.include_network_metadata { json!(c.host_port) } else { json!("<redacted>") },
+                            "mode": cfg_val.as_ref().and_then(|v| v.get("mode")),
+                            "mixed_port": cfg_val.as_ref().and_then(|v| v.get("mixed-port")),
+                            "tun": tun_val,
+                            "effective_outbound": proxies_val.get("effective-outbound"),
+                            "groups": groups_summary,
+                            "recent_failure_diagnostics": recent_diags,
+                        }),
+                        false,
+                    );
+                }
+                LiveControllerOutcome::AuthRejected { status } => Some(status),
+                _ => None,
+            };
 
             match loaded {
                 Ok((cfg, src)) => match ProxyEngine::build_standalone_router(&cfg) {
-                    Ok(router) => mcp_tool_result(
-                        &json!({
+                    Ok(router) => {
+                        let note = match auth_rejected_status {
+                            Some(status) => auth_rejected_note(status),
+                            None => "No live rust-clash controller responded; showing offline profile snapshot.".to_string(),
+                        };
+                        let mut out = json!({
                             "daemon_connected": false,
                             "metadata_privacy_mode": if opts.include_network_metadata { "full" } else { "redacted" },
                             "controller": if opts.include_network_metadata { json!(cfg.external_controller) } else { json!("<redacted>") },
@@ -1383,10 +1610,16 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                             "mixed_port": cfg.mixed_port,
                             "node_count": cfg.proxies.len(),
                             "effective_outbound": router.effective_primary_outbound(),
-                            "note": "No live rust-clash controller responded; showing offline profile snapshot."
-                        }),
-                        false,
-                    ),
+                            "note": note,
+                        });
+                        if let Some(status) = auth_rejected_status
+                            && let Some(obj) = out.as_object_mut()
+                        {
+                            obj.insert("auth_error".to_string(), json!(true));
+                            obj.insert("http_status".to_string(), json!(status));
+                        }
+                        mcp_tool_result(&out, false)
+                    }
                     Err(e) => mcp_tool_result(
                         &json!({ "error": redact_sensitive_text(&e.to_string()) }),
                         true,
@@ -1430,32 +1663,38 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     true,
                 );
             };
-            let Some(ref c) = ctrl else {
+            if ctrl_clients.is_empty() {
                 return mcp_tool_result(
                     &json!({ "error": "no controller configured to switch live Selector group" }),
                     true,
                 );
-            };
+            }
 
             let path = format!("/proxies/{}", url_encode_component(group));
-            match c
-                .request_json(
-                    "PUT",
-                    &path,
-                    Some(&json!({ "name": proxy })),
-                    Duration::from_secs(4),
-                )
-                .await
+            match request_live_controller_json(
+                &ctrl_clients,
+                "PUT",
+                &path,
+                Some(&json!({ "name": proxy })),
+                Duration::from_secs(4),
+            )
+            .await
             {
-                Ok((status, _)) if (200..300).contains(&status) => mcp_tool_result(
-                    &json!({
-                        "ok": true,
-                        "group": group,
-                        "selected": proxy,
-                    }),
-                    false,
-                ),
-                Ok((status, err_val)) => mcp_tool_result(
+                LiveControllerOutcome::Response { status, .. } if (200..300).contains(&status) => {
+                    mcp_tool_result(
+                        &json!({
+                            "ok": true,
+                            "group": group,
+                            "selected": proxy,
+                        }),
+                        false,
+                    )
+                }
+                LiveControllerOutcome::Response {
+                    status,
+                    body: err_val,
+                    ..
+                } => mcp_tool_result(
                     &json!({
                         "ok": false,
                         "http_status": status,
@@ -1463,8 +1702,21 @@ async fn execute_tool_call(name: &str, args: &Value, opts: &McpServerOptions) ->
                     }),
                     true,
                 ),
-                Err(e) => mcp_tool_result(
-                    &json!({ "error": redact_sensitive_text(&e.to_string()) }),
+                LiveControllerOutcome::AuthRejected { status } => mcp_tool_result(
+                    &json!({
+                        "ok": false,
+                        "auth_error": true,
+                        "http_status": status,
+                        "error": format!(
+                            "Live rust-clash controller rejected authentication (HTTP {status}). Check --secret / RUST_CLASH_SECRET or restart rust-clash-desktop."
+                        ),
+                    }),
+                    true,
+                ),
+                LiveControllerOutcome::Unreachable => mcp_tool_result(
+                    &json!({
+                        "error": "No live rust-clash controller responded to switch Selector group."
+                    }),
                     true,
                 ),
             }
@@ -2746,5 +2998,260 @@ rules:
             "parse error on Content-Length stream must preserve Content-Length framing, got: {out_str}"
         );
         assert!(out_str.contains("-32700"));
+    }
+
+    #[tokio::test]
+    async fn mcp_auto_discovers_ephemeral_secret_and_random_port_without_leaking_secret() {
+        let state_dir = std::env::temp_dir()
+            .join(format!("rc-mcp-discovery-live-{}", std::process::id()))
+            .join(format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Active profile YAML deliberately omits `secret:` (standard subscription scenario)
+        let mut cfg = ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        cfg.mixed_port = 0;
+        cfg.dns.listen = "127.0.0.1:0".to_string();
+        cfg.tun.enable = false;
+        cfg.secret = None;
+        let ephemeral_secret = cfg.ensure_ephemeral_secret();
+        assert!(!ephemeral_secret.is_empty());
+
+        let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+            .await
+            .expect("engine starts");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_addr, api_task) = proxy_core::api::spawn_api_server(
+            "127.0.0.1:0",
+            std::sync::Arc::clone(&engine),
+            shutdown_rx,
+        )
+        .await
+        .expect("ephemeral port API binds");
+        engine
+            .publish_controller_discovery(state_dir.clone(), bound_addr)
+            .expect("discovery file written");
+
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: None,
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let status_res =
+            execute_tool_call_with_state_dir("get_proxy_status", &json!({}), &opts, &state_dir)
+                .await;
+        let text = status_res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains(&ephemeral_secret),
+            "ephemeral secret MUST never leak into MCP tool output"
+        );
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["daemon_connected"], true);
+        assert_eq!(parsed["controller"], "<redacted>");
+
+        // Also verify `explain_route` seamlessly connects to the live controller
+        let explain_res = execute_tool_call_with_state_dir(
+            "explain_route",
+            &json!({ "target": "example.com:443" }),
+            &opts,
+            &state_dir,
+        )
+        .await;
+        let explain_text = explain_res["content"][0]["text"].as_str().unwrap();
+        assert!(!explain_text.contains(&ephemeral_secret));
+        let explain_val: Value = serde_json::from_str(explain_text).unwrap();
+        assert!(explain_val.get("auth_error").is_none());
+
+        // Shutdown cleanly removes the PID-owned discovery file
+        let _ = shutdown_tx.send(true);
+        engine.shutdown_async().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
+        assert!(
+            proxy_core::platform::recovery::read_controller_discovery(&state_dir).is_none(),
+            "graceful shutdown must remove PID-owned controller discovery file"
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_degrades_gracefully_when_discovery_file_is_stale_or_dead() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rc-mcp-discovery-stale-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Bind then immediately drop a loopback TCP port so we guarantee a dead port
+        let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let stale_ep = proxy_core::platform::recovery::ControllerRuntimeEndpoint {
+            pid: 999_999,
+            addr: format!("127.0.0.1:{dead_port}"),
+            secret: Some("stale-secret-dead-daemon".to_string()),
+        };
+        proxy_core::platform::recovery::write_controller_discovery(&state_dir, &stale_ep).unwrap();
+
+        // Write a config whose external-controller also points to the dead port
+        let cfg_path = state_dir.join("offline.yaml");
+        let yaml = format!(
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:{dead_port}\nmode: rule\nrules:\n  - MATCH,DIRECT\n"
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let opts = McpServerOptions {
+            config_path: Some(cfg_path),
+            controller: None,
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let status_res =
+            execute_tool_call_with_state_dir("get_proxy_status", &json!({}), &opts, &state_dir)
+                .await;
+        assert_eq!(status_res["isError"], false);
+        let text = status_res["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("stale-secret-dead-daemon"));
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["daemon_connected"], false);
+        assert!(parsed.get("auth_error").is_none());
+        assert!(
+            parsed["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No live rust-clash controller responded")
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_reports_clear_401_auth_error_without_echoing_secret_or_controller() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rc-mcp-discovery-401-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut cfg = ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        cfg.mixed_port = 0;
+        cfg.dns.listen = "127.0.0.1:0".to_string();
+        cfg.tun.enable = false;
+        cfg.secret = None;
+        let real_secret = cfg.ensure_ephemeral_secret();
+
+        let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+            .await
+            .expect("engine starts");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_addr, api_task) = proxy_core::api::spawn_api_server(
+            "127.0.0.1:0",
+            std::sync::Arc::clone(&engine),
+            shutdown_rx,
+        )
+        .await
+        .expect("api binds");
+        engine
+            .publish_controller_discovery(state_dir.clone(), bound_addr)
+            .expect("discovery written");
+
+        let wrong_secret = "wrong-super-secret-token-xyz987";
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: None,
+            secret: Some(wrong_secret.to_string()),
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let status_res =
+            execute_tool_call_with_state_dir("get_proxy_status", &json!({}), &opts, &state_dir)
+                .await;
+        let text = status_res["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains(&real_secret), "must not leak real secret");
+        assert!(!text.contains(wrong_secret), "must not echo wrong secret");
+        assert!(
+            !text.contains(&bound_addr.to_string()),
+            "must not leak live controller address in redacted mode"
+        );
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["daemon_connected"], false);
+        assert_eq!(parsed["auth_error"], true);
+        assert_eq!(parsed["http_status"], 401);
+        assert!(
+            parsed["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("401 Unauthorized")
+        );
+
+        let _ = shutdown_tx.send(true);
+        engine.shutdown_async().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn mcp_explicit_controller_does_not_leak_local_discovery_secret_to_other_endpoints() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rc-mcp-discovery-iso-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let local_ep = proxy_core::platform::recovery::ControllerRuntimeEndpoint {
+            pid: std::process::id(),
+            addr: "127.0.0.1:19090".to_string(),
+            secret: Some("local-desktop-secret".to_string()),
+        };
+        proxy_core::platform::recovery::write_controller_discovery(&state_dir, &local_ep).unwrap();
+
+        // Explicit --controller pointing to a DIFFERENT port must NOT receive local discovery secret
+        let other_clients = resolve_controller_clients_in_state_dir(
+            &state_dir,
+            Some("127.0.0.1:19999"),
+            None,
+            None,
+        );
+        assert_eq!(other_clients.len(), 1);
+        assert_eq!(other_clients[0].host_port, "127.0.0.1:19999");
+        assert_eq!(other_clients[0].secret, None);
+
+        // Explicit --controller matching the SAME local loopback port (including localhost alias) reuses it cleanly
+        let same_clients = resolve_controller_clients_in_state_dir(
+            &state_dir,
+            Some("http://localhost:19090/"),
+            None,
+            None,
+        );
+        assert_eq!(same_clients.len(), 1);
+        assert_eq!(same_clients[0].host_port, "127.0.0.1:19090");
+        assert_eq!(
+            same_clients[0].secret.as_deref(),
+            Some("local-desktop-secret")
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }
