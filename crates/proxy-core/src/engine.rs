@@ -32,7 +32,7 @@ use crate::{
     inbound::{
         mixed::{MixedInboundPolicy, spawn_mixed_inbound_with_policy},
         tun::{
-            OsTunGuard, VirtualTunHandle, attach_os_tun_with_spec, spawn_userspace_tun_with_ipv6,
+            OsTunGuard, VirtualTunHandle, attach_os_tun_with_spec, spawn_userspace_tun_with_options,
         },
     },
     outbound::{
@@ -930,7 +930,14 @@ impl TunService {
         if let Some(guard) = self.os_guard.take() {
             let _ = tokio::task::spawn_blocking(move || guard.stop_now()).await;
         }
-        let _ = self.task.await;
+        let abort_handle = self.task.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(3), &mut self.task)
+            .await
+            .is_err()
+        {
+            abort_handle.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(500), self.task).await;
+        }
     }
 }
 
@@ -1269,12 +1276,19 @@ fn start_tun_service(
         cfg.tun.ipv6
     };
     let ipv6_enabled = Arc::new(std::sync::atomic::AtomicBool::new(initial_ipv6));
-    let (vtun, t_tun) = spawn_userspace_tun_with_ipv6(
+    // On Windows Wintun there is no kernel `SO_MARK` / `addDisallowedApplication` exclusion, so
+    // drop any non-DNS-hijacked TCP/UDP flow originating from our own PID as a last-resort
+    // loop-prevention guard (backed by in-memory `GetExtended*Table` + `WIN_PID_INFO_CACHE`).
+    // Linux `/dev/net/tun` uses kernel `SO_MARK` (`0x1a5`) policy routing instead, avoiding
+    // `/proc/<pid>/fd` scans on every TUN flow and keeping in-process `ip netns` E2E clients working.
+    let drop_self_pid = cfg!(target_os = "windows") && cfg.tun.auto_route;
+    let (vtun, t_tun) = spawn_userspace_tun_with_options(
         cfg.tun.mtu,
         Arc::clone(&router_slot),
         Arc::clone(&hub),
         tun_stop_rx,
         Arc::clone(&ipv6_enabled),
+        drop_self_pid,
     );
 
     if cfg.tun.auto_route {
@@ -4350,7 +4364,7 @@ impl ProxyEngine {
                 }
             });
         } else {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
             loop {
                 if let Ok(mut guard) = self.services.try_lock() {
                     let _ = guard.mixed.shutdown_tx.send(true);

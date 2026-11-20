@@ -373,6 +373,19 @@ impl DirectOutbound {
                         format!("refusing to dial Fake-IP {ip} via DIRECT outbound"),
                     ));
                 }
+                let is_non_unicast = match ip {
+                    IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified(),
+                    IpAddr::V6(v6) => v6.is_multicast() || v6.is_unspecified(),
+                };
+                if is_non_unicast && crate::platform::socket_protect::has_custom_socket_protector()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        format!(
+                            "refusing multicast/broadcast target {ip} via DIRECT while OS TUN is active"
+                        ),
+                    ));
+                }
                 Ok(vec![SocketAddr::new(*ip, target.port)])
             }
             HostName::Domain(domain) => {

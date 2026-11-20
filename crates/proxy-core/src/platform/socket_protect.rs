@@ -353,6 +353,56 @@ impl WindowsUnicastIfProtector {
             Ok(())
         }
     }
+
+    fn apply_multicast_if_and_no_loop(&self, sock: &Socket, is_ipv6: bool) {
+        let idx = if is_ipv6 {
+            self.if_index_v6.load(Ordering::Acquire)
+        } else {
+            self.if_index_v4.load(Ordering::Acquire)
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                IP_MULTICAST_IF, IP_MULTICAST_LOOP, IPPROTO_IP, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+                IPV6_MULTICAST_LOOP, SOCKET, setsockopt,
+            };
+
+            let raw = sock.as_raw_socket() as SOCKET;
+            // Best-effort disable multicast loopback so local UDP sockets never reflect multicast
+            // packets back to the host or Wintun adapter.
+            let loop_off: u32 = 0;
+            let (level, loop_opt, if_opt, if_val) = if is_ipv6 {
+                (IPPROTO_IPV6, IPV6_MULTICAST_LOOP, IPV6_MULTICAST_IF, idx)
+            } else {
+                (IPPROTO_IP, IP_MULTICAST_LOOP, IP_MULTICAST_IF, idx.to_be())
+            };
+            // SAFETY: `raw` is a valid Winsock UDP `SOCKET` owned by `sock`, and `loop_off`/`if_val`
+            // are stack-allocated 4-byte `DWORD` values matching MSDN Winsock multicast options.
+            unsafe {
+                let _ = setsockopt(
+                    raw,
+                    level,
+                    loop_opt,
+                    (&raw const loop_off).cast::<u8>(),
+                    std::mem::size_of::<u32>() as i32,
+                );
+                if idx != 0 {
+                    let _ = setsockopt(
+                        raw,
+                        level,
+                        if_opt,
+                        (&raw const if_val).cast::<u8>(),
+                        std::mem::size_of::<u32>() as i32,
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (sock, idx);
+        }
+    }
 }
 
 impl SocketProtector for WindowsUnicastIfProtector {
@@ -371,7 +421,9 @@ impl SocketProtector for WindowsUnicastIfProtector {
             Some(sa) => sa.is_ipv6(),
             None => socket_is_ipv6(sock),
         };
-        self.apply_unicast_if(sock, is_v6)
+        self.apply_unicast_if(sock, is_v6)?;
+        self.apply_multicast_if_and_no_loop(sock, is_v6);
+        Ok(())
     }
 
     fn description(&self) -> String {
