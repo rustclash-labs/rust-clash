@@ -22,29 +22,39 @@
 > **全量 AI 编写与审核声明**：本项目从底层纯 Rust 代理内核、用户态 `smoltcp` TUN 协议栈、Tauri 2 桌面端、React Web 控制台到 Android 原生客户端，**全部代码全程由 Gemini Argon、Gemini Carbon 与 Gemini Neon 编写，并由 GPT 参与代码审核**（人工仅负责需求方向与实机回归指导）。当前处于实验性 Pre-1.0 阶段，尚未经过独立第三方密码学安全审计。
 
 <p align="center">
-  <img alt="RustClash 仪表盘总览" src="docs/images/dashboard-overview.png" width="92%">
+  <img alt="RustClash Android 浅色模式主界面与节点列表预览（城市地标天际线 · 实时速率与延迟 · 右手单手主控）" src="docs/images/android-light-showcase.png" width="94%">
 </p>
 
 <details>
-<summary>更多界面预览（安全审计 · 全链路耗时瀑布图 · AI 连通矩阵 · MCP）</summary>
+<summary>更多界面预览（Android 五页浅色全览 · 桌面端控制台 · 安全审计 · 全链路瀑布图 · AI 矩阵 · MCP）</summary>
 <br>
+<p align="center">
+  <img src="docs/images/android-light-overview.png" alt="Android 浅色模式五页全览（首页 · 节点 · 规则 · 配置 · 设置）" width="100%" />
+  <br><strong>Android 原生 Jetpack Compose 浅色全览</strong> — 城市地标天际线、实时速率波形、智能分流规则、订阅配置与浅/深色外观。
+</p>
 <table>
   <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/dashboard-overview.png" alt="桌面端与 Web 控制台仪表盘" />
+      <br><strong>桌面端与内嵌 Web 控制台</strong> — 跨 Windows / macOS / Linux 实时内核遥测与系统接管控制。
+    </td>
     <td width="50%" valign="top">
       <img src="docs/images/config-security-audit.png" alt="配置安全静态审计" />
       <br><strong>配置安全静态审计</strong> — 自动检测证书跳过风险、DNS 抢先解析泄漏与规则遮蔽。
     </td>
+  </tr>
+  <tr>
     <td width="50%" valign="top">
       <img src="docs/images/timing-waterfall.png" alt="全链路耗时瀑布图" />
       <br><strong>全链路耗时瀑布图</strong> — 拆解 <code>DNS → 隧道 → TLS → HTTP 首字节</code> 延迟并验证真实 UDP 转发。
     </td>
-  </tr>
-  <tr>
     <td width="50%" valign="top">
       <img src="docs/images/ai-endpoint-matrix.png" alt="AI 与开发接口矩阵" />
       <br><strong>AI 与开发者接口矩阵</strong> — 一键探测主流 AI / API 端点，精确定位阻塞阶段。
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <img src="docs/images/mcp-integration.png" alt="MCP 脱敏集成" />
       <br><strong>隐私脱敏 MCP 服务</strong> — 一键接入 AI 编程助手，自动擦除节点密钥与敏感元数据。
     </td>

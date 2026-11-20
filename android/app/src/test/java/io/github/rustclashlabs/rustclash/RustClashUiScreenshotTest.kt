@@ -1629,7 +1629,7 @@ class RustClashUiScreenshotTest {
                     rateHistory = listOf(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 6_000L, 48_000L),
                     exitIp = ExitIpUi(
                         verified = true,
-                        ip = "77.93.91.109",
+                        ip = "198.51.100.88",
                         country = "Singapore",
                         countryCode = "SG",
                         isp = "Equinix SG",
