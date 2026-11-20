@@ -41,37 +41,54 @@ pub fn select_physical_default_egress(
     candidates: &[ForwardRouteCandidate],
     excluded_tun_luid: u64,
 ) -> PhysicalEgressInfo {
-    let mut info = PhysicalEgressInfo::default();
-    let mut best_v4_metric: Option<u32> = None;
-    let mut best_v6_metric: Option<u32> = None;
+    let pick_pass = |require_ip_connected: bool| {
+        let mut info = PhysicalEgressInfo::default();
+        let mut best_v4_metric: Option<u32> = None;
+        let mut best_v6_metric: Option<u32> = None;
 
-    for c in candidates {
-        if c.prefix_length != 0
-            || c.loopback
-            || c.if_index <= 1
-            || c.luid == 0
-            || c.luid == excluded_tun_luid
-            || !c.oper_up
-            || !c.ip_connected
-        {
-            continue;
-        }
-        let effective_metric = c.route_metric.saturating_add(c.interface_metric);
-        if c.is_ipv6 {
-            if best_v6_metric.is_none_or(|m| effective_metric < m) {
-                best_v6_metric = Some(effective_metric);
-                info.v6_if_index = c.if_index;
-                info.v6_luid = c.luid;
-                info.v6_gateway = c.next_hop;
+        for c in candidates {
+            if c.prefix_length != 0
+                || c.loopback
+                || c.if_index <= 1
+                || c.luid == 0
+                || c.luid == excluded_tun_luid
+                || !c.oper_up
+                || (require_ip_connected && !c.ip_connected)
+            {
+                continue;
             }
-        } else if best_v4_metric.is_none_or(|m| effective_metric < m) {
-            best_v4_metric = Some(effective_metric);
-            info.v4_if_index = c.if_index;
-            info.v4_luid = c.luid;
-            info.v4_gateway = c.next_hop;
+            let effective_metric = c.route_metric.saturating_add(c.interface_metric);
+            if c.is_ipv6 {
+                if best_v6_metric.is_none_or(|m| effective_metric < m) {
+                    best_v6_metric = Some(effective_metric);
+                    info.v6_if_index = c.if_index;
+                    info.v6_luid = c.luid;
+                    info.v6_gateway = c.next_hop;
+                }
+            } else if best_v4_metric.is_none_or(|m| effective_metric < m) {
+                best_v4_metric = Some(effective_metric);
+                info.v4_if_index = c.if_index;
+                info.v4_luid = c.luid;
+                info.v4_gateway = c.next_hop;
+            }
+        }
+        info
+    };
+
+    let mut info = pick_pass(true);
+    if info.v4_if_index == 0 || info.v6_if_index == 0 {
+        let fallback = pick_pass(false);
+        if info.v4_if_index == 0 {
+            info.v4_if_index = fallback.v4_if_index;
+            info.v4_luid = fallback.v4_luid;
+            info.v4_gateway = fallback.v4_gateway;
+        }
+        if info.v6_if_index == 0 {
+            info.v6_if_index = fallback.v6_if_index;
+            info.v6_luid = fallback.v6_luid;
+            info.v6_gateway = fallback.v6_gateway;
         }
     }
-
     info
 }
 
@@ -1365,6 +1382,17 @@ mod win_impl {
                 (api.get_adapter_luid)(adapter, &raw mut luid);
                 (api.get_running_driver_version)()
             };
+            let tun_luid_val = unsafe { luid.Value };
+            // Re-verify physical egress excluding this Wintun adapter's own LUID (defends against
+            // any stale pre-existing RustClash Wintun adapter with leftover routes).
+            let refined_egress = detect_windows_physical_egress(tun_luid_val);
+            let initial_egress =
+                if refined_egress.v4_if_index != 0 || refined_egress.v6_if_index != 0 {
+                    refined_egress
+                } else {
+                    initial_egress
+                };
+            protector.update_indices(initial_egress.v4_if_index, initial_egress.v6_if_index);
 
             // 3. Start 4 MiB Wintun ring-buffer session
             // SAFETY: `adapter` is valid and `WINTUN_RING_CAPACITY` is 4 MiB.
@@ -1787,6 +1815,14 @@ mod win_impl {
             self.stopped = true;
             self.stop_flag.store(true, Ordering::Release);
             let _ = self.stop_watch_tx.send(true);
+            // Signal `stop_event` immediately so `rx_thread` halts packet ingestion before we wait
+            // on `CancelMibChangeNotify2` or join worker threads.
+            if !self.stop_event.0.is_null() {
+                // SAFETY: Signaling our valid Win32 manual-reset event.
+                unsafe {
+                    let _ = SetEvent(self.stop_event.0);
+                }
+            }
 
             // 1. Cancel `NotifyIpInterfaceChange` FIRST before dropping `notify_ctx`!
             if !self.notify_handle.0.is_null() {
@@ -1798,13 +1834,7 @@ mod win_impl {
             }
             let _ = self.notify_ctx.take();
 
-            // 2. Signal `stop_event` and join RX/TX threads BEFORE calling `WintunEndSession`!
-            if !self.stop_event.0.is_null() {
-                // SAFETY: Signaling our valid Win32 manual-reset event.
-                unsafe {
-                    let _ = SetEvent(self.stop_event.0);
-                }
-            }
+            // 2. Join RX/TX threads BEFORE calling `WintunEndSession`!
             if let Some(h) = self.rx_thread.take() {
                 let _ = h.join();
             }

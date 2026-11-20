@@ -239,8 +239,22 @@ pub fn spawn_userspace_tun_with_ipv6(
     mtu: usize,
     router: Arc<RwLock<Arc<Router>>>,
     hub: Arc<TelemetryHub>,
+    shutdown: watch::Receiver<bool>,
+    ipv6_enabled: Arc<AtomicBool>,
+) -> (VirtualTunHandle, JoinHandle<()>) {
+    spawn_userspace_tun_with_options(mtu, router, hub, shutdown, ipv6_enabled, false)
+}
+
+/// Spawn the `smoltcp` userspace `any_ip` transparent TUN stack with live `ipv6_enabled` gating
+/// and optional `drop_self_pid` loop prevention (enabled for real OS TUN sessions so any leaked
+/// packet originating from `rust-clash` itself is dropped immediately instead of self-looping).
+pub fn spawn_userspace_tun_with_options(
+    mtu: usize,
+    router: Arc<RwLock<Arc<Router>>>,
+    hub: Arc<TelemetryHub>,
     mut shutdown: watch::Receiver<bool>,
     ipv6_enabled: Arc<AtomicBool>,
+    drop_self_pid: bool,
 ) -> (VirtualTunHandle, JoinHandle<()>) {
     let (ingress_tx, mut ingress_rx) = mpsc::channel::<Vec<u8>>(TUN_PACKET_QUEUE_CAPACITY);
     let (egress_tx, egress_rx) = mpsc::channel::<Vec<u8>>(TUN_PACKET_QUEUE_CAPACITY);
@@ -308,6 +322,7 @@ pub fn spawn_userspace_tun_with_ipv6(
                 if device.tx_sender.capacity() == 0 {
                     consecutive_zero_delays = 0;
                     tokio::select! {
+                        biased;
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
                                 break;
@@ -333,6 +348,7 @@ pub fn spawn_userspace_tun_with_ipv6(
             } else {
                 consecutive_zero_delays = 0;
                 tokio::select! {
+                    biased;
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
                             break;
@@ -345,6 +361,7 @@ pub fn spawn_userspace_tun_with_ipv6(
                         handle_ingress_packet(
                             pkt,
                             &ipv6_enabled,
+                            drop_self_pid,
                             &shutting_down,
                             &mut device,
                             &mut sockets,
@@ -357,13 +374,14 @@ pub fn spawn_userspace_tun_with_ipv6(
                             &hub,
                         );
                         for _ in 0..256 {
-                            if device.rx_queue.len() >= TUN_DEVICE_RX_MAX_PACKETS {
+                            if *shutdown.borrow() || device.rx_queue.len() >= TUN_DEVICE_RX_MAX_PACKETS {
                                 break;
                             }
                             match ingress_rx.try_recv() {
                                 Ok(more) => handle_ingress_packet(
                                     more,
                                     &ipv6_enabled,
+                                    drop_self_pid,
                                     &shutting_down,
                                     &mut device,
                                     &mut sockets,
@@ -620,7 +638,7 @@ pub fn spawn_userspace_tun_with_ipv6(
             flow.task_abort.abort();
             sockets.remove(flow.handle);
         }
-        let _ = udp_nat.reset_all_sessions();
+        let _ = udp_nat.shutdown();
     });
 
     (
@@ -632,10 +650,41 @@ pub fn spawn_userspace_tun_with_ipv6(
     )
 }
 
+/// Returns `true` for L3 IPv4 packets that must never be NAT-forwarded or proxied through a TUN
+/// adapter (multicast `224.0.0.0/4` such as mDNS/LLMNR/SSDP, limited broadcast `255.255.255.255`,
+/// link-local `169.254.0.0/16`, or unspecified `0.0.0.0`), preventing Windows/OS TUN multicast
+/// self-amplification storms.
+pub(crate) fn should_drop_tun_ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> bool {
+    dst.is_multicast()
+        || dst.is_broadcast()
+        || dst.is_unspecified()
+        || dst.is_link_local()
+        || src.is_multicast()
+        || src.is_broadcast()
+        || src.is_unspecified()
+}
+
+/// Returns `true` for L3 IPv6 packets that must never be NAT-forwarded or proxied through a TUN
+/// adapter (multicast `ff00::/8`, link-local `fe80::/10`, or unspecified `::`).
+pub(crate) fn should_drop_tun_ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr) -> bool {
+    let is_v6_link_local = |ip: Ipv6Addr| (ip.segments()[0] & 0xffc0) == 0xfe80;
+    dst.is_multicast()
+        || dst.is_unspecified()
+        || is_v6_link_local(dst)
+        || src.is_multicast()
+        || src.is_unspecified()
+}
+
+fn is_self_process_socket(transport: SocketTransport, local_addr: SocketAddr) -> bool {
+    crate::platform::process::find_local_process_nonblocking(transport, local_addr)
+        .is_some_and(|info| info.pid == std::process::id())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_ingress_packet(
     pkt: Vec<u8>,
     ipv6_enabled: &Arc<AtomicBool>,
+    drop_self_pid: bool,
     shutting_down: &Arc<AtomicBool>,
     device: &mut VirtualIpDevice,
     sockets: &mut SocketSet<'static>,
@@ -661,6 +710,9 @@ fn handle_ingress_packet(
             }
             let src_v4: Ipv4Addr = ip4.src_addr();
             let dst_v4: Ipv4Addr = ip4.dst_addr();
+            if should_drop_tun_ipv4_packet(src_v4, dst_v4) {
+                return;
+            }
             match ip4.next_header() {
                 IpProtocol::Udp => {
                     if let Ok(udp) = UdpPacket::new_checked(ip4.payload())
@@ -681,6 +733,7 @@ fn handle_ingress_packet(
                                 SocketAddr::new(IpAddr::V4(src_v4), src_port),
                                 dst_sock,
                                 payload,
+                                drop_self_pid,
                                 shutting_down,
                                 egress_tx,
                                 udp_sem,
@@ -707,6 +760,7 @@ fn handle_ingress_packet(
                         register_syn_flow(
                             tuple,
                             IpAddress::Ipv4(dst_v4),
+                            drop_self_pid,
                             sockets,
                             flows,
                             wake_notify,
@@ -727,6 +781,9 @@ fn handle_ingress_packet(
             };
             let src_v6: Ipv6Addr = ip6.src_addr();
             let dst_v6: Ipv6Addr = ip6.dst_addr();
+            if should_drop_tun_ipv6_packet(src_v6, dst_v6) {
+                return;
+            }
             match ip6.next_header() {
                 IpProtocol::Udp => {
                     let Ok(udp) = UdpPacket::new_checked(ip6.payload()) else {
@@ -760,6 +817,7 @@ fn handle_ingress_packet(
                             src_addr,
                             dst_sock,
                             payload,
+                            drop_self_pid,
                             shutting_down,
                             egress_tx,
                             udp_sem,
@@ -793,6 +851,7 @@ fn handle_ingress_packet(
                             register_syn_flow(
                                 tuple,
                                 IpAddress::Ipv6(dst_v6),
+                                drop_self_pid,
                                 sockets,
                                 flows,
                                 wake_notify,
@@ -847,6 +906,7 @@ fn spawn_tun_udp_handler(
     src: SocketAddr,
     dst: SocketAddr,
     payload: Vec<u8>,
+    drop_self_pid: bool,
     shutting_down: &Arc<AtomicBool>,
     egress_tx: &mpsc::Sender<Vec<u8>>,
     udp_sem: &Arc<Semaphore>,
@@ -897,7 +957,17 @@ fn spawn_tun_udp_handler(
             return;
         }
 
-        // 2. General non-53 UDP datagram stateful NAT session forwarding!
+        // 2. Prevent any OS-level TUN routing loop caused by our own process's outbound sockets.
+        if drop_self_pid && is_self_process_socket(SocketTransport::Udp, src) {
+            tracing::debug!(
+                %src,
+                %dst,
+                "Dropped self-originated UDP packet entering OS TUN to prevent routing loop"
+            );
+            return;
+        }
+
+        // 3. General non-53 UDP datagram stateful NAT session forwarding!
         let route_epoch = current_router.epoch();
         let raw_target = TargetAddr::from(dst);
         let decision = current_router
@@ -925,14 +995,16 @@ fn spawn_tun_udp_handler(
         )
         .await;
         if shutting_down_task.load(Ordering::Acquire) {
-            let _ = nat.reset_all_sessions();
+            let _ = nat.shutdown();
         }
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_syn_flow(
     tuple: FourTuple,
     listen_ip: IpAddress,
+    drop_self_pid: bool,
     sockets: &mut SocketSet<'static>,
     flows: &mut HashMap<FourTuple, BridgeFlow>,
     wake_notify: &Arc<Notify>,
@@ -1008,6 +1080,18 @@ fn register_syn_flow(
                 wake_task,
             )
             .await;
+            return;
+        }
+
+        // Prevent any OS-level TUN routing loop caused by our own process's outbound TCP sockets.
+        if drop_self_pid && is_self_process_socket(SocketTransport::Tcp, tuple.src) {
+            tracing::debug!(
+                src = %tuple.src,
+                dst = %tuple.dst,
+                "Aborted self-originated TCP SYN entering OS TUN to prevent routing loop"
+            );
+            remote_failed_task.store(true, Ordering::Release);
+            wake_task.notify_one();
             return;
         }
 
@@ -2445,5 +2529,174 @@ mod tests {
             }
             _ => panic!("expected Recovered outcome without truncating coalesced payload"),
         }
+    }
+
+    #[tokio::test]
+    async fn tun_drops_ipv4_and_ipv6_multicast_broadcast_and_link_local_packets() {
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Direct,
+                HashMap::new(),
+                &[],
+                &rules,
+                dns,
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let ipv6_enabled = Arc::new(AtomicBool::new(true));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, tun_task) = spawn_userspace_tun_with_options(
+            1500,
+            router_slot,
+            Arc::clone(&hub),
+            shutdown_rx,
+            ipv6_enabled,
+            true,
+        );
+
+        let src_v4 = Ipv4Addr::new(198, 18, 0, 1);
+        let noisy_v4 = [
+            // mDNS, LLMNR, SSDP/UPnP, limited broadcast, link-local
+            (Ipv4Addr::new(224, 0, 0, 251), 5353u16),
+            (Ipv4Addr::new(224, 0, 0, 252), 5355u16),
+            (Ipv4Addr::new(239, 255, 255, 250), 1900u16),
+            (Ipv4Addr::BROADCAST, 67u16),
+            (Ipv4Addr::new(169, 254, 10, 20), 137u16),
+            (Ipv4Addr::UNSPECIFIED, 5353u16),
+        ];
+        for (idx, (dst_ip, dst_port)) in noisy_v4.into_iter().enumerate() {
+            assert!(should_drop_tun_ipv4_packet(src_v4, dst_ip));
+            let pkt = build_ipv4_udp_packet(
+                src_v4,
+                55000 + idx as u16,
+                dst_ip,
+                dst_port,
+                b"multicast-loop-probe",
+            )
+            .expect("valid v4 udp packet");
+            vtun.ingress_tx.send(pkt).await.unwrap();
+        }
+
+        let src_v6: Ipv6Addr = "fd00::1".parse().unwrap();
+        let noisy_v6 = [
+            ("ff02::fb".parse::<Ipv6Addr>().unwrap(), 5353u16),
+            ("ff02::1:3".parse::<Ipv6Addr>().unwrap(), 5355u16),
+            ("ff02::c".parse::<Ipv6Addr>().unwrap(), 1900u16),
+            ("fe80::1".parse::<Ipv6Addr>().unwrap(), 5353u16),
+            (Ipv6Addr::UNSPECIFIED, 5353u16),
+        ];
+        for (idx, (dst_ip, dst_port)) in noisy_v6.into_iter().enumerate() {
+            assert!(should_drop_tun_ipv6_packet(src_v6, dst_ip));
+            let pkt = build_ipv6_udp_packet(
+                src_v6,
+                56000 + idx as u16,
+                dst_ip,
+                dst_port,
+                b"multicast-v6-probe",
+            )
+            .expect("valid v6 udp packet");
+            vtun.ingress_tx.send(pkt).await.unwrap();
+        }
+
+        // Valid Fake-IP and LAN unicast destinations must NOT be dropped.
+        assert!(!should_drop_tun_ipv4_packet(
+            src_v4,
+            Ipv4Addr::new(198, 18, 0, 50)
+        ));
+        assert!(!should_drop_tun_ipv4_packet(
+            src_v4,
+            Ipv4Addr::new(10, 21, 220, 1)
+        ));
+        assert!(!should_drop_tun_ipv6_packet(
+            src_v6,
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            hub.total_connections(),
+            0,
+            "multicast/broadcast/link-local TUN packets must never create connections or NAT sessions"
+        );
+        assert_eq!(hub.active_connection_count(), 0);
+        assert!(
+            vtun.egress_rx.try_recv().is_err(),
+            "dropped multicast/broadcast packets must emit zero egress packets"
+        );
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), tun_task)
+            .await
+            .expect("TUN task must exit promptly on shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tun_self_pid_guard_drops_looped_udp_from_own_process() {
+        let own_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let own_src = own_sock.local_addr().unwrap();
+        if !is_self_process_socket(SocketTransport::Udp, own_src) {
+            // Skip assertion only on restricted sandboxes where OS socket tables are hidden.
+            return;
+        }
+
+        let udp_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst_port = udp_sink.local_addr().unwrap().port();
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Direct,
+                HashMap::new(),
+                &[],
+                &rules,
+                dns,
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (vtun, tun_task) = spawn_userspace_tun_with_options(
+            1500,
+            router_slot,
+            Arc::clone(&hub),
+            shutdown_rx,
+            Arc::new(AtomicBool::new(true)),
+            true,
+        );
+
+        let IpAddr::V4(src_ip) = own_src.ip() else {
+            unreachable!()
+        };
+        let pkt = build_ipv4_udp_packet(
+            src_ip,
+            own_src.port(),
+            Ipv4Addr::LOCALHOST,
+            dst_port,
+            b"self-loop-must-drop",
+        )
+        .expect("valid v4 udp packet");
+        vtun.ingress_tx.send(pkt).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), udp_sink.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "self-PID UDP packet entering OS TUN must be dropped instead of looping back to outbound"
+        );
+        assert_eq!(hub.total_connections(), 0);
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
     }
 }

@@ -328,7 +328,17 @@ fn platform_find_process(
 }
 
 #[cfg(target_os = "windows")]
+static WIN_PID_INFO_CACHE: LazyLock<Mutex<LruCache<u32, (Instant, Option<LocalProcessInfo>)>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(512).expect("non-zero"))));
+
+#[cfg(target_os = "windows")]
 fn query_win_process_info(pid: u32) -> Option<LocalProcessInfo> {
+    if let Some((ts, cached)) = WIN_PID_INFO_CACHE.lock().get(&pid).cloned()
+        && ts.elapsed() < PROCESS_CACHE_TTL
+    {
+        return cached;
+    }
+
     use windows_sys::Win32::{
         Foundation::CloseHandle,
         System::Threading::{
@@ -337,27 +347,33 @@ fn query_win_process_info(pid: u32) -> Option<LocalProcessInfo> {
         },
     };
 
-    unsafe {
+    let info = unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return None;
+            None
+        } else {
+            let mut buf = [0u16; 1024];
+            let mut size = buf.len() as u32;
+            let ok =
+                QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size);
+            let _ = CloseHandle(handle);
+            if ok == 0 || size == 0 {
+                None
+            } else {
+                let full_path = String::from_utf16_lossy(&buf[..size as usize]);
+                let name = basename_from_path(&full_path);
+                Some(LocalProcessInfo {
+                    name,
+                    path: Some(full_path),
+                    pid,
+                })
+            }
         }
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let ok =
-            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size);
-        let _ = CloseHandle(handle);
-        if ok == 0 || size == 0 {
-            return None;
-        }
-        let full_path = String::from_utf16_lossy(&buf[..size as usize]);
-        let name = basename_from_path(&full_path);
-        Some(LocalProcessInfo {
-            name,
-            path: Some(full_path),
-            pid,
-        })
-    }
+    };
+    WIN_PID_INFO_CACHE
+        .lock()
+        .put(pid, (Instant::now(), info.clone()));
+    info
 }
 
 #[cfg(target_os = "windows")]

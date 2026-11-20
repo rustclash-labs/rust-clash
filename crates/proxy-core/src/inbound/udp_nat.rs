@@ -9,7 +9,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
@@ -196,6 +196,7 @@ pub struct UdpNatManager {
     boot: Instant,
     closed: AtomicBool,
     shutdown_tx: watch::Sender<bool>,
+    evict_lock: Mutex<()>,
     sessions: Arc<DashMap<NatSessionKey, NatSessionEntry>>,
     fast_routes: Arc<DashMap<(SocketAddr, SocketAddr), CachedUdpRoute>>,
     hub: Arc<TelemetryHub>,
@@ -249,6 +250,7 @@ impl UdpNatManager {
             boot: Instant::now(),
             closed: AtomicBool::new(false),
             shutdown_tx,
+            evict_lock: Mutex::new(()),
             sessions: Arc::new(DashMap::new()),
             fast_routes: Arc::new(DashMap::new()),
             hub: Arc::clone(&hub),
@@ -582,31 +584,38 @@ impl UdpNatManager {
             return;
         }
 
-        if self.sessions.len() >= self.max_sessions {
-            let _ = self.reap_idle_sessions();
-            if self.sessions.len() >= self.max_sessions {
-                let oldest_key = self
-                    .sessions
-                    .iter()
-                    .min_by_key(|entry| entry.value().last_active_ms.load(Ordering::Relaxed))
-                    .map(|entry| entry.key().clone());
-                if let Some(k) = oldest_key
-                    && let Some((_, evicted)) = self.sessions.remove(&k)
-                {
-                    evicted.conn_entry.request_close();
-                    self.hub.unregister_connection(&evicted.conn_entry.id);
-                    self.fast_routes.retain(|rk, rv| {
-                        !(rk.0 == k.client_src
-                            && rv.outbound_name == k.outbound_name
-                            && rv.fake_ip_scope == k.fake_ip_scope)
-                    });
+        // Serialize slow-path eviction + slot claim under `evict_lock` (never held across `.await`)
+        // so concurrent UDP bursts cannot race past `max_sessions` by evicting the same oldest key.
+        let (rx, conn_entry, reverse_map, last_active_ms, last_active_wall_ms, idle_timeout_ms) = {
+            let _evict_guard = self.evict_lock.lock();
+
+            if self.sessions.len() >= self.max_sessions && !self.sessions.contains_key(&key) {
+                let _ = self.reap_idle_sessions();
+                while self.sessions.len() >= self.max_sessions {
+                    let Some(oldest_key) = self
+                        .sessions
+                        .iter()
+                        .min_by_key(|entry| entry.value().last_active_ms.load(Ordering::Relaxed))
+                        .map(|entry| entry.key().clone())
+                    else {
+                        break;
+                    };
+                    if let Some((_, evicted)) = self.sessions.remove(&oldest_key) {
+                        evicted.conn_entry.request_close();
+                        self.hub.unregister_connection(&evicted.conn_entry.id);
+                        self.fast_routes.retain(|rk, rv| {
+                            !(rk.0 == oldest_key.client_src
+                                && rv.outbound_name == oldest_key.outbound_name
+                                && rv.fake_ip_scope == oldest_key.fake_ip_scope)
+                        });
+                    } else {
+                        break;
+                    }
                 }
             }
-        }
 
-        // Synchronously claim or join the session slot BEFORE any `.await` (`open_udp_session`),
-        // preventing concurrent QUIC Initial bursts from opening N parallel upstream sessions!
-        let (rx, conn_entry, reverse_map, last_active_ms, last_active_wall_ms, idle_timeout_ms) =
+            // Synchronously claim or join the session slot BEFORE any `.await` (`open_udp_session`),
+            // preventing concurrent QUIC Initial bursts from opening N parallel upstream sessions!
             match self.sessions.entry(key.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                     if !occ.get().tx.is_closed() && !occ.get().conn_entry.is_closed() {
@@ -627,6 +636,7 @@ impl UdpNatManager {
                             self.hub.record_upload(&occ.get().conn_entry, payload_len);
                         }
                         drop(occ);
+                        drop(_evict_guard);
                         self.cache_fast_route(
                             client_src,
                             &raw_dst,
@@ -727,7 +737,8 @@ impl UdpNatManager {
                         idle_timeout_ms,
                     )
                 }
-            };
+            }
+        };
 
         if self.closed.load(Ordering::Acquire) {
             if self
@@ -2046,6 +2057,62 @@ mod tests {
         )
         .await;
         assert_eq!(mgr2.active_session_count(), 0);
+        assert_eq!(hub.active_connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn udp_nat_strictly_enforces_max_sessions_under_concurrent_burst() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mgr = UdpNatManager::new(
+            "test-cap-burst",
+            32,
+            Arc::clone(&hub),
+            Arc::new(|_, _, _| {}),
+        );
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(AsyncMutex::new(Vec::new()));
+        let outbound: DynOutbound = Arc::new(SlowMockUdpOutbound { open_calls, sent });
+
+        let dst = TargetAddr::from("1.1.1.1:443".parse::<SocketAddr>().unwrap());
+        let mut tasks = Vec::new();
+        for port in 40000u16..40180u16 {
+            let m = Arc::clone(&mgr);
+            let ob = Arc::clone(&outbound);
+            let d = dst.clone();
+            tasks.push(tokio::spawn(async move {
+                let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2)), port);
+                m.send_datagram_with_epoch(
+                    src,
+                    d.clone(),
+                    None,
+                    d,
+                    "MATCH",
+                    "",
+                    vec!["mock-quic-node".into()],
+                    ob,
+                    vec![1, 2, 3],
+                    1,
+                )
+                .await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        assert!(
+            mgr.active_session_count() <= 32,
+            "UDP NAT session count ({}) must never exceed max_sessions (32) under concurrent burst",
+            mgr.active_session_count()
+        );
+        assert!(
+            hub.active_connection_count() <= 32,
+            "TelemetryHub active connections ({}) must stay bounded by max_sessions (32)",
+            hub.active_connection_count()
+        );
+
+        mgr.shutdown();
+        assert_eq!(mgr.active_session_count(), 0);
         assert_eq!(hub.active_connection_count(), 0);
     }
 }

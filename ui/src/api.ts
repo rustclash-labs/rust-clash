@@ -481,13 +481,28 @@ async function apiFetch<T>(
     headers.set("Content-Type", "application/json");
   }
   let resp: Response;
+  const controller = init?.signal ? null : new AbortController();
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 25_000) : null;
   try {
-    resp = await fetch(url, { ...init, headers });
+    resp = await fetch(url, {
+      ...init,
+      headers,
+      signal: init?.signal ?? controller?.signal,
+    });
   } catch (err) {
+    if (controller?.signal.aborted) {
+      throw new Error(
+        "Request to RustClash controller timed out (25s) — please retry or inspect diagnostics.",
+      );
+    }
     const detail = err instanceof Error && err.message ? ` (${err.message})` : "";
     throw new Error(
       `Cannot reach RustClash controller API — check that the daemon is running${detail}.`,
     );
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
   }
   if (!resp.ok) {
     let errText = `${resp.status} ${resp.statusText}`.trim();
