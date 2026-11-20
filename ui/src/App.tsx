@@ -18,6 +18,7 @@ import {
   NetworkNodesIcon,
   ProfileDocIcon,
   RefreshIcon,
+  ShieldCheckIcon,
   SidebarToggleIcon,
   SunIcon,
   ToolboxIcon,
@@ -39,6 +40,7 @@ import type {
   TrafficPoint,
   VersionInfo,
 } from "./types";
+import { formatBytes } from "./utils/format";
 import { ConnectionsView } from "./views/ConnectionsView";
 import { DashboardView } from "./views/DashboardView";
 import { ProfilesView } from "./views/ProfilesView";
@@ -532,6 +534,13 @@ export const App: React.FC = () => {
 
   const sysProxyOn = Boolean(config?.sysproxy?.enabled);
   const tunOn = Boolean(config?.["tun-active"] ?? config?.tun?.enable);
+  const coreRssBytes = config?.["process-rss-bytes"] ?? connections?.memory ?? null;
+  const mixedPortNum = config?.["mixed-port"] ?? 7890;
+  const verLabel = version?.version
+    ? /^(v|rust-clash)/i.test(version.version)
+      ? version.version
+      : `v${version.version}`
+    : "Pure Rust";
 
   return (
     <div
@@ -539,6 +548,15 @@ export const App: React.FC = () => {
     >
       <aside className="sidebar">
         <div className="sidebar-top">
+          {!sidebarCollapsed && (
+            <div className="sidebar-brand">
+              <span className="sidebar-brand-mark" aria-hidden="true">R</span>
+              <div className="sidebar-brand-meta">
+                <span className="sidebar-brand-name">RustClash</span>
+                <span className="sidebar-brand-ver tabular">{verLabel}</span>
+              </div>
+            </div>
+          )}
           <button
             id="sidebar-collapse-btn"
             type="button"
@@ -582,6 +600,36 @@ export const App: React.FC = () => {
             );
           })}
         </nav>
+
+        {!sidebarCollapsed && (
+          <div className="sidebar-kernel-foot">
+            <div className="sidebar-kernel-row">
+              <span className="sidebar-kernel-status">
+                <span
+                  className={`sidebar-kernel-dot ${
+                    online && !authRequired ? "online" : "offline"
+                  }`}
+                />
+                <span>
+                  {online && !authRequired
+                    ? tr("内核运行中", "Core Online")
+                    : tr("内核重连中", "Reconnecting")}
+                </span>
+              </span>
+              <span className="mono tabular" style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                :{mixedPortNum}
+              </span>
+            </div>
+            {coreRssBytes != null && coreRssBytes > 0 && (
+              <div className="sidebar-kernel-row" style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                <span>{tr("常驻内存", "Core RSS")}</span>
+                <span className="tabular" style={{ color: "var(--text-secondary)", fontWeight: 600 }}>
+                  {formatBytes(coreRssBytes)}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
       </aside>
 
       <div className="workspace">
@@ -617,7 +665,26 @@ export const App: React.FC = () => {
         )}
 
         <header className="topbar">
-          <h1 className="topbar-title">{pageTitles[tab]}</h1>
+          <div className="topbar-title-group">
+            <h1 className="topbar-title">{pageTitles[tab]}</h1>
+            {tab === "dashboard" && (
+              <span className="topbar-mode-pill">
+                {config?.mode === "global"
+                  ? tr("全局代理", "Global")
+                  : config?.mode === "direct"
+                    ? tr("全局直连", "Direct")
+                    : tr("智能分流", "Smart Rule")}
+                {" · "}
+                {sysProxyOn && tunOn
+                  ? tr("系统代理 + TUN", "SysProxy + TUN")
+                  : tunOn
+                    ? "TUN"
+                    : sysProxyOn
+                      ? tr("系统代理", "SysProxy")
+                      : tr("待机", "Standby")}
+              </span>
+            )}
+          </div>
 
           <div className="topbar-actions" ref={healthWrapRef}>
             {config?.demo?.enabled && (
@@ -665,6 +732,24 @@ export const App: React.FC = () => {
                 <span>{tr("正在重连...", "Reconnecting...")}</span>
               </button>
             )}
+
+            <button
+              id="open-site-doctor-btn"
+              type="button"
+              className="header-pill-btn"
+              onClick={() => {
+                setSiteDoctorTarget("chatgpt.com");
+                setToolsSubTab("diagnostics");
+                setTab("tools");
+              }}
+              title={tr(
+                "网站打不开一键排障：按网址诊断分流路径、DNS 与 TLS 握手",
+                "Site Connectivity Doctor: diagnose route, DNS & TLS for any site",
+              )}
+            >
+              <ShieldCheckIcon size={14} />
+              <span>{tr("网络诊断", "Site Doctor")}</span>
+            </button>
 
             <button
               id="lang-toggle-btn"
@@ -881,7 +966,9 @@ export const App: React.FC = () => {
           </div>
         </header>
 
-        <main className="content-scroll">
+        <main
+          className={`content-scroll ${tab === "dashboard" ? "dashboard-content" : ""}`}
+        >
           {toastMsg && (
             <div
               className="bento-card bento-card-compact"

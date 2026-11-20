@@ -8,29 +8,20 @@ import {
   testProxyDelay,
 } from "../api";
 import {
-  ActivityPulseIcon,
-  ArrowDownIcon,
-  ArrowUpIcon,
+  ExitCountryLandmark,
+  countryDisplayFor,
+  landmarkCaptionFor,
+} from "../components/ExitCountryLandmark";
+import {
   CheckIcon,
-  ChevronDownIcon,
   ChevronRightIcon,
-  ChipMemoryIcon,
   CloseIcon,
   CopyIcon,
-  DirectTargetIcon,
   GithubMarkIcon,
-  GlobeIcon,
   GoogleGIcon,
   LayersGroupIcon,
-  MonitorIpIcon,
-  ProfileDocIcon,
   RefreshIcon,
-  RuleListIcon,
-  ScallopedMasterShape,
-  ScallopedShieldBadge,
   ShieldCheckIcon,
-  SplitRouteIcon,
-  SysProxyIcon,
   WifiIcon,
 } from "../components/Icons";
 import { Sparkline } from "../components/Sparkline";
@@ -52,14 +43,11 @@ import {
   formatBytes,
   formatCompactCount,
   formatDurationHms,
-  formatSpeed,
   prettyProtocolLabel,
-  splitBytesParts,
   splitSpeedParts,
 } from "../utils/format";
 import {
   deriveExitIpDisplay,
-  deriveMemoryDisplay,
   deriveThreeLayerStatus,
   planMasterToggle,
   resolveIntranetIpDisplay,
@@ -104,18 +92,6 @@ function saveTakeoverPref(pref: TakeoverPref): void {
   }
 }
 
-function getBrowserHeapBytes(): number | null {
-  if (typeof performance === "undefined") return null;
-  const mem = (
-    performance as Performance & {
-      memory?: { usedJSHeapSize?: number };
-    }
-  ).memory;
-  return typeof mem?.usedJSHeapSize === "number" && mem.usedJSHeapSize > 0
-    ? mem.usedJSHeapSize
-    : null;
-}
-
 function isTunPrivilegeFailure(
   err: unknown,
   msg: string,
@@ -152,7 +128,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onRefreshAll,
   onOpenProfiles,
   onOpenProxies,
-  onOpenTools,
   onOpenSiteDoctor,
 }) => {
   const { lang, tr } = useI18n();
@@ -160,8 +135,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
   const [tunPrivilegeHint, setTunPrivilegeHint] = useState<string | null>(null);
-  const [ipCopied, setIpCopied] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [lanIpCopied, setLanIpCopied] = useState(false);
+  const [exitIpCopied, setExitIpCopied] = useState(false);
 
   // Exit IP state (`GET /tools/ip`) — null means not yet checked
   const [exitIp, setExitIp] = useState<ExitIpInfo | null>(null);
@@ -196,18 +171,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }, 1000);
     return () => window.clearInterval(timer);
   }, []);
-
-  // Peak speeds tracking across session
-  const peakUpRef = useRef<number>(0);
-  const peakDownRef = useRef<number>(0);
-  for (const pt of trafficHistory) {
-    if (pt.up > peakUpRef.current) peakUpRef.current = pt.up;
-    if (pt.down > peakDownRef.current) peakDownRef.current = pt.down;
-  }
-  if (latestTraffic.up > peakUpRef.current) peakUpRef.current = latestTraffic.up;
-  if (latestTraffic.down > peakDownRef.current) {
-    peakDownRef.current = latestTraffic.down;
-  }
 
   const groups = useMemo(() => {
     const list = Object.values(proxies).filter(
@@ -316,27 +279,28 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
   }, [online]);
 
-  useEffect(() => {
-    if (!online) return;
-    void loadExitIp(false);
-    void probeConnectivity();
-  }, [online, effectiveOutbound, config?.mode, loadExitIp, probeConnectivity]);
-
-  useEffect(() => {
-    if (!online || !advancedOpen) return;
-    void loadAuxActivity();
-  }, [advancedOpen, activityTab, online, loadAuxActivity]);
-
   const sysproxyEnabled = Boolean(config?.sysproxy?.enabled);
   const tunEnabled = Boolean(config?.tun.enable || config?.["tun-active"]);
   const proxyRunning = sysproxyEnabled || tunEnabled;
 
-  // Auto-expand Advanced Network section if TUN privilege error occurs
   useEffect(() => {
-    if (tunPrivilegeHint) {
-      setAdvancedOpen(true);
-    }
-  }, [tunPrivilegeHint]);
+    if (!online || (!proxyRunning && !config?.demo.enabled)) return;
+    void loadExitIp(false);
+    void probeConnectivity();
+  }, [
+    online,
+    proxyRunning,
+    config?.demo.enabled,
+    effectiveOutbound,
+    config?.mode,
+    loadExitIp,
+    probeConnectivity,
+  ]);
+
+  useEffect(() => {
+    if (!online) return;
+    void loadAuxActivity();
+  }, [activityTab, online, loadAuxActivity]);
 
   // Compute live uptime seconds
   const uptimeSecs = useMemo(() => {
@@ -409,7 +373,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           }
           saveTakeoverPref(plan.nextSavedPref);
         } catch (stepErr) {
-          // Roll back partial SysProxy mutation if TUN teardown failed
           if (sysproxyDisabled) {
             await setSysProxy(true).catch(() => {});
           }
@@ -428,7 +391,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           }
           saveTakeoverPref(plan.nextSavedPref);
         } catch (stepErr) {
-          // Roll back SysProxy if TUN privilege / setup failed in a multi-step enable
           if (sysproxyTurnedOn) {
             await setSysProxy(false).catch(() => {});
           }
@@ -535,8 +497,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     if (!intranetIp) return;
     try {
       await navigator.clipboard?.writeText(intranetIp);
-      setIpCopied(true);
-      window.setTimeout(() => setIpCopied(false), 1800);
+      setLanIpCopied(true);
+      window.setTimeout(() => setLanIpCopied(false), 1600);
+    } catch {
+      // ignore clipboard restriction
+    }
+  };
+
+  const handleCopyExitIp = async (ipStr: string) => {
+    if (!ipStr) return;
+    try {
+      await navigator.clipboard?.writeText(ipStr);
+      setExitIpCopied(true);
+      window.setTimeout(() => setExitIpCopied(false), 1600);
     } catch {
       // ignore clipboard restriction
     }
@@ -553,36 +526,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     );
   }, [profilesSnapshot]);
 
-  const groupCount =
-    config?.["group-count"] ?? activeProfile?.group_count ?? groups.length;
   const proxyCount =
     config?.["proxy-count"] ?? activeProfile?.proxy_count ?? concreteNodeCount;
   const ruleCount =
     config?.["rule-count"] ?? activeProfile?.rule_count ?? rules.length;
 
-  // Upload & Download speeds & sparklines
+  // Live speed & cumulative totals
   const upParts = splitSpeedParts(latestTraffic.up);
   const downParts = splitSpeedParts(latestTraffic.down);
   const totalUp = connections?.uploadTotal ?? latestTraffic.total_up;
   const totalDown = connections?.downloadTotal ?? latestTraffic.total_down;
-  const upSeries = useMemo(
-    () => trafficHistory.slice(-36).map((p) => p.up),
-    [trafficHistory],
-  );
+  const combinedTotal = totalUp + totalDown;
   const downSeries = useMemo(
-    () => trafficHistory.slice(-36).map((p) => p.down),
+    () => trafficHistory.slice(-36).map((p) => p.down + p.up),
     [trafficHistory],
   );
-
-  // Honest Memory Model (zero fabricated 28 MiB / 0.36x fallback)
-  const rawCoreRss =
-    config?.["process-rss-bytes"] ?? connections?.memory ?? null;
-  const rawJsHeap = getBrowserHeapBytes();
-  const memModel = deriveMemoryDisplay(rawCoreRss, rawJsHeap);
-  const totalMemParts =
-    memModel.available && memModel.totalBytes != null
-      ? splitBytesParts(memModel.totalBytes)
-      : null;
 
   // Honest 3-Layer Connection Status & Exit IP Display
   const threeLayer = deriveThreeLayerStatus({
@@ -595,7 +553,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     probing: serviceLatency.probing,
     googleMs: serviceLatency.google,
     githubMs: serviceLatency.github,
-    exitIpOk: exitIp === null ? undefined : exitIp.ok !== false && Boolean(exitIp.ip),
+    exitIpOk:
+      exitIp === null ? undefined : exitIp.ok !== false && Boolean(exitIp.ip),
   });
 
   const exitDisplay = deriveExitIpDisplay({
@@ -607,15 +566,122 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     effectiveProto,
   });
 
-  const nodeTypeTag =
-    (exitDisplay.verified ? exitIp?.node_type || exitIp?.ip_type : "") ||
-    (effectiveProto !== "DIRECT"
-      ? prettyProtocolLabel(effectiveProto)
-      : tr("直连出站", "Direct"));
-  const qualityTag = lang === "zh" ? exitDisplay.qualityZh : exitDisplay.qualityEn;
-  const orgLabel = lang === "zh" ? exitDisplay.orgZh : exitDisplay.orgEn;
-  const displayIp =
-    lang === "zh" ? exitDisplay.headlineZh : exitDisplay.headlineEn;
+  // Only show city landmark & verified IP prominently when takeover is active (or in demo) & verified
+  const showActiveExit = Boolean(
+    online && (proxyRunning || config?.demo.enabled) && exitDisplay.verified,
+  );
+  const exitCountryCode = showActiveExit ? (exitIp?.country_code ?? "") : "";
+  const countryInfo = countryDisplayFor(
+    exitCountryCode,
+    exitIp?.country,
+    lang,
+  );
+  const landmarkCaption = showActiveExit
+    ? landmarkCaptionFor(exitCountryCode, lang)
+    : "";
+  const verifiedOrg = lang === "zh" ? exitDisplay.orgZh : exitDisplay.orgEn;
+  const verifiedIpText = lang === "zh" ? exitDisplay.headlineZh : exitDisplay.headlineEn;
+  const ipTypeLabel = showActiveExit ? (exitIp?.node_type || exitIp?.ip_type || "") : "";
+
+  // Primary latency metric & sparkbars from real probe / proxy history
+  const activeProxyObj = proxies[effectiveOutbound];
+  const nodeHistoryDelays = useMemo(() => {
+    const raw = (activeProxyObj?.history ?? [])
+      .map((h) => h.delay)
+      .filter((d) => typeof d === "number" && d > 0);
+    return raw.slice(-11);
+  }, [activeProxyObj]);
+
+  const hasManualOrLiveProbe =
+    proxyRunning ||
+    Boolean(config?.demo.enabled) ||
+    serviceLatency.google !== undefined ||
+    serviceLatency.github !== undefined;
+
+  const primaryLatencyMs = useMemo(() => {
+    const candidates: number[] = [];
+    if (typeof serviceLatency.google === "number" && serviceLatency.google > 0) {
+      candidates.push(serviceLatency.google);
+    }
+    if (typeof serviceLatency.github === "number" && serviceLatency.github > 0) {
+      candidates.push(serviceLatency.github);
+    }
+    if (
+      showActiveExit &&
+      typeof exitIp?.latency_ms === "number" &&
+      exitIp.latency_ms > 0
+    ) {
+      candidates.push(exitIp.latency_ms);
+    }
+    if (nodeHistoryDelays.length > 0) {
+      candidates.push(nodeHistoryDelays[nodeHistoryDelays.length - 1]);
+    }
+    return candidates.length > 0 ? Math.min(...candidates) : null;
+  }, [
+    serviceLatency.google,
+    serviceLatency.github,
+    showActiveExit,
+    exitIp?.latency_ms,
+    nodeHistoryDelays,
+  ]);
+
+  const latencyQuality = useMemo(() => {
+    if (!online) return { text: tr("核心离线", "Core Offline"), tone: "muted" };
+    if (!hasManualOrLiveProbe) {
+      if (primaryLatencyMs != null) {
+        return { text: tr("待机 · 上次测速", "Standby · Last Test"), tone: "muted" };
+      }
+      return { text: tr("待机中", "Standby"), tone: "muted" };
+    }
+    if (serviceLatency.probing && primaryLatencyMs == null) {
+      return { text: tr("正在测速…", "Probing..."), tone: "muted" };
+    }
+    if (primaryLatencyMs == null) {
+      if (serviceLatency.google === null && serviceLatency.github === null) {
+        return { text: tr("连通异常", "Unreachable"), tone: "rose" };
+      }
+      return { text: tr("等待测速", "Not Probed"), tone: "muted" };
+    }
+    if (primaryLatencyMs < 80) {
+      return { text: tr("质量极佳", "Excellent"), tone: "emerald" };
+    }
+    if (primaryLatencyMs < 180) {
+      return { text: tr("线路良好", "Good"), tone: "emerald" };
+    }
+    if (primaryLatencyMs < 360) {
+      return { text: tr("延迟偏高", "Moderate"), tone: "amber" };
+    }
+    return { text: tr("拥塞较慢", "High Latency"), tone: "rose" };
+  }, [
+    online,
+    hasManualOrLiveProbe,
+    serviceLatency.probing,
+    serviceLatency.google,
+    serviceLatency.github,
+    primaryLatencyMs,
+    tr,
+  ]);
+
+  const sparkbarRatios = useMemo(() => {
+    if (!hasManualOrLiveProbe || primaryLatencyMs == null) {
+      return new Array<number>(11).fill(0.2);
+    }
+    if (nodeHistoryDelays.length >= 2) {
+      const maxD = Math.max(...nodeHistoryDelays, 60);
+      const padded =
+        nodeHistoryDelays.length >= 11
+          ? nodeHistoryDelays
+          : [
+              ...new Array<number>(11 - nodeHistoryDelays.length).fill(
+                nodeHistoryDelays[0],
+              ),
+              ...nodeHistoryDelays,
+            ];
+      return padded.map((d) => Math.max(0.32, Math.min(0.96, d / maxD)));
+    }
+    const level = Math.max(0.35, Math.min(0.88, primaryLatencyMs / 80));
+    return new Array<number>(11).fill(level);
+  }, [hasManualOrLiveProbe, nodeHistoryDelays, primaryLatencyMs]);
 
   // Activity counts
   const liveConns = connections?.connections ?? [];
@@ -630,8 +696,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const pickerGroupObj = quickPickerGroup ? proxies[quickPickerGroup] : null;
 
+  const modeSummary =
+    config?.mode === "global"
+      ? tr("全局代理 · 全部流量经节点", "Global · All traffic via proxy")
+      : config?.mode === "direct"
+        ? tr("全局直连 · 绕过代理节点", "Direct · Bypass proxy nodes")
+        : tr("规则分流 · 国内直连 / 国外代理", "Rule · Smart split routing");
+
   return (
-    <>
+    <div className="dashboard-layout">
       {toast && (
         <div className={`banner ${toast.ok ? "banner-ok" : "banner-err"}`}>
           <span>{toast.text}</span>
@@ -685,132 +758,77 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       )}
 
-      <div className="bento-grid">
-        {/* ROW 1: Three-Layer Status Hero (6) + Upload (3) + Download (3) */}
-        <section className="bento-card hero-card col-6">
-          <svg
-            className="hero-wave-bg"
-            viewBox="0 0 280 200"
-            preserveAspectRatio="none"
-            aria-hidden="true"
+      {threeLayer.connectivity.state === "unreachable" && proxyRunning && (
+        <div className="banner banner-err">
+          <span>
+            {tr(
+              "当前已启用接管但外部连通性探测失败，可使用「网络诊断」定位 DNS、隧道或 TLS 阻塞阶段。",
+              "Takeover is enabled but connectivity probes failed — open Site Doctor to isolate DNS, tunnel, or TLS issues.",
+            )}
+          </span>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => onOpenSiteDoctor("chatgpt.com")}
           >
-            <path
-              d="M78,0 C60,28 84,56 64,86 C44,116 68,154 96,176 C124,198 164,194 205,200 L280,200 L280,0 Z"
-              fill="var(--hero-wave-fill)"
-            />
-          </svg>
+            <ShieldCheckIcon size={13} />
+            <span>{tr("立即诊断", "Diagnose")}</span>
+          </button>
+        </div>
+      )}
 
-          <div className="hero-content">
-            <div className="hero-left">
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <span className="bento-card-label">
-                  <ActivityPulseIcon size={16} />
-                  <span>{tr("连接状态", "Status")}</span>
-                </span>
-                <span className={`status-pill ${threeLayer.hero.pillClass}`}>
-                  <span className="status-pill-dot" />
+      {/* ROW 1: Dual Golden Hero Cards — Emerald Master Control (5) + Panoramic City Landmark (7) */}
+      <div className="bento-grid dashboard-top-row">
+        <section
+          className={`hero-control-card col-5 ${proxyRunning ? "connected" : "standby"}`}
+        >
+          <div className="hero-control-top">
+            <div className="hero-control-meta">
+              <div className="hero-control-status">
+                <span
+                  className={`hero-status-dot ${
+                    !online
+                      ? "offline"
+                      : proxyRunning
+                        ? threeLayer.connectivity.state === "unreachable"
+                          ? "error"
+                          : "running"
+                        : "idle"
+                  }`}
+                />
+                <span>
                   {lang === "zh" ? threeLayer.hero.zh : threeLayer.hero.en}
                 </span>
+                {online && proxyRunning && (
+                  <span className="hero-uptime tabular">
+                    · {formatDurationHms(uptimeSecs)}
+                  </span>
+                )}
               </div>
 
-              <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
-                <button
-                  type="button"
-                  className="country-badge-btn"
-                  onClick={() => {
-                    void loadExitIp(true);
-                    void probeConnectivity();
-                  }}
-                  title={
-                    exitDisplay.verified
-                      ? tr(
-                          "已通过出口探测验证地区，点击重新检测",
-                          "Verified exit region — click to re-verify",
-                        )
-                      : tr(
-                          "尚未验证出口地区，点击立即探测真实出口 IP",
-                          "Exit region unverified — click to probe real exit IP",
-                        )
-                  }
-                >
-                  {ipLoading ? (
-                    <RefreshIcon size={15} spinning />
-                  ) : (
-                    exitDisplay.badgeCode
-                  )}
-                </button>
-                <div style={{ minWidth: 0 }}>
-                  <div
-                    className="hero-ip-text tabular"
-                    style={{
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {displayIp}
-                  </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      marginTop: 5,
-                      flexWrap: "wrap",
-                    }}
-                  >
-                    <span className="hero-meta-tag">{nodeTypeTag}</span>
-                    <span className="hero-meta-tag tabular">{qualityTag}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "flex-end",
-                  gap: 20,
-                  minWidth: 0,
-                }}
+              <button
+                type="button"
+                className="hero-node-title-btn"
+                onClick={() => onOpenProxies(primaryGroup?.name)}
+                title={tr("点击切换代理节点", "Click to switch proxy node")}
               >
-                <div>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                    {tr("运行时间", "Uptime")}
-                  </div>
-                  <div
-                    className="tabular"
-                    style={{ fontSize: 13, fontWeight: 650, marginTop: 1 }}
-                  >
-                    {online ? formatDurationHms(uptimeSecs) : "—"}
-                  </div>
-                </div>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                    {exitDisplay.verified
-                      ? tr("已验证运营商", "Verified ASN / ISP")
-                      : tr("当前出站说明", "Outbound Info")}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 13,
-                      fontWeight: 600,
-                      marginTop: 1,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={orgLabel}
-                  >
-                    {orgLabel}
-                  </div>
-                </div>
+                <span className="hero-node-title">{effectiveOutbound}</span>
+                <ChevronRightIcon size={15} />
+              </button>
+
+              <div className="hero-node-sub">
+                {effectiveProto !== "DIRECT"
+                  ? `${prettyProtocolLabel(effectiveProto)} · ${modeSummary}`
+                  : modeSummary}
               </div>
             </div>
 
             <button
               id="master-proxy-switch-btn"
               type="button"
-              className="master-switch-btn"
+              className={`hero-power-btn ${proxyRunning ? "on" : "off"} ${
+                busyKey === "master" ? "busy" : ""
+              }`}
               disabled={busyKey === "master"}
               onClick={() => void handleMasterToggle()}
               title={
@@ -830,139 +848,29 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   : tr("开启系统接管", "Enable takeover")
               }
             >
-              <ScallopedMasterShape
-                running={proxyRunning}
-                busy={busyKey === "master"}
-                size={68}
-              />
+              {busyKey === "master" ? (
+                <RefreshIcon size={22} spinning />
+              ) : (
+                <svg
+                  width="24"
+                  height="24"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.3"
+                  strokeLinecap="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 2.5v9.5" />
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                </svg>
+              )}
             </button>
           </div>
 
-          {/* Explicit Three-Layer Status Separation */}
-          <div className="three-layer-strip">
-            <div className="three-layer-cell">
-              <span className="three-layer-title">
-                {tr("1. 代理内核", "1. Core Engine")}
-              </span>
-              <span className="three-layer-val">
-                <span className={`layer-dot ${threeLayer.core.tone}`} />
-                <span>
-                  {lang === "zh" ? threeLayer.core.zh : threeLayer.core.en}
-                </span>
-              </span>
-            </div>
-
-            <div className="three-layer-cell">
-              <span className="three-layer-title">
-                {tr("2. 系统代理 / TUN", "2. System Takeover")}
-              </span>
-              <span
-                className="three-layer-val"
-                title={
-                  lang === "zh"
-                    ? threeLayer.takeover.zh
-                    : threeLayer.takeover.en
-                }
-              >
-                <span className={`layer-dot ${threeLayer.takeover.tone}`} />
-                <span>
-                  {lang === "zh"
-                    ? threeLayer.takeover.zh
-                    : threeLayer.takeover.en}
-                </span>
-              </span>
-            </div>
-
-            <div className="three-layer-cell">
-              <span className="three-layer-title">
-                {tr("3. 互联网连通性", "3. Connectivity")}
-              </span>
-              <span
-                className="three-layer-val"
-                title={
-                  lang === "zh"
-                    ? threeLayer.connectivity.zh
-                    : threeLayer.connectivity.en
-                }
-              >
-                <span
-                  className={`layer-dot ${threeLayer.connectivity.tone}`}
-                />
-                <span>
-                  {lang === "zh"
-                    ? threeLayer.connectivity.zh
-                    : threeLayer.connectivity.en}
-                </span>
-              </span>
-            </div>
-          </div>
-        </section>
-
-        <section className="bento-card speed-card col-3">
-          <div>
-            <div className="bento-card-head" style={{ marginBottom: 4 }}>
-              <span className="bento-card-label">
-                <ArrowUpIcon size={14} color="var(--text-secondary)" />
-                <span>{tr("上传速度", "Upload")}</span>
-              </span>
-              <span
-                className="tabular"
-                style={{ fontSize: 11, color: "var(--text-muted)" }}
-              >
-                {tr("峰值", "Peak")} {formatSpeed(peakUpRef.current)}
-              </span>
-            </div>
-            <div className="speed-big-row tabular">
-              <span className="speed-big-num">{upParts.value}</span>
-              <span className="speed-big-unit">{upParts.unit}</span>
-            </div>
-            <div className="speed-total-sub tabular">
-              {tr("累计", "Total")} {formatBytes(totalUp)}
-            </div>
-          </div>
-          <div className="sparkline-wrap">
-            <Sparkline values={upSeries} strokeColor="#3b82f6" height={52} />
-          </div>
-        </section>
-
-        <section className="bento-card speed-card col-3">
-          <div>
-            <div className="bento-card-head" style={{ marginBottom: 4 }}>
-              <span className="bento-card-label">
-                <ArrowDownIcon size={14} color="var(--accent-blue)" />
-                <span>{tr("下载速度", "Download")}</span>
-              </span>
-              <span
-                className="tabular"
-                style={{ fontSize: 11, color: "var(--text-muted)" }}
-              >
-                {tr("峰值", "Peak")} {formatSpeed(peakDownRef.current)}
-              </span>
-            </div>
-            <div className="speed-big-row tabular">
-              <span className="speed-big-num">{downParts.value}</span>
-              <span className="speed-big-unit">{downParts.unit}</span>
-            </div>
-            <div className="speed-total-sub tabular">
-              {tr("累计", "Total")} {formatBytes(totalDown)}
-            </div>
-          </div>
-          <div className="sparkline-wrap">
-            <Sparkline values={downSeries} strokeColor="#1677ff" height={52} />
-          </div>
-        </section>
-
-        {/* ROW 2: Outbound Mode (5) + System Proxy (3) + Site Connectivity Doctor Entry (4) */}
-        <section className="bento-card bento-card-compact col-5">
-          <span
-            className="bento-card-label"
-            style={{ fontWeight: 600, color: "var(--text-primary)" }}
-          >
-            <SplitRouteIcon size={16} />
-            <span>{tr("分流模式", "Routing mode")}</span>
-          </span>
+          {/* 1-Tap Routing Mode Segmented Bar */}
           <div
-            className="mode-pills"
+            className="hero-mode-bar"
             role="group"
             aria-label={tr("分流模式", "Routing mode")}
           >
@@ -970,346 +878,369 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               id="mode-rule-btn"
               type="button"
               disabled={Boolean(busyKey)}
-              className={`mode-pill-btn ${
+              className={`hero-mode-btn ${
                 (config?.mode ?? "rule") === "rule" ? "active" : ""
               }`}
               onClick={() => handleModeSwitch("rule")}
             >
-              <RuleListIcon size={14} />
-              <span>{tr("规则", "Rule")}</span>
+              {tr("规则分流", "Rule")}
             </button>
             <button
               id="mode-global-btn"
               type="button"
               disabled={Boolean(busyKey)}
-              className={`mode-pill-btn ${
+              className={`hero-mode-btn ${
                 config?.mode === "global" ? "active" : ""
               }`}
               onClick={() => handleModeSwitch("global")}
             >
-              <GlobeIcon size={14} />
-              <span>{tr("全局", "Global")}</span>
+              {tr("全局代理", "Global")}
             </button>
             <button
               id="mode-direct-btn"
               type="button"
               disabled={Boolean(busyKey)}
-              className={`mode-pill-btn ${
+              className={`hero-mode-btn ${
                 config?.mode === "direct" ? "active" : ""
               }`}
               onClick={() => handleModeSwitch("direct")}
             >
-              <DirectTargetIcon size={14} />
-              <span>{tr("直连", "Direct")}</span>
+              {tr("全局直连", "Direct")}
             </button>
+          </div>
+
+          {/* Inline System Proxy + TUN Twin Toggles */}
+          <div className="hero-takeover-row">
+            <div className="hero-takeover-pill">
+              <span className="hero-takeover-label">
+                {tr("系统代理", "System Proxy")}
+              </span>
+              <button
+                id="toggle-sysproxy-btn"
+                type="button"
+                role="switch"
+                aria-checked={sysproxyEnabled}
+                aria-label={tr("系统代理开关", "Toggle System proxy")}
+                disabled={
+                  busyKey === "sysproxy" || config?.sysproxy?.supported === false
+                }
+                className={`mini-switch ${sysproxyEnabled ? "checked" : ""}`}
+                onClick={handleSysProxySwitch}
+              />
+            </div>
+
+            <div className="hero-takeover-pill">
+              <span className="hero-takeover-label">
+                {tr("TUN 网卡", "TUN Mode")}
+              </span>
+              <button
+                id="toggle-tun-btn"
+                type="button"
+                role="switch"
+                aria-checked={tunEnabled}
+                aria-label={tr("TUN 虚拟网卡开关", "Toggle TUN")}
+                disabled={busyKey === "tun" || !config}
+                className={`mini-switch ${tunEnabled ? "checked" : ""}`}
+                onClick={handleTunSwitch}
+              />
+            </div>
           </div>
         </section>
 
-        <section className="bento-card bento-card-compact col-3">
-          <span
-            className="bento-card-label"
-            style={{ fontWeight: 600, color: "var(--text-primary)" }}
-          >
-            <SysProxyIcon size={16} />
-            <span>{tr("系统代理", "System proxy")}</span>
-          </span>
-          <button
-            id="toggle-sysproxy-btn"
-            type="button"
-            role="switch"
-            aria-checked={sysproxyEnabled}
-            aria-label={tr("系统代理开关", "Toggle System proxy")}
-            disabled={
-              busyKey === "sysproxy" || config?.sysproxy?.supported === false
-            }
-            className={`pill-switch ${sysproxyEnabled ? "checked" : ""}`}
-            onClick={handleSysProxySwitch}
-          />
-        </section>
+        {/* Panoramic Exit Country Landmark Card (7 cols) */}
+        <section className="bento-card landmark-showcase-card col-7">
+          <div className="landmark-head">
+            <div className="landmark-title-col">
+              <div className="landmark-kicker">
+                <span>{tr("落地出口", "Exit Location")}</span>
+                <span className="landmark-iso-pill">
+                  {showActiveExit
+                    ? exitDisplay.badgeCode
+                    : config?.demo.enabled
+                      ? "LAB"
+                      : "LOCAL"}
+                </span>
+              </div>
 
-        <section
-          className="bento-card bento-card-compact col-4"
-          style={{
-            borderColor:
-              threeLayer.connectivity.state === "unreachable"
-                ? "var(--accent-rose)"
-                : undefined,
-          }}
-        >
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 13, fontWeight: 650 }}>
-              {tr("某个网站打不开？", "Website Won't Open?")}
+              <div className="landmark-country-row">
+                {showActiveExit ? (
+                  <>
+                    {countryInfo.flag && (
+                      <span className="landmark-flag" aria-hidden="true">
+                        {countryInfo.flag}
+                      </span>
+                    )}
+                    <span className="landmark-country-name">
+                      {countryInfo.name}
+                    </span>
+                  </>
+                ) : config?.demo.enabled ? (
+                  <span className="landmark-country-name">
+                    {tr("演练沙盒", "Demo Sandbox")}
+                  </span>
+                ) : (
+                  <span className="landmark-country-name">
+                    {tr("本地网络", "Local Network")}
+                  </span>
+                )}
+              </div>
+
+              <div className="landmark-sub" title={verifiedOrg}>
+                {showActiveExit
+                  ? ipTypeLabel
+                    ? `${verifiedOrg} · ${ipTypeLabel}`
+                    : verifiedOrg
+                  : !online
+                    ? tr("等待连接本地代理核心", "Waiting for local proxy core")
+                    : !proxyRunning
+                      ? tr(
+                          "待机 · 开启接管后自动识别落地出口",
+                          "Standby · Exit region detected automatically once enabled",
+                        )
+                      : ipLoading
+                        ? tr("正在探测真实落地出口…", "Probing verified exit IP...")
+                        : verifiedOrg}
+              </div>
             </div>
-            <div
-              style={{
-                fontSize: 11.5,
-                color: "var(--text-muted)",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {tr(
-                "按网址诊断分流路径、DNS 与 TLS 握手",
-                "Check route, DNS & TLS for any site",
+
+            <div className="landmark-right-col">
+              <div className="landmark-ip-actions">
+                {showActiveExit ? (
+                  <button
+                    type="button"
+                    className="landmark-ip-pill mono tabular"
+                    onClick={() => void handleCopyExitIp(verifiedIpText)}
+                    title={
+                      exitIpCopied
+                        ? tr("已复制出口 IP", "Copied Exit IP")
+                        : tr("点击复制出口 IP", "Click to copy exit IP")
+                    }
+                  >
+                    <span>{verifiedIpText}</span>
+                    {exitIpCopied ? (
+                      <CheckIcon size={13} />
+                    ) : (
+                      <CopyIcon size={13} />
+                    )}
+                  </button>
+                ) : (
+                  <span className="landmark-standby-chip">
+                    {!online
+                      ? tr("离线", "Offline")
+                      : ipLoading
+                        ? tr("探测中…", "Probing...")
+                        : !proxyRunning
+                          ? tr("待机", "Standby")
+                          : tr("未探测", "Unverified")}
+                  </span>
+                )}
+
+                {(proxyRunning || config?.demo.enabled) && (
+                  <button
+                    type="button"
+                    className="bento-icon-action"
+                    disabled={!online || ipLoading}
+                    onClick={() => {
+                      void loadExitIp(true);
+                      void probeConnectivity();
+                    }}
+                    title={tr("重新探测真实出口 IP", "Re-probe real exit IP")}
+                    aria-label={tr("重新探测出口 IP", "Re-probe exit IP")}
+                  >
+                    <RefreshIcon size={14} spinning={ipLoading} />
+                  </button>
+                )}
+              </div>
+
+              {showActiveExit && landmarkCaption && (
+                <div className="landmark-caption">{landmarkCaption}</div>
               )}
             </div>
           </div>
-          <button
-            id="open-site-doctor-btn"
-            type="button"
-            className="btn btn-primary btn-sm"
-            style={{ flexShrink: 0 }}
-            onClick={() => onOpenSiteDoctor("chatgpt.com")}
-          >
-            {tr("诊断连接问题", "Site Doctor")}
-          </button>
-        </section>
 
-        {/* ROW 3: Active Profile (4) + Service Connectivity (3) + Proxy Groups Quick Switcher (5) */}
-        <section
-          className="bento-card col-4"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            justifyContent: "space-between",
-            gap: 10,
-          }}
-        >
+          <div className="landmark-canvas-wrap">
+            <ExitCountryLandmark
+              countryCode={exitCountryCode}
+              connected={showActiveExit}
+            />
+          </div>
+        </section>
+      </div>
+
+      {/* ROW 2: Refined 3-Column Bento Telemetry (Throughput 4 + Latency 4 + Quick Groups 4) */}
+      <div className="bento-grid dashboard-mid-row">
+        {/* Col 1: Unified Real-Time Throughput */}
+        <section className="bento-card telemetry-card col-4">
           <div>
             <div className="bento-card-head" style={{ marginBottom: 6 }}>
               <span className="bento-card-label">
-                <ProfileDocIcon size={16} />
-                <span>{tr("当前配置", "Profile")}</span>
+                <span>{tr("实时速率", "Live Throughput")}</span>
+              </span>
+              <span className="tabular" style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+                {tr("累计", "Total")} {formatBytes(combinedTotal)}
+              </span>
+            </div>
+
+            <div className="throughput-primary-row">
+              <div className="speed-big-row tabular">
+                <span className="throughput-dir-dl">↓</span>
+                <span className="speed-big-num">{downParts.value}</span>
+                <span className="speed-big-unit">{downParts.unit}</span>
+              </div>
+              <span className="tabular throughput-sub-bytes">
+                {formatBytes(totalDown)}
+              </span>
+            </div>
+
+            <div className="throughput-secondary-row">
+              <span className="tabular throughput-up-val">
+                <span className="throughput-dir-ul">↑</span>
+                {upParts.value} {upParts.unit}
+              </span>
+              <span className="tabular throughput-sub-bytes">
+                {formatBytes(totalUp)}
+              </span>
+            </div>
+          </div>
+
+          <div className="sparkline-wrap-clean">
+            <Sparkline
+              values={downSeries}
+              strokeColor="var(--accent-blue)"
+              height={48}
+              idle={!proxyRunning}
+            />
+          </div>
+        </section>
+
+        {/* Col 2: Node Latency & Service Connectivity */}
+        <section className="bento-card telemetry-card col-4">
+          <div>
+            <div className="bento-card-head" style={{ marginBottom: 6 }}>
+              <span className="bento-card-label">
+                <span>{tr("节点延迟与连通性", "Latency & Reachability")}</span>
               </span>
               <button
                 type="button"
                 className="bento-icon-action"
-                onClick={onOpenProfiles}
-                title={tr("管理订阅配置", "Manage Profiles")}
+                onClick={() => void probeConnectivity()}
+                title={tr("重新检测连通性", "Re-test connectivity")}
               >
-                <ChevronRightIcon size={15} />
+                <RefreshIcon size={14} spinning={serviceLatency.probing} />
               </button>
             </div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                minWidth: 0,
-              }}
-            >
-              <span
-                style={{
-                  fontSize: 15,
-                  fontWeight: 650,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  flex: 1,
-                }}
-                title={activeProfile?.name ?? "Default"}
-              >
-                {activeProfile?.name ?? tr("默认配置", "Default Profile")}
-              </span>
-              <span
-                style={{
-                  fontSize: 11,
-                  color: "var(--text-muted)",
-                  flexShrink: 0,
-                }}
-              >
-                {activeProfile?.kind === "subscription"
-                  ? tr("订阅", "Sub")
-                  : tr("本地", "Local")}
-              </span>
-              {(activeProfile?.manual_proxy_count ?? 0) > 0 && (
-                <span className="badge badge-emerald tabular">
-                  +{activeProfile?.manual_proxy_count} {tr("手动", "Manual")}
-                </span>
-              )}
+
+            <div className="latency-top-split">
+              <div>
+                <div className="speed-big-row tabular">
+                  <span className="speed-big-num">
+                    {primaryLatencyMs != null ? primaryLatencyMs : "—"}
+                  </span>
+                  {primaryLatencyMs != null && (
+                    <span className="speed-big-unit">ms</span>
+                  )}
+                </div>
+                <div className={`latency-quality-label ${latencyQuality.tone}`}>
+                  {latencyQuality.text}
+                </div>
+              </div>
+
+              <div className="service-compact-stack">
+                <div className="service-mini-chip">
+                  <GoogleGIcon size={13} />
+                  <span className="service-mini-name">Google</span>
+                  <span className="service-mini-ms tabular">
+                    {serviceLatency.probing && serviceLatency.google === undefined
+                      ? "…"
+                      : serviceLatency.google != null
+                        ? `${serviceLatency.google}ms`
+                        : serviceLatency.google === null
+                          ? tr("超时", "Fail")
+                          : "—"}
+                  </span>
+                </div>
+                <div className="service-mini-chip">
+                  <GithubMarkIcon size={13} />
+                  <span className="service-mini-name">GitHub</span>
+                  <span className="service-mini-ms tabular">
+                    {serviceLatency.probing && serviceLatency.github === undefined
+                      ? "…"
+                      : serviceLatency.github != null
+                        ? `${serviceLatency.github}ms`
+                        : serviceLatency.github === null
+                          ? tr("超时", "Fail")
+                          : "—"}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
 
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-              gap: 6,
-              paddingTop: 4,
-            }}
-          >
-            <div>
-              <div className="tabular" style={{ fontSize: 15.5, fontWeight: 700 }}>
-                {groupCount}
-              </div>
-              <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                {tr("策略组", "Groups")}
-              </div>
-            </div>
-            <div>
-              <div className="tabular" style={{ fontSize: 15.5, fontWeight: 700 }}>
-                {proxyCount}
-              </div>
-              <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                {tr("节点", "Nodes")}
-              </div>
-            </div>
-            <div>
-              <div className="tabular" style={{ fontSize: 15.5, fontWeight: 700 }}>
-                {ruleCount.toLocaleString()}
-              </div>
-              <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                {tr("规则", "Rules")}
-              </div>
-            </div>
+          <div className="latency-sparkbars" aria-hidden="true">
+            {sparkbarRatios.map((ratio, idx) => (
+              <span
+                key={idx}
+                className={`latency-bar ${
+                  !hasManualOrLiveProbe || primaryLatencyMs == null
+                    ? "idle"
+                    : idx === sparkbarRatios.length - 1
+                      ? "latest"
+                      : idx >= 7
+                        ? "recent"
+                        : "past"
+                }`}
+                style={{ height: `${Math.round(ratio * 100)}%` }}
+              />
+            ))}
           </div>
         </section>
 
-        <section
-          className="bento-card col-3"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            justifyContent: "space-between",
-            gap: 8,
-          }}
-        >
-          <div className="bento-card-head" style={{ marginBottom: 2 }}>
+        {/* Col 3: Proxy Groups Quick Switcher */}
+        <section className="bento-card telemetry-card col-4">
+          <div className="bento-card-head" style={{ marginBottom: 8 }}>
             <span className="bento-card-label">
-              <ShieldCheckIcon size={16} />
-              <span>{tr("连通性检测", "Connectivity")}</span>
-            </span>
-            <button
-              type="button"
-              className="bento-icon-action"
-              onClick={() => void probeConnectivity()}
-              title={tr("重新检测连通性", "Re-test connectivity")}
-            >
-              <RefreshIcon size={14} spinning={serviceLatency.probing} />
-            </button>
-          </div>
-
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            <div className="service-pill-row">
-              <span className="service-icon-wrap">
-                <GoogleGIcon size={16} />
-                <span
-                  className={`service-dot ${
-                    serviceLatency.google == null
-                      ? serviceLatency.google === null
-                        ? "warn"
-                        : "idle"
-                      : serviceLatency.google < 400
-                        ? ""
-                        : "warn"
-                  }`}
-                />
-              </span>
-              <span className="tabular" style={{ fontSize: 12.5, fontWeight: 600 }}>
-                {serviceLatency.probing && serviceLatency.google === undefined
-                  ? tr("检测中…", "Testing...")
-                  : serviceLatency.google != null
-                    ? `${serviceLatency.google} ms`
-                    : serviceLatency.google === null
-                      ? tr("超时 / 失败", "Unreachable")
-                      : tr("尚未检测", "Not Checked")}
-              </span>
-              <span
-                style={{
-                  marginLeft: "auto",
-                  fontSize: 11,
-                  color: "var(--text-muted)",
-                }}
-              >
-                Google
-              </span>
-            </div>
-
-            <div className="service-pill-row">
-              <span className="service-icon-wrap">
-                <GithubMarkIcon size={16} />
-                <span
-                  className={`service-dot ${
-                    serviceLatency.github == null
-                      ? serviceLatency.github === null
-                        ? "warn"
-                        : "idle"
-                      : serviceLatency.github < 400
-                        ? ""
-                        : "warn"
-                  }`}
-                />
-              </span>
-              <span className="tabular" style={{ fontSize: 12.5, fontWeight: 600 }}>
-                {serviceLatency.probing && serviceLatency.github === undefined
-                  ? tr("检测中…", "Testing...")
-                  : serviceLatency.github != null
-                    ? `${serviceLatency.github} ms`
-                    : serviceLatency.github === null
-                      ? tr("超时 / 失败", "Unreachable")
-                      : tr("尚未检测", "Not Checked")}
-              </span>
-              <span
-                style={{
-                  marginLeft: "auto",
-                  fontSize: 11,
-                  color: "var(--text-muted)",
-                }}
-              >
-                GitHub
-              </span>
-            </div>
-          </div>
-        </section>
-
-        <section className="bento-card col-5">
-          <div className="bento-card-head" style={{ marginBottom: 10 }}>
-            <span className="bento-card-label">
-              <LayersGroupIcon size={16} />
-              <span>{tr("当前节点与策略组", "Active Node & Groups")}</span>
+              <LayersGroupIcon size={15} />
+              <span>{tr("策略组快切", "Quick Groups")}</span>
               <span className="badge badge-neutral tabular">{groups.length}</span>
             </span>
             <button
               type="button"
-              className="bento-icon-action"
+              className="text-link-btn"
               onClick={() => onOpenProxies()}
-              title={tr("前往代理节点页", "Open Proxies")}
             >
-              <ChevronRightIcon size={15} />
+              <span>{tr("全部节点", "All")}</span>
+              <ChevronRightIcon size={13} />
             </button>
           </div>
 
           {groups.length === 0 ? (
-            <div
-              className="sub-pill-box"
-              style={{
-                padding: "16px 14px",
-                textAlign: "center",
-                color: "var(--text-muted)",
-              }}
-            >
-              <div style={{ marginBottom: 8 }}>
-                {tr("尚未添加代理策略组或订阅", "No proxy groups configured yet")}
+            <div className="groups-empty-box">
+              <div style={{ color: "var(--text-muted)", fontSize: 12 }}>
+                {tr("尚未配置代理策略组", "No proxy groups configured")}
               </div>
               <button
                 type="button"
                 className="btn btn-primary btn-sm"
                 onClick={onOpenProfiles}
               >
-                {tr("去导入订阅", "Import Subscription")}
+                {tr("去导入订阅", "Import Profile")}
               </button>
             </div>
           ) : (
-            <div className="proxy-mini-grid">
-              {groups.map((grp) => {
+            <div className="quick-group-list">
+              {groups.slice(0, 6).map((grp) => {
                 const selectedNode = grp.now || grp.effective_outbound || "DIRECT";
+                const nodeObj = proxies[selectedNode];
+                const lastDelay =
+                  nodeObj && nodeObj.history.length > 0
+                    ? nodeObj.history[nodeObj.history.length - 1]?.delay
+                    : undefined;
                 return (
                   <button
                     key={grp.name}
                     type="button"
-                    className={`proxy-mini-card ${
-                      quickPickerGroup === grp.name ? "active-popover" : ""
+                    className={`quick-group-row ${
+                      quickPickerGroup === grp.name ? "active" : ""
                     }`}
                     onClick={() => {
                       if (grp.type === "Selector") {
@@ -1320,471 +1251,292 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     }}
                     title={`${grp.name} → ${selectedNode}`}
                   >
-                    <span className="proxy-mini-avatar">
-                      {extractBadgeInitial(grp.name)}
-                    </span>
-                    <div style={{ minWidth: 0, flex: 1 }}>
-                      <div
-                        style={{
-                          fontSize: 12.5,
-                          fontWeight: 650,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {grp.name}
-                      </div>
-                      <div
-                        style={{
-                          fontSize: 11,
-                          color: "var(--text-muted)",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          marginTop: 1,
-                        }}
-                      >
-                        {selectedNode}
-                      </div>
+                    <div className="quick-group-info">
+                      <span className="quick-group-name">{grp.name}</span>
+                      <span className="quick-group-now">{selectedNode}</span>
                     </div>
+                    {lastDelay && lastDelay > 0 ? (
+                      <span className="quick-group-delay tabular">
+                        {lastDelay} ms
+                      </span>
+                    ) : (
+                      <span style={{ color: "var(--text-muted)", display: "inline-flex" }}>
+                        <ChevronRightIcon size={13} />
+                      </span>
+                    )}
                   </button>
                 );
               })}
             </div>
           )}
         </section>
+      </div>
 
-        {/* ROW 4: Collapsible Advanced Network & System Section (TUN, Allow LAN, Memory, Live Activity) */}
-        <section className="bento-card col-12" style={{ padding: "12px 18px" }}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: 12,
-              cursor: "pointer",
-              userSelect: "none",
-              flexWrap: "wrap",
-            }}
-            onClick={() => setAdvancedOpen((v) => !v)}
-          >
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 650 }}>
-                {tr(
-                  "高级网络接管与底层运行状态",
-                  "Advanced Network Takeover & Runtime Telemetry",
-                )}
-              </div>
-              <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                {tr(
-                  "包含 TUN 虚拟网卡、局域网监听共享、真实进程内存占用及实时连接 / DNS 明细",
-                  "TUN virtual interface, LAN sharing, verified memory RSS, and live connection / DNS tables",
-                )}
-              </div>
-            </div>
-
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span
-                className={`badge ${
-                  tunEnabled ? "badge-emerald" : "badge-neutral"
-                }`}
-              >
-                TUN: {tunEnabled ? tr("已启用", "On") : tr("关闭", "Off")}
+      {/* ROW 3 (Bottom A, flex: 1): Live Connections, Recent Routing & Fake-IP DNS Stream */}
+      <section className="bento-card activity-stream-card">
+        <div className="activity-stream-head">
+          <div className="activity-tabs-compact">
+            <button
+              type="button"
+              className={`activity-seg-btn ${activityTab === "live" ? "active" : ""}`}
+              onClick={() => setActivityTab("live")}
+            >
+              <span>{tr("实时连接", "Live")}</span>
+              <span className="activity-seg-count tabular">
+                {formatCompactCount(liveConns.length)}
               </span>
-              <span
-                className={`badge ${
-                  config?.["allow-lan"] ? "badge-sky" : "badge-neutral"
-                }`}
-              >
-                LAN: {config?.["allow-lan"] ? tr("已开启", "On") : tr("关闭", "Off")}
+            </button>
+            <button
+              type="button"
+              className={`activity-seg-btn ${activityTab === "recent" ? "active" : ""}`}
+              onClick={() => setActivityTab("recent")}
+            >
+              <span>{tr("最近分流", "Recent")}</span>
+              <span className="activity-seg-count tabular">
+                {formatCompactCount(totalReqCount)}
               </span>
-              <span className="badge badge-neutral tabular">
-                {tr("内存: ", "Mem: ")}
-                {memModel.coreBytes != null
-                  ? formatBytes(memModel.coreBytes)
-                  : tr("暂无数据", "Unavailable")}
+            </button>
+            <button
+              type="button"
+              className={`activity-seg-btn ${activityTab === "dns" ? "active" : ""}`}
+              onClick={() => setActivityTab("dns")}
+            >
+              <span>{tr("DNS / Fake-IP", "DNS / Fake-IP")}</span>
+              <span className="activity-seg-count tabular">
+                {formatCompactCount(dnsQueryCount)}
               </span>
-              <span style={{ color: "var(--text-muted)", display: "inline-flex" }}>
-                {advancedOpen ? (
-                  <ChevronDownIcon size={16} />
-                ) : (
-                  <ChevronRightIcon size={16} />
-                )}
-              </span>
-            </div>
+            </button>
           </div>
 
-          {advancedOpen && (
-            <div className="bento-grid" style={{ marginTop: 13 }}>
-              <div className="sub-pill-box col-4" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                  <ScallopedShieldBadge size={30} active={tunEnabled} />
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 650 }}>
-                      {tr("TUN 虚拟网卡", "TUN Interface")}
-                    </div>
-                    <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                      {tunEnabled
-                        ? tr("已接管全局三层流量", "Layer-3 takeover active")
-                        : tr("接管不走系统代理的应用流量", "Capture non-proxy-aware apps")}
-                    </div>
-                  </div>
-                </div>
-                <button
-                  id="toggle-tun-btn"
-                  type="button"
-                  role="switch"
-                  aria-checked={tunEnabled}
-                  aria-label={tr("TUN 虚拟网卡开关", "Toggle TUN")}
-                  disabled={busyKey === "tun" || !config}
-                  className={`pill-switch ${tunEnabled ? "checked" : ""}`}
-                  onClick={handleTunSwitch}
-                />
-              </div>
+          <div className="activity-meta-bar">
+            <button
+              type="button"
+              className="activity-profile-chip"
+              onClick={onOpenProfiles}
+              title={tr("点击管理订阅与配置", "Click to manage profiles")}
+            >
+              <span className="activity-profile-label">
+                {activeProfile?.name ?? tr("默认配置", "Default")}
+              </span>
+              <span className="activity-profile-stats tabular">
+                {proxyCount} {tr("节点", "Nodes")} · {ruleCount.toLocaleString()}{" "}
+                {tr("规则", "Rules")}
+              </span>
+            </button>
 
-              <div
-                className="sub-pill-box col-4"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  justifyContent: "space-between",
-                  gap: 8,
-                }}
+            {intranetIp && (
+              <button
+                type="button"
+                className="activity-lan-ip mono tabular"
+                onClick={() => void handleCopyIntranetIp()}
+                title={
+                  lanIpCopied
+                    ? tr("已复制局域网 IP", "Copied LAN IP")
+                    : tr("点击复制本机局域网 IP", "Copy LAN IP")
+                }
               >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span className="bento-card-label" style={{ fontSize: 12 }}>
-                    <MonitorIpIcon size={15} />
-                    <span>{tr("本机局域网地址", "LAN / Intranet IP")}</span>
-                  </span>
-                  <button
-                    type="button"
-                    className="bento-icon-action"
-                    disabled={!intranetIp}
-                    onClick={() => void handleCopyIntranetIp()}
-                    title={
-                      !intranetIp
-                        ? tr("暂无局域网地址", "No LAN IP reported")
-                        : ipCopied
-                          ? tr("已复制", "Copied")
-                          : tr("复制地址", "Copy IP")
-                    }
-                  >
-                    {ipCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                  </button>
-                </div>
+                <WifiIcon size={12} />
+                <span>{intranetIp}</span>
+                {lanIpCopied ? <CheckIcon size={12} /> : <CopyIcon size={11} />}
+              </button>
+            )}
 
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 8,
-                  }}
-                >
-                  <span
-                    className="tabular"
-                    style={{
-                      fontSize: 15,
-                      fontWeight: 700,
-                      color: intranetIp ? "var(--text-primary)" : "var(--text-muted)",
-                    }}
-                  >
-                    {intranetIp ?? tr("暂无数据", "Unavailable")}
-                  </span>
+            <div className="activity-lan-toggle">
+              <span>{tr("局域网共享", "Allow LAN")}</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={Boolean(config?.["allow-lan"])}
+                aria-label={tr("允许局域网连接", "Allow LAN")}
+                disabled={busyKey === "allow-lan" || !config}
+                className={`mini-switch neutral ${
+                  config?.["allow-lan"] ? "checked" : ""
+                }`}
+                onClick={handleAllowLanSwitch}
+              />
+            </div>
+          </div>
+        </div>
 
-                  <div style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
-                    <WifiIcon size={14} />
-                    <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                      {tr("局域网共享", "Allow LAN")}
-                    </span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={Boolean(config?.["allow-lan"])}
-                      aria-label={tr("允许局域网连接", "Allow LAN")}
-                      disabled={busyKey === "allow-lan" || !config}
-                      className={`pill-switch ${config?.["allow-lan"] ? "checked" : ""}`}
-                      onClick={handleAllowLanSwitch}
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div
-                className="sub-pill-box col-4"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  justifyContent: "space-between",
-                  gap: 6,
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span className="bento-card-label" style={{ fontSize: 12 }}>
-                    <ChipMemoryIcon size={15} />
-                    <span>{tr("真实内存占用", "Process Memory")}</span>
-                  </span>
-                  <button
-                    type="button"
-                    className="bento-icon-action"
-                    onClick={onOpenTools}
-                    title={tr("打开工具与设置", "Open Tools")}
-                  >
-                    <ChevronRightIcon size={14} />
-                  </button>
-                </div>
-
-                {totalMemParts ? (
-                  <>
-                    <div className="tabular" style={{ fontSize: 16, fontWeight: 700 }}>
-                      {totalMemParts.value}{" "}
-                      <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-muted)" }}>
-                        {totalMemParts.unit}
-                      </span>
-                    </div>
-                    <div className="mem-bar-track" style={{ margin: "2px 0" }}>
-                      <div className="mem-bar-core" style={{ width: `${memModel.corePct}%` }} />
-                      <div className="mem-bar-ui" style={{ width: `${memModel.uiPct}%` }} />
-                    </div>
-                  </>
+        <div className="activity-stream-body">
+          {activityTab === "dns" ? (
+            <table className="bento-table">
+              <thead>
+                <tr>
+                  <th>{tr("域名", "Domain")}</th>
+                  <th>Fake-IP</th>
+                  <th>{tr("真实 IP", "Real IP")}</th>
+                  <th style={{ textAlign: "right" }}>TTL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {!fakeIpPool || fakeIpPool.entries.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="activity-empty-cell">
+                      {tr(
+                        "暂无 Fake-IP DNS 解析记录 · 流量经过代理后将实时显示映射明细",
+                        "No Fake-IP DNS entries yet — mappings appear here once traffic flows",
+                      )}
+                    </td>
+                  </tr>
                 ) : (
-                  <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)" }}>
-                    {tr("暂无数据", "Unavailable")}
-                  </div>
+                  fakeIpPool.entries.slice(0, 30).map((entry) => (
+                    <tr key={`${entry.ip}-${entry.domain}`}>
+                      <td
+                        className="mono"
+                        style={{
+                          maxWidth: 260,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          fontWeight: 550,
+                        }}
+                        title={entry.domain}
+                      >
+                        {entry.domain}
+                      </td>
+                      <td className="mono tabular" style={{ color: "var(--text-secondary)" }}>
+                        {entry.ip}
+                      </td>
+                      <td className="mono tabular" style={{ color: "var(--text-muted)" }}>
+                        {entry.real_ip || "—"}
+                      </td>
+                      <td
+                        className="mono tabular"
+                        style={{ textAlign: "right", color: "var(--text-muted)" }}
+                      >
+                        {entry.ttl_secs ? `${entry.ttl_secs}s` : "LRU"}
+                      </td>
+                    </tr>
+                  ))
                 )}
-
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--text-muted)" }}>
-                  <span className="tabular">
-                    {tr("核心 RSS: ", "Core RSS: ")}
-                    <strong style={{ color: "var(--text-secondary)" }}>
-                      {memModel.coreBytes != null
-                        ? formatBytes(memModel.coreBytes)
-                        : tr("暂无数据", "Unavailable")}
-                    </strong>
-                  </span>
-                  <span className="tabular">
-                    {tr("界面堆: ", "UI Heap: ")}
-                    <strong style={{ color: "var(--text-secondary)" }}>
-                      {memModel.uiBytes != null
-                        ? formatBytes(memModel.uiBytes)
-                        : tr("未暴露", "N/A")}
-                    </strong>
-                  </span>
-                </div>
-              </div>
-
-              {/* Activity & DNS Table */}
-              <div className="sub-pill-box col-12" style={{ padding: "12px 14px" }}>
-                <div className="activity-tabs">
-                  <button
-                    type="button"
-                    className={`activity-tab-btn ${activityTab === "live" ? "active" : ""}`}
-                    onClick={() => setActivityTab("live")}
-                  >
-                    <span className="activity-tab-count tabular">
-                      {formatCompactCount(liveConns.length)}
-                    </span>
-                    <span>{tr("实时连接", "Live connections")}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={`activity-tab-btn ${activityTab === "recent" ? "active" : ""}`}
-                    onClick={() => setActivityTab("recent")}
-                  >
-                    <span className="activity-tab-count tabular">
-                      {formatCompactCount(totalReqCount)}
-                    </span>
-                    <span>{tr("历史连接", "Recent requests")}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={`activity-tab-btn ${activityTab === "dns" ? "active" : ""}`}
-                    onClick={() => setActivityTab("dns")}
-                  >
-                    <span className="activity-tab-count tabular">
-                      {formatCompactCount(dnsQueryCount)}
-                    </span>
-                    <span>{tr("DNS 查询", "DNS queries")}</span>
-                  </button>
-                </div>
-
-                <div className="bento-table-scroll">
-                  {activityTab === "dns" ? (
-                    <table className="bento-table">
-                      <thead>
-                        <tr>
-                          <th>{tr("域名", "Domain")}</th>
-                          <th>Fake-IP</th>
-                          <th>{tr("真实 IP", "Real IP")}</th>
-                          <th style={{ textAlign: "right" }}>TTL</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {!fakeIpPool || fakeIpPool.entries.length === 0 ? (
-                          <tr>
-                            <td
-                              colSpan={4}
+              </tbody>
+            </table>
+          ) : (
+            <table className="bento-table">
+              <thead>
+                <tr>
+                  <th>{tr("来源", "Source")}</th>
+                  <th>{tr("目标域名", "Target")}</th>
+                  <th>{tr("命中规则", "Rule")}</th>
+                  <th>{tr("出口链路", "Exit")}</th>
+                  <th style={{ textAlign: "right" }}>{tr("下载 / 上传", "DL / UL")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(activityTab === "live" ? liveConns : recentDiagnostics)
+                  .length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="activity-empty-cell">
+                      {!proxyRunning
+                        ? tr(
+                            "待机中 · 开启系统代理或 TUN 接管后，这里将实时呈现连接分流与 DNS 命中轨迹",
+                            "Standby — enable System Proxy or TUN to watch live routing and connection trails here",
+                          )
+                        : activityTab === "live"
+                          ? tr("当前没有活跃连接", "No active connections right now")
+                          : tr("暂无最近请求记录", "No recent requests recorded")}
+                    </td>
+                  </tr>
+                ) : (
+                  (activityTab === "live" ? liveConns : recentDiagnostics)
+                    .slice(0, 30)
+                    .map((conn) => {
+                      const procLabel =
+                        conn.metadata.process?.trim() ||
+                        conn.metadata.type ||
+                        conn.metadata.source;
+                      const targetLabel = `${
+                        conn.metadata.host || conn.metadata.destination_ip || "*"
+                      }:${conn.metadata.destination_port}`;
+                      const ruleLabel = conn.rule
+                        ? conn.rule_payload
+                          ? `${conn.rule},${conn.rule_payload}`
+                          : conn.rule
+                        : "MATCH";
+                      const exitHop =
+                        conn.effective_outbound ||
+                        conn.chains[conn.chains.length - 1] ||
+                        conn.chains[0] ||
+                        "DIRECT";
+                      const isDirect = exitHop.toUpperCase() === "DIRECT";
+                      return (
+                        <tr key={`${conn.id}-${conn.start_epoch_ms}`}>
+                          <td>
+                            <div
                               style={{
-                                textAlign: "center",
-                                padding: "22px 8px",
-                                color: "var(--text-muted)",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 7,
+                                maxWidth: 140,
                               }}
                             >
-                              {tr(
-                                "暂无 Fake-IP DNS 解析记录",
-                                "No Fake-IP DNS entries yet",
-                              )}
-                            </td>
-                          </tr>
-                        ) : (
-                          fakeIpPool.entries.slice(0, 30).map((entry) => (
-                            <tr key={`${entry.ip}-${entry.domain}`}>
-                              <td
+                              <span className="source-avatar">
+                                {extractBadgeInitial(procLabel)}
+                              </span>
+                              <span
                                 style={{
-                                  maxWidth: 220,
                                   overflow: "hidden",
                                   textOverflow: "ellipsis",
                                   fontWeight: 550,
                                 }}
-                                title={entry.domain}
+                                title={procLabel}
                               >
-                                {entry.domain}
-                              </td>
-                              <td className="tabular" style={{ color: "var(--text-secondary)" }}>
-                                {entry.ip}
-                              </td>
-                              <td className="tabular" style={{ color: "var(--text-muted)" }}>
-                                {entry.real_ip || "—"}
-                              </td>
-                              <td
-                                className="tabular"
-                                style={{ textAlign: "right", color: "var(--text-muted)" }}
-                              >
-                                {entry.ttl_secs ? `${entry.ttl_secs}s` : "LRU"}
-                              </td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
-                  ) : (
-                    <table className="bento-table">
-                      <thead>
-                        <tr>
-                          <th>{tr("来源", "Source")}</th>
-                          <th>{tr("目标", "Target")}</th>
-                          <th>{tr("出站", "Exit")}</th>
-                          <th style={{ textAlign: "right" }}>{tr("下载", "Download")}</th>
-                          <th style={{ textAlign: "right" }}>{tr("上传", "Upload")}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(activityTab === "live" ? liveConns : recentDiagnostics)
-                          .length === 0 ? (
-                          <tr>
-                            <td
-                              colSpan={5}
-                              style={{
-                                textAlign: "center",
-                                padding: "22px 8px",
-                                color: "var(--text-muted)",
-                              }}
+                                {procLabel}
+                              </span>
+                            </div>
+                          </td>
+                          <td
+                            className="mono"
+                            style={{
+                              maxWidth: 230,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              color: "var(--text-primary)",
+                            }}
+                            title={targetLabel}
+                          >
+                            {targetLabel}
+                          </td>
+                          <td
+                            className="mono"
+                            style={{
+                              maxWidth: 170,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              color: "var(--text-muted)",
+                            }}
+                            title={ruleLabel}
+                          >
+                            {ruleLabel}
+                          </td>
+                          <td>
+                            <span
+                              className={`badge ${
+                                isDirect ? "badge-neutral" : "badge-emerald"
+                              }`}
+                              title={exitHop}
                             >
-                              {activityTab === "live"
-                                ? tr("当前没有活跃连接", "No active connections right now")
-                                : tr("暂无最近请求记录", "No recent requests recorded")}
-                            </td>
-                          </tr>
-                        ) : (
-                          (activityTab === "live" ? liveConns : recentDiagnostics)
-                            .slice(0, 30)
-                            .map((conn) => {
-                              const procLabel =
-                                conn.metadata.process?.trim() ||
-                                conn.metadata.type ||
-                                conn.metadata.source;
-                              const targetLabel = `${
-                                conn.metadata.host || conn.metadata.destination_ip || "*"
-                              }:${conn.metadata.destination_port}`;
-                              const exitHop =
-                                conn.effective_outbound ||
-                                conn.chains[conn.chains.length - 1] ||
-                                conn.chains[0] ||
-                                "DIRECT";
-                              return (
-                                <tr key={`${conn.id}-${conn.start_epoch_ms}`}>
-                                  <td>
-                                    <div
-                                      style={{
-                                        display: "flex",
-                                        alignItems: "center",
-                                        gap: 8,
-                                        maxWidth: 145,
-                                      }}
-                                    >
-                                      <span className="source-avatar">
-                                        {extractBadgeInitial(procLabel)}
-                                      </span>
-                                      <span
-                                        style={{
-                                          overflow: "hidden",
-                                          textOverflow: "ellipsis",
-                                          fontWeight: 550,
-                                        }}
-                                        title={procLabel}
-                                      >
-                                        {procLabel}
-                                      </span>
-                                    </div>
-                                  </td>
-                                  <td
-                                    style={{
-                                      maxWidth: 185,
-                                      overflow: "hidden",
-                                      textOverflow: "ellipsis",
-                                      color: "var(--text-secondary)",
-                                    }}
-                                    title={targetLabel}
-                                  >
-                                    {targetLabel}
-                                  </td>
-                                  <td
-                                    style={{
-                                      maxWidth: 120,
-                                      overflow: "hidden",
-                                      textOverflow: "ellipsis",
-                                      color: "var(--text-secondary)",
-                                    }}
-                                    title={exitHop}
-                                  >
-                                    {exitHop}
-                                  </td>
-                                  <td
-                                    className="tabular"
-                                    style={{ textAlign: "right", color: "var(--text-secondary)" }}
-                                  >
-                                    {formatBytes(conn.download)}
-                                  </td>
-                                  <td
-                                    className="tabular"
-                                    style={{ textAlign: "right", color: "var(--text-secondary)" }}
-                                  >
-                                    {formatBytes(conn.upload)}
-                                  </td>
-                                </tr>
-                              );
-                            })
-                        )}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-            </div>
+                              {exitHop}
+                            </span>
+                          </td>
+                          <td
+                            className="mono tabular"
+                            style={{
+                              textAlign: "right",
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            {formatBytes(conn.download)} / {formatBytes(conn.upload)}
+                          </td>
+                        </tr>
+                      );
+                    })
+                )}
+              </tbody>
+            </table>
           )}
-        </section>
-      </div>
+        </div>
+      </section>
 
       {/* Quick Group Node Picker Modal */}
       {pickerGroupObj && (
@@ -1897,10 +1649,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           style={{
                             color:
                               delay < 150
-                                ? "#16a34a"
+                                ? "var(--accent-emerald)"
                                 : delay < 400
-                                  ? "#d97706"
-                                  : "#e11d48",
+                                  ? "var(--accent-amber)"
+                                  : "var(--accent-rose)",
                             fontWeight: 600,
                           }}
                         >
@@ -1915,6 +1667,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       )}
-    </>
+    </div>
   );
 };
