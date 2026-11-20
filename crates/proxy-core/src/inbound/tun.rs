@@ -134,7 +134,7 @@ struct BridgeFlow {
     established: bool,
     remote_connected: Arc<AtomicBool>,
     dial_timeout_notify: Arc<Notify>,
-    dial_timeout_notified: bool,
+    dial_timeout_notified_at: Option<(Instant, u64)>,
     created_at: Instant,
     created_wall_ms: u64,
     last_active: Instant,
@@ -153,31 +153,56 @@ struct BridgeFlow {
 impl BridgeFlow {
     fn is_dial_timed_out(&self, now: Instant, now_wall_ms: u64) -> bool {
         !self.remote_connected.load(Ordering::Acquire)
-            && (now.duration_since(self.created_at) > OUTBOUND_CONNECT_TIMEOUT
+            && (now.saturating_duration_since(self.created_at) > OUTBOUND_CONNECT_TIMEOUT
                 || now_wall_ms.saturating_sub(self.created_wall_ms)
                     > OUTBOUND_CONNECT_TIMEOUT.as_millis() as u64)
     }
 
+    /// Notify `flow_task` once when outbound dialing exceeds `OUTBOUND_CONNECT_TIMEOUT`, recording
+    /// the delivery timestamp so `OUTBOUND_CONNECT_HARD_REAP_GRACE` is always granted even after
+    /// an Android deep-sleep wall-clock jump.
+    fn notify_dial_timeout_if_needed(&mut self, now: Instant, now_wall_ms: u64) -> bool {
+        if self.dial_timeout_notified_at.is_none() && self.is_dial_timed_out(now, now_wall_ms) {
+            self.dial_timeout_notified_at = Some((now, now_wall_ms));
+            self.dial_timeout_notify.notify_one();
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_timed_out(&self, now: Instant, now_wall_ms: u64, send_queue_bytes: usize) -> bool {
         let syn_timed_out = !self.established
-            && (now.duration_since(self.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT
+            && (now.saturating_duration_since(self.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT
                 || now_wall_ms.saturating_sub(self.created_wall_ms)
                     > TCP_SYN_HANDSHAKE_TIMEOUT.as_millis() as u64);
-        let hard_dial_limit = OUTBOUND_CONNECT_TIMEOUT + OUTBOUND_CONNECT_HARD_REAP_GRACE;
-        let dial_hard_timed_out = !self.remote_connected.load(Ordering::Acquire)
-            && (now.duration_since(self.created_at) > hard_dial_limit
-                || now_wall_ms.saturating_sub(self.created_wall_ms)
-                    > hard_dial_limit.as_millis() as u64);
-        let idle_timed_out = now.duration_since(self.last_active) > TCP_IDLE_TIMEOUT
-            || now_wall_ms.saturating_sub(self.last_active_wall_ms)
-                > TCP_IDLE_TIMEOUT.as_millis() as u64;
+        let remote_connected = self.remote_connected.load(Ordering::Acquire);
+        // Enforce hard-reap grace relative to when `dial_timeout_notify` was delivered (not
+        // `created_wall_ms`) so waking from a >17s Android AP suspend never aborts `flow_task`
+        // in the same poll tick before `ConnectionGuard::record_failed()` executes.
+        let dial_hard_timed_out = !remote_connected
+            && self
+                .dial_timeout_notified_at
+                .is_some_and(|(notified_mono, notified_wall_ms)| {
+                    now.saturating_duration_since(notified_mono) > OUTBOUND_CONNECT_HARD_REAP_GRACE
+                        || now_wall_ms.saturating_sub(notified_wall_ms)
+                            > OUTBOUND_CONNECT_HARD_REAP_GRACE.as_millis() as u64
+                });
+        // Apply `TCP_IDLE_TIMEOUT` only after outbound connect succeeds; pending dials are
+        // strictly bounded by `notify_dial_timeout_if_needed` + `dial_hard_timed_out` so a >120s
+        // suspend wakeup cannot preempt the 2s `record_failed()` grace window either.
+        let idle_timed_out = remote_connected
+            && (now.saturating_duration_since(self.last_active) > TCP_IDLE_TIMEOUT
+                || now_wall_ms.saturating_sub(self.last_active_wall_ms)
+                    > TCP_IDLE_TIMEOUT.as_millis() as u64);
         let fin_age_exceeded = self
             .fin_started_at
-            .is_some_and(|t| now.duration_since(t) > TCP_HALF_CLOSE_TIMEOUT)
+            .is_some_and(|t| now.saturating_duration_since(t) > TCP_HALF_CLOSE_TIMEOUT)
             || self.fin_started_wall_ms.is_some_and(|w| {
                 now_wall_ms.saturating_sub(w) > TCP_HALF_CLOSE_TIMEOUT.as_millis() as u64
             });
-        let fin_idle_exceeded = now.duration_since(self.last_active) > TCP_HALF_CLOSE_TIMEOUT
+        let fin_idle_exceeded = now.saturating_duration_since(self.last_active)
+            > TCP_HALF_CLOSE_TIMEOUT
             || now_wall_ms.saturating_sub(self.last_active_wall_ms)
                 > TCP_HALF_CLOSE_TIMEOUT.as_millis() as u64;
         let fin_timed_out = fin_age_exceeded
@@ -527,10 +552,7 @@ pub fn spawn_userspace_tun_with_options(
 
                 // Signal `flow_task` when outbound connect exceeds 15s (monotonic or wall-clock)
                 // so `ConnectionGuard::record_failed` records the exact dial timeout before RST.
-                if flow.is_dial_timed_out(now, now_wall) && !flow.dial_timeout_notified {
-                    flow.dial_timeout_notified = true;
-                    flow.dial_timeout_notify.notify_one();
-                }
+                let _ = flow.notify_dial_timeout_if_needed(now, now_wall);
 
                 // Enforce SYN handshake timeout, hard dial backstop, half-close linger timeout,
                 // and idle timeout using both monotonic `Instant` and wall-clock epoch ms
@@ -577,35 +599,58 @@ pub fn spawn_userspace_tun_with_options(
                 let check_now = Instant::now();
                 let check_now_wall = TelemetryHub::now_ms();
                 for flow in flows.values() {
-                    if !flow.established || !flow.remote_connected.load(Ordering::Acquire) {
-                        let limit = if !flow.established {
-                            TCP_SYN_HANDSHAKE_TIMEOUT
-                        } else if !flow.dial_timeout_notified {
-                            OUTBOUND_CONNECT_TIMEOUT
+                    let remote_connected = flow.remote_connected.load(Ordering::Acquire);
+                    if !flow.established || !remote_connected {
+                        let (rem_mono, rem_wall) = if !flow.established {
+                            (
+                                TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(
+                                    check_now.saturating_duration_since(flow.created_at),
+                                ),
+                                TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(Duration::from_millis(
+                                    check_now_wall.saturating_sub(flow.created_wall_ms),
+                                )),
+                            )
+                        } else if let Some((notified_mono, notified_wall_ms)) =
+                            flow.dial_timeout_notified_at
+                        {
+                            (
+                                OUTBOUND_CONNECT_HARD_REAP_GRACE.saturating_sub(
+                                    check_now.saturating_duration_since(notified_mono),
+                                ),
+                                OUTBOUND_CONNECT_HARD_REAP_GRACE.saturating_sub(
+                                    Duration::from_millis(
+                                        check_now_wall.saturating_sub(notified_wall_ms),
+                                    ),
+                                ),
+                            )
                         } else {
-                            OUTBOUND_CONNECT_TIMEOUT + OUTBOUND_CONNECT_HARD_REAP_GRACE
+                            (
+                                OUTBOUND_CONNECT_TIMEOUT.saturating_sub(
+                                    check_now.saturating_duration_since(flow.created_at),
+                                ),
+                                OUTBOUND_CONNECT_TIMEOUT.saturating_sub(Duration::from_millis(
+                                    check_now_wall.saturating_sub(flow.created_wall_ms),
+                                )),
+                            )
                         };
-                        let rem_mono =
-                            limit.saturating_sub(check_now.duration_since(flow.created_at));
-                        let rem_wall = limit.saturating_sub(Duration::from_millis(
-                            check_now_wall.saturating_sub(flow.created_wall_ms),
-                        ));
                         next_delay = fold_min_delay(
                             next_delay,
                             rem_mono.min(rem_wall).max(Duration::from_millis(1)),
                         );
                     }
-                    let rem_idle_mono =
-                        TCP_IDLE_TIMEOUT.saturating_sub(check_now.duration_since(flow.last_active));
-                    let rem_idle_wall = TCP_IDLE_TIMEOUT.saturating_sub(Duration::from_millis(
-                        check_now_wall.saturating_sub(flow.last_active_wall_ms),
-                    ));
-                    next_delay = fold_min_delay(
-                        next_delay,
-                        rem_idle_mono
-                            .min(rem_idle_wall)
-                            .max(Duration::from_millis(1)),
-                    );
+                    if remote_connected {
+                        let rem_idle_mono = TCP_IDLE_TIMEOUT
+                            .saturating_sub(check_now.saturating_duration_since(flow.last_active));
+                        let rem_idle_wall = TCP_IDLE_TIMEOUT.saturating_sub(Duration::from_millis(
+                            check_now_wall.saturating_sub(flow.last_active_wall_ms),
+                        ));
+                        next_delay = fold_min_delay(
+                            next_delay,
+                            rem_idle_mono
+                                .min(rem_idle_wall)
+                                .max(Duration::from_millis(1)),
+                        );
+                    }
                     if let Some(fin_t) = flow.fin_started_at {
                         let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
                         if flow.pending_tx.is_empty() && sock.send_queue() == 0 {
@@ -1408,7 +1453,7 @@ fn register_syn_flow(
             established: false,
             remote_connected,
             dial_timeout_notify,
-            dial_timeout_notified: false,
+            dial_timeout_notified_at: None,
             created_at: now,
             created_wall_ms: now_wall,
             last_active: now,
@@ -1758,7 +1803,7 @@ mod tests {
             established: true,
             remote_connected: Arc::new(AtomicBool::new(true)),
             dial_timeout_notify: Arc::new(Notify::new()),
-            dial_timeout_notified: false,
+            dial_timeout_notified_at: None,
             created_at: mono_now,
             created_wall_ms: base_wall,
             last_active: mono_now,
@@ -1809,13 +1854,13 @@ mod tests {
         let mono_now = Instant::now();
         let base_wall = 1_700_000_000_000u64;
         let remote_connected = Arc::new(AtomicBool::new(false));
-        let flow = BridgeFlow {
+        let mut flow = BridgeFlow {
             handle,
             // smoltcp completed local 3-way handshake (<1ms), while outbound dial is still pending.
             established: true,
             remote_connected: Arc::clone(&remote_connected),
             dial_timeout_notify: Arc::new(Notify::new()),
-            dial_timeout_notified: false,
+            dial_timeout_notified_at: None,
             created_at: mono_now,
             created_wall_ms: base_wall,
             // Even if client sent TLS ClientHello bytes at +14s, created_wall_ms governs dial budget!
@@ -1833,21 +1878,89 @@ mod tests {
         };
 
         // At 14s wall-clock (monotonic frozen), neither soft dial timeout nor hard reap fires.
-        assert!(!flow.is_dial_timed_out(mono_now, base_wall + 14_000));
+        assert!(!flow.notify_dial_timeout_if_needed(mono_now, base_wall + 14_000));
         assert!(!flow.is_timed_out(mono_now, base_wall + 14_000, 0));
 
         // At 15.5s wall-clock (monotonic frozen during Android Doze/suspend), soft dial timeout
-        // fires so `flow_task` records `outbound dial+handshake ... timed out after 15s`.
-        assert!(flow.is_dial_timed_out(mono_now, base_wall + 15_500));
+        // fires once so `flow_task` records `outbound dial+handshake ... timed out after 15s`,
+        // while hard reap waits for `OUTBOUND_CONNECT_HARD_REAP_GRACE` (2s) after notification.
+        assert!(flow.notify_dial_timeout_if_needed(mono_now, base_wall + 15_500));
+        assert!(!flow.notify_dial_timeout_if_needed(mono_now, base_wall + 16_000));
         assert!(!flow.is_timed_out(mono_now, base_wall + 15_500, 0));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 17_400, 0));
 
-        // At 18s wall-clock (> 15s + 2s grace), hard reap backstop also fires if still unconnected.
+        // At 18s wall-clock (> 2s after notification), hard reap backstop fires if still unconnected.
         assert!(flow.is_timed_out(mono_now, base_wall + 18_000, 0));
 
         // Once remote_connected flips true, neither dial timeout nor hard dial backstop triggers.
         remote_connected.store(true, Ordering::Release);
         assert!(!flow.is_dial_timed_out(mono_now, base_wall + 18_000));
         assert!(!flow.is_timed_out(mono_now, base_wall + 18_000, 0));
+    }
+
+    #[tokio::test]
+    async fn deep_sleep_wakeup_preserves_dial_timeout_record_failed_grace_window() {
+        let mut sockets = SocketSet::new(vec![]);
+        let sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        let handle = sockets.add(sock);
+        let (_tx, rx) = mpsc::channel(1);
+        let (_bridge_closed_tx, bridge_closed_rx) = watch::channel(());
+        let noop_task = tokio::spawn(async {});
+
+        let mono_now = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+        let dial_notify = Arc::new(Notify::new());
+        let mut flow = BridgeFlow {
+            handle,
+            established: true,
+            remote_connected: Arc::new(AtomicBool::new(false)),
+            dial_timeout_notify: Arc::clone(&dial_notify),
+            dial_timeout_notified_at: None,
+            created_at: mono_now,
+            created_wall_ms: base_wall,
+            last_active: mono_now,
+            last_active_wall_ms: base_wall,
+            fin_started_at: None,
+            fin_started_wall_ms: None,
+            pending_tx: BytesMut::new(),
+            from_remote_rx: rx,
+            to_remote_tx: None,
+            _bridge_closed_rx: bridge_closed_rx,
+            remote_eof: false,
+            remote_failed: Arc::new(AtomicBool::new(false)),
+            task_abort: noop_task.abort_handle(),
+        };
+
+        // Simulate waking from a 268s Android AP deep sleep (> 17s hard dial AND > 120s TCP_IDLE_TIMEOUT)
+        // while CLOCK_MONOTONIC stayed frozen at `mono_now`.
+        let wakeup_wall = base_wall + 268_000;
+        assert!(flow.notify_dial_timeout_if_needed(mono_now, wakeup_wall));
+
+        // On the exact wakeup poll tick (and throughout the 2s grace window), `is_timed_out` MUST
+        // stay false so `flow_task` is NOT synchronously aborted before calling `record_failed()`.
+        assert!(!flow.is_timed_out(mono_now, wakeup_wall, 0));
+        assert!(!flow.is_timed_out(
+            mono_now + Duration::from_millis(1_900),
+            wakeup_wall + 1_900,
+            0
+        ));
+
+        // The stored notification permit must immediately wake `flow_task`.
+        tokio::time::timeout(Duration::from_millis(50), dial_notify.notified())
+            .await
+            .expect("dial_timeout_notify must wake flow_task on deep-sleep wakeup");
+
+        // If `flow_task` fails to exit within `OUTBOUND_CONNECT_HARD_REAP_GRACE` (2s) after
+        // notification (either by monotonic or wall clock), the hard-reap backstop fires.
+        assert!(flow.is_timed_out(
+            mono_now + Duration::from_millis(2_100),
+            wakeup_wall + 500,
+            0
+        ));
+        assert!(flow.is_timed_out(mono_now, wakeup_wall + 2_100, 0));
     }
 
     #[tokio::test]
@@ -1869,7 +1982,7 @@ mod tests {
             established: true,
             remote_connected: Arc::new(AtomicBool::new(true)),
             dial_timeout_notify: Arc::new(Notify::new()),
-            dial_timeout_notified: false,
+            dial_timeout_notified_at: None,
             created_at: mono_now,
             created_wall_ms: base_wall,
             last_active: mono_now + Duration::from_secs(20),
