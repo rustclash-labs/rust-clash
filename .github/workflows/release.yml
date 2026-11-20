@@ -36,11 +36,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
   CI: "true"
 
 jobs:
@@ -94,6 +95,15 @@ jobs:
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Invalid release tag '$TAG'. Expected format like 'v0.4.0'." >&2
             exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] && git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            EXISTING_TAG_SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+            HEAD_SHA="$(git rev-parse HEAD)"
+            if [[ "$EXISTING_TAG_SHA" != "$HEAD_SHA" ]]; then
+              echo "::error::Tag '${TAG}' already exists at ${EXISTING_TAG_SHA:0:12}, which differs from main HEAD ${HEAD_SHA:0:12}." >&2
+              exit 1
+            fi
           fi
 
           VERSION="${TAG#v}"
@@ -352,12 +362,16 @@ jobs:
             librsvg2-dev \
             patchelf \
             rpm
-      - name: Build Tauri Linux Packages (deb + rpm) & Standalone CLI (Shared Release Graph)
+      - name: Build Tauri Linux Packages (deb + rpm) & Standalone CLI (Single Cargo Invocation)
         run: |
           set -euo pipefail
           mkdir -p release-out
-          (cd crates/tauri-app && npx --yes --package=@tauri-apps/cli@2.12.4 tauri build --target x86_64-unknown-linux-gnu --bundles deb,rpm --features desktop)
-          cargo build --locked --release -p proxy-cli -p tauri-app --features tauri-app/desktop --target x86_64-unknown-linux-gnu --bin rust-clash
+          (cd crates/tauri-app && npx --yes --package=@tauri-apps/cli@2.12.4 tauri build \
+            --target x86_64-unknown-linux-gnu \
+            --bundles deb,rpm \
+            --features tauri-app/desktop \
+            -- --locked -p tauri-app -p proxy-cli)
+          test -x target/x86_64-unknown-linux-gnu/release/rust-clash
           cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md target/x86_64-unknown-linux-gnu/release/
           tar -C target/x86_64-unknown-linux-gnu/release -czf release-out/rust-clash-cli-linux-x86_64.tar.gz \
             rust-clash LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md
@@ -409,15 +423,31 @@ jobs:
           python scripts/fetch_wintun.py --self-test
           python scripts/fetch_wintun.py --arch amd64 --out-dir target/x86_64-pc-windows-msvc/release
           python scripts/fetch_wintun.py --arch amd64 --out-dir crates/tauri-app/wintun-bundle
-      - name: Build Tauri Windows Installers (NSIS + MSI) & Standalone CLI (Shared Release Graph)
+      - name: Build Tauri Windows Installers (NSIS + MSI) & Standalone CLI (Single Cargo Invocation)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-out | Out-Null
           Push-Location crates/tauri-app
-          $extraCfg = '{"bundle":{"resources":{"../../LICENSE-MIT":"LICENSE-MIT","../../LICENSE-APACHE":"LICENSE-APACHE","../../THIRD_PARTY_NOTICES.md":"THIRD_PARTY_NOTICES.md","wintun-bundle/wintun.dll":"wintun.dll","wintun-bundle/wintun-LICENSE.txt":"wintun-LICENSE.txt"}}}'
-          npx --yes --package=@tauri-apps/cli@2.12.4 tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi --features desktop --config $extraCfg
-          Pop-Location
-          cargo build --locked --release -p proxy-cli -p tauri-app --features tauri-app/desktop --target x86_64-pc-windows-msvc --bin rust-clash
+          $extraCfgFile = "tauri.windows-ci.json"
+          '{"bundle":{"resources":{"../../LICENSE-MIT":"LICENSE-MIT","../../LICENSE-APACHE":"LICENSE-APACHE","../../THIRD_PARTY_NOTICES.md":"THIRD_PARTY_NOTICES.md","wintun-bundle/wintun.dll":"wintun.dll","wintun-bundle/wintun-LICENSE.txt":"wintun-LICENSE.txt"}}}' | Set-Content -Path $extraCfgFile -Encoding utf8NoBOM
+          try {
+            $tauriArgs = @(
+              '--yes', '--package=@tauri-apps/cli@2.12.4', 'tauri', 'build',
+              '--target', 'x86_64-pc-windows-msvc',
+              '--bundles', 'nsis,msi',
+              '--features', 'tauri-app/desktop',
+              '--config', $extraCfgFile,
+              '--', '--locked', '-p', 'tauri-app', '-p', 'proxy-cli'
+            )
+            & npx @tauriArgs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $extraCfgFile
+            Pop-Location
+          }
+          if (-not (Test-Path "target/x86_64-pc-windows-msvc/release/rust-clash.exe")) {
+            throw "Expected standalone CLI binary missing at target/x86_64-pc-windows-msvc/release/rust-clash.exe"
+          }
           Compress-Archive -Path `
             target/x86_64-pc-windows-msvc/release/rust-clash.exe, `
             target/x86_64-pc-windows-msvc/release/wintun.dll, `
@@ -469,15 +499,19 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "release-macos-${{ matrix.arch }}"
-      - name: Build macOS (${{ matrix.arch }}) DMG Installer & Standalone CLI (Shared Release Graph)
+      - name: Build macOS (${{ matrix.arch }}) DMG Installer & Standalone CLI (Single Cargo Invocation)
         env:
           TARGET_TRIPLE: ${{ matrix.target }}
           CLI_ARCHIVE: ${{ matrix.cli_archive }}
         run: |
           set -euo pipefail
           mkdir -p release-out
-          (cd crates/tauri-app && npx --yes --package=@tauri-apps/cli@2.12.4 tauri build --target "$TARGET_TRIPLE" --bundles dmg --features desktop)
-          cargo build --locked --release -p proxy-cli -p tauri-app --features tauri-app/desktop --target "$TARGET_TRIPLE" --bin rust-clash
+          (cd crates/tauri-app && npx --yes --package=@tauri-apps/cli@2.12.4 tauri build \
+            --target "$TARGET_TRIPLE" \
+            --bundles dmg \
+            --features tauri-app/desktop \
+            -- --locked -p tauri-app -p proxy-cli)
+          test -x "target/${TARGET_TRIPLE}/release/rust-clash"
           cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "target/${TARGET_TRIPLE}/release/"
           tar -C "target/${TARGET_TRIPLE}/release" -czf "release-out/${CLI_ARCHIVE}" \
             rust-clash LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md
