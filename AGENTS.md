@@ -16,4 +16,4 @@ This repository is maintained under the organization identity **`RustClash Labs 
    - Instead:
      - If `rustclash-push-bot[bot]` GitHub App credentials are configured, authenticate as `rustclash-push-bot[bot]`.
      - Otherwise, push commits authored and committed as `RustClash Labs <rustclash.labs@proton.me>` directly to `main` (Git over HTTPS does not embed the pusher's username into commit objects).
-   - Trigger releases strictly by pushing a `v*.*.*` tag (or `gh workflow run release.yml`) so **`github-actions[bot]`** publishes the GitHub Release with author-free release notes.
+   - Trigger releases strictly via `workflow_dispatch` on `main` (preferred: keeps `Swatinem/rust-cache` warm on `refs/heads/main` and lets **`github-actions[bot]`** atomically create the `v*.*.*` tag and GitHub Release) or by pushing a `v*.*.*` tag so **`github-actions[bot]`** publishes the GitHub Release with author-free release notes.
