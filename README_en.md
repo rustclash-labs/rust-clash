@@ -22,29 +22,39 @@ A pure-Rust multi-platform proxy client and userspace TUN engine. Transparent, l
 > **100% AI-Authored & AI-Reviewed Codebase**: Every line of code in this repository — the pure-Rust proxy kernel, `smoltcp` userspace TUN stack, Tauri 2 desktop client, React Web UI, and native Android app — was **written end-to-end by Gemini Argon, Gemini Carbon, and Gemini Neon, with GPT participating in code review** (humans provided product direction and real-device acceptance feedback only). Experimental Pre-1.0 prototype; not independently security-audited.
 
 <p align="center">
-  <img alt="RustClash Overview Dashboard" src="docs/images/dashboard-overview.png" width="92%">
+  <img alt="RustClash Android Light UI Showcase — Exit City Landmark Skylines, Live Telemetry & One-Handed Controls" src="docs/images/android-light-showcase.png" width="94%">
 </p>
 
 <details>
-<summary>More screenshots (Security Audit · Timing Waterfall · AI Matrix · MCP)</summary>
+<summary>More screenshots (Android 5-Screen Light Overview · Desktop Console · Security Audit · Timing Waterfall · AI Matrix · MCP)</summary>
 <br>
+<p align="center">
+  <img src="docs/images/android-light-overview.png" alt="Android Light UI 5-Screen Overview (Home, Nodes, Rules, Profiles, Settings)" width="100%" />
+  <br><strong>Native Android Jetpack Compose Light UI</strong> — Exit city landmark skylines, live throughput &amp; latency telemetry, smart routing rules, profiles, and appearance controls.
+</p>
 <table>
   <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/dashboard-overview.png" alt="Desktop and Web Console Overview" />
+      <br><strong>Desktop &amp; Embedded Web Console</strong> — Real-time kernel telemetry and OS takeover controls across Windows, macOS, and Linux.
+    </td>
     <td width="50%" valign="top">
       <img src="docs/images/config-security-audit.png" alt="Config Security Audit" />
       <br><strong>Config Security Audit</strong> — Static linter catching MITM risks, DNS leaks, and shadowed rules.
     </td>
+  </tr>
+  <tr>
     <td width="50%" valign="top">
       <img src="docs/images/timing-waterfall.png" alt="Timing Waterfall" />
       <br><strong>Timing Waterfall</strong> — Breaks latency into <code>DNS → Tunnel → TLS → HTTP TTFB</code> plus UDP check.
     </td>
-  </tr>
-  <tr>
     <td width="50%" valign="top">
       <img src="docs/images/ai-endpoint-matrix.png" alt="AI Endpoint Matrix" />
       <br><strong>AI &amp; Dev Readiness Matrix</strong> — 1-click stage-isolated probe across common AI and API endpoints.
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <img src="docs/images/mcp-integration.png" alt="MCP Integration" />
       <br><strong>Privacy-First MCP Studio</strong> — Ready-to-copy <code>MCP</code> config and credential-redacted YAML view.
     </td>
