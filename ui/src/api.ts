@@ -244,6 +244,32 @@ export async function updateDesktopPrefs(
   return { close_to_tray: closeToTray };
 }
 
+export interface ElevatedRelaunchOutcome {
+  status: "relaunching" | "cancelled" | "already_elevated" | "unsupported";
+  message?: string;
+}
+
+export async function relaunchElevatedForTun(
+  preserveSysproxy?: boolean,
+): Promise<ElevatedRelaunchOutcome> {
+  if (typeof window === "undefined") {
+    return { status: "unsupported" };
+  }
+  const w = window as HostWindow;
+  if (!w.__TAURI_INTERNALS__?.invoke) {
+    return { status: "unsupported" };
+  }
+  return w.__TAURI_INTERNALS__.invoke<ElevatedRelaunchOutcome>(
+    "relaunch_elevated_for_tun",
+    preserveSysproxy === undefined
+      ? {}
+      : {
+          preserve_sysproxy: preserveSysproxy,
+          preserveSysproxy,
+        },
+  );
+}
+
 export const androidBridge = {
   isAvailable(): boolean {
     if (typeof window === "undefined") return false;
