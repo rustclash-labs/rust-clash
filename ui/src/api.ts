@@ -684,7 +684,11 @@ export const clashApi = {
       method: "PUT",
       body: JSON.stringify({ payload }),
     }),
-  getProxies: () => apiFetch<{ proxies: Record<string, ProxyInfo> }>("/proxies"),
+  getProxies: () =>
+    apiFetch<{
+      proxies: Record<string, ProxyInfo>;
+      "group-order"?: string[];
+    }>("/proxies"),
   selectProxy: (groupName: string, memberName: string) =>
     apiFetch<void>(`/proxies/${encodeURIComponent(groupName)}`, {
       method: "PUT",
