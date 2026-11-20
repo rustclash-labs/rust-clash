@@ -3,9 +3,25 @@ use std::net::IpAddr;
 pub const MAX_SNIFF_BYTES: usize = 16 * 1024;
 const MAX_HTTP_SNIFF_BYTES: usize = 8 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniffedProtocol {
+    Tls,
+    Http,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SniffOutcome {
     Domain(String),
+    NeedMoreBytes,
+    NoHostname,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SniffOutcomeWithProto {
+    Domain {
+        domain: String,
+        protocol: SniffedProtocol,
+    },
     NeedMoreBytes,
     NoHostname,
 }
@@ -57,13 +73,47 @@ pub fn normalize_valid_hostname(raw: &str) -> Option<String> {
 /// Inspect leading TCP payload bytes for a TLS `ClientHello` SNI (`server_name` extension)
 /// or an HTTP/1.x `Host` header. Immediately returns `NoHostname` for non-TLS/non-HTTP bytes.
 pub fn sniff_client_hello_or_http_host(buf: &[u8]) -> SniffOutcome {
+    match sniff_tcp_protocol(buf, true, true) {
+        SniffOutcomeWithProto::Domain { domain, .. } => SniffOutcome::Domain(domain),
+        SniffOutcomeWithProto::NeedMoreBytes => SniffOutcome::NeedMoreBytes,
+        SniffOutcomeWithProto::NoHostname => SniffOutcome::NoHostname,
+    }
+}
+
+/// Protocol-filtered variant of [`sniff_client_hello_or_http_host`] that also reports whether the
+/// hostname came from TLS SNI or HTTP `Host`, immediately returning `NoHostname` if the leading
+/// bytes cannot match any enabled protocol.
+pub fn sniff_tcp_protocol(buf: &[u8], allow_tls: bool, allow_http: bool) -> SniffOutcomeWithProto {
+    if !allow_tls && !allow_http {
+        return SniffOutcomeWithProto::NoHostname;
+    }
     if buf.is_empty() {
-        return SniffOutcome::NeedMoreBytes;
+        return SniffOutcomeWithProto::NeedMoreBytes;
     }
     if buf[0] == 0x16 {
-        return sniff_tls_client_hello(buf);
+        if !allow_tls {
+            return SniffOutcomeWithProto::NoHostname;
+        }
+        return match sniff_tls_client_hello(buf) {
+            SniffOutcome::Domain(domain) => SniffOutcomeWithProto::Domain {
+                domain,
+                protocol: SniffedProtocol::Tls,
+            },
+            SniffOutcome::NeedMoreBytes => SniffOutcomeWithProto::NeedMoreBytes,
+            SniffOutcome::NoHostname => SniffOutcomeWithProto::NoHostname,
+        };
     }
-    sniff_http_host(buf)
+    if !allow_http {
+        return SniffOutcomeWithProto::NoHostname;
+    }
+    match sniff_http_host(buf) {
+        SniffOutcome::Domain(domain) => SniffOutcomeWithProto::Domain {
+            domain,
+            protocol: SniffedProtocol::Http,
+        },
+        SniffOutcome::NeedMoreBytes => SniffOutcomeWithProto::NeedMoreBytes,
+        SniffOutcome::NoHostname => SniffOutcomeWithProto::NoHostname,
+    }
 }
 
 fn sniff_tls_client_hello(buf: &[u8]) -> SniffOutcome {
@@ -354,6 +404,56 @@ pub(crate) mod test_helpers {
         record.extend_from_slice(&hs);
         record
     }
+
+    /// Build a realistic Chrome post-quantum (`X25519MLKEM768` / ECH-sized) TLS `ClientHello`
+    /// (~2060B total) where a large `key_share` (`0x0033`) extension precedes the `server_name`
+    /// (`0x0000`) extension so the SNI sits beyond the first 1460B TCP MSS segment!
+    pub fn build_pq_tls_client_hello(sni: &str, key_share_len: usize) -> Vec<u8> {
+        let mut exts = Vec::new();
+        // Leading `key_share` extension (simulating 1216B+ ML-KEM-768 + X25519 share + padding)
+        exts.extend_from_slice(&0x0033u16.to_be_bytes());
+        exts.extend_from_slice(&(key_share_len as u16).to_be_bytes());
+        exts.resize(exts.len() + key_share_len, 0x5A);
+
+        // Trailing `server_name` (SNI) extension past byte 1460!
+        let name_bytes = sni.as_bytes();
+        let list_len = 1 + 2 + name_bytes.len();
+        let mut ext_sni = Vec::with_capacity(2 + list_len);
+        ext_sni.extend_from_slice(&(list_len as u16).to_be_bytes());
+        ext_sni.push(0x00);
+        ext_sni.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+        ext_sni.extend_from_slice(name_bytes);
+        exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        exts.extend_from_slice(&(ext_sni.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ext_sni);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0xBB; 32]);
+        body.push(32); // 32B TLS 1.3 legacy session id
+        body.extend_from_slice(&[0xCC; 32]);
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01, 0x13, 0x02, 0x13, 0x03]);
+        body.push(0x01);
+        body.push(0x00);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let hs_len = body.len();
+        hs.push(((hs_len >> 16) & 0xff) as u8);
+        hs.push(((hs_len >> 8) & 0xff) as u8);
+        hs.push((hs_len & 0xff) as u8);
+        hs.extend_from_slice(&body);
+
+        let mut record = Vec::with_capacity(5 + hs.len());
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
 }
 
 #[cfg(test)]
@@ -391,6 +491,21 @@ mod tests {
         assert_eq!(
             sniff_client_hello_or_http_host(&two_records),
             SniffOutcome::Domain("api.github.com".to_string())
+        );
+
+        // Chrome ~2060B PQ ClientHello split across 1460B + remainder TCP segments
+        let pq_hello = test_helpers::build_pq_tls_client_hello("linux.do", 1950);
+        assert!(pq_hello.len() > 2000 && pq_hello.len() < 2200);
+        assert_eq!(
+            sniff_tcp_protocol(&pq_hello[..1460], true, false),
+            SniffOutcomeWithProto::NeedMoreBytes
+        );
+        assert_eq!(
+            sniff_tcp_protocol(&pq_hello, true, false),
+            SniffOutcomeWithProto::Domain {
+                domain: "linux.do".to_string(),
+                protocol: SniffedProtocol::Tls,
+            }
         );
     }
 

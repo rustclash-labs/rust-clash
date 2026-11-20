@@ -293,6 +293,7 @@ pub async fn run_tun_benchmark(args: BenchTunArgs) -> Result<()> {
         unified_delay: true,
         geodata_mode: false,
         mmdb_path: None,
+        sniffer: Default::default(),
         hosts: std::collections::HashMap::new(),
         dns: DnsConfig {
             enable: true,

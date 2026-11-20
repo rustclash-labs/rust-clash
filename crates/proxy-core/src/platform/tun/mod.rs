@@ -26,10 +26,16 @@ pub struct TunLaunchSpec {
     pub strict_route: bool,
     pub enable_ipv6: bool,
     pub auto_detect_interface: bool,
+    pub dns_hijack: bool,
     pub fake_ip_net: Ipv4Net,
     pub tun_ipv4_cidr: Ipv4Net,
     pub tun_ipv6_cidr: Ipv6Net,
+    /// Proxy server literal IPs that should bypass TUN routing.
     pub bypass_ips: Vec<IpAddr>,
+    /// Bootstrap/upstream DNS server literal IPs (separated from proxy servers so Windows Wintun
+    /// with `IP_UNICAST_IF` + `dns_hijack` does not install global `/32` bypass routes that let
+    /// other OS processes escape TUN DNS hijack).
+    pub dns_bypass_ips: Vec<IpAddr>,
     pub local_dns_addr: Option<SocketAddr>,
     pub wintun_dll_path: Option<PathBuf>,
     pub state_dir: PathBuf,
@@ -38,6 +44,16 @@ pub struct TunLaunchSpec {
 }
 
 impl TunLaunchSpec {
+    pub fn all_bypass_ips(&self) -> Vec<IpAddr> {
+        let mut out = self.bypass_ips.clone();
+        for ip in &self.dns_bypass_ips {
+            if !out.contains(ip) {
+                out.push(*ip);
+            }
+        }
+        out
+    }
+
     pub fn gateway_ipv4(&self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.fake_ip_net.network()).saturating_add(1))
     }

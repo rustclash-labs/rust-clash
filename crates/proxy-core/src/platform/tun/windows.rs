@@ -194,6 +194,55 @@ pub fn parse_braced_guid(raw: &str) -> io::Result<(u32, u16, u16, [u8; 8])> {
     Ok((d1, d2, d3, d4))
 }
 
+/// Lowest valid manual Windows `MIB_IPINTERFACE_ROW.Metric` (`0` is reserved for automatic metric).
+/// Setting Wintun to `UseAutomaticMetric = 0, Metric = 1` keeps Wintun strictly lower than physical
+/// Ethernet/Wi-Fi adapters (typically `5..35`), so Windows `Dnscache` & SMHNR prefer Wintun DNS.
+pub const WINTUN_LOWEST_INTERFACE_METRIC: u32 = 1;
+
+/// Compute `(interface_metric, split_route_metric)` for Wintun's IPv4/IPv6 interface and
+/// `0.0.0.0/1` + `128.0.0.0/1` / `198.18.0.0/15` split routes so total route metric (`1` or `2`)
+/// stays strictly below physical default routes.
+pub fn compute_wintun_route_metrics(strict_route: bool) -> (u32, u32) {
+    let route_metric = if strict_route { 0 } else { 1 };
+    (WINTUN_LOWEST_INTERFACE_METRIC, route_metric)
+}
+
+/// Select the IP addresses that should receive global `/32` / `/128` bypass routes on the physical
+/// Windows NIC.
+///
+/// Proxy server literal IPs are always included as belt-and-suspenders protection. Upstream/public
+/// DNS server IPs (`1.1.1.1`, `8.8.8.8`, `223.5.5.5`, `119.29.29.29`, etc.) are **omitted** for any
+/// address family where `WindowsUnicastIfProtector` (`IP_UNICAST_IF` / `IPV6_UNICAST_IF`) is active
+/// and `dns_hijack` is enabled—otherwise global `/32` routes allow *other* Windows processes to
+/// escape Wintun's `any:53` Fake-IP DNS hijack!
+pub fn select_windows_physical_bypass_ips(
+    proxy_bypass_ips: &[IpAddr],
+    dns_bypass_ips: &[IpAddr],
+    dns_hijack: bool,
+    has_v4_unicast_protector: bool,
+    has_v6_unicast_protector: bool,
+) -> Vec<IpAddr> {
+    let mut out = Vec::with_capacity(proxy_bypass_ips.len() + dns_bypass_ips.len());
+    for &ip in proxy_bypass_ips {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    for &ip in dns_bypass_ips {
+        let protected_by_unicast_if = match ip {
+            IpAddr::V4(_) => has_v4_unicast_protector,
+            IpAddr::V6(_) => has_v6_unicast_protector,
+        };
+        if dns_hijack && protected_by_unicast_if {
+            continue;
+        }
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// Testable abstraction over Windows `iphlpapi.dll` interface DNS APIs (`ConvertInterfaceLuidToGuid`,
 /// `GetInterfaceDnsSettings`, and `SetInterfaceDnsSettings`), enabling deterministic fault-injection
 /// verification across all CI platforms while driving genuine Win32 syscalls on Windows.
@@ -524,9 +573,9 @@ mod win_impl {
     use super::{
         ForwardRouteCandidate, PhysicalEgressInfo, WINDOWS_SPLIT_IPV4_PREFIXES,
         WINDOWS_SPLIT_IPV6_PREFIXES, WindowsDnsOps, apply_windows_adapter_dns_transactional,
-        format_braced_guid, merge_non_zero_protector_indices, parse_braced_guid,
-        resolve_secure_wintun_dll_path, rollback_windows_record_with_ops,
-        select_physical_default_egress,
+        compute_wintun_route_metrics, format_braced_guid, merge_non_zero_protector_indices,
+        parse_braced_guid, resolve_secure_wintun_dll_path, rollback_windows_record_with_ops,
+        select_physical_default_egress, select_windows_physical_bypass_ips,
     };
     use crate::{
         inbound::tun::VirtualTunHandle,
@@ -902,7 +951,12 @@ mod win_impl {
         Ok(())
     }
 
-    fn set_adapter_mtu(luid: NET_LUID_LH, family: u16, mtu: u32) -> io::Result<()> {
+    fn configure_adapter_ip_interface(
+        luid: NET_LUID_LH,
+        family: u16,
+        mtu: u32,
+        manual_metric: Option<u32>,
+    ) -> io::Result<()> {
         // SAFETY: `GetIpInterfaceEntry` populates `row` for `(luid, family)` before `SetIpInterfaceEntry`.
         unsafe {
             let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
@@ -916,12 +970,47 @@ mod win_impl {
                 row.SitePrefixLength = 0;
             }
             row.NlMtu = mtu;
+            match manual_metric {
+                Some(metric) => {
+                    row.UseAutomaticMetric = 0;
+                    row.Metric = metric.max(1);
+                }
+                None => {
+                    row.UseAutomaticMetric = 1;
+                }
+            }
             let st_set = SetIpInterfaceEntry(&raw mut row);
             if st_set != 0 {
                 return Err(io::Error::from_raw_os_error(st_set as i32));
             }
         }
         Ok(())
+    }
+
+    /// Best-effort call to Windows `dnsapi.dll!DnsFlushResolverCache` so stale pre-TUN real/poisoned
+    /// DNS entries (on TUN start) or stale `198.18.x.x` Fake-IP entries (on TUN stop) are purged
+    /// immediately from Windows `Dnscache`.
+    fn flush_windows_dns_resolver_cache() {
+        type FnDnsFlushResolverCache = unsafe extern "system" fn() -> i32;
+        let dll_wide = to_wide_nul("dnsapi.dll");
+        // SAFETY: Loading signed system `dnsapi.dll` strictly from System32, calling its no-arg
+        // `DnsFlushResolverCache` export if present, and releasing the module handle immediately.
+        unsafe {
+            let module = LoadLibraryExW(
+                dll_wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+            if module.is_null() {
+                return;
+            }
+            if let Ok(flush_fn) =
+                load_proc::<FnDnsFlushResolverCache>(module, b"DnsFlushResolverCache\0")
+            {
+                let _ = flush_fn();
+            }
+            let _ = FreeLibrary(module);
+        }
     }
 
     fn add_iphlpapi_route(
@@ -1132,6 +1221,8 @@ mod win_impl {
             tracing::warn!("{}", msg);
             outcome.warnings.push(msg);
         }
+        // Purge stale `198.18.x.x` Fake-IP entries from Windows `Dnscache` immediately after DNS rollback.
+        flush_windows_dns_resolver_cache();
         outcome
     }
 
@@ -1179,7 +1270,9 @@ mod win_impl {
     struct NetChangeCallbackCtx {
         adapter_luid: u64,
         auto_route: bool,
-        bypass_ips: Vec<IpAddr>,
+        dns_hijack: bool,
+        proxy_bypass_ips: Vec<IpAddr>,
+        dns_bypass_ips: Vec<IpAddr>,
         fake_ip_net: ipnet::Ipv4Net,
         tun_ipv6_cidr: ipnet::Ipv6Net,
         state_dir: PathBuf,
@@ -1260,7 +1353,14 @@ mod win_impl {
         ctx.protector
             .update_indices(effective.v4_if_index, effective.v6_if_index);
 
-        if ctx.auto_route && !ctx.bypass_ips.is_empty() && routes_handoff_needed {
+        let effective_bypass = select_windows_physical_bypass_ips(
+            &ctx.proxy_bypass_ips,
+            &ctx.dns_bypass_ips,
+            ctx.dns_hijack,
+            effective.v4_if_index != 0,
+            effective.v6_if_index != 0,
+        );
+        if ctx.auto_route && routes_handoff_needed {
             let rec_snap = {
                 let mut rec_guard = ctx.recovery_record.lock();
                 let mut kept_wintun_routes = Vec::with_capacity(rec_guard.owned_routes.len());
@@ -1273,7 +1373,7 @@ mod win_impl {
                 }
                 let new_bypass = install_physical_bypass_routes(
                     &effective,
-                    &ctx.bypass_ips,
+                    &effective_bypass,
                     ctx.fake_ip_net,
                     ctx.tun_ipv6_cidr,
                 );
@@ -1417,12 +1517,21 @@ mod win_impl {
                 dns_backup: None,
             };
 
-            // 4. Configure adapter IPv4, IPv6, MTU, split-tunnel routes, bypass routes, and DNS transactionally
+            // 4. Configure adapter IPv4, IPv6, MTU, lowest InterfaceMetric, split-tunnel routes,
+            //    selective bypass routes, and DNS transactionally
             let setup_res = (|| -> io::Result<()> {
                 let gw_v4 = spec.gateway_ipv4();
                 set_adapter_unicast_ip(luid, IpAddr::V4(gw_v4), spec.fake_ip_net.prefix_len())?;
                 let mtu_u32 = spec.mtu.clamp(1280, 65535) as u32;
-                let _ = set_adapter_mtu(luid, AF_INET, mtu_u32);
+                let (iface_metric, route_metric) = compute_wintun_route_metrics(spec.strict_route);
+                let manual_metric = spec.auto_route.then_some(iface_metric);
+                if let Err(err) =
+                    configure_adapter_ip_interface(luid, AF_INET, mtu_u32, manual_metric)
+                {
+                    tracing::warn!(
+                        "Windows Wintun IPv4 interface MTU/metric configuration failed: {err}"
+                    );
+                }
 
                 if spec.enable_ipv6 {
                     set_adapter_unicast_ip(
@@ -1430,14 +1539,19 @@ mod win_impl {
                         IpAddr::V6(spec.tun_ipv6_cidr.addr()),
                         spec.tun_ipv6_cidr.prefix_len(),
                     )?;
-                    let _ = set_adapter_mtu(luid, AF_INET6, mtu_u32);
+                    if let Err(err) =
+                        configure_adapter_ip_interface(luid, AF_INET6, mtu_u32, manual_metric)
+                    {
+                        tracing::warn!(
+                            "Windows Wintun IPv6 interface MTU/metric configuration failed: {err}"
+                        );
+                    }
                 }
 
                 if !spec.auto_route {
                     return Ok(());
                 }
 
-                let metric = if spec.strict_route { 1 } else { 5 };
                 let luid_val = unsafe { luid.Value };
                 let zero_v4 = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
@@ -1448,7 +1562,7 @@ mod win_impl {
                         prefix_str.parse().unwrap(),
                         plen,
                         zero_v4,
-                        metric,
+                        route_metric,
                     )?;
                     rec.owned_routes.push(r);
                 }
@@ -1457,15 +1571,24 @@ mod win_impl {
                     IpAddr::V4(spec.fake_ip_net.network()),
                     spec.fake_ip_net.prefix_len(),
                     zero_v4,
-                    metric,
+                    route_metric,
                 )?;
                 rec.owned_routes.push(r_fake);
 
-                // Explicit `/32` (IPv4) and `/128` (IPv6) bypass routes on the physical interface
-                // for proxy servers & bootstrap DNS!
+                // Explicit `/32` (IPv4) and `/128` (IPv6) physical bypass routes:
+                // keep literal proxy server IPs, but omit public/upstream DNS servers when
+                // `WindowsUnicastIfProtector` (`IP_UNICAST_IF`) + `dns_hijack` are active so
+                // other Windows processes cannot bypass Wintun's `any:53` Fake-IP hijack!
+                let effective_bypass = select_windows_physical_bypass_ips(
+                    &spec.bypass_ips,
+                    &spec.dns_bypass_ips,
+                    spec.dns_hijack,
+                    initial_egress.v4_if_index != 0,
+                    initial_egress.v6_if_index != 0,
+                );
                 rec.owned_routes.extend(install_physical_bypass_routes(
                     &initial_egress,
-                    &spec.bypass_ips,
+                    &effective_bypass,
                     spec.fake_ip_net,
                     spec.tun_ipv6_cidr,
                 ));
@@ -1478,7 +1601,7 @@ mod win_impl {
                             prefix6_str.parse().unwrap(),
                             plen6,
                             zero_v6,
-                            metric,
+                            route_metric,
                         )?;
                         rec.owned_routes.push(r6);
                     }
@@ -1512,6 +1635,10 @@ mod win_impl {
 
                 let rec_snap = rec.clone();
                 update_current_journal(&spec.state_dir, |j| j.windows_tun = Some(rec_snap))?;
+
+                // Purge stale pre-TUN / poisoned DNS entries from Windows `Dnscache` so apps
+                // immediately resolve through Wintun's lowest-metric DNS (`spec.dns_ipv4()`).
+                flush_windows_dns_resolver_cache();
                 Ok(())
             })();
 
@@ -1554,7 +1681,9 @@ mod win_impl {
             let mut notify_ctx = Box::new(NetChangeCallbackCtx {
                 adapter_luid: unsafe { luid.Value },
                 auto_route: spec.auto_route,
-                bypass_ips: spec.bypass_ips.clone(),
+                dns_hijack: spec.dns_hijack,
+                proxy_bypass_ips: spec.bypass_ips.clone(),
+                dns_bypass_ips: spec.dns_bypass_ips.clone(),
                 fake_ip_net: spec.fake_ip_net,
                 tun_ipv6_cidr: spec.tun_ipv6_cidr,
                 state_dir: spec.state_dir.clone(),
@@ -2459,5 +2588,55 @@ mod tests {
         assert!(outcome2.warnings.is_empty());
         assert_eq!(ops.v4_calls, 1);
         assert_eq!(ops.v6_calls, 2);
+    }
+
+    #[test]
+    fn wintun_metrics_beat_physical_ethernet_for_windows_dnscache_priority() {
+        let (iface_normal, route_normal) = compute_wintun_route_metrics(false);
+        assert_eq!(iface_normal, WINTUN_LOWEST_INTERFACE_METRIC);
+        assert_eq!(iface_normal, 1);
+        assert_eq!(route_normal, 1);
+        assert!(
+            iface_normal + route_normal < 5,
+            "Wintun effective metric must stay strictly below physical Ethernet metric (5)"
+        );
+
+        let (iface_strict, route_strict) = compute_wintun_route_metrics(true);
+        assert_eq!(iface_strict, 1);
+        assert_eq!(route_strict, 0);
+        assert_eq!(iface_strict + route_strict, 1);
+    }
+
+    #[test]
+    fn windows_physical_bypass_omits_public_dns_when_unicast_protector_and_dns_hijack_active() {
+        let proxy_ips: Vec<IpAddr> = vec!["198.51.100.42".parse().unwrap()];
+        let dns_ips: Vec<IpAddr> = vec![
+            "1.1.1.1".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            "223.5.5.5".parse().unwrap(),
+            "119.29.29.29".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ];
+
+        // Normal Windows Wintun + IP_UNICAST_IF + dns_hijack=true: never leak public DNS via global /32 routes!
+        let selected = select_windows_physical_bypass_ips(&proxy_ips, &dns_ips, true, true, true);
+        assert_eq!(selected, proxy_ips);
+
+        // IPv4 protector active, IPv6 protector absent: keep proxy IP + IPv6 DNS fallback only.
+        let v4_only_prot =
+            select_windows_physical_bypass_ips(&proxy_ips, &dns_ips, true, true, false);
+        assert_eq!(
+            v4_only_prot,
+            vec![
+                "198.51.100.42".parse::<IpAddr>().unwrap(),
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+            ]
+        );
+
+        // When dns_hijack is disabled or no unicast protector exists, include DNS bypass IPs.
+        let no_hijack = select_windows_physical_bypass_ips(&proxy_ips, &dns_ips, false, true, true);
+        assert_eq!(no_hijack.len(), 6);
+        let no_prot = select_windows_physical_bypass_ips(&proxy_ips, &dns_ips, true, false, false);
+        assert_eq!(no_prot.len(), 6);
     }
 }

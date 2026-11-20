@@ -973,6 +973,35 @@ impl TelemetryHub {
         combined
     }
 
+    /// Return newest-first failed/errored connection diagnostics pulled directly from the
+    /// dedicated `failed_diagnostics` ring (plus any live failed connection), so routine
+    /// `active`/`closed` traffic churn never crowds out real failures.
+    pub fn failed_diagnostics_snapshot(&self, limit: usize) -> Vec<ConnectionSnapshot> {
+        let cap = limit.clamp(1, 500);
+        let mut seen = HashSet::new();
+        let mut failed: Vec<ConnectionSnapshot> = Vec::new();
+        for entry in self.connections.iter() {
+            let snap = entry.value().snapshot();
+            if (snap.status == "failed" || snap.error.is_some()) && seen.insert(snap.id.clone()) {
+                failed.push(snap);
+            }
+        }
+        {
+            let ring = self.failed_diagnostics.lock();
+            for snap in ring.iter().rev() {
+                if (snap.status == "failed" || snap.error.is_some()) && seen.insert(snap.id.clone())
+                {
+                    failed.push(snap.clone());
+                }
+            }
+        }
+        failed.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
+        if failed.len() > cap {
+            failed.truncate(cap);
+        }
+        failed
+    }
+
     /// Return active + archived connection snapshots overlapping `[since_epoch_ms, now]`,
     /// sorted newest-first and capped at `MAX_DEBUG_DIAGNOSTICS`.
     pub fn diagnostics_since(&self, since_epoch_ms: u64, limit: usize) -> Vec<ConnectionSnapshot> {

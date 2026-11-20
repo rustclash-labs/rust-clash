@@ -634,8 +634,9 @@ mod darwin_impl {
         egress: &MacOsDualStackEgress,
         rec: &mut MacOsRecoveryRecord,
     ) {
+        let all_bypass = spec.all_bypass_ips();
         let cmds = build_macos_bypass_route_commands(
-            &spec.bypass_ips,
+            &all_bypass,
             spec.fake_ip_net,
             spec.tun_ipv6_cidr,
             egress.v4_gw.as_deref(),
@@ -986,7 +987,10 @@ mod darwin_impl {
 
                         if spec_watch.auto_route && (if_changed || gw_changed) {
                             let mut rec_guard = rec_watch.lock();
-                            if gw_changed && !spec_watch.bypass_ips.is_empty() {
+                            if gw_changed
+                                && (!spec_watch.bypass_ips.is_empty()
+                                    || !spec_watch.dns_bypass_ips.is_empty())
+                            {
                                 let mut split_routes =
                                     Vec::with_capacity(rec_guard.owned_route_del_args.len());
                                 let mut old_bypass = Vec::new();

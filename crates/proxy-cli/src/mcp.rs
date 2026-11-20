@@ -900,6 +900,148 @@ fn scrub_diagnostic_entries(entries: &mut Value, include_network_metadata: bool)
     }
 }
 
+fn summarize_recent_connections(entries: &[Value]) -> Value {
+    let mut active = 0usize;
+    let mut connecting = 0usize;
+    let mut closed = 0usize;
+    let mut failed = 0usize;
+    let mut by_exit: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut by_network: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut zero_download_tcp_count = 0usize;
+    let mut tun_fake_ip_count = 0usize;
+    let mut tun_real_ip_count = 0usize;
+
+    for item in entries {
+        match item.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+            "active" => active += 1,
+            "connecting" => connecting += 1,
+            "closed" => closed += 1,
+            "failed" => failed += 1,
+            _ => {}
+        }
+        let exit = item
+            .get("exit_type")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("UNKNOWN");
+        *by_exit.entry(exit.to_string()).or_insert(0) += 1;
+
+        let net = item
+            .get("metadata")
+            .and_then(|m| m.get("network"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        *by_network.entry(net.to_string()).or_insert(0) += 1;
+
+        let upload = item.get("upload").and_then(|v| v.as_u64()).unwrap_or(0);
+        let download = item.get("download").and_then(|v| v.as_u64()).unwrap_or(0);
+        if net.eq_ignore_ascii_case("tcp") && upload > 0 && download == 0 {
+            zero_download_tcp_count += 1;
+        }
+
+        let inbound = item
+            .get("metadata")
+            .and_then(|m| m.get("type").or_else(|| m.get("inbound")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if inbound.starts_with("TUN") {
+            let has_fake_ip = item
+                .get("metadata")
+                .and_then(|m| m.get("fake_ip"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+            if has_fake_ip {
+                tun_fake_ip_count += 1;
+            } else {
+                tun_real_ip_count += 1;
+            }
+        }
+    }
+
+    json!({
+        "sampled_count": entries.len(),
+        "by_status": {
+            "active": active,
+            "connecting": connecting,
+            "closed": closed,
+            "failed": failed,
+        },
+        "by_exit_type": by_exit,
+        "by_network": by_network,
+        "zero_download_tcp_count": zero_download_tcp_count,
+        "tun_fake_ip_count": tun_fake_ip_count,
+        "tun_real_ip_count": tun_real_ip_count,
+    })
+}
+
+fn redact_network_tokens_in_log(text: &str) -> String {
+    text.split_whitespace()
+        .map(|tok| {
+            let trimmed = tok.trim_matches(|c: char| {
+                matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '\'' | '"')
+            });
+            let looks_like_endpoint = trimmed.parse::<std::net::IpAddr>().is_ok()
+                || trimmed.parse::<std::net::SocketAddr>().is_ok()
+                || trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || (trimmed.contains('.')
+                    && trimmed.contains(':')
+                    && trimmed
+                        .rsplit_once(':')
+                        .is_some_and(|(_, p)| p.parse::<u16>().is_ok()));
+            if looks_like_endpoint {
+                "[redacted-endpoint]"
+            } else {
+                tok
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_recent_warn_error_logs(
+    logs_val: Option<&Value>,
+    limit: usize,
+    include_network_metadata: bool,
+) -> Value {
+    let Some(arr) = logs_val
+        .and_then(|v| v.get("logs"))
+        .and_then(|v| v.as_array())
+    else {
+        return json!([]);
+    };
+    let mut out = Vec::new();
+    for entry in arr.iter().rev() {
+        let level = entry
+            .get("type")
+            .or_else(|| entry.get("level"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(level.as_str(), "warn" | "warning" | "error") {
+            continue;
+        }
+        let raw_msg = entry.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+        let secret_safe = redact_sensitive_text(raw_msg);
+        let msg = if include_network_metadata {
+            secret_safe
+        } else {
+            redact_network_tokens_in_log(&secret_safe)
+        };
+        out.push(json!({
+            "timestamp_ms": entry.get("timestamp_ms"),
+            "level": level,
+            "payload": msg,
+        }));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Value::Array(out)
+}
+
 fn build_tools_list(allow_mutations: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({
@@ -1520,13 +1662,28 @@ async fn execute_tool_call_with_state_dir(
                         .await
                         .ok()
                         .and_then(|(st, v)| (st == 200).then_some(v));
-                    let diag_val = c
+                    let failed_diag_val = c
                         .request_json(
                             "GET",
-                            "/connections/diagnostics?limit=15",
+                            "/connections/diagnostics?limit=15&failed_only=true",
                             None,
                             Duration::from_secs(2),
                         )
+                        .await
+                        .ok()
+                        .and_then(|(st, v)| (st == 200).then_some(v));
+                    let recent_all_val = c
+                        .request_json(
+                            "GET",
+                            "/connections/diagnostics?limit=50",
+                            None,
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|(st, v)| (st == 200).then_some(v));
+                    let logs_val = c
+                        .request_json("GET", "/logs", None, Duration::from_secs(2))
                         .await
                         .ok()
                         .and_then(|(st, v)| (st == 200).then_some(v));
@@ -1548,10 +1705,33 @@ async fn execute_tool_call_with_state_dir(
                         }
                     }
 
-                    let mut recent_diags = diag_val
-                        .and_then(|d| d.get("diagnostics").cloned())
-                        .unwrap_or_else(|| json!([]));
-                    scrub_diagnostic_entries(&mut recent_diags, opts.include_network_metadata);
+                    // Strictly retain only genuinely failed/errored entries in `recent_failure_diagnostics`
+                    // (even if connected to an older controller build that ignores `failed_only=true`).
+                    let mut recent_failures = Value::Array(
+                        failed_diag_val
+                            .and_then(|d| d.get("diagnostics").and_then(|v| v.as_array()).cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|item| {
+                                item.get("status").and_then(|v| v.as_str()) == Some("failed")
+                                    || item.get("error").is_some_and(|v| !v.is_null())
+                            })
+                            .take(15)
+                            .collect(),
+                    );
+                    scrub_diagnostic_entries(&mut recent_failures, opts.include_network_metadata);
+
+                    let recent_all_entries = recent_all_val
+                        .and_then(|d| d.get("diagnostics").and_then(|v| v.as_array()).cloned())
+                        .unwrap_or_default();
+                    let recent_connections_summary =
+                        summarize_recent_connections(&recent_all_entries);
+
+                    let recent_warn_error_logs = extract_recent_warn_error_logs(
+                        logs_val.as_ref(),
+                        10,
+                        opts.include_network_metadata,
+                    );
 
                     let mut tun_val = cfg_val.as_ref().and_then(|v| v.get("tun").cloned());
                     if !opts.include_network_metadata
@@ -1585,7 +1765,9 @@ async fn execute_tool_call_with_state_dir(
                             "tun": tun_val,
                             "effective_outbound": proxies_val.get("effective-outbound"),
                             "groups": groups_summary,
-                            "recent_failure_diagnostics": recent_diags,
+                            "recent_failure_diagnostics": recent_failures,
+                            "recent_connections_summary": recent_connections_summary,
+                            "recent_warn_error_logs": recent_warn_error_logs,
                         }),
                         false,
                     );
@@ -3252,6 +3434,163 @@ rules:
             Some("local-desktop-secret")
         );
 
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_get_proxy_status_isolates_failed_diagnostics_and_summarizes_anomalies() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rc-mcp-failed-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut cfg = proxy_core::config::ClashConfig {
+            mixed_port: 0,
+            external_controller: "127.0.0.1:0".to_string(),
+            secret: None,
+            ..Default::default()
+        };
+        cfg.dns.listen = "127.0.0.1:0".to_string();
+        cfg.tun.enable = false;
+        cfg.ensure_ephemeral_secret();
+
+        let engine = proxy_core::engine::ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+            .await
+            .expect("start engine");
+
+        let hub = engine.hub();
+        let direct_ob = proxy_core::outbound::DirectOutbound::new("DIRECT");
+        // 1. Seed 2 failed connections FIRST
+        for idx in 0..2u16 {
+            let target =
+                proxy_core::addr::TargetAddr::new_domain(format!("broken{idx}.example.com"), 443)
+                    .unwrap();
+            let guard = hub.register_connection_with_outbound_guard(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &target,
+                None,
+                "MATCH",
+                "",
+                vec!["PROXY".to_string()],
+                &direct_ob,
+            );
+            guard.record_failed("outbound dial+handshake timed out");
+        }
+
+        // 2. Flood 20 normal closed connections + 1 zero-download active TCP TUN connection AFTER
+        //    the failures so naive `/connections/diagnostics?limit=15` would completely hide them!
+        for idx in 0..20u16 {
+            let target =
+                proxy_core::addr::TargetAddr::new_domain(format!("ok{idx}.example.com"), 443)
+                    .unwrap();
+            let guard = hub.register_connection_with_outbound_guard(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &target,
+                Some(format!("198.18.0.{}", 10 + idx)),
+                "GEOSITE",
+                "cn",
+                vec!["DIRECT".to_string()],
+                &direct_ob,
+            );
+            guard.mark_established();
+            hub.record_upload(guard.connection(), 512);
+            hub.record_download(guard.connection(), 4096);
+            drop(guard);
+        }
+        let stall_target = proxy_core::addr::TargetAddr::new_ip("31.13.73.1".parse().unwrap(), 443);
+        let stall_guard = hub.register_connection_with_outbound_guard(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &stall_target,
+            None,
+            "MATCH",
+            "",
+            vec!["PROXY".to_string()],
+            &direct_ob,
+        );
+        stall_guard.mark_established();
+        hub.record_upload(stall_guard.connection(), 2048);
+
+        hub.push_log(
+            "info",
+            "routine info message should not appear in warn/error",
+        );
+        hub.push_log(
+            "warn",
+            "Wintun dial warning toward 31.13.73.1:443 with secret=super-secret-xyz",
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_addr, api_task) =
+            proxy_core::api::spawn_api_server("127.0.0.1:0", engine.clone(), shutdown_rx)
+                .await
+                .expect("spawn api server");
+        engine
+            .publish_controller_discovery(state_dir.clone(), bound_addr)
+            .expect("write controller discovery");
+
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: None,
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let res =
+            execute_tool_call_with_state_dir("get_proxy_status", &json!({}), &opts, &state_dir)
+                .await;
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("super-secret-xyz"));
+        assert!(!text.contains("31.13.73.1"));
+
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["daemon_connected"], true);
+
+        let failures = parsed["recent_failure_diagnostics"].as_array().unwrap();
+        assert_eq!(
+            failures.len(),
+            2,
+            "recent_failure_diagnostics must contain ONLY the 2 real failures, not routine closed connections: {failures:?}"
+        );
+        for item in failures {
+            assert_eq!(item["status"], "failed");
+            assert!(item["error"].as_str().is_some());
+        }
+
+        let summary = &parsed["recent_connections_summary"];
+        assert_eq!(summary["zero_download_tcp_count"], 1);
+        assert_eq!(summary["tun_fake_ip_count"], 20);
+        assert_eq!(summary["tun_real_ip_count"], 3); // 2 failed + 1 stalled real-IP
+
+        let warn_logs = parsed["recent_warn_error_logs"].as_array().unwrap();
+        assert!(
+            warn_logs.iter().any(|l| {
+                l["level"] == "warn"
+                    && l["payload"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("[redacted-endpoint]")
+            }),
+            "recent_warn_error_logs must surface redacted warn/error entries: {warn_logs:?}"
+        );
+        assert!(
+            warn_logs.iter().all(|l| l["level"] != "info"),
+            "routine info logs must not pollute recent_warn_error_logs"
+        );
+
+        drop(stall_guard);
+        let _ = shutdown_tx.send(true);
+        engine.shutdown_async().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

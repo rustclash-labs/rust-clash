@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use crate::{
     addr::TargetAddr,
     config::{
-        ProxyGroupConfig, ProxyGroupType, RuleProviderConfig, RunMode,
+        ProxyGroupConfig, ProxyGroupType, RuleProviderConfig, RunMode, SnifferConfig,
         validate_groups_and_rules_with_context,
     },
     dns::FakeIpDnsEngine,
@@ -141,6 +141,7 @@ pub struct Router {
     unified_delay: AtomicBool,
     tun_dns_hijack: AtomicBool,
     low_power_mode: AtomicBool,
+    sniffer: RwLock<SnifferConfig>,
     outbounds: HashMap<String, DynOutbound>,
     groups: HashMap<String, Arc<ProxyGroup>>,
     group_order: Vec<String>,
@@ -275,6 +276,7 @@ impl Router {
             unified_delay: AtomicBool::new(true),
             tun_dns_hijack: AtomicBool::new(true),
             low_power_mode: AtomicBool::new(false),
+            sniffer: RwLock::new(SnifferConfig::default()),
             outbounds,
             groups,
             group_order,
@@ -340,6 +342,14 @@ impl Router {
 
     pub fn set_tun_dns_hijack(&self, enabled: bool) {
         self.tun_dns_hijack.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn sniffer(&self) -> SnifferConfig {
+        self.sniffer.read().clone()
+    }
+
+    pub fn set_sniffer(&self, cfg: SnifferConfig) {
+        *self.sniffer.write() = cfg;
     }
 
     pub fn is_low_power_mode(&self) -> bool {

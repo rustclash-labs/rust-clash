@@ -347,6 +347,7 @@ async fn real_linux_kernel_netns_tun_tcp_udp_dns_and_teardown_e2e() {
         unified_delay: true,
         geodata_mode: false,
         mmdb_path: None,
+        sniffer: Default::default(),
         hosts: std::collections::HashMap::new(),
         dns: DnsConfig {
             enable: true,

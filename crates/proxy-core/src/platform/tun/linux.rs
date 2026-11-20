@@ -523,7 +523,8 @@ impl LinuxSystemTunSession {
 
             // 2. High-priority explicit bypasses for proxy server & upstream DNS IPs
             let mut ipv6_bypass_ok = true;
-            for ip in &spec.bypass_ips {
+            let all_bypass = spec.all_bypass_ips();
+            for ip in &all_bypass {
                 match ip {
                     IpAddr::V4(v4) if !v4.is_loopback() && !spec.fake_ip_net.contains(v4) => {
                         let host_cidr = format!("{v4}/32");
@@ -699,7 +700,7 @@ impl LinuxSystemTunSession {
                     .unwrap_or_default();
                 let bypass_note = if all_nameservers_bypass_tun(
                     &resolv_nameservers,
-                    &spec.bypass_ips,
+                    &all_bypass,
                     spec.strict_route,
                 ) {
                     format!(

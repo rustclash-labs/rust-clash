@@ -1204,6 +1204,8 @@ async fn close_single_connection(
 struct DiagnosticsQuery {
     #[serde(default = "default_diagnostics_limit")]
     limit: usize,
+    #[serde(default)]
+    failed_only: bool,
 }
 
 fn default_diagnostics_limit() -> usize {
@@ -1214,7 +1216,11 @@ async fn get_connection_diagnostics_api(
     State(engine): State<Arc<ProxyEngine>>,
     Query(q): Query<DiagnosticsQuery>,
 ) -> impl IntoResponse {
-    let entries = engine.hub().diagnostics_snapshot(q.limit);
+    let entries = if q.failed_only {
+        engine.hub().failed_diagnostics_snapshot(q.limit)
+    } else {
+        engine.hub().diagnostics_snapshot(q.limit)
+    };
     Json(serde_json::json!({
         "diagnostics": entries,
     }))
