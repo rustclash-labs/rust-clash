@@ -374,6 +374,7 @@ async fn real_linux_kernel_netns_tun_tcp_udp_dns_and_teardown_e2e() {
             inet6_address: Some("fdfe:dcba:9876::1/126".into()),
             wintun_path: None,
             mtu: 1400,
+            route_exclude_address: Vec::new(),
         },
         proxies: vec![ProxyNodeConfig::Ss {
             name: "WAN-SS2022".into(),

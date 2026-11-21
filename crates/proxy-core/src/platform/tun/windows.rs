@@ -243,6 +243,263 @@ pub fn select_windows_physical_bypass_ips(
     out
 }
 
+/// Metric used for `tun.route-exclude-address` bypass routes on the physical Windows NIC.
+/// Set above Windows's default on-link metric (`256`) so any pre-existing direct on-link subnet
+/// route of identical prefix length keeps precedence (preserving direct LAN ARP), while still
+/// strictly beating Wintun's `/1` split-tunnel routes via longest-prefix match.
+pub const WINDOWS_EXCLUDE_ROUTE_METRIC: u32 = 300;
+
+/// Planned static route for installation on Windows via `CreateIpForwardEntry2`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedWindowsRoute {
+    pub interface_luid: u64,
+    pub dest: IpAddr,
+    pub prefix_len: u8,
+    pub next_hop: IpAddr,
+    pub metric: u32,
+}
+
+/// Plan `/32` (IPv4) and `/128` (IPv6) bypass routes on the active physical Windows NIC.
+pub fn plan_windows_physical_bypass_routes(
+    egress: &PhysicalEgressInfo,
+    bypass_ips: &[IpAddr],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+) -> Vec<PlannedWindowsRoute> {
+    let mut routes = Vec::new();
+    for &ip in bypass_ips {
+        match ip {
+            IpAddr::V4(v4)
+                if !v4.is_loopback()
+                    && !v4.is_unspecified()
+                    && !fake_ip_net.contains(&v4)
+                    && egress.v4_luid != 0 =>
+            {
+                let nh = egress
+                    .v4_gateway
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                let candidate = PlannedWindowsRoute {
+                    interface_luid: egress.v4_luid,
+                    dest: ip,
+                    prefix_len: 32,
+                    next_hop: nh,
+                    metric: 1,
+                };
+                if !routes.contains(&candidate) {
+                    routes.push(candidate);
+                }
+            }
+            IpAddr::V6(v6)
+                if !v6.is_loopback()
+                    && !v6.is_unspecified()
+                    && !tun_ipv6_cidr.contains(&v6)
+                    && egress.v6_luid != 0 =>
+            {
+                let nh6 = egress
+                    .v6_gateway
+                    .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+                let candidate = PlannedWindowsRoute {
+                    interface_luid: egress.v6_luid,
+                    dest: ip,
+                    prefix_len: 128,
+                    next_hop: nh6,
+                    metric: 1,
+                };
+                if !routes.contains(&candidate) {
+                    routes.push(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+    routes
+}
+
+/// Plan more-specific physical NIC static bypass routes for `tun.route-exclude-address` CIDRs.
+///
+/// Automatically skips prefixes with length `<= 1` (which cannot beat Wintun `/1` split routes),
+/// IPv4 CIDRs overlapping `fake_ip_net`, and IPv6 CIDRs at least as specific as `tun_ipv6_cidr`
+/// that overlap it (preserving broad ULA excludes such as `fc00::/7`, since Wintun's `/126` stays
+/// more specific).
+pub fn plan_windows_physical_exclude_routes(
+    egress: &PhysicalEgressInfo,
+    exclude_cidrs: &[ipnet::IpNet],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+    enable_ipv6: bool,
+) -> Vec<PlannedWindowsRoute> {
+    let mut routes = Vec::new();
+    for &cidr in exclude_cidrs {
+        match cidr {
+            ipnet::IpNet::V4(v4net) => {
+                let net = v4net.trunc();
+                if net.prefix_len() <= 1
+                    || crate::config::ipv4_nets_overlap(net, fake_ip_net)
+                    || egress.v4_luid == 0
+                {
+                    continue;
+                }
+                let nh = egress
+                    .v4_gateway
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                let candidate = PlannedWindowsRoute {
+                    interface_luid: egress.v4_luid,
+                    dest: IpAddr::V4(net.network()),
+                    prefix_len: net.prefix_len(),
+                    next_hop: nh,
+                    metric: WINDOWS_EXCLUDE_ROUTE_METRIC,
+                };
+                if !routes.iter().any(|r: &PlannedWindowsRoute| {
+                    r.interface_luid == candidate.interface_luid
+                        && r.dest == candidate.dest
+                        && r.prefix_len == candidate.prefix_len
+                        && r.next_hop == candidate.next_hop
+                }) {
+                    routes.push(candidate);
+                }
+            }
+            ipnet::IpNet::V6(v6net) => {
+                if !enable_ipv6 {
+                    continue;
+                }
+                let net = v6net.trunc();
+                if net.prefix_len() <= 1
+                    || (net.prefix_len() >= tun_ipv6_cidr.prefix_len()
+                        && crate::config::ipv6_nets_overlap(net, tun_ipv6_cidr))
+                    || egress.v6_luid == 0
+                {
+                    continue;
+                }
+                let nh6 = egress
+                    .v6_gateway
+                    .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+                let candidate = PlannedWindowsRoute {
+                    interface_luid: egress.v6_luid,
+                    dest: IpAddr::V6(net.network()),
+                    prefix_len: net.prefix_len(),
+                    next_hop: nh6,
+                    metric: WINDOWS_EXCLUDE_ROUTE_METRIC,
+                };
+                if !routes.iter().any(|r: &PlannedWindowsRoute| {
+                    r.interface_luid == candidate.interface_luid
+                        && r.dest == candidate.dest
+                        && r.prefix_len == candidate.prefix_len
+                        && r.next_hop == candidate.next_hop
+                }) {
+                    routes.push(candidate);
+                }
+            }
+        }
+    }
+    routes
+}
+
+/// Install both `/32`/`/128` physical bypass routes and `route-exclude-address` CIDR routes via `add_route`,
+/// deduplicating identical `(interface_luid, dest, prefix_len, next_hop)` entries.
+pub fn install_windows_physical_routes_with_ops<F>(
+    egress: &PhysicalEgressInfo,
+    bypass_ips: &[IpAddr],
+    exclude_cidrs: &[ipnet::IpNet],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+    enable_ipv6: bool,
+    mut add_route: F,
+) -> Vec<WindowsRouteRecord>
+where
+    F: FnMut(u64, IpAddr, u8, IpAddr, u32) -> io::Result<WindowsRouteRecord>,
+{
+    let mut planned =
+        plan_windows_physical_bypass_routes(egress, bypass_ips, fake_ip_net, tun_ipv6_cidr);
+    for ex in plan_windows_physical_exclude_routes(
+        egress,
+        exclude_cidrs,
+        fake_ip_net,
+        tun_ipv6_cidr,
+        enable_ipv6,
+    ) {
+        if !planned.iter().any(|r| {
+            r.interface_luid == ex.interface_luid
+                && r.dest == ex.dest
+                && r.prefix_len == ex.prefix_len
+                && r.next_hop == ex.next_hop
+        }) {
+            planned.push(ex);
+        }
+    }
+
+    let mut installed = Vec::with_capacity(planned.len());
+    for route in planned {
+        if let Ok(rec) = add_route(
+            route.interface_luid,
+            route.dest,
+            route.prefix_len,
+            route.next_hop,
+            route.metric,
+        ) {
+            installed.push(rec);
+        }
+    }
+    installed
+}
+
+/// Reconcile owned physical bypass + `route-exclude-address` routes on a Windows network handoff
+/// (`NotifyIpInterfaceChange`): preserves Wintun split/fake-ip routes on `adapter_luid`, deletes
+/// all prior physical NIC routes, and installs fresh physical routes on `effective_egress`.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_windows_handoff_routes_with_ops<D, A>(
+    rec: &mut WindowsRecoveryRecord,
+    adapter_luid: u64,
+    effective_egress: &PhysicalEgressInfo,
+    effective_bypass_ips: &[IpAddr],
+    exclude_cidrs: &[ipnet::IpNet],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+    enable_ipv6: bool,
+    mut delete_route: D,
+    add_route: A,
+) where
+    D: FnMut(&WindowsRouteRecord) -> io::Result<()>,
+    A: FnMut(u64, IpAddr, u8, IpAddr, u32) -> io::Result<WindowsRouteRecord>,
+{
+    let mut kept_wintun_routes = Vec::with_capacity(rec.owned_routes.len());
+    for r in rec.owned_routes.drain(..) {
+        if r.interface_luid == adapter_luid {
+            kept_wintun_routes.push(r);
+        } else {
+            let _ = delete_route(&r);
+        }
+    }
+    let new_physical = install_windows_physical_routes_with_ops(
+        effective_egress,
+        effective_bypass_ips,
+        exclude_cidrs,
+        fake_ip_net,
+        tun_ipv6_cidr,
+        enable_ipv6,
+        add_route,
+    );
+    kept_wintun_routes.extend(new_physical);
+    rec.owned_routes = kept_wintun_routes;
+}
+
+/// Parse Windows DNS server list strings (`NameServer` / `DhcpNameServer` / `GetInterfaceDnsSettings`),
+/// which may be comma-, semicolon-, whitespace-, or NUL-delimited, stripping any IPv6 `%zone` suffix.
+pub fn parse_windows_dns_server_list(raw: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for token in raw.split([',', ';', ' ', '\t', '\r', '\n', '\0']) {
+        let clean = token.trim().split('%').next().unwrap_or("").trim();
+        if clean.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = clean.parse::<IpAddr>()
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// Testable abstraction over Windows `iphlpapi.dll` interface DNS APIs (`ConvertInterfaceLuidToGuid`,
 /// `GetInterfaceDnsSettings`, and `SetInterfaceDnsSettings`), enabling deterministic fault-injection
 /// verification across all CI platforms while driving genuine Win32 syscalls on Windows.
@@ -536,7 +793,7 @@ mod win_impl {
         Win32::{
             Foundation::{
                 CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
-                FreeLibrary, GetLastError, HANDLE, HMODULE,
+                ERROR_SUCCESS, FreeLibrary, GetLastError, HANDLE, HMODULE,
             },
             NetworkManagement::{
                 IpHelper::{
@@ -561,6 +818,10 @@ mod win_impl {
                     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
                     LoadLibraryExW,
                 },
+                Registry::{
+                    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+                    RegQueryValueExW,
+                },
                 Threading::{
                     CreateEventW, GetCurrentProcess, OpenProcessToken, SetEvent,
                     WaitForMultipleObjects,
@@ -573,9 +834,11 @@ mod win_impl {
     use super::{
         ForwardRouteCandidate, PhysicalEgressInfo, WINDOWS_SPLIT_IPV4_PREFIXES,
         WINDOWS_SPLIT_IPV6_PREFIXES, WindowsDnsOps, apply_windows_adapter_dns_transactional,
-        compute_wintun_route_metrics, format_braced_guid, merge_non_zero_protector_indices,
-        parse_braced_guid, resolve_secure_wintun_dll_path, rollback_windows_record_with_ops,
-        select_physical_default_egress, select_windows_physical_bypass_ips,
+        compute_wintun_route_metrics, format_braced_guid, install_windows_physical_routes_with_ops,
+        merge_non_zero_protector_indices, parse_braced_guid, parse_windows_dns_server_list,
+        reconcile_windows_handoff_routes_with_ops, resolve_secure_wintun_dll_path,
+        rollback_windows_record_with_ops, select_physical_default_egress,
+        select_windows_physical_bypass_ips,
     };
     use crate::{
         inbound::tun::VirtualTunHandle,
@@ -599,6 +862,10 @@ mod win_impl {
         data3: 0x49d2,
         data4: [0x9b, 0x83, 0x53, 0xc6, 0xe9, 0x04, 0x1a, 0x21],
     };
+
+    /// LUID of the currently active RustClash Wintun adapter (`0` when stopped) so
+    /// `discover_windows_physical_dns_servers()` always excludes the TUN adapter.
+    static ACTIVE_WINTUN_LUID: AtomicU64 = AtomicU64::new(0);
 
     const WINTUN_RING_CAPACITY: u32 = 0x0040_0000; // 4 MiB ring buffer (within official 128 KiB..64 MiB range)
 
@@ -1226,53 +1493,149 @@ mod win_impl {
         outcome
     }
 
-    fn install_physical_bypass_routes(
-        egress: &PhysicalEgressInfo,
-        bypass_ips: &[IpAddr],
-        fake_ip_net: ipnet::Ipv4Net,
-        tun_ipv6_cidr: ipnet::Ipv6Net,
-    ) -> Vec<WindowsRouteRecord> {
-        let mut routes = Vec::new();
-        for ip in bypass_ips {
-            match ip {
-                IpAddr::V4(v4)
-                    if !v4.is_loopback()
-                        && !v4.is_unspecified()
-                        && !fake_ip_net.contains(v4)
-                        && egress.v4_luid != 0 =>
-                {
-                    let nh = egress
-                        .v4_gateway
-                        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                    if let Ok(r_byp) = add_iphlpapi_route(egress.v4_luid, *ip, 32, nh, 1) {
-                        routes.push(r_byp);
-                    }
-                }
-                IpAddr::V6(v6)
-                    if !v6.is_loopback()
-                        && !v6.is_unspecified()
-                        && !tun_ipv6_cidr.contains(v6)
-                        && egress.v6_luid != 0 =>
-                {
-                    let nh6 = egress
-                        .v6_gateway
-                        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-                    if let Ok(r_byp6) = add_iphlpapi_route(egress.v6_luid, *ip, 128, nh6, 1) {
-                        routes.push(r_byp6);
-                    }
-                }
-                _ => {}
-            }
+    unsafe fn query_reg_dns_string(hkey: HKEY, name: &str) -> Option<String> {
+        let name_w = to_wide_nul(name);
+        let mut byte_len: u32 = 0;
+        // SAFETY: `hkey` is an open registry key handle and `name_w` is NUL-terminated UTF-16.
+        let rc0 = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut byte_len,
+            )
+        };
+        if rc0 != ERROR_SUCCESS || byte_len == 0 || byte_len > 65_536 {
+            return None;
         }
-        routes
+        let mut wbuf = vec![0u16; (byte_len as usize).div_ceil(2) + 1];
+        // SAFETY: `wbuf` has capacity >= `byte_len` bytes.
+        let rc1 = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                wbuf.as_mut_ptr().cast::<u8>(),
+                &raw mut byte_len,
+            )
+        };
+        if rc1 != ERROR_SUCCESS {
+            return None;
+        }
+        let u16_len = ((byte_len as usize) / 2).min(wbuf.len());
+        let mut trimmed_end = u16_len;
+        while trimmed_end > 0 && wbuf[trimmed_end - 1] == 0 {
+            trimmed_end -= 1;
+        }
+        if trimmed_end == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&wbuf[..trimmed_end]))
+    }
+
+    fn read_windows_interface_registry_dns(guid: &str, ipv6: bool) -> (Vec<IpAddr>, Vec<IpAddr>) {
+        let service = if ipv6 { "Tcpip6" } else { "Tcpip" };
+        let subkey = to_wide_nul(&format!(
+            "SYSTEM\\CurrentControlSet\\Services\\{service}\\Parameters\\Interfaces\\{guid}"
+        ));
+        let mut hkey: HKEY = std::ptr::null_mut();
+        // SAFETY: Read-only HKLM registry lookup using NUL-terminated UTF-16 subkey.
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                0,
+                KEY_READ,
+                &raw mut hkey,
+            )
+        };
+        if rc != ERROR_SUCCESS || hkey.is_null() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut static_ips = Vec::new();
+        let mut dhcp_ips = Vec::new();
+        // SAFETY: `hkey` was opened above and is closed before returning.
+        unsafe {
+            for key_name in ["NameServer", "ProfileNameServer"] {
+                if let Some(raw) = query_reg_dns_string(hkey, key_name) {
+                    for ip in parse_windows_dns_server_list(&raw) {
+                        if !static_ips.contains(&ip) {
+                            static_ips.push(ip);
+                        }
+                    }
+                }
+            }
+            if let Some(raw) = query_reg_dns_string(hkey, "DhcpNameServer") {
+                for ip in parse_windows_dns_server_list(&raw) {
+                    if !dhcp_ips.contains(&ip) {
+                        dhcp_ips.push(ip);
+                    }
+                }
+            }
+            let _ = RegCloseKey(hkey);
+        }
+        (static_ips, dhcp_ips)
+    }
+
+    /// Discover OS / DHCP DNS servers on the active physical default-egress Windows NIC
+    /// (excluding the active Wintun adapter LUID). Prefers configured static DNS on each family
+    /// before falling back to DHCP DNS (`DhcpNameServer`), matching Windows `Dnscache` precedence.
+    pub fn discover_windows_physical_dns_servers() -> Vec<IpAddr> {
+        let excluded_luid = ACTIVE_WINTUN_LUID.load(Ordering::Acquire);
+        let egress = detect_windows_physical_egress(excluded_luid);
+        let mut dns_backend = IpHlpApiDnsBackend;
+        let mut out = Vec::new();
+
+        let mut collect_family = |luid: u64, ipv6: bool| {
+            if luid == 0 || luid == excluded_luid {
+                return;
+            }
+            let Ok(guid) = dns_backend.resolve_luid_guid(luid) else {
+                return;
+            };
+            let mut static_ips = Vec::new();
+            if let Ok(snap) = dns_backend.get_dns_settings(&guid, ipv6) {
+                for ip in parse_windows_dns_server_list(&snap.name_server) {
+                    if !static_ips.contains(&ip) {
+                        static_ips.push(ip);
+                    }
+                }
+            }
+            let (reg_static, reg_dhcp) = read_windows_interface_registry_dns(&guid, ipv6);
+            for ip in reg_static {
+                if !static_ips.contains(&ip) {
+                    static_ips.push(ip);
+                }
+            }
+            let chosen = if !static_ips.is_empty() {
+                static_ips
+            } else {
+                reg_dhcp
+            };
+            for ip in chosen {
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+        };
+
+        collect_family(egress.v4_luid, false);
+        collect_family(egress.v6_luid, true);
+        out
     }
 
     struct NetChangeCallbackCtx {
         adapter_luid: u64,
         auto_route: bool,
+        enable_ipv6: bool,
         dns_hijack: bool,
         proxy_bypass_ips: Vec<IpAddr>,
         dns_bypass_ips: Vec<IpAddr>,
+        route_exclude_cidrs: Vec<ipnet::IpNet>,
         fake_ip_net: ipnet::Ipv4Net,
         tun_ipv6_cidr: ipnet::Ipv6Net,
         state_dir: PathBuf,
@@ -1363,22 +1726,18 @@ mod win_impl {
         if ctx.auto_route && routes_handoff_needed {
             let rec_snap = {
                 let mut rec_guard = ctx.recovery_record.lock();
-                let mut kept_wintun_routes = Vec::with_capacity(rec_guard.owned_routes.len());
-                for r in rec_guard.owned_routes.drain(..) {
-                    if r.interface_luid == ctx.adapter_luid {
-                        kept_wintun_routes.push(r);
-                    } else {
-                        let _ = delete_iphlpapi_route(&r);
-                    }
-                }
-                let new_bypass = install_physical_bypass_routes(
+                reconcile_windows_handoff_routes_with_ops(
+                    &mut rec_guard,
+                    ctx.adapter_luid,
                     &effective,
                     &effective_bypass,
+                    &ctx.route_exclude_cidrs,
                     ctx.fake_ip_net,
                     ctx.tun_ipv6_cidr,
+                    ctx.enable_ipv6,
+                    delete_iphlpapi_route,
+                    add_iphlpapi_route,
                 );
-                kept_wintun_routes.extend(new_bypass);
-                rec_guard.owned_routes = kept_wintun_routes;
                 rec_guard.clone()
             };
             let _ = update_current_journal(&ctx.state_dir, |j| j.windows_tun = Some(rec_snap));
@@ -1484,6 +1843,7 @@ mod win_impl {
                 (api.get_running_driver_version)()
             };
             let tun_luid_val = unsafe { luid.Value };
+            ACTIVE_WINTUN_LUID.store(tun_luid_val, Ordering::Release);
             // Re-verify physical egress excluding this Wintun adapter's own LUID (defends against
             // any stale pre-existing RustClash Wintun adapter with leftover routes).
             let refined_egress = detect_windows_physical_egress(tun_luid_val);
@@ -1502,6 +1862,7 @@ mod win_impl {
                 let err = io::Error::last_os_error();
                 // SAFETY: Closing `adapter` on session start failure.
                 unsafe { (api.close_adapter)(adapter) };
+                ACTIVE_WINTUN_LUID.store(0, Ordering::Release);
                 clear_global_socket_protector();
                 return Err(io::Error::new(
                     err.kind(),
@@ -1519,7 +1880,7 @@ mod win_impl {
             };
 
             // 4. Configure adapter IPv4, IPv6, MTU, lowest InterfaceMetric, split-tunnel routes,
-            //    selective bypass routes, and DNS transactionally
+            //    selective bypass routes, `route-exclude-address` bypass routes, and DNS transactionally
             let setup_res = (|| -> io::Result<()> {
                 let gw_v4 = spec.gateway_ipv4();
                 set_adapter_unicast_ip(luid, IpAddr::V4(gw_v4), spec.fake_ip_net.prefix_len())?;
@@ -1576,10 +1937,10 @@ mod win_impl {
                 )?;
                 rec.owned_routes.push(r_fake);
 
-                // Explicit `/32` (IPv4) and `/128` (IPv6) physical bypass routes:
-                // keep literal proxy server IPs, but omit public/upstream DNS servers when
-                // `WindowsUnicastIfProtector` (`IP_UNICAST_IF`) + `dns_hijack` are active so
-                // other Windows processes cannot bypass Wintun's `any:53` Fake-IP hijack!
+                // Explicit `/32`/`/128` physical bypass routes + `tun.route-exclude-address` CIDR bypasses:
+                // keep literal proxy server IPs and user-excluded LAN CIDRs, but omit public/upstream
+                // DNS servers when `WindowsUnicastIfProtector` (`IP_UNICAST_IF`) + `dns_hijack` are active
+                // so other Windows processes cannot bypass Wintun's `any:53` Fake-IP hijack!
                 let effective_bypass = select_windows_physical_bypass_ips(
                     &spec.bypass_ips,
                     &spec.dns_bypass_ips,
@@ -1587,12 +1948,16 @@ mod win_impl {
                     initial_egress.v4_if_index != 0,
                     initial_egress.v6_if_index != 0,
                 );
-                rec.owned_routes.extend(install_physical_bypass_routes(
-                    &initial_egress,
-                    &effective_bypass,
-                    spec.fake_ip_net,
-                    spec.tun_ipv6_cidr,
-                ));
+                rec.owned_routes
+                    .extend(install_windows_physical_routes_with_ops(
+                        &initial_egress,
+                        &effective_bypass,
+                        &spec.route_exclude_cidrs,
+                        spec.fake_ip_net,
+                        spec.tun_ipv6_cidr,
+                        spec.enable_ipv6,
+                        add_iphlpapi_route,
+                    ));
 
                 if spec.enable_ipv6 {
                     let zero_v6 = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
@@ -1651,6 +2016,7 @@ mod win_impl {
                     (api.end_session)(session);
                     (api.close_adapter)(adapter);
                 }
+                ACTIVE_WINTUN_LUID.store(0, Ordering::Release);
                 clear_global_socket_protector();
                 return Err(err);
             }
@@ -1665,6 +2031,7 @@ mod win_impl {
                     (api.end_session)(session);
                     (api.close_adapter)(adapter);
                 }
+                ACTIVE_WINTUN_LUID.store(0, Ordering::Release);
                 clear_global_socket_protector();
                 return Err(err);
             }
@@ -1682,9 +2049,11 @@ mod win_impl {
             let mut notify_ctx = Box::new(NetChangeCallbackCtx {
                 adapter_luid: unsafe { luid.Value },
                 auto_route: spec.auto_route,
+                enable_ipv6: spec.enable_ipv6,
                 dns_hijack: spec.dns_hijack,
                 proxy_bypass_ips: spec.bypass_ips.clone(),
                 dns_bypass_ips: spec.dns_bypass_ips.clone(),
+                route_exclude_cidrs: spec.route_exclude_cidrs.clone(),
                 fake_ip_net: spec.fake_ip_net,
                 tun_ipv6_cidr: spec.tun_ipv6_cidr,
                 state_dir: spec.state_dir.clone(),
@@ -1799,6 +2168,7 @@ mod win_impl {
                         (api.close_adapter)(adapter);
                         let _ = CloseHandle(stop_event);
                     }
+                    ACTIVE_WINTUN_LUID.store(0, Ordering::Release);
                     clear_global_socket_protector();
                     return Err(err);
                 }
@@ -1861,6 +2231,7 @@ mod win_impl {
                         (api.close_adapter)(adapter);
                         let _ = CloseHandle(stop_event);
                     }
+                    ACTIVE_WINTUN_LUID.store(0, Ordering::Release);
                     clear_global_socket_protector();
                     return Err(err);
                 }
@@ -1995,6 +2366,7 @@ mod win_impl {
                 }
             }
 
+            ACTIVE_WINTUN_LUID.store(0, Ordering::Release);
             clear_global_socket_protector();
         }
     }
@@ -2008,8 +2380,9 @@ mod win_impl {
 
 #[cfg(windows)]
 pub use win_impl::{
-    WindowsWintunSession, detect_windows_physical_egress, is_windows_process_elevated,
-    preflight_windows_tun, recover_windows_tun_record, recover_windows_tun_record_pruning,
+    WindowsWintunSession, detect_windows_physical_egress, discover_windows_physical_dns_servers,
+    is_windows_process_elevated, preflight_windows_tun, recover_windows_tun_record,
+    recover_windows_tun_record_pruning,
 };
 
 #[cfg(test)]
@@ -2639,5 +3012,195 @@ mod tests {
         assert_eq!(no_hijack.len(), 6);
         let no_prot = select_windows_physical_bypass_ips(&proxy_ips, &dns_ips, true, false, false);
         assert_eq!(no_prot.len(), 6);
+    }
+
+    #[test]
+    fn windows_route_exclude_address_plans_installs_hands_off_and_rolls_back_cleanly() {
+        let fake_net: ipnet::Ipv4Net = "198.18.0.0/15".parse().unwrap();
+        let tun_v6: ipnet::Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
+        let wintun_luid = 9000u64;
+        let wifi_egress = PhysicalEgressInfo {
+            v4_if_index: 12,
+            v4_luid: 1001,
+            v4_gateway: Some("192.168.1.1".parse().unwrap()),
+            v6_if_index: 12,
+            v6_luid: 1001,
+            v6_gateway: Some("fe80::1".parse().unwrap()),
+        };
+        let eth_egress = PhysicalEgressInfo {
+            v4_if_index: 20,
+            v4_luid: 2002,
+            v4_gateway: Some("10.10.0.1".parse().unwrap()),
+            v6_if_index: 20,
+            v6_luid: 2002,
+            v6_gateway: Some("fe80::2".parse().unwrap()),
+        };
+
+        let exclude_cidrs: Vec<ipnet::IpNet> = vec![
+            "192.168.0.0/16".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+            "172.16.0.0/12".parse().unwrap(),
+            "198.18.10.0/24".parse().unwrap(), // overlaps fake-ip -> skipped
+            "198.16.0.0/13".parse().unwrap(),  // contains fake-ip -> skipped
+            "0.0.0.0/1".parse().unwrap(),      // prefix <= 1 -> skipped
+            "fc00::/7".parse().unwrap(),       // broader than TUN /126 -> kept
+            "fdfe:dcba:9876::/126".parse().unwrap(), // overlaps TUN /126 at >=126 -> skipped
+        ];
+        let proxy_bypass: Vec<IpAddr> = vec!["203.0.113.5".parse().unwrap()];
+
+        let planned = plan_windows_physical_exclude_routes(
+            &wifi_egress,
+            &exclude_cidrs,
+            fake_net,
+            tun_v6,
+            true,
+        );
+        assert_eq!(planned.len(), 4);
+        assert_eq!(planned[0].dest, "192.168.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(planned[0].prefix_len, 16);
+        assert_eq!(planned[0].metric, WINDOWS_EXCLUDE_ROUTE_METRIC);
+        assert_eq!(planned[3].dest, "fc00::".parse::<IpAddr>().unwrap());
+        assert_eq!(planned[3].prefix_len, 7);
+
+        // Install initial Wintun + physical bypass + exclude routes
+        let mut rec = WindowsRecoveryRecord {
+            adapter_name: "RustClash".to_string(),
+            adapter_luid: wintun_luid,
+            owned_routes: vec![
+                WindowsRouteRecord {
+                    destination_prefix: "0.0.0.0".to_string(),
+                    prefix_length: 1,
+                    next_hop: "0.0.0.0".to_string(),
+                    interface_luid: wintun_luid,
+                },
+                WindowsRouteRecord {
+                    destination_prefix: "128.0.0.0".to_string(),
+                    prefix_length: 1,
+                    next_hop: "0.0.0.0".to_string(),
+                    interface_luid: wintun_luid,
+                },
+            ],
+            dns_interface_guid: None,
+            previous_dns_servers: None,
+            dns_backup: None,
+        };
+
+        let mut added_metrics: Vec<(String, u8, u32)> = Vec::new();
+        let initial_phys = install_windows_physical_routes_with_ops(
+            &wifi_egress,
+            &proxy_bypass,
+            &exclude_cidrs,
+            fake_net,
+            tun_v6,
+            true,
+            |luid, dest, plen, nh, metric| {
+                added_metrics.push((dest.to_string(), plen, metric));
+                Ok(WindowsRouteRecord {
+                    destination_prefix: dest.to_string(),
+                    prefix_length: plen,
+                    next_hop: nh.to_string(),
+                    interface_luid: luid,
+                })
+            },
+        );
+        assert_eq!(initial_phys.len(), 5); // 1 proxy /32 + 3 IPv4 exclude + 1 IPv6 exclude
+        assert_eq!(added_metrics[0], ("203.0.113.5".to_string(), 32, 1));
+        assert_eq!(
+            added_metrics[1],
+            ("192.168.0.0".to_string(), 16, WINDOWS_EXCLUDE_ROUTE_METRIC)
+        );
+        rec.owned_routes.extend(initial_phys);
+
+        // Network handoff Wi-Fi -> Ethernet: deletes all 5 Wi-Fi routes, preserves 2 Wintun routes, installs 5 Ethernet routes
+        let mut deleted_handoff = Vec::new();
+        reconcile_windows_handoff_routes_with_ops(
+            &mut rec,
+            wintun_luid,
+            &eth_egress,
+            &proxy_bypass,
+            &exclude_cidrs,
+            fake_net,
+            tun_v6,
+            true,
+            |r| {
+                deleted_handoff.push((
+                    r.interface_luid,
+                    r.destination_prefix.clone(),
+                    r.prefix_length,
+                ));
+                Ok(())
+            },
+            |luid, dest, plen, nh, _metric| {
+                Ok(WindowsRouteRecord {
+                    destination_prefix: dest.to_string(),
+                    prefix_length: plen,
+                    next_hop: nh.to_string(),
+                    interface_luid: luid,
+                })
+            },
+        );
+        assert_eq!(deleted_handoff.len(), 5);
+        assert!(deleted_handoff.iter().all(|(luid, _, _)| *luid == 1001));
+        assert_eq!(rec.owned_routes.len(), 7);
+        assert_eq!(
+            rec.owned_routes
+                .iter()
+                .filter(|r| r.interface_luid == wintun_luid)
+                .count(),
+            2
+        );
+        assert_eq!(
+            rec.owned_routes
+                .iter()
+                .filter(|r| r.interface_luid == 2002)
+                .count(),
+            5
+        );
+
+        // Teardown rollback deletes all 7 routes cleanly (including every exclude CIDR route!)
+        let mut dns_ops = FaultInjectingDnsBackend::default();
+        let mut deleted_rollback = Vec::new();
+        let mut outcome = RecoveryOutcome::default();
+        let rem = rollback_windows_record_with_ops(
+            &rec,
+            &mut dns_ops,
+            |r| {
+                deleted_rollback.push((
+                    r.interface_luid,
+                    r.destination_prefix.clone(),
+                    r.prefix_length,
+                ));
+                Ok(())
+            },
+            &mut outcome,
+        );
+        assert!(rem.is_none());
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(deleted_rollback.len(), 7);
+        assert!(
+            deleted_rollback
+                .iter()
+                .any(|(_, d, p)| d == "192.168.0.0" && *p == 16)
+        );
+        assert!(
+            deleted_rollback
+                .iter()
+                .any(|(_, d, p)| d == "fc00::" && *p == 7)
+        );
+    }
+
+    #[test]
+    fn parse_windows_dns_server_list_handles_commas_spaces_nuls_and_ipv6_zones() {
+        let raw = "192.168.1.1, 10.0.0.53;fe80::1%12\x00192.168.1.1\0 2001:4860:4860::8888 ";
+        let parsed = parse_windows_dns_server_list(raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "192.168.1.1".parse::<IpAddr>().unwrap(),
+                "10.0.0.53".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse::<IpAddr>().unwrap(),
+                "2001:4860:4860::8888".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 }

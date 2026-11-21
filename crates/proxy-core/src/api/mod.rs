@@ -771,6 +771,7 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
             "strict-route": cfg.tun.strict_route,
             "ipv6": cfg.tun.ipv6,
             "mtu": cfg.tun.mtu,
+            "route-exclude-address": cfg.tun.route_exclude_address,
             "last-error": engine.last_tun_error(),
             "health": tun_health,
         },
@@ -811,6 +812,8 @@ struct PatchTunReq {
     #[serde(rename = "strict-route", alias = "strict_route")]
     strict_route: Option<bool>,
     ipv6: Option<bool>,
+    #[serde(rename = "route-exclude-address", alias = "route_exclude_address")]
+    route_exclude_address: Option<Vec<String>>,
 }
 
 async fn patch_configs(
@@ -833,24 +836,26 @@ async fn patch_configs(
     if let Some(level) = patch.log_level {
         engine.set_log_level(level);
     }
-    let (tun_enable, tun_strict_route, tun_ipv6) = match patch.tun {
-        Some(t) => (t.enable, t.strict_route, t.ipv6),
-        None => (None, None, None),
+    let (tun_enable, tun_strict_route, tun_ipv6, tun_route_exclude_address) = match patch.tun {
+        Some(t) => (t.enable, t.strict_route, t.ipv6, t.route_exclude_address),
+        None => (None, None, None, None),
     };
     if (patch.allow_lan.is_some()
         || patch.mixed_port.is_some()
         || patch.ipv6.is_some()
         || tun_enable.is_some()
         || tun_strict_route.is_some()
-        || tun_ipv6.is_some())
+        || tun_ipv6.is_some()
+        || tun_route_exclude_address.is_some())
         && let Err(err) = engine
-            .apply_config_patch(
+            .apply_config_patch_with_tun_exclude(
                 patch.allow_lan,
                 patch.mixed_port,
                 patch.ipv6,
                 tun_enable,
                 tun_strict_route,
                 tun_ipv6,
+                tun_route_exclude_address,
             )
             .await
     {
@@ -2250,16 +2255,45 @@ async fn stream_memory_ws(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct LogsQuery {
+    level: Option<String>,
+}
+
 async fn get_or_ws_logs(
     ws_res: std::result::Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     ws_stop: Option<axum::extract::Extension<WsShutdownWatch>>,
+    Query(query): Query<LogsQuery>,
     State(engine): State<Arc<ProxyEngine>>,
 ) -> Response {
     let api_stop = ws_stop.and_then(|e| e.0.0);
     match ws_res {
         Ok(ws) => ws.on_upgrade(move |socket| stream_logs_ws(socket, engine, api_stop)),
         Err(_) => {
-            let logs = engine.hub().recent_logs();
+            let level_norm = query
+                .level
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase());
+            let logs = match level_norm.as_deref() {
+                Some("error" | "err") => engine
+                    .hub()
+                    .important_logs()
+                    .into_iter()
+                    .filter(|e| matches!(e.level.to_ascii_lowercase().as_str(), "error" | "err"))
+                    .collect(),
+                Some("warn" | "warning") => engine
+                    .hub()
+                    .important_logs()
+                    .into_iter()
+                    .filter(|e| {
+                        matches!(
+                            e.level.to_ascii_lowercase().as_str(),
+                            "warn" | "warning" | "error" | "err"
+                        )
+                    })
+                    .collect(),
+                _ => engine.hub().recent_logs(),
+            };
             Json(serde_json::json!({ "logs": logs })).into_response()
         }
     }

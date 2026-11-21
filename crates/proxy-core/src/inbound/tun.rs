@@ -767,11 +767,21 @@ fn handle_ingress_packet(
                         let dst_port = udp.dst_port();
                         let dst_sock = SocketAddr::new(IpAddr::V4(dst_v4), dst_port);
                         let hijack_dns = dst_port == 53 && router.read().tun_dns_hijack();
-                        let is_unmapped_fake = !hijack_dns
+                        let mut is_unmapped_fake = !hijack_dns
                             && router
                                 .read()
                                 .dns()
                                 .is_unmapped_fake_ip(&TargetAddr::from(dst_sock));
+                        if is_unmapped_fake
+                            && let crate::inbound::sniff::SniffOutcome::Domain(domain) =
+                                crate::inbound::sniff::sniff_quic_initial_sni(udp.payload())
+                        {
+                            let _ = router
+                                .read()
+                                .dns()
+                                .recover_unmapped_fake_ip(dst_v4, &domain);
+                            is_unmapped_fake = false;
+                        }
                         if !is_unmapped_fake {
                             let payload = udp.payload().to_vec();
                             spawn_tun_udp_handler(
@@ -787,7 +797,7 @@ fn handle_ingress_packet(
                             );
                             return;
                         }
-                        // Unmapped Fake-IP UDP (non-hijacked): fall through to `device.rx_queue` so
+                        // Unmapped Fake-IP UDP (non-hijacked, non-QUIC-Initial): fall through to `device.rx_queue` so
                         // `smoltcp` `iface.poll()` immediately emits `ICMPv4 Destination Unreachable (PortUnreachable)`!
                     } else {
                         return;
@@ -842,21 +852,40 @@ fn handle_ingress_packet(
                     let src_addr = SocketAddr::new(IpAddr::V6(src_v6), src_port);
                     let dst_sock = SocketAddr::new(IpAddr::V6(dst_v6), dst_port);
                     let hijack_dns = dst_port == 53 && router.read().tun_dns_hijack();
-                    let is_unmapped_fake = !hijack_dns
+                    let mut is_unmapped_fake = !hijack_dns
                         && router
                             .read()
                             .dns()
                             .is_unmapped_fake_ip(&TargetAddr::from(dst_sock));
-                    if !is_unmapped_fake
-                        && (hijack_dns
-                            || !should_fast_reject_unreachable_direct_ipv6(
-                                src_addr,
-                                dst_v6,
-                                dst_port,
-                                SocketTransport::Udp,
-                                router,
-                            ))
+                    if is_unmapped_fake
+                        && let Some(mapped_v4) = dst_v6.to_ipv4_mapped()
+                        && let crate::inbound::sniff::SniffOutcome::Domain(domain) =
+                            crate::inbound::sniff::sniff_quic_initial_sni(udp.payload())
                     {
+                        let _ = router
+                            .read()
+                            .dns()
+                            .recover_unmapped_fake_ip(mapped_v4, &domain);
+                        is_unmapped_fake = false;
+                    }
+                    let fast_reject = !hijack_dns
+                        && !is_unmapped_fake
+                        && should_fast_reject_unreachable_direct_ipv6(
+                            src_addr,
+                            dst_v6,
+                            dst_port,
+                            SocketTransport::Udp,
+                            router,
+                        )
+                        && !(router
+                            .read()
+                            .sniffer()
+                            .should_sniff_real_ip_udp(IpAddr::V6(dst_v6), dst_port)
+                            && matches!(
+                                crate::inbound::sniff::sniff_quic_initial_sni(udp.payload()),
+                                crate::inbound::sniff::SniffOutcome::Domain(_)
+                            ));
+                    if !is_unmapped_fake && !fast_reject {
                         let payload = udp.payload().to_vec();
                         spawn_tun_udp_handler(
                             src_addr,
@@ -1012,31 +1041,32 @@ fn spawn_tun_udp_handler(
             return;
         }
 
-        // 3. General non-53 UDP datagram stateful NAT session forwarding!
+        // 3. General non-53 UDP datagram stateful NAT session forwarding (with QUIC Initial SNI sniffing)!
         let route_epoch = current_router.epoch();
         let raw_target = TargetAddr::from(dst);
-        let decision = current_router
-            .route_async_with_context(
-                Some(src.ip()),
-                Some(src),
-                crate::platform::process::SocketTransport::Udp,
-                &raw_target,
-            )
-            .await;
+        let resolved = crate::inbound::udp_nat::route_udp_datagram_with_quic_sniff(
+            &current_router,
+            src,
+            &raw_target,
+            &payload,
+        )
+        .await;
         if shutting_down_task.load(Ordering::Acquire) {
             return;
         }
-        nat.send_datagram_with_epoch(
+        nat.send_datagram_with_options(
             src,
             raw_target,
-            decision.restored_from_fake_ip,
-            decision.target,
-            &decision.rule_type,
-            &decision.rule_payload,
-            decision.chains,
-            decision.outbound,
+            resolved.decision.restored_from_fake_ip,
+            resolved.decision.target,
+            resolved.dial_target,
+            &resolved.decision.rule_type,
+            &resolved.decision.rule_payload,
+            resolved.decision.chains,
+            resolved.decision.outbound,
             payload,
             route_epoch,
+            resolved.sniffed,
         )
         .await;
         if shutting_down_task.load(Ordering::Acquire) {
@@ -1256,7 +1286,7 @@ fn register_syn_flow(
             decision.target.clone()
         };
 
-        let conn_guard = hub_clone.register_connection_with_outbound_guard(
+        let conn_guard = hub_clone.register_connection_with_outbound_guard_sniffed(
             "TUN(smoltcp)",
             "tcp",
             Some(tuple.src),
@@ -1266,6 +1296,7 @@ fn register_syn_flow(
             &decision.rule_payload,
             decision.chains.clone(),
             decision.outbound.as_ref(),
+            sniffed_real_ip.is_some(),
         );
         let conn_entry = Arc::clone(conn_guard.connection());
         hub_clone.push_log(
@@ -1762,6 +1793,7 @@ pub fn attach_os_tun(
         tun_ipv6_cidr,
         bypass_ips,
         dns_bypass_ips: Vec::new(),
+        route_exclude_cidrs: Vec::new(),
         local_dns_addr: None,
         wintun_dll_path: None,
         state_dir: crate::platform::recovery::default_state_dir(),

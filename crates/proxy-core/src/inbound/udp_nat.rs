@@ -186,6 +186,99 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.changed().await;
 }
 
+/// Outcome of routing an initial UDP datagram with optional QUIC Initial SNI sniffing.
+pub struct ResolvedUdpRoute {
+    pub decision: crate::router::RouteDecision,
+    pub dial_target: TargetAddr,
+    pub sniffed: bool,
+}
+
+/// Route a UDP datagram via `router`, applying RFC 9001/9369 QUIC Initial SNI sniffing on:
+/// 1. Unmapped Fake-IP destinations (recovering the Fake-IP mapping when SNI is present), and
+/// 2. Real IP destinations matching `SnifferConfig::should_sniff_real_ip_udp(ip, port)`.
+///
+/// When a real-IP destination is sniffed, the recovered domain participates in rule matching and
+/// connection telemetry (`sniffed = true`), and overrides `dial_target` ONLY when the matched
+/// outbound is `PROXY` and `SnifferConfig::should_override_destination(Quic, domain)` allows it
+/// (`DIRECT` and `skip-domain` preserve the raw destination IP).
+pub async fn route_udp_datagram_with_quic_sniff(
+    router: &crate::router::Router,
+    client_src: SocketAddr,
+    raw_dst: &TargetAddr,
+    payload: &[u8],
+) -> ResolvedUdpRoute {
+    use crate::inbound::sniff::{SniffOutcome, SniffedProtocol, sniff_quic_initial_sni};
+
+    let sniffer_cfg = router.sniffer();
+    let mut sniffed_real_ip: Option<String> = None;
+
+    let route_target = if let Some(dst_ip) = raw_dst.host.as_ip() {
+        let is_unmapped_fake = router.dns().is_unmapped_fake_ip(raw_dst);
+        let is_fake = router.dns().is_fake_ip(dst_ip);
+        if is_unmapped_fake {
+            match sniff_quic_initial_sni(payload) {
+                SniffOutcome::Domain(domain) => {
+                    let fake_v4 = match dst_ip {
+                        IpAddr::V4(v4) => Some(v4),
+                        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                    };
+                    if let Some(v4) = fake_v4 {
+                        let _ = router.dns().recover_unmapped_fake_ip(v4, &domain);
+                    }
+                    if !router.dns().is_unmapped_fake_ip(raw_dst) {
+                        raw_dst.clone()
+                    } else {
+                        TargetAddr::new_domain(domain, raw_dst.port)
+                            .unwrap_or_else(|_| raw_dst.clone())
+                    }
+                }
+                SniffOutcome::NeedMoreBytes | SniffOutcome::NoHostname => raw_dst.clone(),
+            }
+        } else if !is_fake && sniffer_cfg.should_sniff_real_ip_udp(dst_ip, raw_dst.port) {
+            match sniff_quic_initial_sni(payload) {
+                SniffOutcome::Domain(domain) => {
+                    let target = TargetAddr::new_domain(domain.clone(), raw_dst.port)
+                        .unwrap_or_else(|_| raw_dst.clone());
+                    sniffed_real_ip = Some(domain);
+                    target
+                }
+                SniffOutcome::NeedMoreBytes | SniffOutcome::NoHostname => raw_dst.clone(),
+            }
+        } else {
+            raw_dst.clone()
+        }
+    } else {
+        raw_dst.clone()
+    };
+
+    let decision = router
+        .route_async_with_context(
+            Some(client_src.ip()),
+            Some(client_src),
+            crate::platform::process::SocketTransport::Udp,
+            &route_target,
+        )
+        .await;
+
+    let dial_target = if let Some(ref domain) = sniffed_real_ip {
+        if decision.outbound.exit_category() == "PROXY"
+            && sniffer_cfg.should_override_destination(SniffedProtocol::Quic, domain)
+        {
+            decision.target.clone()
+        } else {
+            raw_dst.clone()
+        }
+    } else {
+        decision.target.clone()
+    };
+
+    ResolvedUdpRoute {
+        decision,
+        dial_target,
+        sniffed: sniffed_real_ip.is_some(),
+    }
+}
+
 /// Stateful multi-datagram UDP NAT manager shared by TUN and SOCKS5 `UDP ASSOCIATE`.
 /// Maintains persistent `OutboundUdpSession`s per `(client_src, outbound)` (and per Fake-IP on proxy
 /// outbounds) so QUIC/HTTP3, gaming, and STUN/WebRTC flows preserve NAT port bindings and return addresses.
@@ -501,6 +594,42 @@ impl UdpNatManager {
         payload: Vec<u8>,
         router_epoch: u64,
     ) {
+        self.send_datagram_with_options(
+            client_src,
+            raw_dst,
+            restored_from_fake_ip,
+            target.clone(),
+            target,
+            rule_type,
+            rule_payload,
+            chains,
+            outbound,
+            payload,
+            router_epoch,
+            false,
+        )
+        .await;
+    }
+
+    /// Send a UDP datagram through the stateful NAT table with separate `telemetry_target`
+    /// (for connection metadata/diagnostics, e.g. sniffed QUIC SNI domain) and `dial_target`
+    /// (for outbound forwarding, e.g. raw IP on `DIRECT`/`skip-domain` or sniffed domain on `PROXY`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_datagram_with_options(
+        &self,
+        client_src: SocketAddr,
+        raw_dst: TargetAddr,
+        restored_from_fake_ip: Option<Ipv4Addr>,
+        telemetry_target: TargetAddr,
+        dial_target: TargetAddr,
+        rule_type: &str,
+        rule_payload: &str,
+        chains: Vec<String>,
+        outbound: DynOutbound,
+        payload: Vec<u8>,
+        router_epoch: u64,
+        sniffed: bool,
+    ) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -513,17 +642,18 @@ impl UdpNatManager {
                 "ERROR" => "routing chain resolution error",
                 _ => "selected outbound does not support UDP relay",
             };
-            self.hub.record_instant_failed_diagnostic(
+            self.hub.record_instant_failed_diagnostic_sniffed(
                 self.inbound_label,
                 "udp",
                 Some(client_src),
-                &target,
+                &telemetry_target,
                 restored_from_fake_ip.map(|ip| ip.to_string()),
                 rule_type,
                 rule_payload,
                 chains,
                 outbound.as_ref(),
                 reason,
+                sniffed,
             );
             return;
         }
@@ -541,7 +671,7 @@ impl UdpNatManager {
         let now_ms = self.now_ms();
         let now_wall_ms = TelemetryHub::now_ms();
         let was_fake_ip = restored_from_fake_ip.is_some();
-        let session_timeout = self.session_idle_timeout(target.port);
+        let session_timeout = self.session_idle_timeout(dial_target.port);
         let pkt_idle_timeout_ms = (session_timeout.as_millis() as u64).max(1);
 
         // Fast-path check before potentially running capacity eviction.
@@ -560,15 +690,15 @@ impl UdpNatManager {
                 !existing
                     .reverse_map
                     .read()
-                    .has_outbound(&target, &raw_dst, was_fake_ip);
+                    .has_outbound(&dial_target, &raw_dst, was_fake_ip);
             if needs_map_update {
                 existing
                     .reverse_map
                     .write()
-                    .record_outbound(&target, &raw_dst, was_fake_ip);
+                    .record_outbound(&dial_target, &raw_dst, was_fake_ip);
             }
             let payload_len = payload.len();
-            if existing.tx.try_send((target.clone(), payload)).is_ok() {
+            if existing.tx.try_send((dial_target.clone(), payload)).is_ok() {
                 self.hub.record_upload(&existing.conn_entry, payload_len);
             }
             drop(existing);
@@ -577,7 +707,7 @@ impl UdpNatManager {
                 &raw_dst,
                 outbound.name(),
                 fake_ip_scope,
-                &target,
+                &dial_target,
                 was_fake_ip,
                 router_epoch,
             );
@@ -627,12 +757,17 @@ impl UdpNatManager {
                             .idle_timeout_ms
                             .fetch_max(pkt_idle_timeout_ms, Ordering::Relaxed);
                         occ.get().reverse_map.write().record_outbound(
-                            &target,
+                            &dial_target,
                             &raw_dst,
                             was_fake_ip,
                         );
                         let payload_len = payload.len();
-                        if occ.get().tx.try_send((target.clone(), payload)).is_ok() {
+                        if occ
+                            .get()
+                            .tx
+                            .try_send((dial_target.clone(), payload))
+                            .is_ok()
+                        {
                             self.hub.record_upload(&occ.get().conn_entry, payload_len);
                         }
                         drop(occ);
@@ -642,36 +777,37 @@ impl UdpNatManager {
                             &raw_dst,
                             outbound.name(),
                             fake_ip_scope,
-                            &target,
+                            &dial_target,
                             was_fake_ip,
                             router_epoch,
                         );
                         return;
                     }
-                    let conn_entry = self.hub.register_connection_with_outbound(
+                    let conn_entry = self.hub.register_connection_with_outbound_sniffed(
                         self.inbound_label,
                         "udp",
                         Some(client_src),
-                        &target,
+                        &telemetry_target,
                         restored_from_fake_ip.map(|ip| ip.to_string()),
                         rule_type,
                         rule_payload,
                         chains.clone(),
                         outbound.as_ref(),
+                        sniffed,
                     );
                     let reverse_map = Arc::new(RwLock::new(ReverseTargetMap::with_fake_ip_pin(
                         fake_ip_scope,
                     )));
                     reverse_map
                         .write()
-                        .record_outbound(&target, &raw_dst, was_fake_ip);
+                        .record_outbound(&dial_target, &raw_dst, was_fake_ip);
                     let last_active_ms = Arc::new(AtomicU64::new(now_ms));
                     let last_active_wall_ms = Arc::new(AtomicU64::new(now_wall_ms));
                     let idle_timeout_ms = Arc::new(AtomicU64::new(pkt_idle_timeout_ms));
                     let (tx, rx) =
                         mpsc::channel::<(TargetAddr, Vec<u8>)>(UDP_SESSION_QUEUE_CAPACITY);
                     let payload_len = payload.len();
-                    if tx.try_send((target.clone(), payload)).is_ok() {
+                    if tx.try_send((dial_target.clone(), payload)).is_ok() {
                         self.hub.record_upload(&conn_entry, payload_len);
                     }
                     let evicted = occ.insert(NatSessionEntry {
@@ -694,30 +830,31 @@ impl UdpNatManager {
                     )
                 }
                 dashmap::mapref::entry::Entry::Vacant(vac) => {
-                    let conn_entry = self.hub.register_connection_with_outbound(
+                    let conn_entry = self.hub.register_connection_with_outbound_sniffed(
                         self.inbound_label,
                         "udp",
                         Some(client_src),
-                        &target,
+                        &telemetry_target,
                         restored_from_fake_ip.map(|ip| ip.to_string()),
                         rule_type,
                         rule_payload,
                         chains.clone(),
                         outbound.as_ref(),
+                        sniffed,
                     );
                     let reverse_map = Arc::new(RwLock::new(ReverseTargetMap::with_fake_ip_pin(
                         fake_ip_scope,
                     )));
                     reverse_map
                         .write()
-                        .record_outbound(&target, &raw_dst, was_fake_ip);
+                        .record_outbound(&dial_target, &raw_dst, was_fake_ip);
                     let last_active_ms = Arc::new(AtomicU64::new(now_ms));
                     let last_active_wall_ms = Arc::new(AtomicU64::new(now_wall_ms));
                     let idle_timeout_ms = Arc::new(AtomicU64::new(pkt_idle_timeout_ms));
                     let (tx, rx) =
                         mpsc::channel::<(TargetAddr, Vec<u8>)>(UDP_SESSION_QUEUE_CAPACITY);
                     let payload_len = payload.len();
-                    if tx.try_send((target.clone(), payload)).is_ok() {
+                    if tx.try_send((dial_target.clone(), payload)).is_ok() {
                         self.hub.record_upload(&conn_entry, payload_len);
                     }
                     vac.insert(NatSessionEntry {
@@ -758,10 +895,11 @@ impl UdpNatManager {
             &raw_dst,
             outbound.name(),
             fake_ip_scope,
-            &target,
+            &dial_target,
             was_fake_ip,
             router_epoch,
         );
+        let target = telemetry_target;
 
         let inbound_label = self.inbound_label;
         let hub_clone = Arc::clone(&self.hub);
@@ -2114,5 +2252,357 @@ mod tests {
         mgr.shutdown();
         assert_eq!(mgr.active_session_count(), 0);
         assert_eq!(hub.active_connection_count(), 0);
+    }
+
+    type SentDatagrams = Arc<AsyncMutex<Vec<(TargetAddr, Vec<u8>)>>>;
+
+    struct RecordingTargetUdpSession {
+        sent: SentDatagrams,
+        reply_rx: AsyncMutex<mpsc::Receiver<(TargetAddr, Vec<u8>)>>,
+        reply_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundUdpSession for RecordingTargetUdpSession {
+        async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> std::io::Result<()> {
+            self.sent
+                .lock()
+                .await
+                .push((target.clone(), payload.to_vec()));
+            let _ = self
+                .reply_tx
+                .try_send((target.clone(), b"quic-ack".to_vec()));
+            Ok(())
+        }
+
+        async fn recv_from(&self) -> std::io::Result<(Vec<u8>, TargetAddr)> {
+            let (target, payload) = self
+                .reply_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))?;
+            Ok((payload, target))
+        }
+    }
+
+    struct RecordingUdpOutbound {
+        name: &'static str,
+        category: &'static str,
+        sent: SentDatagrams,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundHandler for RecordingUdpOutbound {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn protocol(&self) -> &'static str {
+            if self.category == "DIRECT" {
+                "direct"
+            } else {
+                "vless"
+            }
+        }
+        fn exit_category(&self) -> &'static str {
+            self.category
+        }
+        async fn connect_tcp(
+            &self,
+            _target: &TargetAddr,
+        ) -> std::io::Result<crate::outbound::BoxedStream> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "udp only",
+            ))
+        }
+        fn udp_supported(&self) -> bool {
+            true
+        }
+        async fn open_udp_session(
+            &self,
+        ) -> std::io::Result<Box<dyn crate::outbound::OutboundUdpSession>> {
+            let (reply_tx, reply_rx) = mpsc::channel(16);
+            Ok(Box::new(RecordingTargetUdpSession {
+                sent: Arc::clone(&self.sent),
+                reply_rx: AsyncMutex::new(reply_rx),
+                reply_tx,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_sni_sniffing_routes_overrides_proxy_preserves_direct_and_recovers_fake_ip() {
+        use crate::inbound::sniff::{
+            QUIC_VERSION_1, QUIC_VERSION_2, test_helpers::build_quic_initial_packet,
+        };
+
+        let proxy_sent = Arc::new(AsyncMutex::new(Vec::new()));
+        let direct_sent = Arc::new(AsyncMutex::new(Vec::new()));
+        let fallback_sent = Arc::new(AsyncMutex::new(Vec::new()));
+
+        let mut outbounds: HashMap<String, DynOutbound> = HashMap::new();
+        outbounds.insert(
+            "proxy-quic".to_string(),
+            Arc::new(RecordingUdpOutbound {
+                name: "proxy-quic",
+                category: "PROXY",
+                sent: Arc::clone(&proxy_sent),
+            }),
+        );
+        outbounds.insert(
+            "direct-mock".to_string(),
+            Arc::new(RecordingUdpOutbound {
+                name: "direct-mock",
+                category: "DIRECT",
+                sent: Arc::clone(&direct_sent),
+            }),
+        );
+        outbounds.insert(
+            "fallback".to_string(),
+            Arc::new(RecordingUdpOutbound {
+                name: "fallback",
+                category: "PROXY",
+                sent: Arc::clone(&fallback_sent),
+            }),
+        );
+
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let router = Arc::new(
+            crate::router::Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &[
+                    "DOMAIN-SUFFIX,direct.quic.test,direct-mock".to_string(),
+                    "DOMAIN-SUFFIX,builtin-direct.quic.test,DIRECT".to_string(),
+                    "DOMAIN-SUFFIX,quic.test,proxy-quic".to_string(),
+                    "MATCH,fallback".to_string(),
+                ],
+                Arc::clone(&dns),
+            )
+            .unwrap(),
+        );
+        let mut sniffer = crate::config::SnifferConfig::default();
+        sniffer.skip_domain.push("skip.quic.test".to_string());
+        router.set_sniffer(sniffer);
+
+        let hub = Arc::new(TelemetryHub::new());
+        let replies = Arc::new(Mutex::new(Vec::<(SocketAddr, TargetAddr, Vec<u8>)>::new()));
+        let replies_sink = Arc::clone(&replies);
+        let mgr = UdpNatManager::new(
+            "TUN(smoltcp)",
+            64,
+            Arc::clone(&hub),
+            Arc::new(move |src, ret_target, payload| {
+                replies_sink.lock().push((src, ret_target, payload));
+            }),
+        );
+
+        let epoch = router.epoch();
+
+        // 1. Real-IP QUIC v1 Initial (UDP 443) -> sniffed SNI routes to `proxy-quic`,
+        //    overrides dial target to domain, sets `metadata.sniffed == true`, maps reply back to real IP,
+        //    and caches fast route for follow-up Short-Header QUIC packets.
+        let src1: SocketAddr = "198.18.0.1:51001".parse().unwrap();
+        let raw_dst1_sock: SocketAddr = "104.16.132.229:443".parse().unwrap();
+        let raw_dst1 = TargetAddr::from(raw_dst1_sock);
+        let quic_v1 = build_quic_initial_packet(
+            QUIC_VERSION_1,
+            b"\x83\x94\xc8\xf0\x3e\x51\x57\x08",
+            "edge.quic.test",
+        );
+        let res1 = route_udp_datagram_with_quic_sniff(&router, src1, &raw_dst1, &quic_v1).await;
+        assert!(res1.sniffed);
+        assert_eq!(res1.decision.outbound.name(), "proxy-quic");
+        assert_eq!(res1.decision.rule_type, "DomainSuffix");
+        assert_eq!(
+            res1.dial_target,
+            TargetAddr::new_domain("edge.quic.test", 443).unwrap()
+        );
+        mgr.send_datagram_with_options(
+            src1,
+            raw_dst1.clone(),
+            res1.decision.restored_from_fake_ip,
+            res1.decision.target,
+            res1.dial_target,
+            &res1.decision.rule_type,
+            &res1.decision.rule_payload,
+            res1.decision.chains,
+            res1.decision.outbound,
+            quic_v1,
+            epoch,
+            res1.sniffed,
+        )
+        .await;
+        // Follow-up QUIC Short Header packet hits O(1) fast path using cached domain dial target!
+        let short_hdr_pkt = vec![0x43, 0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            mgr.try_send_fast(src1, raw_dst1_sock, epoch, short_hdr_pkt.clone()),
+            Ok(())
+        );
+
+        // 2. Real-IP QUIC v2 Initial matching `DIRECT`-category rule -> keeps raw IP as dial target!
+        let src2: SocketAddr = "198.18.0.1:51002".parse().unwrap();
+        let raw_dst2: TargetAddr = "93.184.216.34:443".parse().unwrap();
+        let quic_direct = build_quic_initial_packet(
+            QUIC_VERSION_2,
+            b"\x01\x02\x03\x04\x05\x06\x07\x08",
+            "api.direct.quic.test",
+        );
+        let res2 = route_udp_datagram_with_quic_sniff(&router, src2, &raw_dst2, &quic_direct).await;
+        assert!(res2.sniffed);
+        assert_eq!(res2.decision.outbound.name(), "direct-mock");
+        assert_eq!(
+            res2.decision.target,
+            TargetAddr::new_domain("api.direct.quic.test", 443).unwrap()
+        );
+        assert_eq!(
+            res2.dial_target, raw_dst2,
+            "DIRECT outbound must retain original IP as dial target"
+        );
+        // Also verify built-in `DIRECT` outbound preserves raw IP without overriding dial target.
+        let quic_builtin_direct = build_quic_initial_packet(
+            QUIC_VERSION_1,
+            b"\x11\x22\x33\x44\x55\x66\x77\x88",
+            "api.builtin-direct.quic.test",
+        );
+        let res2_builtin =
+            route_udp_datagram_with_quic_sniff(&router, src2, &raw_dst2, &quic_builtin_direct)
+                .await;
+        assert!(res2_builtin.sniffed);
+        assert_eq!(res2_builtin.decision.outbound.name(), "DIRECT");
+        assert_eq!(res2_builtin.dial_target, raw_dst2);
+        mgr.send_datagram_with_options(
+            src2,
+            raw_dst2.clone(),
+            res2.decision.restored_from_fake_ip,
+            res2.decision.target,
+            res2.dial_target,
+            &res2.decision.rule_type,
+            &res2.decision.rule_payload,
+            res2.decision.chains,
+            res2.decision.outbound,
+            quic_direct,
+            epoch,
+            res2.sniffed,
+        )
+        .await;
+
+        // 3. Real-IP QUIC v1 Initial hitting `skip-domain` -> matches domain rule to `proxy-quic`,
+        //    but preserves original IP as dial target!
+        let src3: SocketAddr = "198.18.0.1:51003".parse().unwrap();
+        let raw_dst3: TargetAddr = "104.16.133.229:443".parse().unwrap();
+        let quic_skip = build_quic_initial_packet(
+            QUIC_VERSION_1,
+            b"\xaa\xbb\xcc\xdd\xee\xff\x00\x11",
+            "skip.quic.test",
+        );
+        let res3 = route_udp_datagram_with_quic_sniff(&router, src3, &raw_dst3, &quic_skip).await;
+        assert!(res3.sniffed);
+        assert_eq!(res3.decision.outbound.name(), "proxy-quic");
+        assert_eq!(
+            res3.dial_target, raw_dst3,
+            "skip-domain must preserve original IP without overriding dial target"
+        );
+
+        // 4. Unmapped Fake-IP (`198.18.9.9:443`) with QUIC v1 Initial -> recovers Fake-IP mapping!
+        let src4: SocketAddr = "198.18.0.1:51004".parse().unwrap();
+        let unmapped_fake: TargetAddr = "198.18.9.9:443".parse().unwrap();
+        assert!(dns.is_unmapped_fake_ip(&unmapped_fake));
+        let quic_fake = build_quic_initial_packet(
+            QUIC_VERSION_1,
+            b"\x10\x20\x30\x40\x50\x60\x70\x80",
+            "recovered.quic.test",
+        );
+        let res4 =
+            route_udp_datagram_with_quic_sniff(&router, src4, &unmapped_fake, &quic_fake).await;
+        assert!(
+            !res4.sniffed,
+            "recovered Fake-IP is not a real-IP sniff hit"
+        );
+        assert_eq!(
+            res4.decision.restored_from_fake_ip,
+            Some(Ipv4Addr::new(198, 18, 9, 9))
+        );
+        assert_eq!(res4.decision.outbound.name(), "proxy-quic");
+        assert_eq!(
+            res4.dial_target,
+            TargetAddr::new_domain("recovered.quic.test", 443).unwrap()
+        );
+        assert_eq!(
+            dns.lookup_domain(IpAddr::V4(Ipv4Addr::new(198, 18, 9, 9)))
+                .as_deref(),
+            Some("recovered.quic.test")
+        );
+
+        // 5. Malformed / non-Initial UDP payload on 443 -> fast fallback to raw IP, zero panic.
+        let src5: SocketAddr = "198.18.0.1:51005".parse().unwrap();
+        let raw_dst5: TargetAddr = "104.16.134.229:443".parse().unwrap();
+        for bad in [
+            &b""[..],
+            &[0x43, 0x01, 0x02],
+            &[0xc3, 0x00, 0x00, 0x00, 0x01, 0xff],
+        ] {
+            let res_bad = route_udp_datagram_with_quic_sniff(&router, src5, &raw_dst5, bad).await;
+            assert!(!res_bad.sniffed);
+            assert_eq!(res_bad.decision.outbound.name(), "fallback");
+            assert_eq!(res_bad.dial_target, raw_dst5);
+        }
+
+        // Wait for async UDP NAT workers to deliver packets & replies.
+        for _ in 0..100 {
+            if proxy_sent.lock().await.len() >= 2
+                && !direct_sent.lock().await.is_empty()
+                && !replies.lock().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let ps = proxy_sent.lock().await.clone();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(
+            ps[0].0,
+            TargetAddr::new_domain("edge.quic.test", 443).unwrap()
+        );
+        assert_eq!(
+            ps[1].0,
+            TargetAddr::new_domain("edge.quic.test", 443).unwrap()
+        );
+        assert_eq!(ps[1].1, short_hdr_pkt);
+
+        let ds = direct_sent.lock().await.clone();
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].0, raw_dst2);
+
+        // Reply from `proxy-quic` must be reverse-mapped back to original client dst `104.16.132.229:443`!
+        assert!(
+            replies
+                .lock()
+                .iter()
+                .any(|(c, ret, _)| *c == src1 && *ret == raw_dst1),
+            "PROXY reply must reverse-map sniffed domain back to raw_dst1"
+        );
+
+        let active = hub.list_connections();
+        assert!(
+            active
+                .iter()
+                .any(|c| c.metadata.host == "edge.quic.test" && c.metadata.sniffed),
+            "QUIC sniffed real-IP flow must record metadata.sniffed == true"
+        );
+        assert!(
+            active
+                .iter()
+                .any(|c| c.metadata.host == "api.direct.quic.test" && c.metadata.sniffed),
+            "DIRECT QUIC sniffed flow must also record sniffed domain and metadata.sniffed == true"
+        );
+
+        mgr.shutdown();
     }
 }

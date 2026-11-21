@@ -180,6 +180,7 @@ pub fn reap_expired_dns_upstream_pools() {
 pub fn clear_dns_upstream_pools() {
     TLS_DNS_POOL.lock().clear();
     H2_DNS_POOL.lock().clear();
+    clear_system_dns_cache();
     let live: Vec<Arc<H2DohClient>> = {
         let mut guard = H2_LIVE_CLIENTS.lock();
         std::mem::take(&mut *guard)
@@ -192,14 +193,143 @@ pub fn clear_dns_upstream_pools() {
     }
 }
 
+const SYSTEM_DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct SystemDnsCacheEntry {
+    fetched_at: Instant,
+    fetched_wall_ms: u64,
+    servers: Vec<IpAddr>,
+}
+
+static SYSTEM_DNS_CACHE: LazyLock<Mutex<Option<SystemDnsCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Invalidate the cached OS/DHCP physical NIC DNS server list so the next `system` / `dhcp://system`
+/// query immediately re-discovers the active physical adapter's DNS servers (e.g., on network handoff).
+pub fn clear_system_dns_cache() {
+    *SYSTEM_DNS_CACHE.lock() = None;
+}
+
+/// Filter candidate OS/DHCP DNS server IPs for `system` / `dhcp://system` upstreams, strictly
+/// excluding Wintun/TUN Fake-IP ranges (`198.18.0.0/15` + any custom `extra_fake_ip_net`),
+/// TUN IPv6 ULA ranges (`fdfe:dcba:9876::/126`, `fd00::1`), loopback (`127.0.0.0/8`, `::1`),
+/// link-local (`169.254.0.0/16`, `fe80::/10`), unspecified, broadcast, and multicast addresses
+/// to guarantee zero DNS routing loops.
+pub fn filter_safe_system_dns_servers(
+    candidates: &[IpAddr],
+    extra_fake_ip_net: Option<ipnet::Ipv4Net>,
+) -> Vec<SocketAddr> {
+    let default_fake_net =
+        ipnet::Ipv4Net::new(std::net::Ipv4Addr::new(198, 18, 0, 0), 15).expect("valid fake-ip net");
+    let default_tun_v6 = crate::platform::tun::DEFAULT_TUN_IPV6_CIDR
+        .parse::<ipnet::Ipv6Net>()
+        .expect("valid default TUN IPv6 CIDR")
+        .trunc();
+    let common_tun_v6_dns = std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+
+    let is_safe_v4 = |v4: std::net::Ipv4Addr| -> bool {
+        !v4.is_loopback()
+            && !v4.is_unspecified()
+            && !v4.is_broadcast()
+            && !v4.is_multicast()
+            && !v4.is_link_local()
+            && !default_fake_net.contains(&v4)
+            && !extra_fake_ip_net.is_some_and(|n| n.contains(&v4))
+    };
+
+    let mut out = Vec::new();
+    for &ip in candidates {
+        let safe = match ip {
+            IpAddr::V4(v4) => is_safe_v4(v4),
+            IpAddr::V6(v6) => {
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    is_safe_v4(mapped)
+                } else {
+                    let is_unicast_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+                    !v6.is_loopback()
+                        && !v6.is_unspecified()
+                        && !v6.is_multicast()
+                        && !is_unicast_link_local
+                        && !default_tun_v6.contains(&v6)
+                        && v6 != common_tun_v6_dns
+                }
+            }
+        };
+        if safe {
+            let sa = SocketAddr::new(ip, 53);
+            if !out.contains(&sa) {
+                out.push(sa);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve and cache the active physical default-egress NIC's safe OS/DHCP DNS servers (30s TTL;
+/// refreshed immediately whenever `clear_system_dns_cache()` / `clear_dns_upstream_pools()` runs).
+pub fn resolve_system_dns_servers(extra_fake_ip_net: Option<ipnet::Ipv4Net>) -> Vec<SocketAddr> {
+    let now_mono = Instant::now();
+    let now_wall_ms = TelemetryHub::now_ms();
+    {
+        let guard = SYSTEM_DNS_CACHE.lock();
+        if let Some(entry) = guard.as_ref()
+            && !entry.servers.is_empty()
+            && now_mono.duration_since(entry.fetched_at) < SYSTEM_DNS_CACHE_TTL
+            && now_wall_ms.saturating_sub(entry.fetched_wall_ms)
+                < SYSTEM_DNS_CACHE_TTL.as_millis() as u64
+        {
+            return filter_safe_system_dns_servers(&entry.servers, extra_fake_ip_net);
+        }
+    }
+    let discovered = crate::platform::tun::discover_physical_dns_servers();
+    if !discovered.is_empty() {
+        *SYSTEM_DNS_CACHE.lock() = Some(SystemDnsCacheEntry {
+            fetched_at: Instant::now(),
+            fetched_wall_ms: TelemetryHub::now_ms(),
+            servers: discovered.clone(),
+        });
+    }
+    filter_safe_system_dns_servers(&discovered, extra_fake_ip_net)
+}
+
+/// Exchange a DNS query directly against physical OS/DHCP DNS servers over `protected_udp_bind`
+/// (with RFC 1035 TCP fallback on `TC=1`), failing over across multiple discovered resolvers.
+pub async fn exchange_system_dns_servers(servers: &[SocketAddr], query: &[u8]) -> Result<Vec<u8>> {
+    if servers.is_empty() {
+        return Err(ProxyError::Dns(
+            "no safe physical system DNS servers available for 'system' upstream".into(),
+        ));
+    }
+    let mut last_err = ProxyError::Dns("system DNS query failed".into());
+    for &sa in servers {
+        match forward_udp_dns_with_tcp_fallback(sa, query).await {
+            Ok(resp) => {
+                if let Some(&flags_lo) = resp.get(3) {
+                    let rcode = flags_lo & 0x0F;
+                    if (rcode == 2 || rcode == 5) && servers.len() > 1 {
+                        last_err =
+                            ProxyError::Dns(format!("system DNS {sa} returned RCODE {rcode}"));
+                        continue;
+                    }
+                }
+                return Ok(resp);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DnsEndpointHost {
     Ip(IpAddr),
     Domain(String),
+    System,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DnsUpstream {
+    System,
     Udp(SocketAddr),
     Tcp(SocketAddr),
     Tls {
@@ -389,6 +519,13 @@ impl DnsUpstream {
             }
         }
 
+        let clean_main = main_part.trim_end_matches('/');
+        if clean_main.eq_ignore_ascii_case("system")
+            || clean_main.eq_ignore_ascii_case("dhcp://system")
+        {
+            return Ok(Self::System);
+        }
+
         if let Some(https_rest) = strip_prefix_ignore_ascii_case(main_part, "https://") {
             let normalized_url = format!("https://{https_rest}");
             let parsed = Url::parse(&normalized_url)
@@ -506,6 +643,7 @@ impl DnsUpstream {
 
     pub fn endpoint_host(&self) -> DnsEndpointHost {
         match self {
+            Self::System => DnsEndpointHost::System,
             Self::Udp(sa) | Self::Tcp(sa) => DnsEndpointHost::Ip(sa.ip()),
             Self::Tls { host, .. } | Self::Https { host, .. } => host.clone(),
         }
@@ -518,6 +656,17 @@ impl DnsUpstream {
         extra_ca_der: &[CertificateDer<'static>],
     ) -> Result<Vec<u8>> {
         match self {
+            Self::System => {
+                let servers: Vec<SocketAddr> = if resolved_ips.is_empty() {
+                    resolve_system_dns_servers(None)
+                } else {
+                    resolved_ips
+                        .iter()
+                        .map(|&ip| SocketAddr::new(ip, 53))
+                        .collect()
+                };
+                exchange_system_dns_servers(&servers, query).await
+            }
             Self::Udp(sa) => forward_udp_dns_with_tcp_fallback(*sa, query).await,
             Self::Tcp(sa) => forward_tcp_dns(*sa, query).await,
             Self::Tls {
@@ -2871,5 +3020,61 @@ mod tests {
 
         drop(held.pop());
         assert!(lim_a1.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn parses_system_and_dhcp_system_dns_upstreams_without_bootstrap() {
+        for raw in [
+            "system",
+            "SYSTEM",
+            "dhcp://system",
+            "DHCP://SYSTEM",
+            "dhcp://system/",
+            "system#direct",
+        ] {
+            let parsed = DnsUpstream::parse(raw).expect("must parse system DNS upstream");
+            assert_eq!(parsed, DnsUpstream::System, "input: {raw}");
+            assert!(!parsed.requires_bootstrap());
+            assert_eq!(parsed.literal_socket_addr(), None);
+            assert_eq!(parsed.endpoint_host(), DnsEndpointHost::System);
+        }
+        // Bootstrap `default-nameserver` must still reject non-literal-IP `system`
+        assert!(BootstrapDnsServer::parse("system").is_err());
+        assert!(BootstrapDnsServer::parse("dhcp://system").is_err());
+    }
+
+    #[test]
+    fn filter_safe_system_dns_servers_blocks_wintun_fake_ip_and_loopback_loops() {
+        let custom_fake: ipnet::Ipv4Net = "198.20.0.0/16".parse().unwrap();
+        let candidates: Vec<IpAddr> = vec![
+            "198.18.0.1".parse().unwrap(),           // Wintun gateway -> blocked
+            "198.18.0.2".parse().unwrap(),           // Fake-IP -> blocked
+            "198.19.255.254".parse().unwrap(),       // Wintun peer DNS -> blocked
+            "198.20.1.5".parse().unwrap(),           // Custom fake-ip-range -> blocked
+            "127.0.0.1".parse().unwrap(),            // IPv4 loopback -> blocked
+            "127.0.0.53".parse().unwrap(),           // systemd-resolved stub loopback -> blocked
+            "0.0.0.0".parse().unwrap(),              // unspecified -> blocked
+            "169.254.1.1".parse().unwrap(),          // link-local IPv4 -> blocked
+            "::1".parse().unwrap(),                  // IPv6 loopback -> blocked
+            "fe80::1".parse().unwrap(),              // unscoped link-local IPv6 -> blocked
+            "fdfe:dcba:9876::2".parse().unwrap(),    // Wintun IPv6 DNS -> blocked
+            "fd00::1".parse().unwrap(),              // common TUN ULA DNS -> blocked
+            "::ffff:198.18.0.2".parse().unwrap(),    // IPv4-mapped Fake-IP -> blocked
+            "::ffff:127.0.0.1".parse().unwrap(),     // IPv4-mapped loopback -> blocked
+            "192.168.1.1".parse().unwrap(),          // Physical router DHCP DNS -> allowed!
+            "10.0.0.53".parse().unwrap(),            // Corporate internal DNS -> allowed!
+            "192.168.1.1".parse().unwrap(),          // Duplicate -> deduplicated
+            "2001:4860:4860::8888".parse().unwrap(), // Global IPv6 DNS -> allowed!
+        ];
+
+        let safe = filter_safe_system_dns_servers(&candidates, Some(custom_fake));
+        assert_eq!(
+            safe,
+            vec![
+                "192.168.1.1:53".parse::<SocketAddr>().unwrap(),
+                "10.0.0.53:53".parse::<SocketAddr>().unwrap(),
+                "[2001:4860:4860::8888]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
     }
 }

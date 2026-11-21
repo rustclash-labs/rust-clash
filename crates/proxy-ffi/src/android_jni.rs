@@ -4420,6 +4420,7 @@ mod tests {
                 host: host.to_string(),
                 fake_ip: fake_ip.map(ToOwned::to_owned),
                 process: None,
+                sniffed: false,
             },
             upload,
             download,

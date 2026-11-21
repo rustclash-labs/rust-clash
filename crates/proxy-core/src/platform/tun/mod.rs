@@ -36,6 +36,9 @@ pub struct TunLaunchSpec {
     /// with `IP_UNICAST_IF` + `dns_hijack` does not install global `/32` bypass routes that let
     /// other OS processes escape TUN DNS hijack).
     pub dns_bypass_ips: Vec<IpAddr>,
+    /// Validated destination CIDRs (`tun.route-exclude-address`) that should bypass TUN routing
+    /// via more-specific physical NIC routes / policy rules.
+    pub route_exclude_cidrs: Vec<ipnet::IpNet>,
     pub local_dns_addr: Option<SocketAddr>,
     pub wintun_dll_path: Option<PathBuf>,
     pub state_dir: PathBuf,
@@ -242,5 +245,27 @@ pub fn attach_platform_system_tun(
             io::ErrorKind::Unsupported,
             "System TUN is not supported on this target OS",
         ))
+    }
+}
+
+/// Discover OS / DHCP DNS servers configured on the active physical default-egress network
+/// interface (excluding active TUN adapters where possible). Callers MUST still apply
+/// `dns::upstream::filter_safe_system_dns_servers()` to exclude Fake-IP / TUN / loopback ranges.
+pub fn discover_physical_dns_servers() -> Vec<IpAddr> {
+    #[cfg(windows)]
+    {
+        windows::discover_windows_physical_dns_servers()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::discover_linux_physical_dns_servers()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::discover_macos_physical_dns_servers()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
     }
 }

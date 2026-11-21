@@ -139,6 +139,114 @@ pub fn parse_resolv_conf_nameservers(contents: &str) -> Vec<std::net::IpAddr> {
     out
 }
 
+/// Parse `resolvectl dns <ifname>` output (e.g. `Link 2 (eth0): 192.168.1.1 192.168.1.2#router` or
+/// `Global: 8.8.8.8`) into unique `IpAddr`s.
+pub fn parse_resolvectl_dns_output(output: &str) -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let rhs = match line.split_once(':') {
+            Some((_, rest)) => rest,
+            None => line,
+        };
+        for raw_tok in rhs.split_whitespace() {
+            let no_sni = raw_tok.split('#').next().unwrap_or(raw_tok);
+            let no_zone = no_sni.split('%').next().unwrap_or(no_sni);
+            let clean = no_zone.trim_matches(|c| c == '[' || c == ']');
+            if let Ok(ip) = clean.parse::<std::net::IpAddr>()
+                && !out.contains(&ip)
+            {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// Filter and normalize `tun.route-exclude-address` CIDRs into Linux IPv4 and IPv6 policy-rule
+/// target strings (`pref 8995 to <cidr> lookup main`), skipping `prefix_len <= 1`, Fake-IP
+/// overlaps, and exact TUN IPv6 subnet overlaps.
+pub fn plan_linux_exclude_cidr_rules(
+    exclude_cidrs: &[ipnet::IpNet],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+    enable_ipv6: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut v4_out = Vec::new();
+    let mut v6_out = Vec::new();
+    for &cidr in exclude_cidrs {
+        match cidr {
+            ipnet::IpNet::V4(v4net) => {
+                let net = v4net.trunc();
+                if net.prefix_len() <= 1 || crate::config::ipv4_nets_overlap(net, fake_ip_net) {
+                    continue;
+                }
+                let s = net.to_string();
+                if !v4_out.contains(&s) {
+                    v4_out.push(s);
+                }
+            }
+            ipnet::IpNet::V6(v6net) => {
+                if !enable_ipv6 {
+                    continue;
+                }
+                let net = v6net.trunc();
+                if net.prefix_len() <= 1
+                    || (net.prefix_len() >= tun_ipv6_cidr.prefix_len()
+                        && crate::config::ipv6_nets_overlap(net, tun_ipv6_cidr))
+                {
+                    continue;
+                }
+                let s = net.to_string();
+                if !v6_out.contains(&s) {
+                    v6_out.push(s);
+                }
+            }
+        }
+    }
+    (v4_out, v6_out)
+}
+
+/// Discover physical default-egress DNS servers on Linux for `system` / `dhcp://system` DNS upstreams.
+/// Queries `resolvectl dns <egress_if>` first, then falls back to `/run/systemd/resolve/resolv.conf`
+/// and `/etc/resolv.conf`. Callers apply anti-loop filtering (`198.18.0.0/15`, loopback, etc.).
+#[cfg(target_os = "linux")]
+pub fn discover_linux_physical_dns_servers() -> Vec<IpAddr> {
+    fn extend_unique(out: &mut Vec<IpAddr>, ips: Vec<IpAddr>) {
+        for ip in ips {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+
+    if let (Some(resolvectl_bin), (Some(egress_if), _)) =
+        (resolve_resolvectl_binary(), detect_linux_default_egress())
+        && let Ok(output) = std::process::Command::new(&resolvectl_bin)
+            .args(["dns", &egress_if])
+            .output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        extend_unique(&mut out, parse_resolvectl_dns_output(&stdout));
+    }
+
+    if out.is_empty()
+        && let Ok(contents) = fs::read_to_string("/run/systemd/resolve/resolv.conf")
+    {
+        extend_unique(&mut out, parse_resolv_conf_nameservers(&contents));
+    }
+
+    if out.is_empty()
+        && let Ok(contents) = fs::read_to_string("/etc/resolv.conf")
+    {
+        extend_unique(&mut out, parse_resolv_conf_nameservers(&contents));
+    }
+
+    out
+}
+
 /// Select explicit `pref 8990 ... lookup main` bypass IPs for Linux policy routing.
 /// Always includes proxy server IPs (`proxy_bypass_ips`) as defense-in-depth alongside `SO_MARK`.
 /// Omits upstream `dns_bypass_ips` when `dns_hijack` is enabled because RustClash's own upstream
@@ -591,6 +699,33 @@ impl LinuxSystemTunSession {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            // 2b. User-configured `tun.route-exclude-address` CIDR bypasses (`pref 8995` -> `main`).
+            let (exclude_v4, exclude_v6) = plan_linux_exclude_cidr_rules(
+                &spec.route_exclude_cidrs,
+                spec.fake_ip_net,
+                spec.tun_ipv6_cidr,
+                spec.enable_ipv6,
+            );
+            for cidr in &exclude_v4 {
+                add_owned_rule(
+                    "-4",
+                    &["pref", "8995", "to", cidr, "lookup", "main"],
+                    &mut rec.owned_v4_rule_del_args,
+                )?;
+            }
+            for cidr in &exclude_v6 {
+                if let Err(err) = add_owned_rule(
+                    "-6",
+                    &["pref", "8995", "to", cidr, "lookup", "main"],
+                    &mut rec.owned_v6_rule_del_args,
+                ) {
+                    tracing::warn!(
+                        "Linux TUN: failed adding IPv6 route-exclude-address rule for {cidr} ({err})"
+                    );
+                    ipv6_bypass_ok = false;
                 }
             }
 
@@ -1189,5 +1324,37 @@ mod tests {
             false,
         );
         assert_eq!(no_hijack, vec![proxy_v4, proxy_v6, dns_v4, dns_v6]);
+    }
+
+    #[test]
+    fn parse_resolvectl_and_plan_linux_exclude_cidrs() {
+        let out = "Link 2 (enp3s0): 192.168.50.1 10.0.0.53#corp.dns fe80::1%enp3s0 192.168.50.1\n";
+        let ips = parse_resolvectl_dns_output(out);
+        assert_eq!(
+            ips,
+            vec![
+                "192.168.50.1".parse::<std::net::IpAddr>().unwrap(),
+                "10.0.0.53".parse::<std::net::IpAddr>().unwrap(),
+                "fe80::1".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+
+        let fake_net: ipnet::Ipv4Net = "198.18.0.0/15".parse().unwrap();
+        let tun_v6: ipnet::Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
+        let cidrs: Vec<ipnet::IpNet> = vec![
+            "192.168.0.0/16".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+            "198.18.1.0/24".parse().unwrap(), // overlaps fake-ip -> dropped
+            "0.0.0.0/1".parse().unwrap(),     // prefix <= 1 -> dropped
+            "fc00::/7".parse().unwrap(),      // broader than /126 -> kept
+            "fdfe:dcba:9876::/126".parse().unwrap(), // exact TUN v6 overlap -> dropped
+        ];
+        let (v4, v6) = plan_linux_exclude_cidr_rules(&cidrs, fake_net, tun_v6, true);
+        assert_eq!(v4, vec!["192.168.0.0/16", "10.0.0.0/8"]);
+        assert_eq!(v6, vec!["fc00::/7"]);
+
+        let (v4_only, v6_disabled) = plan_linux_exclude_cidr_rules(&cidrs, fake_net, tun_v6, false);
+        assert_eq!(v4_only, vec!["192.168.0.0/16", "10.0.0.0/8"]);
+        assert!(v6_disabled.is_empty());
     }
 }

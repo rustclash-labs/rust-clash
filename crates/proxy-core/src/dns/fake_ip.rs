@@ -681,7 +681,14 @@ pub struct FakeIpDnsEngine {
     persisted_revision: AtomicU64,
     save_lock: Mutex<()>,
     assignment_notify: Arc<Notify>,
+    #[cfg(test)]
+    system_dns_provider: Mutex<Option<TestSystemDnsProvider>>,
+    #[cfg(test)]
+    system_dns_test_cache: Mutex<Option<(u64, Vec<SocketAddr>)>>,
 }
+
+#[cfg(test)]
+type TestSystemDnsProvider = Arc<dyn Fn() -> Vec<SocketAddr> + Send + Sync>;
 
 impl FakeIpDnsEngine {
     pub fn new(cfg: &DnsConfig) -> Result<Self> {
@@ -858,7 +865,7 @@ impl FakeIpDnsEngine {
                 return false;
             }
             match u.endpoint_host() {
-                DnsEndpointHost::Ip(_) => false,
+                DnsEndpointHost::Ip(_) | DnsEndpointHost::System => false,
                 DnsEndpointHost::Domain(ref d) => {
                     d != "localhost" && !host_covered_by_static_hosts(d)
                 }
@@ -941,6 +948,10 @@ impl FakeIpDnsEngine {
             persisted_revision: AtomicU64::new(0),
             save_lock: Mutex::new(()),
             assignment_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            system_dns_provider: Mutex::new(None),
+            #[cfg(test)]
+            system_dns_test_cache: Mutex::new(None),
         })
     }
 
@@ -1260,6 +1271,41 @@ impl FakeIpDnsEngine {
         self.packet_cache.lock().clear();
         self.bootstrap_cache.lock().clear();
         self.upstream_health.clear();
+        #[cfg(test)]
+        {
+            *self.system_dns_test_cache.lock() = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_system_dns_provider_for_test<F>(&self, provider: F)
+    where
+        F: Fn() -> Vec<SocketAddr> + Send + Sync + 'static,
+    {
+        *self.system_dns_provider.lock() = Some(Arc::new(provider));
+        *self.system_dns_test_cache.lock() = None;
+    }
+
+    fn resolve_effective_system_dns_servers(&self) -> Vec<SocketAddr> {
+        #[cfg(test)]
+        {
+            let provider = self.system_dns_provider.lock().clone();
+            if let Some(prov) = provider {
+                let epoch = self.current_cache_epoch();
+                {
+                    let guard = self.system_dns_test_cache.lock();
+                    if let Some((cached_epoch, ref servers)) = *guard
+                        && cached_epoch == epoch
+                    {
+                        return servers.clone();
+                    }
+                }
+                let servers = prov();
+                *self.system_dns_test_cache.lock() = Some((epoch, servers.clone()));
+                return servers;
+            }
+        }
+        crate::dns::upstream::resolve_system_dns_servers(Some(self.net))
     }
 
     /// Flush positive/negative DNS resolution caches, wire packet caches, and pooled DoT/DoH sockets.
@@ -1756,6 +1802,7 @@ impl FakeIpDnsEngine {
     /// or literal-IP `default-nameserver`s (never touching OS `getaddrinfo`, preventing DNS leaks and recursive TUN loops).
     async fn resolve_bootstrap_host(&self, host: &DnsEndpointHost) -> Result<Vec<IpAddr>> {
         match host {
+            DnsEndpointHost::System => Ok(Vec::new()),
             DnsEndpointHost::Ip(ip) => {
                 if self.is_fake_ip(*ip) {
                     return Err(ProxyError::Dns(format!(
@@ -1924,8 +1971,16 @@ impl FakeIpDnsEngine {
     ) -> Result<Vec<u8>> {
         let start_epoch = self.current_cache_epoch();
         let outcome = async {
-            let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
-            let resp = Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?;
+            let resp = if matches!(upstream, DnsUpstream::System) {
+                let servers = self.resolve_effective_system_dns_servers();
+                Box::pin(crate::dns::upstream::exchange_system_dns_servers(
+                    &servers, raw_query,
+                ))
+                .await?
+            } else {
+                let ips = Box::pin(self.resolve_bootstrap_host(&upstream.endpoint_host())).await?;
+                Box::pin(upstream.exchange(&ips, raw_query, &self.extra_ca_der)).await?
+            };
             if let Some(&flags_hi) = resp.get(2)
                 && (flags_hi & 0x02) != 0
             {
@@ -5533,5 +5588,102 @@ mod tests {
         assert_eq!(packet_queries.load(Ordering::SeqCst), 2);
 
         srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn system_and_dhcp_system_upstreams_resolve_policy_direct_and_refresh_on_flush() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Spawn two mock physical/DHCP UDP DNS servers representing Network A (Wi-Fi) and Network B (Ethernet).
+        let spawn_mock_dns = |ip_v4: Ipv4Addr| async move {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_c = Arc::clone(&hits);
+            let task = tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    hits_c.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(parsed) = DnsQueryPacket::parse(&buf[..n]) {
+                        let ans = if parsed.question.qtype == QTYPE_A {
+                            vec![DnsAnswerData::A(ip_v4)]
+                        } else {
+                            Vec::new()
+                        };
+                        let resp = parsed.build_response(&buf[..n], 0, 60, &ans);
+                        let _ = sock.send_to(&resp, peer).await;
+                    }
+                }
+            });
+            (addr, hits, task)
+        };
+
+        let (dns_net_a, hits_a, task_a) = spawn_mock_dns(Ipv4Addr::new(10, 20, 30, 1)).await;
+        let (dns_net_b, hits_b, task_b) = spawn_mock_dns(Ipv4Addr::new(10, 20, 30, 2)).await;
+        let (dns_public, hits_pub, task_pub) =
+            spawn_mock_dns(Ipv4Addr::new(93, 184, 216, 34)).await;
+
+        let yaml = format!(
+            r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  ipv6: false
+  direct-nameserver: system
+  direct-nameserver-follow-policy: true
+  nameserver:
+    - "{dns_public}"
+  nameserver-policy:
+    "+.bestechnic.com": system
+    "+.lan": dhcp://system
+    "+.local":
+      - system
+"#
+        );
+        let cfg = crate::config::ClashConfig::from_yaml_str(&yaml).unwrap();
+        let engine = FakeIpDnsEngine::new(&cfg.dns).unwrap();
+
+        let active_server = Arc::new(Mutex::new(dns_net_a));
+        let active_clone = Arc::clone(&active_server);
+        engine.set_system_dns_provider_for_test(move || vec![*active_clone.lock()]);
+
+        // 1. `nameserver-policy` `+.bestechnic.com: system` and `+.lan: dhcp://system` hit Network A physical DNS.
+        let bes_ips = engine.resolve_real_ips("erp.bestechnic.com").await.unwrap();
+        assert_eq!(bes_ips, vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 1))]);
+        let lan_ips = engine.resolve_real_ips("nas.lan").await.unwrap();
+        assert_eq!(lan_ips, vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 1))]);
+        let local_ips = engine.resolve_real_ips("printer.local").await.unwrap();
+        assert_eq!(local_ips, vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 1))]);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 3);
+        assert_eq!(hits_pub.load(Ordering::SeqCst), 0);
+
+        // 2. `direct-nameserver: system` (scalar form) also uses physical DNS for non-policy DIRECT domains.
+        let direct_ips = engine
+            .resolve_direct_ips("direct.example.org")
+            .await
+            .unwrap();
+        assert_eq!(direct_ips, vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 1))]);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 4);
+        assert_eq!(hits_pub.load(Ordering::SeqCst), 0);
+
+        // 3. Non-policy `resolve_real_ips` still uses public `nameserver`.
+        let pub_ips = engine.resolve_real_ips("public.example.org").await.unwrap();
+        assert_eq!(pub_ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        assert_eq!(hits_pub.load(Ordering::SeqCst), 1);
+
+        // 4. Simulate network switch to Network B + `flush_cache()` -> refreshes physical DNS server list!
+        *active_server.lock() = dns_net_b;
+        engine.flush_cache();
+
+        let bes_after = engine.resolve_real_ips("erp.bestechnic.com").await.unwrap();
+        assert_eq!(bes_after, vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 2))]);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        task_a.abort();
+        task_b.abort();
+        task_pub.abort();
     }
 }
