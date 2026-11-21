@@ -50,7 +50,17 @@ const MAX_TUN_UDP_SESSIONS: usize = 512;
 const TCP_SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOUND_CONNECT_HARD_REAP_GRACE: Duration = Duration::from_secs(2);
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Established TUN TCP idle ceiling (30 minutes).
+/// Long-lived mobile and desktop channels — such as domestic push (`:5223`, 3m heartbeat),
+/// Telegram MTProto, SSH/WebSockets, and Google FCM (`mtalk.google.com:5228`, 15m Wi-Fi /
+/// 28m cellular heartbeat) — routinely stay application-quiet well beyond 120s while both the
+/// local `smoltcp` keep-alive (45s/120s) and outbound OS TCP keepalive (45s/15s) verify peer
+/// liveness. Retaining a finite 30m ceiling (checked against both monotonic and wall-clock time)
+/// still evicts genuinely abandoned post-deep-sleep zombie flows upon wake.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// Under flow-table saturation (`flows.len() >= MAX_TUN_TCP_FLOWS`), evict the single stalest
+/// established flow idle beyond this threshold before dropping incoming SYNs.
+const TCP_PRESSURE_EVICT_IDLE_AGE: Duration = Duration::from_secs(120);
 const TCP_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded handle to interact with the userspace `smoltcp` TUN stack via raw L3 IPv4/IPv6 packets.
@@ -171,6 +181,12 @@ impl BridgeFlow {
         }
     }
 
+    fn effective_idle_duration(&self, now: Instant, now_wall_ms: u64) -> Duration {
+        let idle_mono = now.saturating_duration_since(self.last_active);
+        let idle_wall = Duration::from_millis(now_wall_ms.saturating_sub(self.last_active_wall_ms));
+        idle_mono.max(idle_wall)
+    }
+
     fn is_timed_out(&self, now: Instant, now_wall_ms: u64, send_queue_bytes: usize) -> bool {
         let syn_timed_out = !self.established
             && (now.saturating_duration_since(self.created_at) > TCP_SYN_HANDSHAKE_TIMEOUT
@@ -189,12 +205,10 @@ impl BridgeFlow {
                             > OUTBOUND_CONNECT_HARD_REAP_GRACE.as_millis() as u64
                 });
         // Apply `TCP_IDLE_TIMEOUT` only after outbound connect succeeds; pending dials are
-        // strictly bounded by `notify_dial_timeout_if_needed` + `dial_hard_timed_out` so a >120s
+        // strictly bounded by `notify_dial_timeout_if_needed` + `dial_hard_timed_out` so a long
         // suspend wakeup cannot preempt the 2s `record_failed()` grace window either.
-        let idle_timed_out = remote_connected
-            && (now.saturating_duration_since(self.last_active) > TCP_IDLE_TIMEOUT
-                || now_wall_ms.saturating_sub(self.last_active_wall_ms)
-                    > TCP_IDLE_TIMEOUT.as_millis() as u64);
+        let idle_timed_out =
+            remote_connected && self.effective_idle_duration(now, now_wall_ms) > TCP_IDLE_TIMEOUT;
         let fin_age_exceeded = self
             .fin_started_at
             .is_some_and(|t| now.saturating_duration_since(t) > TCP_HALF_CLOSE_TIMEOUT)
@@ -1075,6 +1089,25 @@ fn spawn_tun_udp_handler(
     });
 }
 
+/// Pick the single stalest established, remote-connected flow whose effective idle age
+/// (monotonic or wall-clock) exceeds `TCP_PRESSURE_EVICT_IDLE_AGE` for LRU eviction when the
+/// TUN TCP flow table reaches `MAX_TUN_TCP_FLOWS`.
+fn select_pressure_eviction_candidate(
+    flows: &HashMap<FourTuple, BridgeFlow>,
+    now: Instant,
+    now_wall_ms: u64,
+) -> Option<FourTuple> {
+    flows
+        .iter()
+        .filter(|(_, f)| f.established && f.remote_connected.load(Ordering::Acquire))
+        .filter_map(|(tuple, f)| {
+            let idle = f.effective_idle_duration(now, now_wall_ms);
+            (idle > TCP_PRESSURE_EVICT_IDLE_AGE).then_some((*tuple, idle))
+        })
+        .max_by_key(|(_, idle)| *idle)
+        .map(|(tuple, _)| tuple)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn register_syn_flow(
     tuple: FourTuple,
@@ -1089,6 +1122,8 @@ fn register_syn_flow(
     if flows.contains_key(&tuple) {
         return;
     }
+    let now = Instant::now();
+    let now_wall = TelemetryHub::now_ms();
     let half_open_count = flows.values().filter(|f| !f.established).count();
     if half_open_count >= MAX_HALF_OPEN_SYN_FLOWS
         && let Some(oldest_tuple) = flows
@@ -1104,7 +1139,16 @@ fn register_syn_flow(
         sockets.remove(evicted.handle);
     }
     if flows.len() >= MAX_TUN_TCP_FLOWS {
-        return;
+        if let Some(evict_tuple) = select_pressure_eviction_candidate(flows, now, now_wall)
+            && let Some(evicted) = flows.remove(&evict_tuple)
+        {
+            evicted.task_abort.abort();
+            let evicted_sock = sockets.get_mut::<tcp::Socket>(evicted.handle);
+            evicted_sock.abort();
+            sockets.remove(evicted.handle);
+        } else {
+            return;
+        }
     }
 
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]);
@@ -1134,8 +1178,6 @@ fn register_syn_flow(
     let remote_failed = Arc::new(AtomicBool::new(false));
     let remote_failed_task = Arc::clone(&remote_failed);
     let wake_task = Arc::clone(wake_notify);
-    let now = Instant::now();
-    let now_wall = TelemetryHub::now_ms();
     let flow_created_at = now;
     let flow_created_wall_ms = now_wall;
 
@@ -1851,11 +1893,13 @@ mod tests {
             task_abort: noop_task.abort_handle(),
         };
 
-        // Fresh established flow is not timed out.
+        // Fresh established flow and long-lived push/IM/FCM idle intervals are NOT timed out.
         assert!(!flow.is_timed_out(mono_now, base_wall + 5_000, 0));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 309_000, 0));
+        assert!(!flow.is_timed_out(mono_now, base_wall + 1_680_000, 0));
 
-        // Monotonic clock froze at `mono_now`, but wall clock advanced 309s (> 120s TCP_IDLE_TIMEOUT).
-        assert!(flow.is_timed_out(mono_now, base_wall + 309_000, 0));
+        // Monotonic clock froze at `mono_now`, but wall clock advanced 1801s (> 1800s TCP_IDLE_TIMEOUT).
+        assert!(flow.is_timed_out(mono_now, base_wall + 1_801_000, 0));
 
         // Half-closed flow with empty pending_tx & send_queue times out after 10s idle wall-clock advance even if monotonic froze.
         flow.fin_started_at = Some(mono_now);
@@ -1869,6 +1913,178 @@ mod tests {
         flow.fin_started_wall_ms = None;
         assert!(!flow.is_timed_out(mono_now, base_wall + 14_000, 0));
         assert!(flow.is_timed_out(mono_now, base_wall + 16_000, 0));
+    }
+
+    #[tokio::test]
+    async fn established_long_lived_tcp_flow_survives_push_and_fcm_idle_intervals_before_reaping() {
+        let mut sockets = SocketSet::new(vec![]);
+        let sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        let handle = sockets.add(sock);
+        let (_tx, rx) = mpsc::channel(1);
+        let (_bridge_closed_tx, bridge_closed_rx) = watch::channel(());
+        let noop_task = tokio::spawn(async {});
+
+        let mono_now = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+        let flow = BridgeFlow {
+            handle,
+            established: true,
+            remote_connected: Arc::new(AtomicBool::new(true)),
+            dial_timeout_notify: Arc::new(Notify::new()),
+            dial_timeout_notified_at: None,
+            created_at: mono_now,
+            created_wall_ms: base_wall,
+            last_active: mono_now,
+            last_active_wall_ms: base_wall,
+            fin_started_at: None,
+            fin_started_wall_ms: None,
+            pending_tx: BytesMut::new(),
+            from_remote_rx: rx,
+            to_remote_tx: None,
+            _bridge_closed_rx: bridge_closed_rx,
+            remote_eof: false,
+            remote_failed: Arc::new(AtomicBool::new(false)),
+            task_abort: noop_task.abort_handle(),
+        };
+
+        // Typical real-world long-lived TCP idle gaps MUST NOT be aborted with RST:
+        // - 180s (3m domestic push `:5223` heartbeat)
+        // - 300s (5m IM/SSH keepalive)
+        // - 1059s (17m39s Telegram background idle)
+        // - 1680s (28m cellular FCM `mtalk.google.com:5228` heartbeat)
+        // - 1800s exact ceiling boundary
+        for secs in [180u64, 300, 1059, 1680, 1800] {
+            let t_mono = mono_now + Duration::from_secs(secs);
+            let t_wall = base_wall + secs * 1_000;
+            assert!(
+                !flow.is_timed_out(t_mono, t_wall, 0),
+                "established flow must survive {secs}s idle"
+            );
+        }
+
+        // Once idle exceeds 1800s (by monotonic OR wall-clock time), reaping fires cleanly.
+        assert!(flow.is_timed_out(mono_now + Duration::from_secs(1801), base_wall, 0));
+        assert!(flow.is_timed_out(mono_now, base_wall + 1_801_000, 0));
+    }
+
+    #[tokio::test]
+    async fn pressure_eviction_selects_stalest_idle_established_flow_and_spares_recent_or_pending()
+    {
+        let mut sockets = SocketSet::new(vec![]);
+        let make_flow = |sockets: &mut SocketSet<'static>,
+                         established: bool,
+                         remote_connected: bool,
+                         last_active: Instant,
+                         last_active_wall_ms: u64| {
+            let sock = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 64]),
+                tcp::SocketBuffer::new(vec![0u8; 64]),
+            );
+            let handle = sockets.add(sock);
+            let (_tx, rx) = mpsc::channel(1);
+            let (_bridge_closed_tx, bridge_closed_rx) = watch::channel(());
+            let noop_task = tokio::spawn(async {});
+            BridgeFlow {
+                handle,
+                established,
+                remote_connected: Arc::new(AtomicBool::new(remote_connected)),
+                dial_timeout_notify: Arc::new(Notify::new()),
+                dial_timeout_notified_at: None,
+                created_at: last_active,
+                created_wall_ms: last_active_wall_ms,
+                last_active,
+                last_active_wall_ms,
+                fin_started_at: None,
+                fin_started_wall_ms: None,
+                pending_tx: BytesMut::new(),
+                from_remote_rx: rx,
+                to_remote_tx: None,
+                _bridge_closed_rx: bridge_closed_rx,
+                remote_eof: false,
+                remote_failed: Arc::new(AtomicBool::new(false)),
+                task_abort: noop_task.abort_handle(),
+            }
+        };
+
+        let base_mono = Instant::now();
+        let base_wall = 1_700_000_000_000u64;
+        let now = base_mono + Duration::from_secs(600);
+        let now_wall = base_wall + 600_000;
+
+        let tuple_recent = FourTuple {
+            src: SocketAddr::from(([198, 18, 0, 1], 40001)),
+            dst: SocketAddr::from(([1, 1, 1, 1], 443)),
+        };
+        let tuple_pending = FourTuple {
+            src: SocketAddr::from(([198, 18, 0, 1], 40002)),
+            dst: SocketAddr::from(([1, 1, 1, 1], 443)),
+        };
+        let tuple_idle_3m = FourTuple {
+            src: SocketAddr::from(([198, 18, 0, 1], 40003)),
+            dst: SocketAddr::from(([1, 1, 1, 1], 443)),
+        };
+        let tuple_idle_wall_15m = FourTuple {
+            src: SocketAddr::from(([198, 18, 0, 1], 40004)),
+            dst: SocketAddr::from(([1, 1, 1, 1], 443)),
+        };
+
+        let mut flows = HashMap::new();
+        // Recently active established flow (60s idle <= 120s threshold) and pending dial flow
+        // (even with old timestamp) MUST NOT be selected for pressure eviction.
+        flows.insert(
+            tuple_recent,
+            make_flow(
+                &mut sockets,
+                true,
+                true,
+                now - Duration::from_secs(60),
+                now_wall - 60_000,
+            ),
+        );
+        flows.insert(
+            tuple_pending,
+            make_flow(&mut sockets, true, false, base_mono, base_wall - 900_000),
+        );
+        assert_eq!(
+            select_pressure_eviction_candidate(&flows, now, now_wall),
+            None
+        );
+
+        // Add an established flow idle 180s (> 120s) -> becomes evictable.
+        flows.insert(
+            tuple_idle_3m,
+            make_flow(
+                &mut sockets,
+                true,
+                true,
+                now - Duration::from_secs(180),
+                now_wall - 180_000,
+            ),
+        );
+        assert_eq!(
+            select_pressure_eviction_candidate(&flows, now, now_wall),
+            Some(tuple_idle_3m)
+        );
+
+        // Add another established flow whose monotonic clock barely moved (50s, e.g. post-sleep)
+        // but wall clock is 900s stale -> stalest effective idle wins LRU eviction.
+        flows.insert(
+            tuple_idle_wall_15m,
+            make_flow(
+                &mut sockets,
+                true,
+                true,
+                now - Duration::from_secs(50),
+                now_wall - 900_000,
+            ),
+        );
+        assert_eq!(
+            select_pressure_eviction_candidate(&flows, now, now_wall),
+            Some(tuple_idle_wall_15m)
+        );
     }
 
     #[tokio::test]
@@ -1966,9 +2182,9 @@ mod tests {
             task_abort: noop_task.abort_handle(),
         };
 
-        // Simulate waking from a 268s Android AP deep sleep (> 17s hard dial AND > 120s TCP_IDLE_TIMEOUT)
+        // Simulate waking from a 31-minute Android AP deep sleep (> 17s hard dial AND > 1800s TCP_IDLE_TIMEOUT)
         // while CLOCK_MONOTONIC stayed frozen at `mono_now`.
-        let wakeup_wall = base_wall + 268_000;
+        let wakeup_wall = base_wall + 1_860_000;
         assert!(flow.notify_dial_timeout_if_needed(mono_now, wakeup_wall));
 
         // On the exact wakeup poll tick (and throughout the 2s grace window), `is_timed_out` MUST
