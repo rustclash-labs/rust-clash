@@ -119,12 +119,14 @@ function isTunPrivilegeFailure(
   return privilegeOk === false && err instanceof ApiHttpError;
 }
 
-function canAutoElevateWindowsTun(config: ConfigSnapshot | null): boolean {
+function canAutoElevateDesktopTun(config: ConfigSnapshot | null): boolean {
   const h = config?.tun.health;
   return Boolean(
     isTauriDesktop() &&
       h &&
-      h.platform === "windows" &&
+      (h.platform === "windows" ||
+        h.platform === "macos" ||
+        h.platform === "linux") &&
       h.driver_loaded &&
       !h.privilege_ok,
   );
@@ -164,11 +166,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     probing: boolean;
   }>({ probing: false });
 
-  // Activity tab state (`live` | `recent` | `dns`)
-  const [activityTab, setActivityTab] = useState<"live" | "recent" | "dns">(
-    "live",
-  );
+  // Activity tab state (`live` | `recent` | `failed` | `dns`)
+  const [activityTab, setActivityTab] = useState<
+    "live" | "recent" | "failed" | "dns"
+  >("live");
   const [recentDiagnostics, setRecentDiagnostics] = useState<ConnectionItem[]>(
+    [],
+  );
+  const [failedDiagnostics, setFailedDiagnostics] = useState<ConnectionItem[]>(
     [],
   );
   const [fakeIpPool, setFakeIpPool] = useState<FakeIpPoolResponse | null>(null);
@@ -302,12 +307,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const loadAuxActivity = useCallback(async () => {
     if (!online) return;
-    const [diagRes, fakeRes] = await Promise.allSettled([
+    const [diagRes, failedRes, fakeRes] = await Promise.allSettled([
       clashApi.getConnectionDiagnostics(80),
+      clashApi.getConnectionDiagnostics(50, true),
       clashApi.getFakeIpPool(),
     ]);
     if (diagRes.status === "fulfilled") {
       setRecentDiagnostics(diagRes.value.diagnostics);
+    }
+    if (failedRes.status === "fulfilled") {
+      setFailedDiagnostics(
+        failedRes.value.diagnostics.filter(
+          (d) => d.status === "failed" || Boolean(d.error),
+        ),
+      );
     }
     if (fakeRes.status === "fulfilled") {
       setFakeIpPool(fakeRes.value);
@@ -363,7 +376,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
   };
 
-  const tryAutoElevateWindowsTun = async (
+  const tryAutoElevateDesktopTun = async (
     preserveSysproxy: boolean,
   ): Promise<"relaunching" | "cancelled" | "fallback" | "error"> => {
     try {
@@ -459,14 +472,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           throw stepErr;
         }
       } else {
-        // On non-elevated Windows Desktop with Wintun present, trigger UAC relaunch BEFORE
-        // toggling system proxy so cancelling UAC leaves the current session untouched.
+        // On non-elevated Desktop (Windows UAC / macOS / Linux Polkit), trigger elevation BEFORE
+        // toggling system proxy so cancelling the prompt leaves the current session untouched.
         if (
           plan.targetTun &&
           !tunEnabled &&
-          canAutoElevateWindowsTun(config)
+          canAutoElevateDesktopTun(config)
         ) {
-          const elev = await tryAutoElevateWindowsTun(
+          const elev = await tryAutoElevateDesktopTun(
             Boolean(plan.targetSysproxy),
           );
           if (elev !== "fallback") {
@@ -555,8 +568,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     setToast(null);
     void (async () => {
       try {
-        if (nextEnable && canAutoElevateWindowsTun(config)) {
-          const elev = await tryAutoElevateWindowsTun(sysproxyEnabled);
+        if (nextEnable && canAutoElevateDesktopTun(config)) {
+          const elev = await tryAutoElevateDesktopTun(sysproxyEnabled);
           if (elev !== "fallback") {
             return;
           }
@@ -831,7 +844,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             {tunPrivilegeHint}
           </span>
           <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
-            {canAutoElevateWindowsTun(config) && (
+            {canAutoElevateDesktopTun(config) && (
               <button
                 type="button"
                 className="btn btn-sm btn-primary"
@@ -1045,11 +1058,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div
               className="hero-takeover-pill"
               title={
-                canAutoElevateWindowsTun(config) && !tunEnabled
-                  ? tr(
-                      "点击后将弹出 Windows 管理员授权（UAC），同意后自动重启并开启 TUN",
-                      "Clicking will prompt Windows Administrator elevation (UAC) and automatically restart with TUN enabled",
-                    )
+                canAutoElevateDesktopTun(config) && !tunEnabled
+                  ? config?.tun.health?.platform === "windows"
+                    ? tr(
+                        "点击后将弹出 Windows 管理员授权（UAC），同意后自动重启并开启 TUN",
+                        "Clicking will prompt Windows Administrator elevation (UAC) and automatically restart with TUN enabled",
+                      )
+                    : config?.tun.health?.platform === "macos"
+                      ? tr(
+                          "点击后将弹出 macOS 管理员授权窗口，同意后自动提权重启并开启 TUN",
+                          "Clicking will prompt macOS Administrator elevation and automatically restart with TUN enabled",
+                        )
+                      : tr(
+                          "点击后将弹出系统管理员授权（Polkit），同意后自动提权重启并开启 TUN",
+                          "Clicking will prompt Polkit Administrator elevation and automatically restart with TUN enabled",
+                        )
                   : undefined
               }
             >
@@ -1395,7 +1418,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </section>
       </div>
 
-      {/* ROW 3 (Bottom A, flex: 1): Live Connections, Recent Routing & Fake-IP DNS Stream */}
+      {/* ROW 3 (Bottom A, flex: 1): Live Connections, Recent Routing, Failed & Fake-IP DNS Stream */}
       <section className="bento-card activity-stream-card">
         <div className="activity-stream-head">
           <div className="activity-tabs-compact">
@@ -1417,6 +1440,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span>{tr("最近分流", "Recent")}</span>
               <span className="activity-seg-count tabular">
                 {formatCompactCount(totalReqCount)}
+              </span>
+            </button>
+            <button
+              type="button"
+              className={`activity-seg-btn ${activityTab === "failed" ? "active" : ""}`}
+              onClick={() => setActivityTab("failed")}
+            >
+              <span>{tr("异常", "Failed")}</span>
+              <span
+                className="activity-seg-count tabular"
+                style={
+                  failedDiagnostics.length > 0
+                    ? { color: "var(--accent-rose)" }
+                    : undefined
+                }
+              >
+                {formatCompactCount(failedDiagnostics.length)}
               </span>
             </button>
             <button
@@ -1542,119 +1582,152 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <th>{tr("目标域名", "Target")}</th>
                   <th>{tr("命中规则", "Rule")}</th>
                   <th>{tr("出口链路", "Exit")}</th>
-                  <th style={{ textAlign: "right" }}>{tr("下载 / 上传", "DL / UL")}</th>
+                  <th style={{ textAlign: "right" }}>
+                    {activityTab === "failed"
+                      ? tr("失败原因", "Error")
+                      : tr("下载 / 上传", "DL / UL")}
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {(activityTab === "live" ? liveConns : recentDiagnostics)
-                  .length === 0 ? (
-                  <tr>
-                    <td colSpan={5} className="activity-empty-cell">
-                      {!proxyRunning
-                        ? tr(
-                            "待机中 · 开启系统代理或 TUN 接管后，这里将实时呈现连接分流与 DNS 命中轨迹",
-                            "Standby — enable System Proxy or TUN to watch live routing and connection trails here",
-                          )
-                        : activityTab === "live"
-                          ? tr("当前没有活跃连接", "No active connections right now")
-                          : tr("暂无最近请求记录", "No recent requests recorded")}
-                    </td>
-                  </tr>
-                ) : (
-                  (activityTab === "live" ? liveConns : recentDiagnostics)
-                    .slice(0, 30)
-                    .map((conn) => {
-                      const procLabel =
-                        conn.metadata.process?.trim() ||
-                        conn.metadata.type ||
-                        conn.metadata.source;
-                      const targetLabel = `${
-                        conn.metadata.host || conn.metadata.destination_ip || "*"
-                      }:${conn.metadata.destination_port}`;
-                      const ruleLabel = conn.rule
-                        ? conn.rule_payload
-                          ? `${conn.rule},${conn.rule_payload}`
-                          : conn.rule
-                        : "MATCH";
-                      const exitHop =
-                        conn.effective_outbound ||
-                        conn.chains[conn.chains.length - 1] ||
-                        conn.chains[0] ||
-                        "DIRECT";
-                      const isDirect = exitHop.toUpperCase() === "DIRECT";
-                      return (
-                        <tr key={`${conn.id}-${conn.start_epoch_ms}`}>
-                          <td>
-                            <div
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 7,
-                                maxWidth: 140,
-                              }}
-                            >
-                              <span className="source-avatar">
-                                {extractBadgeInitial(procLabel)}
-                              </span>
-                              <span
-                                style={{
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  fontWeight: 550,
-                                }}
-                                title={procLabel}
-                              >
-                                {procLabel}
-                              </span>
-                            </div>
-                          </td>
-                          <td
-                            className="mono"
+                {(() => {
+                  const activeRows =
+                    activityTab === "live"
+                      ? liveConns
+                      : activityTab === "failed"
+                        ? failedDiagnostics
+                        : recentDiagnostics;
+                  if (activeRows.length === 0) {
+                    return (
+                      <tr>
+                        <td colSpan={5} className="activity-empty-cell">
+                          {activityTab === "failed"
+                            ? tr("暂无异常连接记录", "No failed connections recorded")
+                            : !proxyRunning
+                              ? tr(
+                                  "待机中 · 开启系统代理或 TUN 接管后，这里将实时呈现连接分流与 DNS 命中轨迹",
+                                  "Standby — enable System Proxy or TUN to watch live routing and connection trails here",
+                                )
+                              : activityTab === "live"
+                                ? tr("当前没有活跃连接", "No active connections right now")
+                                : tr("暂无最近请求记录", "No recent requests recorded")}
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return activeRows.slice(0, 30).map((conn) => {
+                    const procLabel =
+                      conn.metadata.process?.trim() ||
+                      conn.metadata.type ||
+                      conn.metadata.source;
+                    const targetLabel = `${
+                      conn.metadata.host || conn.metadata.destination_ip || "*"
+                    }:${conn.metadata.destination_port}`;
+                    const ruleLabel = conn.rule
+                      ? conn.rule_payload
+                        ? `${conn.rule},${conn.rule_payload}`
+                        : conn.rule
+                      : "MATCH";
+                    const exitHop =
+                      conn.effective_outbound ||
+                      conn.chains[conn.chains.length - 1] ||
+                      conn.chains[0] ||
+                      "DIRECT";
+                    const isDirect = exitHop.toUpperCase() === "DIRECT";
+                    const isFailed =
+                      conn.status === "failed" || Boolean(conn.error);
+                    return (
+                      <tr key={`${conn.id}-${conn.start_epoch_ms}`}>
+                        <td>
+                          <div
                             style={{
-                              maxWidth: 230,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              color: "var(--text-primary)",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 7,
+                              maxWidth: 140,
                             }}
-                            title={targetLabel}
                           >
-                            {targetLabel}
-                          </td>
-                          <td
-                            className="mono"
-                            style={{
-                              maxWidth: 170,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              color: "var(--text-muted)",
-                            }}
-                            title={ruleLabel}
-                          >
-                            {ruleLabel}
-                          </td>
-                          <td>
-                            <span
-                              className={`badge ${
-                                isDirect ? "badge-neutral" : "badge-emerald"
-                              }`}
-                              title={exitHop}
-                            >
-                              {exitHop}
+                            <span className="source-avatar">
+                              {extractBadgeInitial(procLabel)}
                             </span>
-                          </td>
-                          <td
-                            className="mono tabular"
-                            style={{
-                              textAlign: "right",
-                              color: "var(--text-secondary)",
-                            }}
+                            <span
+                              style={{
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                fontWeight: 550,
+                              }}
+                              title={procLabel}
+                            >
+                              {procLabel}
+                            </span>
+                          </div>
+                        </td>
+                        <td
+                          className="mono"
+                          style={{
+                            maxWidth: 230,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            color: "var(--text-primary)",
+                          }}
+                          title={
+                            conn.error
+                              ? `${targetLabel} — ${conn.error}`
+                              : targetLabel
+                          }
+                        >
+                          {targetLabel}
+                        </td>
+                        <td
+                          className="mono"
+                          style={{
+                            maxWidth: 170,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            color: "var(--text-muted)",
+                          }}
+                          title={ruleLabel}
+                        >
+                          {ruleLabel}
+                        </td>
+                        <td>
+                          <span
+                            className={`badge ${
+                              isFailed
+                                ? "badge-rose"
+                                : isDirect
+                                  ? "badge-neutral"
+                                  : "badge-emerald"
+                            }`}
+                            title={exitHop}
                           >
-                            {formatBytes(conn.download)} / {formatBytes(conn.upload)}
-                          </td>
-                        </tr>
-                      );
-                    })
-                )}
+                            {exitHop}
+                          </span>
+                        </td>
+                        <td
+                          className="mono tabular"
+                          style={{
+                            textAlign: "right",
+                            maxWidth: activityTab === "failed" ? 260 : undefined,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            color:
+                              activityTab === "failed" || isFailed
+                                ? "var(--accent-rose)"
+                                : "var(--text-secondary)",
+                          }}
+                          title={conn.error || undefined}
+                        >
+                          {activityTab === "failed"
+                            ? conn.error || tr("连接失败", "Failed")
+                            : isFailed && conn.error
+                              ? conn.error
+                              : `${formatBytes(conn.download)} / ${formatBytes(conn.upload)}`}
+                        </td>
+                      </tr>
+                    );
+                  });
+                })()}
               </tbody>
             </table>
           )}

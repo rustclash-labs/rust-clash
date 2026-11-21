@@ -1282,12 +1282,13 @@ fn start_tun_service(
         cfg.tun.ipv6
     };
     let ipv6_enabled = Arc::new(std::sync::atomic::AtomicBool::new(initial_ipv6));
-    // On Windows Wintun there is no kernel `SO_MARK` / `addDisallowedApplication` exclusion, so
-    // drop any non-DNS-hijacked TCP/UDP flow originating from our own PID as a last-resort
-    // loop-prevention guard (backed by in-memory `GetExtended*Table` + `WIN_PID_INFO_CACHE`).
+    // On Windows Wintun and macOS utun there is no kernel `SO_MARK` / `addDisallowedApplication`
+    // exclusion, so drop any non-DNS-hijacked TCP/UDP flow originating from our own PID as a
+    // last-resort loop-prevention guard (backed by in-memory `GetExtended*Table` on Windows and
+    // in-memory `proc_pidinfo(PROC_PIDLISTFDS)` + `getsockname` on macOS).
     // Linux `/dev/net/tun` uses kernel `SO_MARK` (`0x1a5`) policy routing instead, avoiding
     // `/proc/<pid>/fd` scans on every TUN flow and keeping in-process `ip netns` E2E clients working.
-    let drop_self_pid = cfg!(target_os = "windows") && cfg.tun.auto_route;
+    let drop_self_pid = cfg!(any(target_os = "windows", target_os = "macos")) && cfg.tun.auto_route;
     let (vtun, t_tun) = spawn_userspace_tun_with_options(
         cfg.tun.mtu,
         Arc::clone(&router_slot),

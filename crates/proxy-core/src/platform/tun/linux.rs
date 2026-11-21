@@ -139,6 +139,42 @@ pub fn parse_resolv_conf_nameservers(contents: &str) -> Vec<std::net::IpAddr> {
     out
 }
 
+/// Select explicit `pref 8990 ... lookup main` bypass IPs for Linux policy routing.
+/// Always includes proxy server IPs (`proxy_bypass_ips`) as defense-in-depth alongside `SO_MARK`.
+/// Omits upstream `dns_bypass_ips` when `dns_hijack` is enabled because RustClash's own upstream
+/// DNS sockets are marked with `SO_MARK` (`LinuxFwmarkProtector`) and bypass `pref 9020 not fwmark`;
+/// keeping global `pref 8990 to <dns_ip> lookup main` rules would let *other* Linux processes send
+/// port-53 queries directly to public resolvers (e.g. `1.1.1.1`/`8.8.8.8`), escaping Fake-IP hijack.
+pub fn select_linux_policy_bypass_ips(
+    proxy_bypass_ips: &[std::net::IpAddr],
+    dns_bypass_ips: &[std::net::IpAddr],
+    dns_hijack: bool,
+) -> Vec<std::net::IpAddr> {
+    let mut out = Vec::with_capacity(proxy_bypass_ips.len() + dns_bypass_ips.len());
+    for &ip in proxy_bypass_ips {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    if !dns_hijack {
+        for &ip in dns_bypass_ips {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn flush_linux_resolved_cache() {
+    if let Some(resolvectl_bin) = resolve_resolvectl_binary() {
+        let _ = std::process::Command::new(&resolvectl_bin)
+            .args(["flush-caches"])
+            .output();
+    }
+}
+
 /// Return `true` when `/etc/resolv.conf` has at least one nameserver and EVERY configured
 /// nameserver matches a Linux TUN bypass policy rule (`pref 8990` explicit bypass or `pref 9000`
 /// loopback / link-local / RFC1918 / CGNAT), meaning unmarked system DNS queries would bypass TUN.
@@ -521,9 +557,16 @@ impl LinuxSystemTunSession {
                 &mut rec.owned_route_del_args,
             )?;
 
-            // 2. High-priority explicit bypasses for proxy server & upstream DNS IPs
+            // 2. High-priority explicit bypasses for proxy server IPs (plus upstream DNS IPs only
+            //    when `dns_hijack` is disabled; when `dns_hijack` is active, RustClash's own upstream
+            //    DNS sockets are `SO_MARK`-protected and bypass `pref 9020` without letting other
+            //    Linux processes escape Fake-IP hijacking).
             let mut ipv6_bypass_ok = true;
-            let all_bypass = spec.all_bypass_ips();
+            let all_bypass = select_linux_policy_bypass_ips(
+                &spec.bypass_ips,
+                &spec.dns_bypass_ips,
+                spec.dns_hijack,
+            );
             for ip in &all_bypass {
                 match ip {
                     IpAddr::V4(v4) if !v4.is_loopback() && !spec.fake_ip_net.contains(v4) => {
@@ -671,6 +714,7 @@ impl LinuxSystemTunSession {
                 match (dns_res, dom_res) {
                     (Ok(d_out), Ok(m_out)) if d_out.status.success() && m_out.status.success() => {
                         resolved_registered = true;
+                        flush_linux_resolved_cache();
                     }
                     (dns_r, dom_r) => {
                         let fmt_out = |res: io::Result<std::process::Output>| match res {
@@ -892,6 +936,7 @@ impl LinuxSystemTunSession {
                     if *guard != latest {
                         *guard = latest;
                         drop(guard);
+                        flush_linux_resolved_cache();
                         transitions_watch.fetch_add(1, Ordering::Relaxed);
                         if let Some(hook) = &net_hook_watch {
                             hook();
@@ -975,6 +1020,7 @@ impl SystemTunSession for LinuxSystemTunSession {
             let _ = h.join();
         }
         rollback_linux_record(&self.recovery_record);
+        flush_linux_resolved_cache();
         clear_global_socket_protector();
         if let Err(err) = update_current_journal(&self.spec.state_dir, |j| j.linux_tun = None) {
             tracing::warn!("Linux TUN: failed clearing recovery journal on stop: {err}");
@@ -1118,5 +1164,30 @@ mod tests {
         assert!(!all_nameservers_bypass_tun(&ns_public, &bypass_ips, false));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn select_linux_policy_bypass_ips_omits_dns_when_hijack_is_active() {
+        let proxy_v4: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let proxy_v6: std::net::IpAddr = "2001:db8::10".parse().unwrap();
+        let dns_v4: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+        let dns_v6: std::net::IpAddr = "2606:4700:4700::1111".parse().unwrap();
+
+        // With `dns_hijack = true`, `SO_MARK` protects RustClash's own DNS sockets, so public DNS
+        // resolvers MUST NOT receive global `pref 8990` bypass rules that other apps could exploit.
+        let hijacked = select_linux_policy_bypass_ips(
+            &[proxy_v4, proxy_v6],
+            &[dns_v4, dns_v6, proxy_v4],
+            true,
+        );
+        assert_eq!(hijacked, vec![proxy_v4, proxy_v6]);
+
+        // With `dns_hijack = false`, deduplicated DNS bypass IPs are included alongside proxy IPs.
+        let no_hijack = select_linux_policy_bypass_ips(
+            &[proxy_v4, proxy_v6],
+            &[dns_v4, dns_v6, proxy_v4],
+            false,
+        );
+        assert_eq!(no_hijack, vec![proxy_v4, proxy_v6, dns_v4, dns_v6]);
     }
 }

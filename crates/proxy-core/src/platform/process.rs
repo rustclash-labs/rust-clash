@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -99,8 +99,10 @@ pub fn find_local_process(
 
 /// Non-spawning variant of [`find_local_process`] safe to call from hot synchronous telemetry
 /// hooks on Tokio worker threads: on Linux and Windows it queries in-memory kernel tables
-/// (`/proc` / `GetExtended*Table`), while on macOS (where uncached lookup spawns `/usr/sbin/lsof`)
-/// it returns cached entries without blocking or violating App Sandbox / NetworkExtension rules.
+/// (`/proc` / `GetExtended*Table`), while on macOS it checks the cache and then inspects our own
+/// process's open socket descriptors via `proc_pidinfo(PROC_PIDLISTFDS)` + `getsockname()` without
+/// spawning `/usr/sbin/lsof` (preserving App Sandbox / NetworkExtension compatibility while still
+/// powering `drop_self_pid` loop prevention on macOS `utun`).
 pub fn find_local_process_nonblocking(
     transport: SocketTransport,
     local_addr: SocketAddr,
@@ -114,6 +116,13 @@ pub fn find_local_process_nonblocking(
             && ts.elapsed() < PROCESS_CACHE_TTL
         {
             return cached;
+        }
+        if let Some(self_info) = find_macos_own_process_socket(transport, local_addr) {
+            PROCESS_CACHE.lock().put(
+                (transport, local_addr),
+                (Instant::now(), Some(self_info.clone())),
+            );
+            return Some(self_info);
         }
         None
     }
@@ -573,13 +582,202 @@ fn find_win_udp6_pid(target: std::net::SocketAddrV6) -> Option<u32> {
 }
 
 // ============================================================================
-// macOS: Darwin `libproc` (`proc_listpids` + `proc_pidpath` + `lsof -nP -Fpcn` fallback)
+// macOS: Darwin `libproc` (`proc_pidinfo(PROC_PIDLISTFDS)` self fast-path + `proc_pidpath` + `lsof` fallback)
 // ============================================================================
+#[cfg(target_os = "macos")]
+static MACOS_PID_INFO_CACHE: LazyLock<Mutex<LruCache<u32, ProcessCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(512).expect("non-zero"))));
+
+#[cfg(target_os = "macos")]
+fn query_darwin_process_info(pid: u32, fallback_cmd: Option<&str>) -> Option<LocalProcessInfo> {
+    if let Some((ts, cached)) = MACOS_PID_INFO_CACHE.lock().get(&pid).cloned()
+        && ts.elapsed() < PROCESS_CACHE_TTL
+    {
+        return cached;
+    }
+    let path = darwin_pid_path(pid);
+    let name = path
+        .as_deref()
+        .map(basename_from_path)
+        .or_else(|| fallback_cmd.map(ToString::to_string));
+    let info = name.map(|name| LocalProcessInfo { name, path, pid });
+    MACOS_PID_INFO_CACHE
+        .lock()
+        .put(pid, (Instant::now(), info.clone()));
+    info
+}
+
+#[cfg(target_os = "macos")]
+fn macos_socket_addr_matches(
+    sock_addr: SocketAddr,
+    query: SocketAddr,
+    transport: SocketTransport,
+) -> bool {
+    if sock_addr.port() != query.port() {
+        return false;
+    }
+    if sock_addr.ip() == query.ip() {
+        return true;
+    }
+    match (sock_addr.ip(), query.ip()) {
+        (IpAddr::V6(v6), IpAddr::V4(v4)) if v6.to_ipv4_mapped() == Some(v4) => true,
+        (IpAddr::V4(v4), IpAddr::V6(v6)) if v6.to_ipv4_mapped() == Some(v4) => true,
+        (IpAddr::V4(v4), _) if transport == SocketTransport::Udp && v4.is_unspecified() => true,
+        (IpAddr::V6(v6), _) if transport == SocketTransport::Udp && v6.is_unspecified() => true,
+        _ => false,
+    }
+}
+
+/// Inspect our own process's open socket descriptors in-memory via Darwin `proc_pidinfo(PROC_PIDLISTFDS)`
+/// + POSIX `getsockopt(SO_TYPE)` + `getsockname()` without spawning `/usr/sbin/lsof`.
+#[cfg(target_os = "macos")]
+fn find_macos_own_process_socket(
+    transport: SocketTransport,
+    local_addr: SocketAddr,
+) -> Option<LocalProcessInfo> {
+    const PROC_PIDLISTFDS: libc::c_int = 1;
+    const PROX_FDTYPE_SOCKET: u32 = 2;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFdInfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let my_pid = std::process::id();
+    // SAFETY: Querying buffer size with NULL buffer for our own PID is standard Darwin libproc usage.
+    let bytes_needed = unsafe {
+        proc_pidinfo(
+            my_pid as libc::c_int,
+            PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if bytes_needed <= 0 {
+        return None;
+    }
+
+    let entry_size = std::mem::size_of::<ProcFdInfo>();
+    let cap = (bytes_needed as usize / entry_size).saturating_add(32);
+    let mut fds = vec![
+        ProcFdInfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        cap
+    ];
+    let buf_bytes = fds
+        .len()
+        .saturating_mul(entry_size)
+        .min(libc::c_int::MAX as usize) as libc::c_int;
+    // SAFETY: `fds` has capacity `buf_bytes` bytes and proper alignment for `ProcFdInfo`.
+    let filled = unsafe {
+        proc_pidinfo(
+            my_pid as libc::c_int,
+            PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast::<libc::c_void>(),
+            buf_bytes,
+        )
+    };
+    if filled <= 0 {
+        return None;
+    }
+
+    let count = (filled as usize / entry_size).min(fds.len());
+    let want_sock_type = match transport {
+        SocketTransport::Tcp => libc::SOCK_STREAM,
+        SocketTransport::Udp => libc::SOCK_DGRAM,
+    };
+
+    for fd_info in &fds[..count] {
+        if fd_info.proc_fdtype != PROX_FDTYPE_SOCKET {
+            continue;
+        }
+        let fd = fd_info.proc_fd;
+        let mut sock_type: libc::c_int = 0;
+        let mut sock_type_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `getsockopt(SOL_SOCKET, SO_TYPE)` reads into `sock_type` of size `sock_type_len`.
+        let trc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&raw mut sock_type).cast::<libc::c_void>(),
+                &raw mut sock_type_len,
+            )
+        };
+        if trc != 0 || sock_type != want_sock_type {
+            continue;
+        }
+
+        // SAFETY: `sockaddr_storage` is a plain C struct safe to zero-initialize.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut storage_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `getsockname` writes at most `storage_len` bytes into `storage`.
+        let grc = unsafe {
+            libc::getsockname(
+                fd,
+                (&raw mut storage).cast::<libc::sockaddr>(),
+                &raw mut storage_len,
+            )
+        };
+        if grc != 0 {
+            continue;
+        }
+
+        let bound_addr = match i32::from(storage.ss_family) {
+            libc::AF_INET => {
+                // SAFETY: `ss_family == AF_INET` guarantees `storage` holds a `sockaddr_in`.
+                let sin = unsafe {
+                    std::ptr::read_unaligned((&raw const storage).cast::<libc::sockaddr_in>())
+                };
+                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                let port = u16::from_be(sin.sin_port);
+                SocketAddr::new(IpAddr::V4(ip), port)
+            }
+            libc::AF_INET6 => {
+                // SAFETY: `ss_family == AF_INET6` guarantees `storage` holds a `sockaddr_in6`.
+                let sin6 = unsafe {
+                    std::ptr::read_unaligned((&raw const storage).cast::<libc::sockaddr_in6>())
+                };
+                let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                let port = u16::from_be(sin6.sin6_port);
+                SocketAddr::new(IpAddr::V6(ip), port)
+            }
+            _ => continue,
+        };
+
+        if macos_socket_addr_matches(bound_addr, local_addr, transport) {
+            return query_darwin_process_info(my_pid, None);
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn platform_find_process(
     transport: SocketTransport,
     local_addr: SocketAddr,
 ) -> Option<LocalProcessInfo> {
+    // Fast in-memory path: check our own process's open socket descriptors first without spawning `lsof`.
+    if let Some(self_info) = find_macos_own_process_socket(transport, local_addr) {
+        return Some(self_info);
+    }
+
     use std::process::Command;
     // Query macOS socket owner narrowly by exact protocol and local port (`-iTCP:<port>` / `-iUDP:<port>`)
     // with machine-readable `-Fpcn` output (< 5ms when scoped to a single port, cached for 2s).
@@ -609,12 +807,7 @@ fn platform_find_process(
             if local_part.ends_with(&port_suffix)
                 && let Some(pid) = cur_pid
             {
-                let path = darwin_pid_path(pid);
-                let name = path
-                    .as_deref()
-                    .map(basename_from_path)
-                    .or_else(|| cur_cmd.clone())?;
-                return Some(LocalProcessInfo { name, path, pid });
+                return query_darwin_process_info(pid, cur_cmd.as_deref());
             }
         }
     }
@@ -673,6 +866,32 @@ mod tests {
             assert_eq!(info.pid, std::process::id());
             assert!(!info.name.is_empty());
             assert!(info.matches_name(&info.name));
+        }
+    }
+
+    #[tokio::test]
+    async fn nonblocking_lookup_resolves_current_process_tcp_and_udp_sockets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(srv_addr).await.unwrap();
+        let (_accepted, tcp_peer_addr) = listener.accept().await.unwrap();
+        let _keep_tcp = client;
+
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_local_addr = udp.local_addr().unwrap();
+
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        )) {
+            let tcp_info = find_local_process_nonblocking(SocketTransport::Tcp, tcp_peer_addr)
+                .expect("expected nonblocking lookup to resolve own TCP socket");
+            assert_eq!(tcp_info.pid, std::process::id());
+
+            let udp_info = find_local_process_nonblocking(SocketTransport::Udp, udp_local_addr)
+                .expect("expected nonblocking lookup to resolve own UDP socket");
+            assert_eq!(udp_info.pid, std::process::id());
         }
     }
 

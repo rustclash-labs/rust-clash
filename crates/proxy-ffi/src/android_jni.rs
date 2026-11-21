@@ -2256,10 +2256,23 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 
 /// Live + recent connection-level diagnostics (`connecting`, `active`, `closed`, `failed`)
 /// exposing target domain, Fake-IP restoration, matched rule, outbound node, exit type, and redacted errors.
+/// Merges the dedicated `failed_diagnostics` ring into the snapshot (deduplicated by `id`) so heavy
+/// routine `active`/`closed` traffic churn never evicts real connection failures from Android's UI.
 pub fn android_get_diagnostics_core(limit: usize) -> serde_json::Value {
     let capped = limit.clamp(1, 500);
     if let Some((_, engine)) = live_handle_and_engine() {
-        let entries = engine.hub().diagnostics_snapshot(capped);
+        let mut entries = engine.hub().diagnostics_snapshot(capped);
+        let failed = engine.hub().failed_diagnostics_snapshot(capped.min(100));
+        if !failed.is_empty() {
+            let mut seen: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.id.clone()).collect();
+            for item in failed {
+                if seen.insert(item.id.clone()) {
+                    entries.push(item);
+                }
+            }
+            entries.sort_by_key(|a| std::cmp::Reverse(a.start_epoch_ms));
+        }
         serde_json::json!({
             "ok": true,
             "vpnRunning": true,
@@ -5510,6 +5523,85 @@ rules:
             engine.router().epoch(),
             epoch_before,
             "inactive YAML import must not reload the live router or disrupt active connections"
+        );
+
+        drop(engine);
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn android_get_diagnostics_preserves_failures_under_heavy_normal_traffic_churn() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustclash-jni-failed-diag-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-protect", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            false,
+            false,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let hub = engine.hub();
+
+        // Record an early failed connection
+        let failed_target =
+            proxy_core::addr::TargetAddr::new_domain("broken.example.test", 443).unwrap();
+        let failed_guard = hub.register_connection_guard(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &failed_target,
+            None,
+            "MATCH",
+            "",
+            vec!["PROXY".to_string()],
+        );
+        failed_guard.record_failed("upstream TLS handshake timed out");
+
+        // Churn 260 normal closed connections so `recent_diagnostics` (cap 200) evicts the failure
+        for i in 0..260 {
+            let t = proxy_core::addr::TargetAddr::new_domain(format!("ok-{i}.example.test"), 443)
+                .unwrap();
+            let g = hub.register_connection_guard(
+                "TUN(smoltcp)",
+                "tcp",
+                None,
+                &t,
+                None,
+                "MATCH",
+                "",
+                vec!["DIRECT".to_string()],
+            );
+            g.mark_established();
+            drop(g);
+        }
+
+        let snap = android_get_diagnostics_core(50);
+        assert_eq!(snap["ok"], true);
+        assert_eq!(snap["vpnRunning"], true);
+        let items = snap["diagnostics"].as_array().expect("diagnostics array");
+        assert!(
+            items.iter().any(|item| {
+                item["metadata"]["host"] == "broken.example.test"
+                    && item["status"] == "failed"
+                    && item["error"]
+                        .as_str()
+                        .is_some_and(|e| e.contains("handshake timed out"))
+            }),
+            "android_get_diagnostics_core must preserve evicted failures from failed_diagnostics ring"
         );
 
         drop(engine);

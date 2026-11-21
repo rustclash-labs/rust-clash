@@ -216,28 +216,54 @@ impl SocketProtector for LinuxFwmarkProtector {
 }
 
 /// macOS `IP_BOUND_IF` / `IPV6_BOUND_IF` protector binding outbound sockets to the physical `enX` NIC.
-/// The interface index can be atomically updated on Wi-Fi / Ethernet handoff without restarting `ProxyEngine`.
+/// Tracks independent IPv4 and IPv6 physical interface indices (so dual-stack or asymmetric NIC
+/// setups bind each family to its exact egress interface) and supports atomic updates on Wi-Fi /
+/// Ethernet handoff without restarting `ProxyEngine`.
 pub struct MacOsBoundIfProtector {
-    if_index: AtomicU32,
+    if_index_v4: AtomicU32,
+    if_index_v6: AtomicU32,
 }
 
 impl MacOsBoundIfProtector {
     pub fn new(if_index: u32) -> Self {
+        Self::new_dual_stack(if_index, if_index)
+    }
+
+    pub fn new_dual_stack(if_index_v4: u32, if_index_v6: u32) -> Self {
         Self {
-            if_index: AtomicU32::new(if_index),
+            if_index_v4: AtomicU32::new(if_index_v4),
+            if_index_v6: AtomicU32::new(if_index_v6),
         }
     }
 
     pub fn set_if_index(&self, if_index: u32) {
-        self.if_index.store(if_index, Ordering::Release);
+        self.update_indices(if_index, if_index);
+    }
+
+    pub fn update_indices(&self, if_index_v4: u32, if_index_v6: u32) {
+        self.if_index_v4.store(if_index_v4, Ordering::Release);
+        self.if_index_v6.store(if_index_v6, Ordering::Release);
     }
 
     pub fn if_index(&self) -> u32 {
-        self.if_index.load(Ordering::Acquire)
+        let v4 = self.v4_if_index();
+        if v4 != 0 { v4 } else { self.v6_if_index() }
+    }
+
+    pub fn v4_if_index(&self) -> u32 {
+        self.if_index_v4.load(Ordering::Acquire)
+    }
+
+    pub fn v6_if_index(&self) -> u32 {
+        self.if_index_v6.load(Ordering::Acquire)
     }
 
     fn bind_if(&self, sock: &Socket, is_ipv6: bool) -> io::Result<()> {
-        let idx = self.if_index();
+        let idx = if is_ipv6 {
+            self.v6_if_index()
+        } else {
+            self.v4_if_index()
+        };
         if idx == 0 {
             return Ok(());
         }
@@ -258,6 +284,29 @@ impl MacOsBoundIfProtector {
             Ok(())
         }
     }
+
+    fn disable_multicast_loop(&self, sock: &Socket, is_ipv6: bool) {
+        #[cfg(target_os = "macos")]
+        {
+            let idx = if is_ipv6 {
+                self.v6_if_index()
+            } else {
+                self.v4_if_index()
+            };
+            if idx == 0 {
+                return;
+            }
+            if is_ipv6 {
+                let _ = sock.set_multicast_loop_v6(false);
+            } else {
+                let _ = sock.set_multicast_loop_v4(false);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (sock, is_ipv6);
+        }
+    }
 }
 
 impl SocketProtector for MacOsBoundIfProtector {
@@ -276,11 +325,17 @@ impl SocketProtector for MacOsBoundIfProtector {
             Some(sa) => sa.is_ipv6(),
             None => socket_is_ipv6(sock),
         };
-        self.bind_if(sock, is_v6)
+        self.bind_if(sock, is_v6)?;
+        self.disable_multicast_loop(sock, is_v6);
+        Ok(())
     }
 
     fn description(&self) -> String {
-        format!("macos-bound-if(idx={})", self.if_index())
+        format!(
+            "macos-bound-if(v4={},v6={})",
+            self.v4_if_index(),
+            self.v6_if_index()
+        )
     }
 }
 
@@ -1611,5 +1666,30 @@ mod tests {
             .expect("staggered fallback candidate must receive full connect budget");
             assert_eq!(winner, healthy_fallback);
         });
+    }
+
+    #[test]
+    fn macos_bound_if_protector_tracks_independent_v4_and_v6_indices() {
+        let single = MacOsBoundIfProtector::new(5);
+        assert_eq!(single.if_index(), 5);
+        assert_eq!(single.v4_if_index(), 5);
+        assert_eq!(single.v6_if_index(), 5);
+        assert_eq!(single.description(), "macos-bound-if(v4=5,v6=5)");
+
+        let dual = MacOsBoundIfProtector::new_dual_stack(7, 11);
+        assert_eq!(dual.v4_if_index(), 7);
+        assert_eq!(dual.v6_if_index(), 11);
+        assert_eq!(dual.if_index(), 7);
+        assert_eq!(dual.description(), "macos-bound-if(v4=7,v6=11)");
+
+        dual.update_indices(0, 14);
+        assert_eq!(dual.v4_if_index(), 0);
+        assert_eq!(dual.v6_if_index(), 14);
+        assert_eq!(dual.if_index(), 14);
+        assert_eq!(dual.description(), "macos-bound-if(v4=0,v6=14)");
+
+        dual.set_if_index(9);
+        assert_eq!(dual.v4_if_index(), 9);
+        assert_eq!(dual.v6_if_index(), 9);
     }
 }

@@ -3552,6 +3552,98 @@ async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> i
         })
         .collect();
 
+    let recent_all = engine.hub().diagnostics_snapshot(100);
+    let mut active_cnt = 0usize;
+    let mut connecting_cnt = 0usize;
+    let mut closed_cnt = 0usize;
+    let mut failed_cnt = 0usize;
+    let mut by_exit: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut by_network: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut zero_download_tcp_count = 0usize;
+    let mut tun_fake_ip_count = 0usize;
+    let mut tun_real_ip_count = 0usize;
+    for entry in &recent_all {
+        match entry.status.as_str() {
+            "active" => active_cnt += 1,
+            "connecting" => connecting_cnt += 1,
+            "closed" => closed_cnt += 1,
+            "failed" => failed_cnt += 1,
+            _ => {}
+        }
+        let exit_key = if entry.exit_type.is_empty() {
+            "UNKNOWN"
+        } else {
+            entry.exit_type.as_str()
+        };
+        *by_exit.entry(exit_key.to_string()).or_insert(0) += 1;
+        let net_key = if entry.metadata.network.is_empty() {
+            "unknown"
+        } else {
+            entry.metadata.network.as_str()
+        };
+        *by_network.entry(net_key.to_string()).or_insert(0) += 1;
+        if net_key.eq_ignore_ascii_case("tcp") && entry.upload > 0 && entry.download == 0 {
+            zero_download_tcp_count += 1;
+        }
+        if entry.metadata.inbound_type.starts_with("TUN") {
+            if entry
+                .metadata
+                .fake_ip
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            {
+                tun_fake_ip_count += 1;
+            } else {
+                tun_real_ip_count += 1;
+            }
+        }
+    }
+    let recent_connections_summary = serde_json::json!({
+        "sampled_count": recent_all.len(),
+        "active": active_cnt,
+        "connecting": connecting_cnt,
+        "closed": closed_cnt,
+        "failed": failed_cnt,
+        "by_exit": by_exit,
+        "by_network": by_network,
+        "zero_download_tcp_count": zero_download_tcp_count,
+        "tun_fake_ip_count": tun_fake_ip_count,
+        "tun_real_ip_count": tun_real_ip_count,
+    });
+
+    let failed_diagnostics_redacted: Vec<serde_json::Value> = engine
+        .hub()
+        .failed_diagnostics_snapshot(50)
+        .into_iter()
+        .map(|mut d| {
+            d.metadata.host = scrub_sensitive_substrings(&d.metadata.host, &known_secrets);
+            d.metadata.source = scrub_sensitive_substrings(&d.metadata.source, &known_secrets);
+            if let Some(ip) = d.metadata.destination_ip.take() {
+                d.metadata.destination_ip = Some(scrub_sensitive_substrings(&ip, &known_secrets));
+            }
+            if let Some(fip) = d.metadata.fake_ip.take() {
+                d.metadata.fake_ip = Some(scrub_sensitive_substrings(&fip, &known_secrets));
+            }
+            if let Some(proc_name) = d.metadata.process.take() {
+                d.metadata.process = Some(scrub_sensitive_substrings(&proc_name, &known_secrets));
+            }
+            d.rule_payload = scrub_sensitive_substrings(&d.rule_payload, &known_secrets);
+            d.effective_outbound =
+                scrub_sensitive_substrings(&d.effective_outbound, &known_secrets);
+            d.remote_endpoint = scrub_sensitive_substrings(&d.remote_endpoint, &known_secrets);
+            d.chains = d
+                .chains
+                .into_iter()
+                .map(|c| scrub_sensitive_substrings(&c, &known_secrets))
+                .collect();
+            if let Some(err) = d.error.take() {
+                d.error = Some(scrub_sensitive_substrings(&err, &known_secrets));
+            }
+            serde_json::to_value(d).unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+
     Json(serde_json::json!({
         "product": "rust-clash",
         "version": env!("CARGO_PKG_VERSION"),
@@ -3573,6 +3665,8 @@ async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> i
             "fake_ip_entries": dns.entry_count(),
             "cached_records": dns.cached_record_count(),
         },
+        "recent_connections_summary": recent_connections_summary,
+        "failed_diagnostics": failed_diagnostics_redacted,
         "recent_logs": logs_redacted,
     }))
 }
@@ -4278,5 +4372,77 @@ rules:
             parse_explain_target("1.1.1.1").unwrap().to_string(),
             "1.1.1.1:443"
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_export_includes_redacted_failed_diagnostics_and_summary() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustclash-api-diag-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let yaml = "mixed-port: 0\nexternal-controller: \"\"\nsecret: \"super-secret-token-99\"\nmode: rule\nproxies:\n  - name: demo-ss\n    type: ss\n    server: 198.51.100.20\n    port: 8388\n    cipher: aes-128-gcm\n    password: \"ss-secret-pass-42\"\nrules:\n  - MATCH,DIRECT\n";
+        let mut cfg = ClashConfig::from_yaml_str(yaml).unwrap();
+        cfg.dns.enable = false;
+        let engine = ProxyEngine::start_with_state_dir(cfg, tmp_dir.clone())
+            .await
+            .unwrap();
+
+        // Register a failed diagnostic whose error accidentally mentions a secret substring
+        let target = crate::addr::TargetAddr::new_domain("fail.example.test", 443).unwrap();
+        let g = engine.hub().register_connection_guard(
+            "Mixed(SOCKS5)",
+            "tcp",
+            None,
+            &target,
+            None,
+            "MATCH",
+            "",
+            vec!["demo-ss".to_string()],
+        );
+        g.record_failed("auth failed with ss-secret-pass-42 and super-secret-token-99");
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (bound, server_handle) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), stop_rx)
+            .await
+            .unwrap();
+
+        let mut conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        conn.write_all(
+            format!(
+                "GET /diagnostics/export HTTP/1.1\r\nHost: {bound}\r\nAuthorization: Bearer super-secret-token-99\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut raw = Vec::new();
+        conn.read_to_end(&mut raw).await.unwrap();
+        assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+        let body = extract_http_response_body_str(&raw).unwrap();
+        assert!(
+            !body.contains("ss-secret-pass-42") && !body.contains("super-secret-token-99"),
+            "export bundle must never leak secrets in failed_diagnostics"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let failed = parsed["failed_diagnostics"]
+            .as_array()
+            .expect("failed_diagnostics array");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["metadata"]["host"], "fail.example.test");
+        assert_eq!(failed[0]["status"], "failed");
+        assert!(
+            failed[0]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("auth failed")),
+            "redacted error context must be preserved"
+        );
+        assert_eq!(parsed["recent_connections_summary"]["failed"], 1);
+        assert_eq!(parsed["recent_connections_summary"]["sampled_count"], 1);
+
+        let _ = stop_tx.send(true);
+        let _ = server_handle.await;
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

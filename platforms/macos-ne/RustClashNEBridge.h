@@ -71,6 +71,10 @@ void rc_ne_flush_dns(RcNeEngineHandle *handle);
 /// on macOS sleep/wake (`NEPacketTunnelProvider.wake()`) or physical interface transitions.
 bool rc_ne_notify_network_change(RcNeEngineHandle *handle);
 
+/// Toggle low-power / sleep mode (`NEPacketTunnelProvider.sleep` -> `true`, `wake()` -> `false`)
+/// to pause background health/preconnect loops and reap idle multiplexed sessions while asleep.
+bool rc_ne_set_low_power_mode(RcNeEngineHandle *handle, bool enabled);
+
 /// Return a newly allocated UTF-8 JSON status snapshot (caller frees with `rc_ne_free_string`).
 char *rc_ne_get_status_json(RcNeEngineHandle *handle);
 
