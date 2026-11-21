@@ -20,6 +20,7 @@ use url::Url;
 use crate::{
     addr::{HostName, TargetAddr},
     error::{ProxyError, Result},
+    inbound::sniff::{MAX_SNIFF_BYTES, SniffOutcomeWithProto, SniffedProtocol, sniff_tcp_protocol},
     outbound::{BoxedStream, OutboundHandler},
     router::Router,
     tracker::{ActiveConnection, TelemetryHub},
@@ -29,6 +30,7 @@ const MAX_MIXED_CONNECTIONS: usize = 1024;
 const MAX_UDP_ASSOC_INFLIGHT: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const MIXED_SNIFF_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Dynamic access-control and authentication policy for the Mixed (HTTP + SOCKS5) inbound listener.
 #[derive(Clone, Debug)]
@@ -525,6 +527,112 @@ async fn relay_bidirectional_coalesced(
     Ok(())
 }
 
+enum MixedTcpSniffResult {
+    EofEmpty,
+    Sniffed {
+        domain: String,
+        protocol: SniffedProtocol,
+        payload: Vec<u8>,
+    },
+    NoDomain {
+        payload: Vec<u8>,
+    },
+}
+
+async fn sniff_tcp_stream_initial_payload(
+    tcp: &mut TcpStream,
+    initial_bytes: &[u8],
+    timeout: Duration,
+    allow_tls: bool,
+    allow_http: bool,
+) -> MixedTcpSniffResult {
+    let mut buf = Vec::with_capacity(initial_bytes.len().max(1024));
+    if !initial_bytes.is_empty() {
+        buf.extend_from_slice(initial_bytes);
+        match sniff_tcp_protocol(&buf, allow_tls, allow_http) {
+            SniffOutcomeWithProto::Domain { domain, protocol } => {
+                return MixedTcpSniffResult::Sniffed {
+                    domain,
+                    protocol,
+                    payload: buf,
+                };
+            }
+            SniffOutcomeWithProto::NoHostname => {
+                return MixedTcpSniffResult::NoDomain { payload: buf };
+            }
+            SniffOutcomeWithProto::NeedMoreBytes => {
+                if buf.len() >= MAX_SNIFF_BYTES {
+                    return MixedTcpSniffResult::NoDomain { payload: buf };
+                }
+            }
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut tmp = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return MixedTcpSniffResult::NoDomain { payload: buf };
+        }
+        let max_read = MAX_SNIFF_BYTES.saturating_sub(buf.len()).min(tmp.len());
+        if max_read == 0 {
+            return MixedTcpSniffResult::NoDomain { payload: buf };
+        }
+        match tokio::time::timeout(remaining, tcp.read(&mut tmp[..max_read])).await {
+            Ok(Ok(0)) => {
+                return if buf.is_empty() {
+                    MixedTcpSniffResult::EofEmpty
+                } else {
+                    MixedTcpSniffResult::NoDomain { payload: buf }
+                };
+            }
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                match sniff_tcp_protocol(&buf, allow_tls, allow_http) {
+                    SniffOutcomeWithProto::Domain { domain, protocol } => {
+                        return MixedTcpSniffResult::Sniffed {
+                            domain,
+                            protocol,
+                            payload: buf,
+                        };
+                    }
+                    SniffOutcomeWithProto::NoHostname => {
+                        return MixedTcpSniffResult::NoDomain { payload: buf };
+                    }
+                    SniffOutcomeWithProto::NeedMoreBytes => {
+                        if buf.len() >= MAX_SNIFF_BYTES {
+                            return MixedTcpSniffResult::NoDomain { payload: buf };
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                return MixedTcpSniffResult::NoDomain { payload: buf };
+            }
+        }
+    }
+}
+
+fn resolve_mixed_dial_target(
+    raw_target: &TargetAddr,
+    decision: &crate::router::RouteDecision,
+    sniffer_cfg: &crate::config::SnifferConfig,
+    sniffed_real_ip: Option<&(String, SniffedProtocol)>,
+) -> TargetAddr {
+    if let Some((domain, proto)) = sniffed_real_ip {
+        if decision.outbound.exit_category() == "PROXY"
+            && sniffer_cfg.should_override_destination(*proto, domain)
+        {
+            decision.target.clone()
+        } else {
+            raw_target.clone()
+        }
+    } else {
+        decision.target.clone()
+    }
+}
+
 struct UdpAssocCleanupGuard {
     udp_task: JoinHandle<()>,
     udp_nat: Arc<crate::inbound::udp_nat::UdpNatManager>,
@@ -568,12 +676,61 @@ async fn handle_socks5(
                     .await;
                 return Err(err);
             }
+
+            let sniffer_cfg = router.sniffer();
+            let should_sniff_real_ip = raw_target.host.as_ip().is_some_and(|dst_ip| {
+                !router.dns().is_fake_ip(dst_ip)
+                    && sniffer_cfg.should_sniff_real_ip_tcp(dst_ip, raw_target.port)
+            });
+
+            let mut reply_sent = false;
+            let mut prefetched_payload = Vec::new();
+            let mut sniffed_real_ip: Option<(String, SniffedProtocol)> = None;
+            let route_target = if should_sniff_real_ip {
+                // Reply with SOCKS5 success so the client immediately transmits its TLS ClientHello
+                // or HTTP request for lossless SNI / Host sniffing (parity with TUN inbound).
+                tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await?;
+                reply_sent = true;
+
+                let allow_tls = sniffer_cfg.should_sniff_tls_port(raw_target.port);
+                let allow_http = sniffer_cfg.should_sniff_http_port(raw_target.port);
+                match sniff_tcp_stream_initial_payload(
+                    tcp,
+                    &[],
+                    MIXED_SNIFF_TIMEOUT,
+                    allow_tls,
+                    allow_http,
+                )
+                .await
+                {
+                    MixedTcpSniffResult::EofEmpty => return Ok(()),
+                    MixedTcpSniffResult::Sniffed {
+                        domain,
+                        protocol,
+                        payload,
+                    } => {
+                        prefetched_payload = payload;
+                        let target = TargetAddr::new_domain(domain.clone(), raw_target.port)
+                            .unwrap_or_else(|_| raw_target.clone());
+                        sniffed_real_ip = Some((domain, protocol));
+                        target
+                    }
+                    MixedTcpSniffResult::NoDomain { payload } => {
+                        prefetched_payload = payload;
+                        raw_target.clone()
+                    }
+                }
+            } else {
+                raw_target.clone()
+            };
+
             let decision = router
                 .route_async_with_context(
                     Some(peer.ip()),
                     Some(peer),
                     crate::platform::process::SocketTransport::Tcp,
-                    &raw_target,
+                    &route_target,
                 )
                 .await;
             if let Err(err) =
@@ -587,12 +744,20 @@ async fn handle_socks5(
                         decision.target
                     ),
                 );
-                let rep = socks5_reply_code_for_io_error(&err);
-                let _ = tcp
-                    .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
+                if !reply_sent {
+                    let rep = socks5_reply_code_for_io_error(&err);
+                    let _ = tcp
+                        .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
                 return Err(err);
             }
+            let dial_target = resolve_mixed_dial_target(
+                &raw_target,
+                &decision,
+                &sniffer_cfg,
+                sniffed_real_ip.as_ref(),
+            );
             let conn_guard = hub.register_connection_with_outbound_guard(
                 "Mixed(SOCKS5)",
                 "tcp",
@@ -620,7 +785,7 @@ async fn handle_socks5(
             let dial_start = Instant::now();
             let outbound_stream = match connect_outbound_with_timeout(
                 decision.outbound.as_ref(),
-                &decision.target,
+                &dial_target,
                 &conn_entry,
             )
             .await
@@ -628,22 +793,31 @@ async fn handle_socks5(
                 Ok(s) => s,
                 Err(err) => {
                     conn_guard.record_failed(&err.to_string());
-                    let rep = socks5_reply_code_for_io_error(&err);
-                    let _ = tcp
-                        .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                        .await;
+                    if !reply_sent {
+                        let rep = socks5_reply_code_for_io_error(&err);
+                        let _ = tcp
+                            .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                            .await;
+                    }
                     return Err(err);
                 }
             };
             conn_guard.mark_established();
             record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
-            // Success reply: BND.ADDR 0.0.0.0:0
-            tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await?;
+            if !reply_sent {
+                // Success reply: BND.ADDR 0.0.0.0:0
+                tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await?;
+            }
             let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
+            let had_prefetched = !prefetched_payload.is_empty();
+            if had_prefetched {
+                tracked.write_all(&prefetched_payload).await?;
+                tracked.flush().await?;
+            }
 
-            relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, false).await
+            relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, had_prefetched).await
         }
         0x03 => {
             // UDP ASSOCIATE: bind ephemeral relay socket on the local interface facing `peer`
@@ -987,12 +1161,64 @@ async fn handle_http_proxy(
             let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
             return Err(err);
         }
+
+        let sniffer_cfg = router.sniffer();
+        let should_sniff_real_ip = raw_target.host.as_ip().is_some_and(|dst_ip| {
+            !router.dns().is_fake_ip(dst_ip)
+                && sniffer_cfg.should_sniff_real_ip_tcp(dst_ip, raw_target.port)
+        });
+
+        let mut reply_sent = false;
+        let mut prefetched_payload = Vec::new();
+        let mut sniffed_real_ip: Option<(String, SniffedProtocol)> = None;
+        let route_target = if should_sniff_real_ip {
+            // Acknowledge CONNECT early so the client sends its TLS ClientHello / HTTP request
+            // for lossless SNI / Host sniffing (parity with TUN inbound).
+            tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+            reply_sent = true;
+
+            let allow_tls = sniffer_cfg.should_sniff_tls_port(raw_target.port);
+            let allow_http = sniffer_cfg.should_sniff_http_port(raw_target.port);
+            match sniff_tcp_stream_initial_payload(
+                tcp,
+                trailing_body,
+                MIXED_SNIFF_TIMEOUT,
+                allow_tls,
+                allow_http,
+            )
+            .await
+            {
+                MixedTcpSniffResult::EofEmpty => return Ok(()),
+                MixedTcpSniffResult::Sniffed {
+                    domain,
+                    protocol,
+                    payload,
+                } => {
+                    prefetched_payload = payload;
+                    let target = TargetAddr::new_domain(domain.clone(), raw_target.port)
+                        .unwrap_or_else(|_| raw_target.clone());
+                    sniffed_real_ip = Some((domain, protocol));
+                    target
+                }
+                MixedTcpSniffResult::NoDomain { payload } => {
+                    prefetched_payload = payload;
+                    raw_target.clone()
+                }
+            }
+        } else {
+            if !trailing_body.is_empty() {
+                prefetched_payload.extend_from_slice(trailing_body);
+            }
+            raw_target.clone()
+        };
+
         let decision = router
             .route_async_with_context(
                 Some(peer.ip()),
                 Some(peer),
                 crate::platform::process::SocketTransport::Tcp,
-                &raw_target,
+                &route_target,
             )
             .await;
         if let Err(err) =
@@ -1006,9 +1232,17 @@ async fn handle_http_proxy(
                     decision.target
                 ),
             );
-            let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+            if !reply_sent {
+                let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+            }
             return Err(err);
         }
+        let dial_target = resolve_mixed_dial_target(
+            &raw_target,
+            &decision,
+            &sniffer_cfg,
+            sniffed_real_ip.as_ref(),
+        );
         let conn_guard = hub.register_connection_with_outbound_guard(
             "Mixed(HTTP-CONNECT)",
             "tcp",
@@ -1036,7 +1270,7 @@ async fn handle_http_proxy(
         let dial_start = Instant::now();
         let outbound_stream = match connect_outbound_with_timeout(
             decision.outbound.as_ref(),
-            &decision.target,
+            &dial_target,
             &conn_entry,
         )
         .await
@@ -1044,23 +1278,27 @@ async fn handle_http_proxy(
             Ok(s) => s,
             Err(err) => {
                 conn_guard.record_failed(&err.to_string());
-                let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+                if !reply_sent {
+                    let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
+                }
                 return Err(err);
             }
         };
         conn_guard.mark_established();
         record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
-        tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
+        if !reply_sent {
+            tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+        }
         let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
-        let had_trailing = !trailing_body.is_empty();
-        if had_trailing {
-            tracked.write_all(trailing_body).await?;
+        let had_prefetched = !prefetched_payload.is_empty();
+        if had_prefetched {
+            tracked.write_all(&prefetched_payload).await?;
             tracked.flush().await?;
         }
 
-        relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, had_trailing).await
+        relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, had_prefetched).await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://example.com/foo HTTP/1.1`)
         if uri_part.len() >= 8 && uri_part[..8].eq_ignore_ascii_case("https://") {
@@ -1231,12 +1469,34 @@ async fn handle_http_proxy(
             return Err(err);
         }
 
+        let sniffer_cfg = router.sniffer();
+        let mut sniffed_real_ip: Option<(String, SniffedProtocol)> = None;
+        let route_target = if raw_target.host.as_ip().is_some_and(|dst_ip| {
+            !router.dns().is_fake_ip(dst_ip)
+                && sniffer_cfg.should_sniff_real_ip_tcp(dst_ip, raw_target.port)
+                && sniffer_cfg.should_sniff_http_port(raw_target.port)
+        }) {
+            match sniff_tcp_protocol(&req_buf[..header_end + 4], false, true) {
+                SniffOutcomeWithProto::Domain { domain, protocol } => {
+                    let target = TargetAddr::new_domain(domain.clone(), raw_target.port)
+                        .unwrap_or_else(|_| raw_target.clone());
+                    sniffed_real_ip = Some((domain, protocol));
+                    target
+                }
+                SniffOutcomeWithProto::NeedMoreBytes | SniffOutcomeWithProto::NoHostname => {
+                    raw_target.clone()
+                }
+            }
+        } else {
+            raw_target.clone()
+        };
+
         let decision = router
             .route_async_with_context(
                 Some(peer.ip()),
                 Some(peer),
                 crate::platform::process::SocketTransport::Tcp,
-                &raw_target,
+                &route_target,
             )
             .await;
         if let Err(err) =
@@ -1253,6 +1513,12 @@ async fn handle_http_proxy(
             let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
             return Err(err);
         }
+        let dial_target = resolve_mixed_dial_target(
+            &raw_target,
+            &decision,
+            &sniffer_cfg,
+            sniffed_real_ip.as_ref(),
+        );
         let conn_guard = hub.register_connection_with_outbound_guard(
             "Mixed(HTTP)",
             "tcp",
@@ -1280,7 +1546,7 @@ async fn handle_http_proxy(
         let dial_start = Instant::now();
         let outbound_stream = match connect_outbound_with_timeout(
             decision.outbound.as_ref(),
-            &decision.target,
+            &dial_target,
             &conn_entry,
         )
         .await
@@ -2289,5 +2555,287 @@ mod tests {
             "/?foo=bar"
         );
         assert_eq!(extract_raw_http_origin_path("http://example.com"), "/");
+    }
+
+    struct RecordingProxyOutbound {
+        name: &'static str,
+        backend_addr: SocketAddr,
+        dialed: Arc<parking_lot::Mutex<Vec<TargetAddr>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for RecordingProxyOutbound {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+            self.dialed.lock().push(target.clone());
+            let stream = TcpStream::connect(self.backend_addr).await?;
+            Ok(Box::new(stream))
+        }
+    }
+
+    fn build_test_tls_client_hello(sni: &str, padding_len: usize) -> Vec<u8> {
+        let host_bytes = sni.as_bytes();
+        let mut sni_ext_body = Vec::new();
+        let list_len = (1 + 2 + host_bytes.len()) as u16;
+        sni_ext_body.extend_from_slice(&list_len.to_be_bytes());
+        sni_ext_body.push(0x00); // host_name
+        sni_ext_body.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        sni_ext_body.extend_from_slice(host_bytes);
+
+        let mut exts = Vec::new();
+        if padding_len > 0 {
+            exts.extend_from_slice(&0x0015u16.to_be_bytes()); // padding ext before SNI (PQ-like)
+            exts.extend_from_slice(&(padding_len as u16).to_be_bytes());
+            exts.resize(exts.len() + padding_len, 0x00);
+        }
+        exts.extend_from_slice(&0x0000u16.to_be_bytes()); // server_name
+        exts.extend_from_slice(&(sni_ext_body.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&sni_ext_body);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2 legacy version
+        body.extend_from_slice(&[0x42; 32]); // random
+        body.push(0x00); // session_id_len
+        body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites_len
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(0x01); // comp_methods_len
+        body.push(0x00); // null compression
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = Vec::with_capacity(4 + body.len());
+        hs.push(0x01); // ClientHello
+        let hs_len = body.len();
+        hs.push(((hs_len >> 16) & 0xff) as u8);
+        hs.push(((hs_len >> 8) & 0xff) as u8);
+        hs.push((hs_len & 0xff) as u8);
+        hs.extend_from_slice(&body);
+
+        let mut rec = Vec::with_capacity(5 + hs.len());
+        rec.push(0x16); // Handshake
+        rec.extend_from_slice(&[0x03, 0x01]); // TLS 1.0 record layer
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[tokio::test]
+    async fn mixed_real_ip_sniffer_routes_and_overrides_socks5_http_connect_and_plain_http() {
+        // Spawn a raw echo backend for TLS streams and a capturing HTTP origin for plain HTTP
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_jh = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = echo_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if s.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let (http_origin_addr, captured_http, http_jh) = spawn_capturing_http_origin("SNIFF").await;
+
+        let proxy_dialed = Arc::new(parking_lot::Mutex::new(Vec::<TargetAddr>::new()));
+        let http_proxy_dialed = Arc::new(parking_lot::Mutex::new(Vec::<TargetAddr>::new()));
+        let fallback_dialed = Arc::new(parking_lot::Mutex::new(Vec::<TargetAddr>::new()));
+
+        let mut outbounds: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        outbounds.insert(
+            "proxy-tls".to_string(),
+            Arc::new(RecordingProxyOutbound {
+                name: "proxy-tls",
+                backend_addr: echo_addr,
+                dialed: Arc::clone(&proxy_dialed),
+            }),
+        );
+        outbounds.insert(
+            "proxy-http".to_string(),
+            Arc::new(RecordingProxyOutbound {
+                name: "proxy-http",
+                backend_addr: http_origin_addr,
+                dialed: Arc::clone(&http_proxy_dialed),
+            }),
+        );
+        outbounds.insert(
+            "fallback".to_string(),
+            Arc::new(RecordingProxyOutbound {
+                name: "fallback",
+                backend_addr: echo_addr,
+                dialed: Arc::clone(&fallback_dialed),
+            }),
+        );
+
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &[
+                    "DOMAIN-SUFFIX,web.sniffed.test,proxy-http".to_string(),
+                    "DOMAIN-SUFFIX,sniffed.test,proxy-tls".to_string(),
+                    "MATCH,fallback".to_string(),
+                ],
+                dns,
+            )
+            .unwrap(),
+        );
+        let mut sniffer = crate::config::SnifferConfig::default();
+        sniffer.skip_domain.push("skip.sniffed.test".to_string());
+        router.set_sniffer(sniffer);
+
+        let hub = Arc::new(TelemetryHub::new());
+        let policy = Arc::new(RwLock::new(MixedInboundPolicy::default()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mixed_addr, mixed_jh) = spawn_mixed_inbound_with_policy(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(router)),
+            policy,
+            Arc::clone(&hub),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        // 1. SOCKS5 real public IP (93.184.216.34:443) with 2-chunk PQ-sized TLS ClientHello
+        {
+            let hello = build_test_tls_client_hello("api.sniffed.test", 1800);
+            let mut s = TcpStream::connect(mixed_addr).await.unwrap();
+            s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut g = [0u8; 2];
+            s.read_exact(&mut g).await.unwrap();
+            assert_eq!(g, [0x05, 0x00]);
+            let mut req = vec![0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34];
+            req.extend_from_slice(&443u16.to_be_bytes());
+            s.write_all(&req).await.unwrap();
+            let mut rep = [0u8; 10];
+            s.read_exact(&mut rep).await.unwrap();
+            assert_eq!(rep[1], 0x00);
+
+            // Split ClientHello across two writes to verify lossless multi-segment reassembly!
+            let split = 900;
+            s.write_all(&hello[..split]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            s.write_all(&hello[split..]).await.unwrap();
+
+            let mut echoed = vec![0u8; hello.len()];
+            tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut echoed))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                echoed, hello,
+                "SOCKS5 sniffed ClientHello must be forwarded completely without byte loss"
+            );
+        }
+
+        // 2. HTTP CONNECT real public IP (93.184.216.34:443) with TLS SNI
+        {
+            let hello = build_test_tls_client_hello("connect.sniffed.test", 0);
+            let mut s = TcpStream::connect(mixed_addr).await.unwrap();
+            s.write_all(b"CONNECT 93.184.216.34:443 HTTP/1.1\r\nHost: 93.184.216.34:443\r\n\r\n")
+                .await
+                .unwrap();
+            let mut resp = vec![0u8; 39];
+            s.read_exact(&mut resp).await.unwrap();
+            assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"));
+
+            s.write_all(&hello).await.unwrap();
+            let mut echoed = vec![0u8; hello.len()];
+            tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut echoed))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(echoed, hello);
+        }
+
+        // 3. Plain HTTP GET http://93.184.216.34/check with Host: web.sniffed.test
+        {
+            let mut s = TcpStream::connect(mixed_addr).await.unwrap();
+            s.write_all(
+                b"GET http://93.184.216.34/check HTTP/1.1\r\nHost: web.sniffed.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut resp = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut resp))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&resp).contains("SNIFF:/check:body="));
+        }
+
+        // 4. `skip-domain` (`skip.sniffed.test`) routes via DOMAIN-SUFFIX to `proxy-tls`,
+        //    but preserves the original IP `93.184.216.34:443` as the remote dial target!
+        {
+            let hello = build_test_tls_client_hello("skip.sniffed.test", 0);
+            let mut s = TcpStream::connect(mixed_addr).await.unwrap();
+            s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut g = [0u8; 2];
+            s.read_exact(&mut g).await.unwrap();
+            let mut req = vec![0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34];
+            req.extend_from_slice(&443u16.to_be_bytes());
+            s.write_all(&req).await.unwrap();
+            let mut rep = [0u8; 10];
+            s.read_exact(&mut rep).await.unwrap();
+            assert_eq!(rep[1], 0x00);
+
+            s.write_all(&hello).await.unwrap();
+            let mut echoed = vec![0u8; hello.len()];
+            tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut echoed))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(echoed, hello);
+        }
+
+        let tls_targets = proxy_dialed.lock().clone();
+        assert_eq!(
+            tls_targets,
+            vec![
+                TargetAddr::new_domain("api.sniffed.test", 443).unwrap(),
+                TargetAddr::new_domain("connect.sniffed.test", 443).unwrap(),
+                "93.184.216.34:443".parse::<TargetAddr>().unwrap(),
+            ],
+            "SOCKS5 & HTTP CONNECT should override dial target on SNI, while skip-domain retains original IP"
+        );
+        let http_targets = http_proxy_dialed.lock().clone();
+        assert_eq!(
+            http_targets,
+            vec![TargetAddr::new_domain("web.sniffed.test", 80).unwrap()],
+            "Plain HTTP real-IP request should route & override via Host header"
+        );
+        assert!(
+            fallback_dialed.lock().is_empty(),
+            "All sniffed real-IP connections should match DOMAIN-SUFFIX instead of falling through to MATCH"
+        );
+        assert_eq!(captured_http.lock().await.len(), 1);
+
+        let _ = shutdown_tx.send(true);
+        mixed_jh.abort();
+        echo_jh.abort();
+        http_jh.abort();
     }
 }

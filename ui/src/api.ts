@@ -425,13 +425,22 @@ export async function probeControllerSettings(
     headers.set("Authorization", `Bearer ${secret}`);
   }
   let resp: Response;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25_000);
   try {
-    resp = await fetch(url, { headers });
+    resp = await fetch(url, { headers, signal: controller.signal });
   } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        `Connection test to RustClash controller at ${base || "local origin"} timed out (25s).`,
+      );
+    }
     const detail = err instanceof Error && err.message ? ` (${err.message})` : "";
     throw new Error(
       `Cannot reach RustClash controller API at ${base || "local origin"}${detail}.`,
     );
+  } finally {
+    clearTimeout(timeoutId);
   }
   if (!resp.ok) {
     let errText = `${resp.status} ${resp.statusText}`.trim();
@@ -765,9 +774,9 @@ export const clashApi = {
     apiFetch<void>(`/connections/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
-  getConnectionDiagnostics: (limit = 150) =>
+  getConnectionDiagnostics: (limit = 150, failedOnly = false) =>
     apiFetch<{ diagnostics: ConnectionItem[] }>(
-      `/connections/diagnostics?limit=${limit}`,
+      `/connections/diagnostics?limit=${limit}${failedOnly ? "&failed_only=true" : ""}`,
     ),
   clearConnectionDiagnostics: () =>
     apiFetch<void>("/connections/diagnostics", { method: "DELETE" }),

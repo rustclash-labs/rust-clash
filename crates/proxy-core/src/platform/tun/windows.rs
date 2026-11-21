@@ -1384,6 +1384,7 @@ mod win_impl {
             let _ = update_current_journal(&ctx.state_dir, |j| j.windows_tun = Some(rec_snap));
         }
 
+        flush_windows_dns_resolver_cache();
         ctx.transitions.fetch_add(1, Ordering::Relaxed);
         if let Some(hook) = &ctx.net_hook {
             hook();

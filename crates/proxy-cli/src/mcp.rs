@@ -264,11 +264,11 @@ pub fn resolve_controller_clients_in_state_dir(
     out
 }
 
-pub fn resolve_controller_client(
+pub fn resolve_controller_clients(
     explicit_controller: Option<&str>,
     explicit_secret: Option<&str>,
     fallback_cfg: Option<&ClashConfig>,
-) -> Option<ControllerClient> {
+) -> Vec<ControllerClient> {
     let state_dir = proxy_core::platform::recovery::default_state_dir();
     resolve_controller_clients_in_state_dir(
         &state_dir,
@@ -276,11 +276,9 @@ pub fn resolve_controller_client(
         explicit_secret,
         fallback_cfg,
     )
-    .into_iter()
-    .next()
 }
 
-enum LiveControllerOutcome {
+pub(crate) enum LiveControllerOutcome {
     Response {
         client: ControllerClient,
         status: u16,
@@ -292,7 +290,7 @@ enum LiveControllerOutcome {
     Unreachable,
 }
 
-async fn request_live_controller_json(
+pub(crate) async fn request_live_controller_json(
     clients: &[ControllerClient],
     method: &str,
     path_and_query: &str,
@@ -328,7 +326,7 @@ async fn request_live_controller_json(
     }
 }
 
-fn auth_rejected_note(status: u16) -> String {
+pub(crate) fn auth_rejected_note(status: u16) -> String {
     let label = if status == 401 {
         "Unauthorized"
     } else {
@@ -1692,7 +1690,7 @@ async fn execute_tool_call_with_state_dir(
                     if let Some(map) = proxies_val.get("proxies").and_then(|v| v.as_object()) {
                         for (k, info) in map {
                             let ty = info.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if matches!(ty, "Selector" | "URLTest" | "Fallback") {
+                            if matches!(ty, "Selector" | "URLTest" | "Fallback" | "LoadBalance") {
                                 groups_summary.push(json!({
                                     "name": k,
                                     "type": ty,
@@ -3588,6 +3586,80 @@ rules:
         );
 
         drop(stall_guard);
+        let _ = shutdown_tx.send(true);
+        engine.shutdown_async().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn get_proxy_status_includes_load_balance_groups() {
+        let state_dir =
+            std::env::temp_dir().join(format!("rustclash-mcp-lb-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let yaml = r#"
+mixed-port: 0
+external-controller: ""
+mode: rule
+proxies:
+  - name: node-a
+    type: ss
+    server: 198.51.100.11
+    port: 8388
+    cipher: aes-128-gcm
+    password: pass-a
+  - name: node-b
+    type: ss
+    server: 198.51.100.12
+    port: 8388
+    cipher: aes-128-gcm
+    password: pass-b
+proxy-groups:
+  - name: LB-POOL
+    type: load-balance
+    strategy: consistent-hashing
+    proxies:
+      - node-a
+      - node-b
+rules:
+  - MATCH,LB-POOL
+"#;
+        let mut cfg = ClashConfig::from_yaml_str(yaml).unwrap();
+        cfg.dns.enable = false;
+        let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+            .await
+            .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_addr, api_task) =
+            proxy_core::api::spawn_api_server("127.0.0.1:0", engine.clone(), shutdown_rx)
+                .await
+                .expect("spawn api server");
+        engine
+            .publish_controller_discovery(state_dir.clone(), bound_addr)
+            .expect("write controller discovery");
+
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: None,
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let res =
+            execute_tool_call_with_state_dir("get_proxy_status", &json!({}), &opts, &state_dir)
+                .await;
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let groups = parsed["groups"].as_array().expect("groups array");
+        assert!(
+            groups.iter().any(|g| g["name"] == "LB-POOL"
+                && g["type"] == "LoadBalance"
+                && g["member_count"] == 2),
+            "get_proxy_status must include LoadBalance groups: {groups:?}"
+        );
+
         let _ = shutdown_tx.send(true);
         engine.shutdown_async().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;

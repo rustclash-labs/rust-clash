@@ -1005,11 +1005,219 @@ pub struct ElevatedRelaunchOutcome {
     pub message: Option<String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowsUacSpawnOutcome {
+enum ElevatedSpawnOutcome {
     Launched,
     Cancelled,
+}
+
+/// POSIX single-quote escaping (`'` -> `'\''`) for shell arguments passed to macOS `osascript`.
+pub fn shell_single_quote(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('\'');
+    for ch in raw.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Escape an arbitrary string for inclusion inside an AppleScript double-quoted string literal.
+pub fn escape_applescript_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Build an AppleScript snippet invoking `do shell script ... with administrator privileges`
+/// that launches the elevated replacement process detached (`nohup ... &`) while preserving
+/// `RUST_CLASH_STATE_DIR` so the root process shares the user's profiles, prefs, and lockfile.
+pub fn build_macos_osascript_elevation_script(
+    exe_path: &Path,
+    state_dir: &Path,
+    args: &[&str],
+) -> String {
+    let mut shell_parts = Vec::with_capacity(args.len() + 4);
+    shell_parts.push("nohup".to_string());
+    shell_parts.push("/usr/bin/env".to_string());
+    shell_parts.push(shell_single_quote(&format!(
+        "RUST_CLASH_STATE_DIR={}",
+        state_dir.display()
+    )));
+    shell_parts.push(shell_single_quote(&exe_path.to_string_lossy()));
+    for arg in args {
+        shell_parts.push(shell_single_quote(arg));
+    }
+    let shell_cmd = format!("{} >/dev/null 2>&1 &", shell_parts.join(" "));
+    format!(
+        "do shell script \"{}\" with administrator privileges with prompt \"RustClash needs administrator privileges to enable System TUN.\"",
+        escape_applescript_string(&shell_cmd)
+    )
+}
+
+/// Detect macOS Authorization Services user cancellation from `osascript` stderr (`(-128)` / `User canceled`).
+pub fn is_macos_osascript_cancelled(stderr: &str) -> bool {
+    let low = stderr.to_ascii_lowercase();
+    low.contains("(-128)") || low.contains("user canceled") || low.contains("user cancelled")
+}
+
+/// Whitelisted Linux desktop session environment variables forwarded across `pkexec` so the
+/// elevated GUI window attaches cleanly to the user's X11 / Wayland display & D-Bus session.
+pub const LINUX_GUI_ENV_ALLOWLIST: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "GDK_BACKEND",
+    "WEBKIT_DISABLE_DMABUF_RENDERER",
+];
+
+/// Build zero-interpolation argv for `pkexec` on Linux, launching the elevated GUI process
+/// detached via `/bin/sh -c 'nohup "$@" >/dev/null 2>&1 &' _ /usr/bin/env ... <exe> <args...>`.
+pub fn build_linux_pkexec_elevation_args(
+    exe_path: &Path,
+    state_dir: &Path,
+    desktop_env: &[(String, String)],
+    args: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(desktop_env.len() + args.len() + 8);
+    out.push("/bin/sh".to_string());
+    out.push("-c".to_string());
+    out.push("nohup \"$@\" >/dev/null 2>&1 &".to_string());
+    out.push("_".to_string());
+    out.push("/usr/bin/env".to_string());
+    out.push(format!("RUST_CLASH_STATE_DIR={}", state_dir.display()));
+    for (k, v) in desktop_env {
+        if !k.is_empty() && !v.is_empty() && !k.contains('=') {
+            out.push(format!("{k}={v}"));
+        }
+    }
+    out.push(exe_path.to_string_lossy().into_owned());
+    for arg in args {
+        out.push((*arg).to_string());
+    }
+    out
+}
+
+/// Detect Polkit `pkexec` user cancellation (exit code `126`).
+pub fn is_linux_pkexec_cancelled(exit_code: Option<i32>) -> bool {
+    exit_code == Some(126)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_elevated_relaunch_macos(
+    exe_path: &Path,
+    state_dir: &Path,
+    args: &[&str],
+) -> Result<ElevatedSpawnOutcome, String> {
+    let script = build_macos_osascript_elevation_script(exe_path, state_dir, args);
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("Failed invoking macOS osascript elevation prompt: {e}"))?;
+    if out.status.success() {
+        return Ok(ElevatedSpawnOutcome::Launched);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if is_macos_osascript_cancelled(&stderr) {
+        return Ok(ElevatedSpawnOutcome::Cancelled);
+    }
+    let detail = if stderr.is_empty() {
+        format!("exit {}", out.status)
+    } else {
+        stderr
+    };
+    Err(format!("macOS administrator elevation failed: {detail}"))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_pkexec_binary() -> Option<PathBuf> {
+    for candidate in [
+        "/usr/bin/pkexec",
+        "/bin/pkexec",
+        "/usr/local/bin/pkexec",
+        "/run/current-system/sw/bin/pkexec",
+    ] {
+        let p = Path::new(candidate);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let p = dir.join("pkexec");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn has_linux_desktop_session_env() -> bool {
+    std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_desktop_env() -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    for &key in LINUX_GUI_ENV_ALLOWLIST {
+        if let Ok(val) = std::env::var(key)
+            && !val.trim().is_empty()
+        {
+            vars.push((key.to_string(), val));
+        }
+    }
+    vars
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_elevated_relaunch_linux(
+    pkexec_bin: &Path,
+    exe_path: &Path,
+    state_dir: &Path,
+    desktop_env: &[(String, String)],
+    args: &[&str],
+) -> Result<ElevatedSpawnOutcome, String> {
+    let pk_args = build_linux_pkexec_elevation_args(exe_path, state_dir, desktop_env, args);
+    let out = std::process::Command::new(pkexec_bin)
+        .args(&pk_args)
+        .output()
+        .map_err(|e| format!("Failed invoking Polkit pkexec elevation prompt: {e}"))?;
+    if out.status.success() {
+        return Ok(ElevatedSpawnOutcome::Launched);
+    }
+    if is_linux_pkexec_cancelled(out.status.code()) {
+        return Ok(ElevatedSpawnOutcome::Cancelled);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        format!("exit {}", out.status)
+    } else {
+        stderr
+    };
+    Err(format!("Linux Polkit elevation failed: {detail}"))
 }
 
 #[cfg(windows)]
@@ -1021,7 +1229,7 @@ fn to_wide_nul(text: &str) -> Vec<u16> {
 fn spawn_elevated_relaunch_windows(
     exe_path: &Path,
     args: &[&str],
-) -> Result<WindowsUacSpawnOutcome, String> {
+) -> Result<ElevatedSpawnOutcome, String> {
     use windows_sys::Win32::{
         Foundation::{ERROR_CANCELLED, GetLastError},
         System::Com::{
@@ -1081,19 +1289,21 @@ fn spawn_elevated_relaunch_windows(
 
     let ok = unsafe { ShellExecuteExW(&mut info) };
     if ok != 0 {
-        return Ok(WindowsUacSpawnOutcome::Launched);
+        return Ok(ElevatedSpawnOutcome::Launched);
     }
     let err_code = unsafe { GetLastError() };
     if err_code == ERROR_CANCELLED {
-        return Ok(WindowsUacSpawnOutcome::Cancelled);
+        return Ok(ElevatedSpawnOutcome::Cancelled);
     }
     Err(format!(
         "Windows UAC elevation launch failed (Win32 error {err_code})"
     ))
 }
 
-/// Validates TUN driver/privilege preflight and, on Windows, triggers a UAC `"runas"` relaunch of
-/// the current executable with `--relaunch-enable-tun` (and optional `--preserve-sysproxy`).
+/// Validates TUN driver/privilege preflight and triggers an OS-native administrator relaunch
+/// (Windows UAC `ShellExecuteExW("runas")`, macOS `osascript ... with administrator privileges`,
+/// or Linux desktop Polkit `pkexec`) of the current executable with `--relaunch-enable-tun`
+/// (and optional `--preserve-sysproxy`).
 ///
 /// Returns `(outcome, should_exit_current_instance)` where `should_exit_current_instance` is
 /// `true` strictly for the single call that spawned the elevated replacement process.
@@ -1118,7 +1328,7 @@ pub async fn prepare_and_spawn_elevated_tun_relaunch(
             .unwrap_or_else(|| "System TUN driver is unavailable".to_string()));
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = preserve_sysproxy;
         Ok((
@@ -1130,8 +1340,31 @@ pub async fn prepare_and_spawn_elevated_tun_relaunch(
         ))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     {
+        #[cfg(target_os = "linux")]
+        let pkexec_bin = {
+            if !has_linux_desktop_session_env() {
+                return Ok((
+                    ElevatedRelaunchOutcome {
+                        status: "unsupported".to_string(),
+                        message: pf.privilege_hint,
+                    },
+                    false,
+                ));
+            }
+            let Some(bin) = resolve_pkexec_binary() else {
+                return Ok((
+                    ElevatedRelaunchOutcome {
+                        status: "unsupported".to_string(),
+                        message: pf.privilege_hint,
+                    },
+                    false,
+                ));
+            };
+            bin
+        };
+
         if !state.try_begin_elevated_relaunch() {
             return Ok((
                 ElevatedRelaunchOutcome {
@@ -1157,30 +1390,45 @@ pub async fn prepare_and_spawn_elevated_tun_relaunch(
                 return Err(format!("Failed resolving current executable path: {err}"));
             }
         };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let state_dir = state.engine.state_dir();
+        #[cfg(target_os = "linux")]
+        let desktop_env = collect_linux_desktop_env();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let spawn_res = std::thread::Builder::new()
-            .name("rc-uac-relaunch".to_string())
+            .name("rc-elev-relaunch".to_string())
             .spawn(move || {
+                #[cfg(windows)]
                 let res = spawn_elevated_relaunch_windows(&exe_path, &args);
+                #[cfg(target_os = "macos")]
+                let res = spawn_elevated_relaunch_macos(&exe_path, &state_dir, &args);
+                #[cfg(target_os = "linux")]
+                let res = spawn_elevated_relaunch_linux(
+                    &pkexec_bin,
+                    &exe_path,
+                    &state_dir,
+                    &desktop_env,
+                    &args,
+                );
                 let _ = tx.send(res);
             });
         if let Err(err) = spawn_res {
             state.cancel_elevated_relaunch();
             return Err(format!(
-                "Failed starting UAC elevation worker thread: {err}"
+                "Failed starting administrator elevation worker thread: {err}"
             ));
         }
 
         match rx.await {
-            Ok(Ok(WindowsUacSpawnOutcome::Launched)) => Ok((
+            Ok(Ok(ElevatedSpawnOutcome::Launched)) => Ok((
                 ElevatedRelaunchOutcome {
                     status: "relaunching".to_string(),
                     message: None,
                 },
                 true,
             )),
-            Ok(Ok(WindowsUacSpawnOutcome::Cancelled)) => {
+            Ok(Ok(ElevatedSpawnOutcome::Cancelled)) => {
                 state.cancel_elevated_relaunch();
                 Ok((
                     ElevatedRelaunchOutcome {
@@ -1196,7 +1444,7 @@ pub async fn prepare_and_spawn_elevated_tun_relaunch(
             }
             Err(_) => {
                 state.cancel_elevated_relaunch();
-                Err("UAC elevation worker thread terminated unexpectedly".to_string())
+                Err("Administrator elevation worker thread terminated unexpectedly".to_string())
             }
         }
     }
@@ -1669,7 +1917,7 @@ mod desktop_ipc {
                     let handle_clone = app_handle.clone();
                     let target = !eng.is_tun_active();
                     tauri::async_runtime::spawn(async move {
-                        #[cfg(windows)]
+                        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
                         if target {
                             let cfg = eng.config_snapshot();
                             let pf =
@@ -1683,6 +1931,7 @@ mod desktop_ipc {
                                             tokio::time::sleep(Duration::from_millis(120)).await;
                                             tray_state.shutdown();
                                             handle_clone.exit(0);
+                                            return;
                                         } else if outcome.status == "cancelled"
                                             || outcome.status == "relaunching"
                                         {
@@ -1701,7 +1950,7 @@ mod desktop_ipc {
                                 }
                             }
                         }
-                        #[cfg(not(windows))]
+                        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
                         let _ = &tray_state;
 
                         if let Err(err) = eng.set_tun_active(target).await {
@@ -2250,25 +2499,91 @@ mod tests {
         assert!(state.try_begin_elevated_relaunch());
         state.cancel_elevated_relaunch();
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
-            // On non-Windows CI (e.g. Linux without CAP_NET_ADMIN), helper returns unsupported or already_elevated cleanly.
+            // On headless Linux CI (no DISPLAY / WAYLAND_DISPLAY and no CAP_NET_ADMIN), helper
+            // returns `unsupported` or `already_elevated` cleanly without spawning pkexec.
             let res = prepare_and_spawn_elevated_tun_relaunch(&state, Some(false)).await;
             if let Ok((outcome, should_exit)) = res {
                 assert!(!should_exit);
                 assert!(
                     outcome.status == "unsupported" || outcome.status == "already_elevated",
-                    "unexpected non-Windows status: {:?}",
+                    "unexpected headless status: {:?}",
                     outcome
                 );
             }
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let _ = prepare_and_spawn_elevated_tun_relaunch;
         }
 
         state.shutdown();
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn macos_osascript_and_linux_pkexec_elevation_builders_escape_safely() {
+        use super::{
+            build_linux_pkexec_elevation_args, build_macos_osascript_elevation_script,
+            is_linux_pkexec_cancelled, is_macos_osascript_cancelled,
+        };
+
+        let exe = PathBuf::from("/Applications/RustClash 'Beta' \"App\".app/Contents/MacOS/rc");
+        let state_dir =
+            PathBuf::from("/Users/alice o'brien/Library/Application Support/rust-clash");
+        let script = build_macos_osascript_elevation_script(
+            &exe,
+            &state_dir,
+            &["--relaunch-enable-tun", "--preserve-sysproxy"],
+        );
+        assert!(script.starts_with("do shell script \"nohup /usr/bin/env "));
+        assert!(script.contains("with administrator privileges"));
+        assert!(script.contains("RUST_CLASH_STATE_DIR="));
+        assert!(script.contains("--relaunch-enable-tun"));
+        assert!(script.contains("--preserve-sysproxy"));
+        assert!(script.contains(">/dev/null 2>&1 &\""));
+        // Single quotes and double quotes must be safely escaped for POSIX sh (`'\''`) then AppleScript (`'\\''`, `\"`)
+        assert_eq!(super::shell_single_quote("a'b"), "'a'\\''b'");
+        assert!(script.contains("'\\\\''"));
+        assert!(script.contains("\\\"App\\\""));
+
+        assert!(is_macos_osascript_cancelled(
+            "execution error: User canceled. (-128)"
+        ));
+        assert!(is_macos_osascript_cancelled("User cancelled the dialog"));
+        assert!(!is_macos_osascript_cancelled("permission denied"));
+
+        let env_vars = vec![
+            ("DISPLAY".to_string(), ":0".to_string()),
+            ("XAUTHORITY".to_string(), "/run/user/1000/xauth".to_string()),
+        ];
+        let pk_args = build_linux_pkexec_elevation_args(
+            std::path::Path::new("/opt/rust-clash/rust-clash-desktop"),
+            std::path::Path::new("/home/alice/.config/rust-clash"),
+            &env_vars,
+            &["--relaunch-enable-tun"],
+        );
+        assert_eq!(pk_args[0], "/bin/sh");
+        assert_eq!(pk_args[1], "-c");
+        assert_eq!(pk_args[2], "nohup \"$@\" >/dev/null 2>&1 &");
+        assert_eq!(pk_args[3], "_");
+        assert_eq!(pk_args[4], "/usr/bin/env");
+        assert_eq!(
+            pk_args[5],
+            "RUST_CLASH_STATE_DIR=/home/alice/.config/rust-clash"
+        );
+        assert!(pk_args.contains(&"DISPLAY=:0".to_string()));
+        assert!(pk_args.contains(&"XAUTHORITY=/run/user/1000/xauth".to_string()));
+        assert_eq!(
+            pk_args[pk_args.len() - 2],
+            "/opt/rust-clash/rust-clash-desktop"
+        );
+        assert_eq!(pk_args[pk_args.len() - 1], "--relaunch-enable-tun");
+
+        assert!(is_linux_pkexec_cancelled(Some(126)));
+        assert!(!is_linux_pkexec_cancelled(Some(127)));
+        assert!(!is_linux_pkexec_cancelled(Some(0)));
+        assert!(!is_linux_pkexec_cancelled(None));
     }
 }

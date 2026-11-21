@@ -294,6 +294,53 @@ where
     (!remaining.is_empty()).then_some(remaining)
 }
 
+/// Merge updated physical interface indices for `MacOsBoundIfProtector`, never overwriting a
+/// previously valid non-zero index with `0` (which would turn `IP_BOUND_IF` / `IPV6_BOUND_IF`
+/// into a no-op and loop outbound sockets into `utun`).
+pub fn merge_macos_protector_indices(
+    prev_v4: u32,
+    prev_v6: u32,
+    latest_v4: u32,
+    latest_v6: u32,
+) -> (u32, u32) {
+    let next_v4 = if latest_v4 != 0 { latest_v4 } else { prev_v4 };
+    let next_v6 = if latest_v6 != 0 { latest_v6 } else { prev_v6 };
+    (next_v4, next_v6)
+}
+
+/// Select host bypass IPs that require explicit macOS `/32` (`-host`) or `/128` (`-inet6 -host`)
+/// routes over the physical gateway. Always includes `proxy_bypass_ips` as defense-in-depth, but
+/// omits upstream `dns_bypass_ips` for any address family where `MacOsBoundIfProtector`
+/// (`IP_BOUND_IF` / `IPV6_BOUND_IF`) is active and `dns_hijack` is enabled—otherwise global
+/// `-host` routes allow *other* macOS processes to escape `utun` Fake-IP DNS hijacking!
+pub fn select_macos_physical_bypass_ips(
+    proxy_bypass_ips: &[IpAddr],
+    dns_bypass_ips: &[IpAddr],
+    dns_hijack: bool,
+    has_v4_bound_if: bool,
+    has_v6_bound_if: bool,
+) -> Vec<IpAddr> {
+    let mut out = Vec::with_capacity(proxy_bypass_ips.len() + dns_bypass_ips.len());
+    for &ip in proxy_bypass_ips {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    for &ip in dns_bypass_ips {
+        let protected_by_bound_if = match ip {
+            IpAddr::V4(_) => has_v4_bound_if,
+            IpAddr::V6(_) => has_v6_bound_if,
+        };
+        if dns_hijack && protected_by_bound_if {
+            continue;
+        }
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "macos")]
 mod darwin_impl {
     use std::{
@@ -316,9 +363,9 @@ mod darwin_impl {
     use super::{
         build_macos_bypass_route_commands, decode_darwin_utun_packet, encode_darwin_utun_packet,
         is_utun_split_route_del_arg, map_bsd_device_to_network_service,
-        normalize_macos_ipv6_gateway, parse_macos_route_get_default,
+        merge_macos_protector_indices, normalize_macos_ipv6_gateway, parse_macos_route_get_default,
         resolve_macos_default_egress_outputs, restore_macos_dns_backups_with_runner,
-        rollback_macos_record_with_runner,
+        rollback_macos_record_with_runner, select_macos_physical_bypass_ips,
     };
     use crate::{
         inbound::tun::VirtualTunHandle,
@@ -365,7 +412,9 @@ mod darwin_impl {
         primary_if: Option<String>,
         primary_gw: Option<String>,
         primary_idx: u32,
+        v4_idx: u32,
         v4_gw: Option<String>,
+        v6_idx: u32,
         v6_gw: Option<String>,
     }
 
@@ -390,6 +439,11 @@ mod darwin_impl {
         }
     }
 
+    fn flush_macos_dns_resolver_cache() {
+        let _ = run_cmd("/usr/bin/dscacheutil", &["-flushcache"]);
+        let _ = run_cmd("/usr/bin/killall", &["-HUP", "mDNSResponder"]);
+    }
+
     fn lookup_if_index(if_name: &str) -> u32 {
         let Ok(cstr) = CString::new(if_name) else {
             return 0;
@@ -406,19 +460,17 @@ mod darwin_impl {
             .as_deref()
             .map(parse_macos_route_get_default)
             .unwrap_or((None, None));
-        let v4_gw = if v4_if_raw.as_deref().is_some_and(|s| !s.starts_with("utun")) {
-            v4_gw_raw
-        } else {
-            None
-        };
+        let v4_if = v4_if_raw.filter(|s| !s.starts_with("utun"));
+        let v4_idx = v4_if.as_deref().map(lookup_if_index).unwrap_or(0);
+        let v4_gw = if v4_if.is_some() { v4_gw_raw } else { None };
 
         let (v6_if_raw, v6_gw_raw) = out6
             .as_deref()
             .map(parse_macos_route_get_default)
             .unwrap_or((None, None));
-        let v6_gw = if let Some(ref if6) = v6_if_raw
-            && !if6.starts_with("utun")
-        {
+        let v6_if = v6_if_raw.filter(|s| !s.starts_with("utun"));
+        let v6_idx = v6_if.as_deref().map(lookup_if_index).unwrap_or(0);
+        let v6_gw = if let Some(ref if6) = v6_if {
             v6_gw_raw.map(|g| normalize_macos_ipv6_gateway(&g, Some(if6)))
         } else {
             None
@@ -432,7 +484,9 @@ mod darwin_impl {
             primary_if,
             primary_gw,
             primary_idx,
+            v4_idx,
             v4_gw,
+            v6_idx,
             v6_gw,
         }
     }
@@ -632,11 +686,19 @@ mod darwin_impl {
     fn install_macos_bypass_routes(
         spec: &TunLaunchSpec,
         egress: &MacOsDualStackEgress,
+        has_v4_bound_if: bool,
+        has_v6_bound_if: bool,
         rec: &mut MacOsRecoveryRecord,
     ) {
-        let all_bypass = spec.all_bypass_ips();
+        let effective_bypass = select_macos_physical_bypass_ips(
+            &spec.bypass_ips,
+            &spec.dns_bypass_ips,
+            spec.dns_hijack,
+            has_v4_bound_if,
+            has_v6_bound_if,
+        );
         let cmds = build_macos_bypass_route_commands(
-            &all_bypass,
+            &effective_bypass,
             spec.fake_ip_net,
             spec.tun_ipv6_cidr,
             egress.v4_gw.as_deref(),
@@ -657,6 +719,7 @@ mod darwin_impl {
         let mut outcome = RecoveryOutcome::default();
         let remaining =
             rollback_macos_record_with_runner(rec, &mut outcome, &mut darwin_cmd_runner);
+        flush_macos_dns_resolver_cache();
         for warn_msg in &outcome.warnings {
             tracing::warn!("macOS utun teardown recovery warning: {}", warn_msg);
         }
@@ -690,7 +753,10 @@ mod darwin_impl {
             let initial_egress = detect_macos_dual_stack_egress();
             let (utun_fd, utun_name) = open_darwin_utun_socket(&spec.device_name)?;
 
-            let protector = Arc::new(MacOsBoundIfProtector::new(initial_egress.primary_idx));
+            let protector = Arc::new(MacOsBoundIfProtector::new_dual_stack(
+                initial_egress.v4_idx,
+                initial_egress.v6_idx,
+            ));
             set_global_socket_protector(Arc::clone(&protector) as _);
 
             let mut rec = MacOsRecoveryRecord {
@@ -748,8 +814,14 @@ mod darwin_impl {
                     ]);
                 }
 
-                // Install both IPv4 `/32` (`-host`) and IPv6 `/128` (`-inet6 -host`) physical bypass routes!
-                install_macos_bypass_routes(&spec, &initial_egress, &mut rec);
+                // Install physical bypass routes (proxy servers + DNS only when unprotected / !dns_hijack).
+                install_macos_bypass_routes(
+                    &spec,
+                    &initial_egress,
+                    initial_egress.v4_idx != 0,
+                    initial_egress.v6_idx != 0,
+                    &mut rec,
+                );
 
                 if spec.enable_ipv6 {
                     for net6 in ["::/1", "8000::/1"] {
@@ -778,6 +850,7 @@ mod darwin_impl {
                     &mut rec,
                     &spec.state_dir,
                 );
+                flush_macos_dns_resolver_cache();
 
                 Ok(())
             })();
@@ -952,7 +1025,7 @@ mod darwin_impl {
                 .name("tun-macos-netwatch".into())
                 .spawn(move || {
                     while !stop_watch.load(Ordering::Acquire) {
-                        for _ in 0..60 {
+                        for _ in 0..20 {
                             if stop_watch.load(Ordering::Acquire) {
                                 return;
                             }
@@ -966,24 +1039,56 @@ mod darwin_impl {
                             .primary_if
                             .as_deref()
                             .is_some_and(|s| s.starts_with("utun"))
-                            || latest.primary_idx == 0
+                            || (latest.v4_idx == 0 && latest.v6_idx == 0 && latest.primary_idx == 0)
                         {
                             continue;
                         }
 
-                        let (if_changed, gw_changed) = {
+                        let (effective, if_changed, gw_changed) = {
                             let mut guard = egress_watch.lock();
-                            if *guard == latest {
+                            let prev = guard.clone();
+                            let (next_v4_idx, next_v6_idx) = merge_macos_protector_indices(
+                                prev.v4_idx,
+                                prev.v6_idx,
+                                latest.v4_idx,
+                                latest.v6_idx,
+                            );
+                            let effective = MacOsDualStackEgress {
+                                primary_if: latest.primary_if.clone().or(prev.primary_if.clone()),
+                                primary_gw: latest.primary_gw.clone().or(prev.primary_gw.clone()),
+                                primary_idx: if latest.primary_idx != 0 {
+                                    latest.primary_idx
+                                } else {
+                                    prev.primary_idx
+                                },
+                                v4_idx: next_v4_idx,
+                                v4_gw: if latest.v4_idx != 0 {
+                                    latest.v4_gw.clone()
+                                } else {
+                                    prev.v4_gw.clone()
+                                },
+                                v6_idx: next_v6_idx,
+                                v6_gw: if latest.v6_idx != 0 {
+                                    latest.v6_gw.clone()
+                                } else {
+                                    prev.v6_gw.clone()
+                                },
+                            };
+                            if prev == effective {
                                 continue;
                             }
-                            let if_chg = guard.primary_if != latest.primary_if;
-                            let gw_chg =
-                                (guard.v4_gw != latest.v4_gw) || (guard.v6_gw != latest.v6_gw);
-                            *guard = latest.clone();
-                            (if_chg, gw_chg)
+                            let if_chg = prev.primary_if != effective.primary_if;
+                            let gw_chg = prev.v4_gw != effective.v4_gw
+                                || prev.v6_gw != effective.v6_gw
+                                || (prev.v4_idx != 0) != (effective.v4_idx != 0)
+                                || (prev.v6_idx != 0) != (effective.v6_idx != 0);
+                            *guard = effective.clone();
+                            (effective, if_chg, gw_chg)
                         };
 
-                        protector.set_if_index(latest.primary_idx);
+                        // Never overwrite a valid non-zero interface index with `0` (which would
+                        // turn `IP_BOUND_IF` / `IPV6_BOUND_IF` into a no-op and loop into `utun`).
+                        protector.update_indices(effective.v4_idx, effective.v6_idx);
 
                         if spec_watch.auto_route && (if_changed || gw_changed) {
                             let mut rec_guard = rec_watch.lock();
@@ -1006,7 +1111,13 @@ mod darwin_impl {
                                     let _ = run_cmd("/sbin/route", &refs);
                                 }
                                 rec_guard.owned_route_del_args = split_routes;
-                                install_macos_bypass_routes(&spec_watch, &latest, &mut rec_guard);
+                                install_macos_bypass_routes(
+                                    &spec_watch,
+                                    &effective,
+                                    effective.v4_idx != 0,
+                                    effective.v6_idx != 0,
+                                    &mut rec_guard,
+                                );
                             }
 
                             if if_changed {
@@ -1026,7 +1137,7 @@ mod darwin_impl {
                                     *last_err_watch.lock() = Some(joined);
                                 }
                                 bind_macos_service_dns_for_iface(
-                                    latest.primary_if.as_deref(),
+                                    effective.primary_if.as_deref(),
                                     &dns_str_for_watch,
                                     &mut rec_guard,
                                     &spec_watch.state_dir,
@@ -1039,6 +1150,7 @@ mod darwin_impl {
                             }
                         }
 
+                        flush_macos_dns_resolver_cache();
                         transitions_watch.fetch_add(1, Ordering::Relaxed);
                         if let Some(hook) = &net_hook_watch {
                             hook();
@@ -1394,5 +1506,46 @@ mod tests {
             "only real failures (Wi-Fi DNS + 1.1.1.1 route) should produce warnings: {:?}",
             outcome.warnings
         );
+    }
+
+    #[test]
+    fn select_macos_physical_bypass_ips_omits_protected_dns_under_hijack() {
+        let proxy_v4: IpAddr = "203.0.113.10".parse().unwrap();
+        let proxy_v6: IpAddr = "2001:db8::10".parse().unwrap();
+        let dns_v4: IpAddr = "1.1.1.1".parse().unwrap();
+        let dns_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+
+        // Both IPv4 & IPv6 protected via IP_BOUND_IF / IPV6_BOUND_IF under dns_hijack -> omit both DNS IPs
+        let both_protected = select_macos_physical_bypass_ips(
+            &[proxy_v4, proxy_v6],
+            &[dns_v4, dns_v6, proxy_v4],
+            true,
+            true,
+            true,
+        );
+        assert_eq!(both_protected, vec![proxy_v4, proxy_v6]);
+
+        // Only IPv4 protected (e.g., v6_idx == 0) -> keep IPv6 DNS bypass, omit IPv4 DNS bypass
+        let v4_only =
+            select_macos_physical_bypass_ips(&[proxy_v4], &[dns_v4, dns_v6], true, true, false);
+        assert_eq!(v4_only, vec![proxy_v4, dns_v6]);
+
+        // dns_hijack disabled -> include all deduplicated bypass IPs
+        let no_hijack = select_macos_physical_bypass_ips(
+            &[proxy_v4],
+            &[dns_v4, dns_v6, proxy_v4],
+            false,
+            true,
+            true,
+        );
+        assert_eq!(no_hijack, vec![proxy_v4, dns_v4, dns_v6]);
+    }
+
+    #[test]
+    fn merge_macos_protector_indices_never_clobbers_valid_index_with_zero() {
+        assert_eq!(merge_macos_protector_indices(5, 8, 0, 9), (5, 9));
+        assert_eq!(merge_macos_protector_indices(5, 8, 6, 0), (6, 8));
+        assert_eq!(merge_macos_protector_indices(5, 8, 0, 0), (5, 8));
+        assert_eq!(merge_macos_protector_indices(0, 0, 4, 7), (4, 7));
     }
 }

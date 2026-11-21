@@ -67,6 +67,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let mtu = (providerCfg["mtu"] as? Int) ?? 1500
         let enableIpv6 = (providerCfg["enableIpv6"] as? Bool) ?? true
+        // Caller should supply ONLY proxy server IPs (never public DNS resolver IPs such as 1.1.1.1 / 8.8.8.8),
+        // because NetworkExtension's own outbound sockets already bypass the tunnel while global excludedRoutes
+        // would let other macOS apps bypass NEDNSSettings Fake-IP hijacking.
         let bypassServers = (providerCfg["bypassIps"] as? [String]) ?? []
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "198.18.0.1")
@@ -187,8 +190,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    override func sleep(completionHandler: @escaping () -> Void) {
+        if let handle = activeHandle() {
+            _ = rc_ne_set_low_power_mode(handle, true)
+        }
+        completionHandler()
+    }
+
     override func wake() {
         guard let handle = activeHandle() else { return }
+        _ = rc_ne_set_low_power_mode(handle, false)
         _ = rc_ne_notify_network_change(handle)
     }
 

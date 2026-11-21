@@ -669,11 +669,12 @@ async fn main() -> Result<()> {
         } => {
             let loaded = mcp::load_cli_or_profile_config(config.as_ref());
             let fallback_cfg = loaded.as_ref().ok().map(|(c, _)| c);
-            let ctrl = mcp::resolve_controller_client(
+            let ctrl_clients = mcp::resolve_controller_clients(
                 controller.as_deref(),
                 secret.as_deref(),
                 fallback_cfg,
             );
+            let explicit_controller_or_secret = controller.is_some() || secret.is_some();
             let clamped_timeout = timeout_ms.clamp(300, 20_000);
             let cfg_for_fallback = loaded.map(|(c, _)| c).unwrap_or_default();
 
@@ -692,25 +693,20 @@ async fn main() -> Result<()> {
 
             if matrix {
                 let mut live_report: Option<proxy_core::probe::EndpointMatrixReport> = None;
-                if !allow_private_targets
-                    && config.is_none()
-                    && let Some(ref c) = ctrl
-                {
+                if !allow_private_targets && config.is_none() && !ctrl_clients.is_empty() {
                     let path = format!(
                         "/proxies/{}/matrix",
                         mcp::url_encode_component(&target_proxy)
                     );
-                    if let Ok((200, val)) = c
-                        .request_json(
-                            "POST",
-                            &path,
-                            Some(&serde_json::json!({ "timeout_ms": clamped_timeout })),
-                            Duration::from_millis(clamped_timeout * 2 + 6000),
-                        )
-                        .await
-                    {
-                        live_report = serde_json::from_value(val).ok();
-                    }
+                    live_report = try_live_probe_json(
+                        &ctrl_clients,
+                        &path,
+                        &serde_json::json!({ "timeout_ms": clamped_timeout }),
+                        Duration::from_millis(clamped_timeout * 2 + 6000),
+                        explicit_controller_or_secret,
+                    )
+                    .await?
+                    .and_then(|v| serde_json::from_value(v).ok());
                 }
 
                 let report = match live_report {
@@ -743,29 +739,24 @@ async fn main() -> Result<()> {
                 }
             } else {
                 let mut live_report: Option<proxy_core::probe::WaterfallProbeReport> = None;
-                if !allow_private_targets
-                    && config.is_none()
-                    && let Some(ref c) = ctrl
-                {
+                if !allow_private_targets && config.is_none() && !ctrl_clients.is_empty() {
                     let path = format!(
                         "/proxies/{}/probe",
                         mcp::url_encode_component(&target_proxy)
                     );
-                    if let Ok((200, val)) = c
-                        .request_json(
-                            "POST",
-                            &path,
-                            Some(&serde_json::json!({
-                                "url": url,
-                                "timeout_ms": clamped_timeout,
-                                "check_udp": udp,
-                            })),
-                            Duration::from_millis(clamped_timeout + 5000),
-                        )
-                        .await
-                    {
-                        live_report = serde_json::from_value(val).ok();
-                    }
+                    live_report = try_live_probe_json(
+                        &ctrl_clients,
+                        &path,
+                        &serde_json::json!({
+                            "url": url,
+                            "timeout_ms": clamped_timeout,
+                            "check_udp": udp,
+                        }),
+                        Duration::from_millis(clamped_timeout + 5000),
+                        explicit_controller_or_secret,
+                    )
+                    .await?
+                    .and_then(|v| serde_json::from_value(v).ok());
                 }
 
                 let report = match live_report {
@@ -1164,5 +1155,139 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             .await
             .context("failed waiting for Ctrl-C signal")?;
         Ok(())
+    }
+}
+
+async fn try_live_probe_json(
+    clients: &[mcp::ControllerClient],
+    path: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+    explicit_controller_or_secret: bool,
+) -> Result<Option<serde_json::Value>> {
+    match mcp::request_live_controller_json(clients, "POST", path, Some(body), timeout).await {
+        mcp::LiveControllerOutcome::Response {
+            status: 200, body, ..
+        } => Ok(Some(body)),
+        mcp::LiveControllerOutcome::Response {
+            client,
+            status,
+            body,
+        } => {
+            if explicit_controller_or_secret {
+                eprintln!(
+                    "Warning: live controller {} returned HTTP {status} for {path}: {body}; falling back to standalone probe.",
+                    client.host_port
+                );
+            }
+            Ok(None)
+        }
+        mcp::LiveControllerOutcome::AuthRejected { status } => {
+            let note = mcp::auth_rejected_note(status);
+            if explicit_controller_or_secret {
+                anyhow::bail!("{note}");
+            }
+            eprintln!("Warning: {note}");
+            Ok(None)
+        }
+        mcp::LiveControllerOutcome::Unreachable => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn live_probe_falls_back_across_stale_candidate_and_surfaces_401() {
+        // Reserve a dead ephemeral port as the stale first candidate
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        // Live mock controller returning HTTP 200 for secret "good-secret", HTTP 401 otherwise
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        let server_jh = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut s, _)) = live_listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.contains("Authorization: Bearer good-secret") {
+                    let body = r#"{"ok":true,"node":"HK-01"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                } else {
+                    let body = r#"{"message":"Unauthorized"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let clients = vec![
+            mcp::ControllerClient {
+                host_port: dead_addr.to_string(),
+                secret: Some("stale".to_string()),
+            },
+            mcp::ControllerClient {
+                host_port: live_addr.to_string(),
+                secret: Some("good-secret".to_string()),
+            },
+        ];
+        let val = try_live_probe_json(
+            &clients,
+            "/proxies/PROXY/probe",
+            &serde_json::json!({"url": "https://example.com"}),
+            Duration::from_secs(2),
+            false,
+        )
+        .await
+        .expect("should succeed via second live candidate");
+        let parsed = val.expect("expected live JSON response from second candidate");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["node"], "HK-01");
+
+        // Wrong secret with explicit --controller/--secret -> fails loudly with actionable 401 message
+        let bad_clients = vec![mcp::ControllerClient {
+            host_port: live_addr.to_string(),
+            secret: Some("wrong-secret".to_string()),
+        }];
+        let err = try_live_probe_json(
+            &bad_clients,
+            "/proxies/PROXY/probe",
+            &serde_json::json!({}),
+            Duration::from_secs(2),
+            true,
+        )
+        .await
+        .expect_err("explicit auth mismatch must error loudly");
+        assert!(err.to_string().contains("401"));
+
+        // Wrong secret without explicit --controller/--secret -> warns and gracefully falls back (Ok(None))
+        let fallback = try_live_probe_json(
+            &bad_clients,
+            "/proxies/PROXY/probe",
+            &serde_json::json!({}),
+            Duration::from_secs(2),
+            false,
+        )
+        .await
+        .expect("implicit discovery auth mismatch should fall back cleanly");
+        assert!(fallback.is_none());
+
+        let _ = server_jh.await;
     }
 }

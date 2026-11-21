@@ -538,6 +538,21 @@ pub extern "C" fn rc_ne_notify_network_change(handle: *mut RcNeEngineHandle) -> 
     .unwrap_or(false)
 }
 
+/// Toggle low-power / screen-off mode on macOS/iOS `NEPacketTunnelProvider` sleep/wake hooks
+/// (`sleep(completionHandler:)` -> `true`, `wake()` -> `false`), pausing background health/preconnect
+/// loops and aggressively reaping idle multiplexed sessions.
+#[unsafe(no_mangle)]
+pub extern "C" fn rc_ne_set_low_power_mode(handle: *mut RcNeEngineHandle, enabled: bool) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(ctx) = lookup_context(handle) else {
+            return false;
+        };
+        ctx.engine.set_low_power_mode(enabled);
+        true
+    }))
+    .unwrap_or(false)
+}
+
 /// Return a newly allocated JSON status string (free with `rc_ne_free_string`), or NULL if stopped.
 #[unsafe(no_mangle)]
 pub extern "C" fn rc_ne_get_status_json(handle: *mut RcNeEngineHandle) -> *mut c_char {
@@ -633,5 +648,37 @@ mod tests {
             .expect("second packet preserved");
         assert_eq!(next.len(), 64);
         assert_eq!(next[0], 0x45);
+    }
+
+    #[test]
+    fn ne_set_low_power_mode_toggles_engine_state_and_handles_null_safely() {
+        assert!(!rc_ne_set_low_power_mode(ptr::null_mut(), true));
+
+        let yaml = CString::new(
+            "mixed-port: 0\nexternal-controller: \"\"\nmode: rule\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let mut err_ptr: *mut c_char = ptr::null_mut();
+        // SAFETY: `yaml` is valid NUL-terminated UTF-8 and `err_ptr` is a valid out-pointer.
+        let handle = unsafe { rc_ne_start_engine_v2(yaml.as_ptr(), 1500, true, &raw mut err_ptr) };
+        if !err_ptr.is_null() {
+            // SAFETY: allocated by `rc_ne_start_engine_v2`.
+            unsafe { rc_ne_free_string(err_ptr) };
+        }
+        assert!(!handle.is_null(), "NE engine should start cleanly");
+
+        assert!(rc_ne_set_low_power_mode(handle, true));
+        {
+            let ctx = lookup_context(handle).expect("handle active");
+            assert!(ctx.engine.router().is_low_power_mode());
+        }
+        assert!(rc_ne_set_low_power_mode(handle, false));
+        {
+            let ctx = lookup_context(handle).expect("handle active");
+            assert!(!ctx.engine.router().is_low_power_mode());
+        }
+
+        rc_ne_stop_engine(handle);
+        assert!(!rc_ne_set_low_power_mode(handle, true));
     }
 }
