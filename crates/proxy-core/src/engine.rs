@@ -681,6 +681,7 @@ impl DemoCluster {
                 inet6_address: None,
                 wintun_path: None,
                 mtu: 1500,
+                route_exclude_address: Vec::new(),
             },
             proxies: vec![
                 ProxyNodeConfig::Vless {
@@ -1339,6 +1340,7 @@ fn start_tun_service(
             tun_ipv6_cidr,
             bypass_ips,
             dns_bypass_ips,
+            route_exclude_cidrs: cfg.tun.effective_route_exclude_cidrs(fake_ip_net),
             local_dns_addr,
             wintun_dll_path: cfg.tun.wintun_path.as_ref().map(PathBuf::from),
             state_dir,
@@ -2695,6 +2697,29 @@ impl ProxyEngine {
         tun_strict_route: Option<bool>,
         tun_ipv6: Option<bool>,
     ) -> Result<()> {
+        self.apply_config_patch_with_tun_exclude(
+            allow_lan,
+            mixed_port,
+            ipv6,
+            tun_enable,
+            tun_strict_route,
+            tun_ipv6,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_config_patch_with_tun_exclude(
+        &self,
+        allow_lan: Option<bool>,
+        mixed_port: Option<u16>,
+        ipv6: Option<bool>,
+        tun_enable: Option<bool>,
+        tun_strict_route: Option<bool>,
+        tun_ipv6: Option<bool>,
+        tun_route_exclude_address: Option<Vec<String>>,
+    ) -> Result<()> {
         if mixed_port == Some(0) {
             return Err(ProxyError::Config(
                 "mixed-port must be between 1 and 65535".into(),
@@ -2706,11 +2731,13 @@ impl ProxyEngine {
             && tun_enable.is_none()
             && tun_strict_route.is_none()
             && tun_ipv6.is_none()
+            && tun_route_exclude_address.is_none()
         {
             return Ok(());
         }
 
-        self.apply_serialized_config_transition(None, |snap| {
+        let tun_exclude_updated = tun_route_exclude_address.is_some();
+        self.apply_serialized_config_transition(None, move |snap| {
             let mut cfg = snap.config.clone();
             if cfg.mixed_port == 0 {
                 cfg.mixed_port = snap.mixed_addr.port();
@@ -2733,6 +2760,10 @@ impl ProxyEngine {
             if let Some(tv6) = tun_ipv6 {
                 cfg.tun.ipv6 = tv6;
             }
+            if let Some(excludes) = tun_route_exclude_address {
+                cfg.tun.route_exclude_address = excludes;
+                cfg.sanitize_tun_route_exclude_address();
+            }
             (cfg, None)
         })
         .await?;
@@ -2752,14 +2783,19 @@ impl ProxyEngine {
             self.hub
                 .push_log("info", format!("Updated DNS ipv6 to {v6}"));
         }
-        if tun_enable.is_some() || tun_strict_route.is_some() || tun_ipv6.is_some() {
+        if tun_enable.is_some()
+            || tun_strict_route.is_some()
+            || tun_ipv6.is_some()
+            || tun_exclude_updated
+        {
             self.hub.push_log(
                 "info",
                 format!(
-                    "TUN runtime updated: enable={}, strict-route={}, ipv6={}, mode={}",
+                    "TUN runtime updated: enable={}, strict-route={}, ipv6={}, route-exclude-address={}, mode={}",
                     snap.config.tun.enable,
                     snap.config.tun.strict_route,
                     snap.config.tun.ipv6,
+                    snap.config.tun.route_exclude_address.len(),
                     snap.tun_mode.as_str()
                 ),
             );

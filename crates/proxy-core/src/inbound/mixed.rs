@@ -758,7 +758,7 @@ async fn handle_socks5(
                 &sniffer_cfg,
                 sniffed_real_ip.as_ref(),
             );
-            let conn_guard = hub.register_connection_with_outbound_guard(
+            let conn_guard = hub.register_connection_with_outbound_guard_sniffed(
                 "Mixed(SOCKS5)",
                 "tcp",
                 Some(peer),
@@ -768,6 +768,7 @@ async fn handle_socks5(
                 &decision.rule_payload,
                 decision.chains.clone(),
                 decision.outbound.as_ref(),
+                sniffed_real_ip.is_some(),
             );
             let conn_entry = Arc::clone(conn_guard.connection());
             hub.push_log(
@@ -948,12 +949,12 @@ async fn handle_socks5(
                         pkt_tasks.spawn(async move {
                             let _permit = permit;
                             let route_epoch = router_for_pkt.epoch();
-                            let decision = router_for_pkt
-                                .route_async_with_context(
-                                    Some(client_udp_addr.ip()),
-                                    Some(client_udp_addr),
-                                    crate::platform::process::SocketTransport::Udp,
+                            let resolved =
+                                crate::inbound::udp_nat::route_udp_datagram_with_quic_sniff(
+                                    &router_for_pkt,
+                                    client_udp_addr,
                                     &raw_dst,
+                                    &payload,
                                 )
                                 .await;
                             if enforce_post_route_target_policy(
@@ -961,7 +962,7 @@ async fn handle_socks5(
                                 local_mixed_port,
                                 &policy_for_pkt,
                                 &router_for_pkt,
-                                &decision,
+                                &resolved.decision,
                             )
                             .await
                             .is_err()
@@ -969,17 +970,19 @@ async fn handle_socks5(
                                 return;
                             }
                             nat_inner
-                                .send_datagram_with_epoch(
+                                .send_datagram_with_options(
                                     client_udp_addr,
                                     raw_dst,
-                                    decision.restored_from_fake_ip,
-                                    decision.target,
-                                    &decision.rule_type,
-                                    &decision.rule_payload,
-                                    decision.chains,
-                                    decision.outbound,
+                                    resolved.decision.restored_from_fake_ip,
+                                    resolved.decision.target,
+                                    resolved.dial_target,
+                                    &resolved.decision.rule_type,
+                                    &resolved.decision.rule_payload,
+                                    resolved.decision.chains,
+                                    resolved.decision.outbound,
                                     payload,
                                     route_epoch,
+                                    resolved.sniffed,
                                 )
                                 .await;
                         });
@@ -1243,7 +1246,7 @@ async fn handle_http_proxy(
             &sniffer_cfg,
             sniffed_real_ip.as_ref(),
         );
-        let conn_guard = hub.register_connection_with_outbound_guard(
+        let conn_guard = hub.register_connection_with_outbound_guard_sniffed(
             "Mixed(HTTP-CONNECT)",
             "tcp",
             Some(peer),
@@ -1253,6 +1256,7 @@ async fn handle_http_proxy(
             &decision.rule_payload,
             decision.chains.clone(),
             decision.outbound.as_ref(),
+            sniffed_real_ip.is_some(),
         );
         let conn_entry = Arc::clone(conn_guard.connection());
         hub.push_log(
@@ -1519,7 +1523,7 @@ async fn handle_http_proxy(
             &sniffer_cfg,
             sniffed_real_ip.as_ref(),
         );
-        let conn_guard = hub.register_connection_with_outbound_guard(
+        let conn_guard = hub.register_connection_with_outbound_guard_sniffed(
             "Mixed(HTTP)",
             "tcp",
             Some(peer),
@@ -1529,6 +1533,7 @@ async fn handle_http_proxy(
             &decision.rule_payload,
             decision.chains.clone(),
             decision.outbound.as_ref(),
+            sniffed_real_ip.is_some(),
         );
         let conn_entry = Arc::clone(conn_guard.connection());
         hub.push_log(
@@ -2751,9 +2756,13 @@ mod tests {
             );
         }
 
-        // 2. HTTP CONNECT real public IP (93.184.216.34:443) with TLS SNI
+        // 2. HTTP CONNECT real public IP (93.184.216.34:443) with ~2KB cross-segment PQ ClientHello
         {
-            let hello = build_test_tls_client_hello("connect.sniffed.test", 0);
+            let hello = build_test_tls_client_hello("connect.sniffed.test", 1850);
+            assert!(
+                hello.len() > 1900,
+                "PQ ClientHello test fixture should exceed one 1460B TCP segment"
+            );
             let mut s = TcpStream::connect(mixed_addr).await.unwrap();
             s.write_all(b"CONNECT 93.184.216.34:443 HTTP/1.1\r\nHost: 93.184.216.34:443\r\n\r\n")
                 .await
@@ -2762,13 +2771,21 @@ mod tests {
             s.read_exact(&mut resp).await.unwrap();
             assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"));
 
-            s.write_all(&hello).await.unwrap();
+            // Split PQ ClientHello across two TCP segments (~1460B + remainder) to verify lossless reassembly.
+            let split = 1460;
+            s.write_all(&hello[..split]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            s.write_all(&hello[split..]).await.unwrap();
+
             let mut echoed = vec![0u8; hello.len()];
             tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut echoed))
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(echoed, hello);
+            assert_eq!(
+                echoed, hello,
+                "HTTP CONNECT ~2KB cross-segment PQ ClientHello must be forwarded losslessly"
+            );
         }
 
         // 3. Plain HTTP GET http://93.184.216.34/check with Host: web.sniffed.test
@@ -2832,6 +2849,12 @@ mod tests {
             "All sniffed real-IP connections should match DOMAIN-SUFFIX instead of falling through to MATCH"
         );
         assert_eq!(captured_http.lock().await.len(), 1);
+        let diags = hub.diagnostics_snapshot(20);
+        assert_eq!(
+            diags.iter().filter(|d| d.metadata.sniffed).count(),
+            4,
+            "All 4 real-IP sniffed connections should record metadata.sniffed == true"
+        );
 
         let _ = shutdown_tx.send(true);
         mixed_jh.abort();

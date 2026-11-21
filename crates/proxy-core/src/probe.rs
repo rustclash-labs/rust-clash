@@ -448,6 +448,8 @@ async fn read_http_response_head<S: tokio::io::AsyncRead + Unpin>(
     let mut cf_mitigated = false;
     let mut server = None;
     let mut has_www_authenticate = false;
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
     for hdr in lines {
         let trimmed = hdr.trim();
         if trimmed.is_empty() {
@@ -462,25 +464,45 @@ async fn read_http_response_head<S: tokio::io::AsyncRead + Unpin>(
                 server = Some(val.chars().take(48).collect());
             } else if kl == "www-authenticate" && !val.is_empty() {
                 has_www_authenticate = true;
+            } else if kl == "content-length" {
+                if let Ok(len) = val.parse::<usize>() {
+                    content_length = Some(len);
+                }
+            } else if kl == "transfer-encoding" && val.to_ascii_lowercase().contains("chunked") {
+                is_chunked = true;
             }
         }
     }
 
     // For `400`/`403`, inspect up to 512 bytes of body so API credential errors (e.g. Google
     // Gemini `"Method doesn't allow unregistered callers"`) are distinguished from geo/WAF blocks.
-    let mut body_bytes = if matches!(status, 400 | 403) && head_end < buf.len() {
-        let end = (head_end + 512).min(buf.len());
-        buf[head_end..end].to_vec()
-    } else {
-        Vec::new()
+    // Loop under a 300ms total deadline so headers ending near the initial 512B buffer boundary
+    // (e.g. 505B headers + 7B chunked length prefix) still collect the subsequent JSON error body.
+    const MAX_ERROR_BODY_SNIPPET_BYTES: usize = 512;
+    let chunked_terminated = |b: &[u8]| -> bool {
+        b.starts_with(b"0\r\n\r\n") || b.windows(7).any(|w| w == b"\r\n0\r\n\r\n")
     };
-    if matches!(status, 400 | 403)
-        && body_bytes.is_empty()
-        && let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(150), stream.read(&mut chunk)).await
-        && n > 0
-    {
-        body_bytes.extend_from_slice(&chunk[..n]);
+    let mut body_bytes = Vec::new();
+    if matches!(status, 400 | 403) {
+        let target_len = content_length.map_or(MAX_ERROR_BODY_SNIPPET_BYTES, |cl| {
+            cl.min(MAX_ERROR_BODY_SNIPPET_BYTES)
+        });
+        if head_end < buf.len() && target_len > 0 {
+            let end = (head_end + target_len).min(buf.len());
+            body_bytes.extend_from_slice(&buf[head_end..end]);
+        }
+        let body_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while body_bytes.len() < target_len && !(is_chunked && chunked_terminated(&body_bytes)) {
+            let remaining = body_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let to_read = (target_len - body_bytes.len()).min(chunk.len());
+            match tokio::time::timeout(remaining, stream.read(&mut chunk[..to_read])).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => body_bytes.extend_from_slice(&chunk[..n]),
+            }
+        }
     }
     let body_snippet = String::from_utf8_lossy(&body_bytes).to_ascii_lowercase();
 
@@ -3370,5 +3392,97 @@ mod tests {
             body_snippet: "user location is not supported".to_string(),
         });
         assert_eq!(v400_geo, ProbeVerdict::BlockedOrChallenged);
+    }
+
+    #[tokio::test]
+    async fn read_http_response_head_handles_505b_header_boundary_chunked_403_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let build_505b_chunked_403_head = || -> Vec<u8> {
+            let base = "HTTP/1.1 403 Forbidden\r\n\
+Content-Type: application/json; charset=UTF-8\r\n\
+Server: scaffolding\r\n\
+Transfer-Encoding: chunked\r\n\
+X-Pad: ";
+            let suffix = "\r\n\r\n";
+            assert!(base.len() + suffix.len() < 505);
+            let pad_len = 505 - base.len() - suffix.len();
+            let mut head = Vec::with_capacity(505);
+            head.extend_from_slice(base.as_bytes());
+            head.resize(base.len() + pad_len, b'a');
+            head.extend_from_slice(suffix.as_bytes());
+            assert_eq!(head.len(), 505);
+            head
+        };
+
+        // Case 1: Google Gemini 403 missing-auth JSON arrives in second chunk after 505B headers + 7B prefix.
+        {
+            let head = build_505b_chunked_403_head();
+            let json_body = "{\n  \"error\": {\n    \"code\": 403,\n    \"message\": \"Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.\"\n  }\n}\n";
+            let chunk_hex = format!("{:x}\r\n", json_body.len());
+            let mut full = Vec::new();
+            full.extend_from_slice(&head);
+            full.extend_from_slice(chunk_hex.as_bytes());
+            full.extend_from_slice(json_body.as_bytes());
+            full.extend_from_slice(b"\r\n0\r\n\r\n");
+
+            // First 512B contains 505B headers + 7B chunked length prefix + `{` (`body_bytes` non-empty!).
+            assert!(full.len() > 512);
+            let first_512 = full[..512].to_vec();
+            let rest = full[512..].to_vec();
+
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let writer = tokio::spawn(async move {
+                server.write_all(&first_512).await.unwrap();
+                server.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                server.write_all(&rest).await.unwrap();
+                server.flush().await.unwrap();
+                // Keep socket open (simulating HTTP/1.1 keep-alive!) so chunked terminator stops the loop promptly.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+
+            let t0 = Instant::now();
+            let (_ttfb, parsed) = read_http_response_head(&mut client).await.unwrap();
+            assert!(
+                t0.elapsed() < Duration::from_millis(250),
+                "chunked terminator must stop body read before 300ms deadline"
+            );
+            assert_eq!(parsed.status, 403);
+            let (verdict, _) = classify_http_verdict(&parsed);
+            assert_eq!(verdict, ProbeVerdict::AuthRequired);
+            writer.abort();
+        }
+
+        // Case 2: Geo-blocked 403 JSON arrives in second chunk across the exact same 505B header boundary.
+        {
+            let head = build_505b_chunked_403_head();
+            let json_body = "{\n  \"error\": {\n    \"code\": 403,\n    \"message\": \"User location is not supported for the API use.\"\n  }\n}\n";
+            let chunk_hex = format!("{:x}\r\n", json_body.len());
+            let mut full = Vec::new();
+            full.extend_from_slice(&head);
+            full.extend_from_slice(chunk_hex.as_bytes());
+            full.extend_from_slice(json_body.as_bytes());
+            full.extend_from_slice(b"\r\n0\r\n\r\n");
+
+            let first_512 = full[..512].to_vec();
+            let rest = full[512..].to_vec();
+
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let writer = tokio::spawn(async move {
+                server.write_all(&first_512).await.unwrap();
+                server.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                server.write_all(&rest).await.unwrap();
+                server.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+
+            let (_ttfb, parsed) = read_http_response_head(&mut client).await.unwrap();
+            assert_eq!(parsed.status, 403);
+            let (verdict, _) = classify_http_verdict(&parsed);
+            assert_eq!(verdict, ProbeVerdict::BlockedOrChallenged);
+            writer.abort();
+        }
     }
 }

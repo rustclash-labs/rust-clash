@@ -577,6 +577,7 @@ impl ClashConfig {
         })?;
         cfg.normalize_secret();
         cfg.sync_root_hosts_into_dns();
+        cfg.sanitize_tun_route_exclude_address();
         Ok(cfg)
     }
 
@@ -598,6 +599,50 @@ impl ClashConfig {
         for (k, v) in &self.hosts {
             self.dns.hosts.entry(k.clone()).or_insert_with(|| v.clone());
         }
+    }
+
+    /// Filter out `tun.route-exclude-address` CIDRs that overlap `dns.fake-ip-range` (or have
+    /// prefix length `<= 1`, which would collide with TUN split-tunnel `/1` routes), canonicalize
+    /// valid CIDRs, and deduplicate while preserving any malformed strings for `validate()` to reject.
+    pub fn sanitize_tun_route_exclude_address(&mut self) {
+        if self.tun.route_exclude_address.is_empty() {
+            return;
+        }
+        let fake_ip_net: Ipv4Net = self.dns.fake_ip_range.trim().parse().unwrap_or_else(|_| {
+            "198.18.0.0/15"
+                .parse()
+                .expect("valid default fake-ip-range")
+        });
+        let mut out = Vec::with_capacity(self.tun.route_exclude_address.len());
+        let mut seen = HashSet::new();
+        for raw in std::mem::take(&mut self.tun.route_exclude_address) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match trimmed.parse::<IpNet>() {
+                Ok(net) => {
+                    let trunc = net.trunc();
+                    if trunc.prefix_len() <= 1 {
+                        continue;
+                    }
+                    if let IpNet::V4(v4_net) = trunc
+                        && ipv4_nets_overlap(v4_net, fake_ip_net)
+                    {
+                        continue;
+                    }
+                    let canonical = trunc.to_string();
+                    if seen.insert(canonical.clone()) {
+                        out.push(canonical);
+                    }
+                }
+                Err(_) => {
+                    // Retain unparseable strings so strict `ClashConfig::validate()` rejects them cleanly.
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+        self.tun.route_exclude_address = out;
     }
 
     pub fn dns_with_merged_hosts(&self) -> DnsConfig {
@@ -722,6 +767,7 @@ impl ClashConfig {
 
         cfg.normalize_secret();
         cfg.sync_root_hosts_into_dns();
+        cfg.sanitize_tun_route_exclude_address();
         let mut rule_report = sanitize_subscription_groups_and_rules(&mut cfg, &skipped_names);
         if non_string_yaml_rules > 0 {
             rule_report.input_rule_count += non_string_yaml_rules;
@@ -1012,6 +1058,20 @@ rules:
         if let Some(ref v6_cidr) = self.tun.inet6_address {
             v6_cidr.parse::<ipnet::Ipv6Net>().map_err(|e| {
                 ProxyError::Config(format!("invalid tun.inet6-address '{v6_cidr}': {e}"))
+            })?;
+        }
+        for cidr in &self.tun.route_exclude_address {
+            cidr.trim().parse::<IpNet>().map_err(|e| {
+                ProxyError::Config(format!(
+                    "invalid tun.route-exclude-address CIDR '{cidr}': {e}"
+                ))
+            })?;
+        }
+        for cidr in &self.sniffer.skip_dst_address {
+            cidr.trim().parse::<IpNet>().map_err(|e| {
+                ProxyError::Config(format!(
+                    "invalid sniffer.skip-dst-address CIDR '{cidr}': {e}"
+                ))
             })?;
         }
 
@@ -2481,6 +2541,53 @@ fn normalize_clash_yaml_root_mapping(map: &mut YamlMap, lenient_subscription: bo
                 tmap.remove("mtu");
             }
         }
+        if let Some(excl_val) = tmap.get("route-exclude-address").cloned() {
+            let items: Vec<String> = match excl_val {
+                YamlValue::Array(seq) => seq
+                    .iter()
+                    .filter_map(YamlValue::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                YamlValue::String(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![trimmed.to_string()]
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let cleaned: Vec<YamlValue> = items
+                .into_iter()
+                .filter(|s| !lenient_subscription || s.parse::<IpNet>().is_ok())
+                .map(YamlValue::String)
+                .collect();
+            if cleaned.is_empty() {
+                tmap.remove("route-exclude-address");
+            } else {
+                tmap.insert(yaml_key("route-exclude-address"), YamlValue::Array(cleaned));
+            }
+        }
+    }
+
+    if let Some(YamlValue::Object(smap)) = map.get_mut("sniffer") {
+        strip_null_entries(smap);
+        for seq_k in ["skip-domain", "force-domain", "skip-dst-address"] {
+            if let Some(v) = smap.get_mut(seq_k) {
+                sanitize_yaml_string_seq(v);
+                if lenient_subscription
+                    && seq_k == "skip-dst-address"
+                    && let YamlValue::Array(seq) = v
+                {
+                    seq.retain(|item| {
+                        item.as_str()
+                            .is_some_and(|s| s.trim().parse::<IpNet>().is_ok())
+                    });
+                }
+            }
+        }
     }
 
     if let Some(YamlValue::Object(rpmap)) = map.get_mut("rule-providers") {
@@ -3562,6 +3669,36 @@ where
     Ok(out)
 }
 
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Null,
+        One(String),
+        Many(Vec<String>),
+    }
+
+    match Option::<OneOrMany>::deserialize(deserializer)? {
+        None | Some(OneOrMany::Null) => Ok(Vec::new()),
+        Some(OneOrMany::One(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![t.to_string()])
+            }
+        }
+        Some(OneOrMany::Many(seq)) => Ok(seq
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DnsConfig {
@@ -3592,7 +3729,11 @@ pub struct DnsConfig {
     #[serde(default = "default_bootstrap_nameservers")]
     pub default_nameserver: Vec<String>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
     pub direct_nameserver: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3807,7 +3948,8 @@ impl DnsConfig {
                         crate::dns::upstream::DnsEndpointHost::Domain(ref d) => {
                             d == "localhost" || host_covered_by_static_hosts(d)
                         }
-                        crate::dns::upstream::DnsEndpointHost::Ip(_) => true,
+                        crate::dns::upstream::DnsEndpointHost::Ip(_)
+                        | crate::dns::upstream::DnsEndpointHost::System => true,
                     };
                     if !covered {
                         needs_bootstrap = true;
@@ -3822,6 +3964,26 @@ impl DnsConfig {
         }
         Ok(())
     }
+}
+
+/// Recommended RFC1918 + CGNAT + IPv6 ULA private subnets for `tun.route-exclude-address`
+/// so LAN / intranet traffic (e.g., SMB 445, NAS, local dev servers) bypasses OS TUN directly.
+pub const DEFAULT_LAN_EXCLUDE_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "fc00::/7",
+];
+
+/// Returns `true` when two IPv4 CIDRs share at least one IP address.
+pub fn ipv4_nets_overlap(a: Ipv4Net, b: Ipv4Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
+
+/// Returns `true` when two IPv6 CIDRs share at least one IP address.
+pub fn ipv6_nets_overlap(a: ipnet::Ipv6Net, b: ipnet::Ipv6Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3863,6 +4025,16 @@ pub struct TunConfig {
 
     #[serde(default = "default_tun_mtu")]
     pub mtu: usize,
+
+    /// Standard Clash / Mihomo `tun.route-exclude-address` CIDR list (IPv4/IPv6) routed directly
+    /// over the physical egress interface when `auto-route: true` (e.g. RFC1918 LAN subnets).
+    /// Any CIDR overlapping `dns.fake-ip-range` or with prefix length `<= 1` is automatically ignored.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        alias = "route_exclude_address"
+    )]
+    pub route_exclude_address: Vec<String>,
 }
 
 fn deserialize_dns_hijack<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
@@ -3951,14 +4123,42 @@ impl Default for TunConfig {
             inet6_address: None,
             wintun_path: None,
             mtu: default_tun_mtu(),
+            route_exclude_address: Vec::new(),
         }
     }
 }
 
+impl TunConfig {
+    /// Parse, canonicalize, deduplicate, and filter `self.route_exclude_address` against
+    /// `fake_ip_net` (dropping any malformed CIDR, prefix length `<= 1`, or Fake-IP overlap).
+    pub fn effective_route_exclude_cidrs(&self, fake_ip_net: Ipv4Net) -> Vec<IpNet> {
+        let mut out = Vec::with_capacity(self.route_exclude_address.len());
+        for raw in &self.route_exclude_address {
+            let Ok(parsed) = raw.trim().parse::<IpNet>() else {
+                continue;
+            };
+            let net = parsed.trunc();
+            if net.prefix_len() <= 1 {
+                continue;
+            }
+            if let IpNet::V4(v4) = net
+                && ipv4_nets_overlap(v4, fake_ip_net)
+            {
+                continue;
+            }
+            if !out.contains(&net) {
+                out.push(net);
+            }
+        }
+        out
+    }
+}
+
 /// Standard Clash / Mihomo protocol sniffer configuration (`sniffer:`).
-/// Enabled by default for common TLS (`443`, `8443`) and HTTP (`80`, `8080`) ports so real-IP
-/// TCP connections entering TUN (e.g. browser DoH or stale/poisoned local DNS) still match
-/// `DOMAIN` / `GEOSITE` rules and override poisoned destination IPs on proxy outbounds.
+/// Enabled by default for common TLS (`443`, `8443`), HTTP (`80`, `8080`), and QUIC (`443`) ports
+/// so real-IP TCP/UDP connections entering TUN or Mixed inbound (e.g. browser DoH or stale/poisoned
+/// local DNS) still match `DOMAIN` / `GEOSITE` rules and override poisoned destination IPs on proxy
+/// outbounds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SnifferConfig {
@@ -3971,7 +4171,7 @@ pub struct SnifferConfig {
     #[serde(default = "default_true")]
     pub parse_pure_ip: bool,
 
-    /// Per-protocol sniff rules (`TLS`, `HTTP`), compatible with Clash / Mihomo `sniffer.sniff`.
+    /// Per-protocol sniff rules (`TLS`, `HTTP`, `QUIC`), compatible with Clash / Mihomo `sniffer.sniff`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sniff: HashMap<String, SniffProtocolConfig>,
 
@@ -3982,6 +4182,16 @@ pub struct SnifferConfig {
     /// Domains that always allow destination override even if matched by `skip-domain`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub force_domain: Vec<String>,
+
+    /// Destination CIDRs excluded from protocol sniffing (e.g. `10.0.0.0/8`, `172.16.0.0/12`,
+    /// `192.168.0.0/16`, `fc00::/7`), compatible with Clash / Mihomo `sniffer.skip-dst-address`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        alias = "skip_dst_address",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub skip_dst_address: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4026,6 +4236,7 @@ impl Default for SnifferConfig {
             sniff: HashMap::new(),
             skip_domain: Vec::new(),
             force_domain: Vec::new(),
+            skip_dst_address: Vec::new(),
         }
     }
 }
@@ -4059,6 +4270,39 @@ impl SnifferConfig {
             }
         }
         false
+    }
+
+    fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+        match ip.to_canonical() {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (seg0 & 0xfe00) == 0xfc00
+                    || (seg0 & 0xffc0) == 0xfe80
+            }
+        }
+    }
+
+    fn is_skipped_dst_ip(&self, ip: std::net::IpAddr) -> bool {
+        if self.skip_dst_address.is_empty() {
+            return false;
+        }
+        let canon = ip.to_canonical();
+        self.skip_dst_address.iter().any(|raw| {
+            raw.trim()
+                .parse::<IpNet>()
+                .is_ok_and(|net| net.contains(&canon))
+        })
     }
 
     /// True if TLS SNI sniffing should run on `port`.
@@ -4097,34 +4341,48 @@ impl SnifferConfig {
         }
     }
 
-    /// True if real-IP TCP sniffing should run for `ip:port` (skips loopback, link-local,
-    /// and RFC1918/ULA private LAN targets so LAN `IP-CIDR`/`GEOIP,PRIVATE` rules are preserved).
-    pub fn should_sniff_real_ip_tcp(&self, ip: std::net::IpAddr, port: u16) -> bool {
+    /// True if QUIC Initial SNI sniffing should run on UDP `port` (defaults to `443`).
+    pub fn should_sniff_quic_port(&self, port: u16) -> bool {
         if !self.enable || !self.parse_pure_ip {
             return false;
         }
-        let is_non_public = match ip.to_canonical() {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_multicast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                let seg0 = v6.segments()[0];
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (seg0 & 0xfe00) == 0xfc00
-                    || (seg0 & 0xffc0) == 0xfe80
-            }
+        if self.sniff.is_empty() {
+            return port == 443;
+        }
+        let Some(entry) = self.protocol_entry("QUIC") else {
+            return false;
         };
-        if is_non_public {
+        if entry.ports.is_empty() {
+            port == 443
+        } else {
+            Self::port_matches_specs(port, &entry.ports)
+        }
+    }
+
+    /// True if real-IP TCP sniffing should run for `ip:port` (skips loopback, link-local,
+    /// RFC1918/ULA private LAN targets, and any CIDR in `skip-dst-address`).
+    pub fn should_sniff_real_ip_tcp(&self, ip: std::net::IpAddr, port: u16) -> bool {
+        if !self.enable
+            || !self.parse_pure_ip
+            || Self::is_non_public_ip(ip)
+            || self.is_skipped_dst_ip(ip)
+        {
             return false;
         }
         self.should_sniff_tls_port(port) || self.should_sniff_http_port(port)
+    }
+
+    /// True if real-IP UDP QUIC SNI sniffing should run for `ip:port` (skips loopback, link-local,
+    /// RFC1918/ULA private LAN targets, and any CIDR in `skip-dst-address`).
+    pub fn should_sniff_real_ip_udp(&self, ip: std::net::IpAddr, port: u16) -> bool {
+        if !self.enable
+            || !self.parse_pure_ip
+            || Self::is_non_public_ip(ip)
+            || self.is_skipped_dst_ip(ip)
+        {
+            return false;
+        }
+        self.should_sniff_quic_port(port)
     }
 
     /// Returns `true` if the sniffed `domain` (extracted via `protocol`) should override the
@@ -4137,6 +4395,7 @@ impl SnifferConfig {
         let proto_key = match protocol {
             crate::inbound::sniff::SniffedProtocol::Tls => "TLS",
             crate::inbound::sniff::SniffedProtocol::Http => "HTTP",
+            crate::inbound::sniff::SniffedProtocol::Quic => "QUIC",
         };
         let base_override = self
             .protocol_entry(proto_key)
@@ -5788,5 +6047,167 @@ rules:
             crate::inbound::sniff::SniffedProtocol::Http,
             "example.com"
         ));
+    }
+
+    #[test]
+    fn tun_route_exclude_address_validates_cidrs_and_filters_fake_ip_overlaps() {
+        // Default config keeps route-exclude-address empty for backward compatibility.
+        let def = ClashConfig::default();
+        assert!(def.tun.route_exclude_address.is_empty());
+
+        let yaml = r#"
+mode: rule
+dns:
+  enable: true
+  fake-ip-range: 198.18.0.0/15
+tun:
+  enable: true
+  auto-route: true
+  route-exclude-address:
+    - "192.168.1.55/16"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "198.18.0.0/16"
+    - "198.16.0.0/13"
+    - "0.0.0.0/1"
+    - "fc00::/7"
+    - "192.168.0.0/16"
+rules:
+  - MATCH,DIRECT
+"#;
+        let parsed = ClashConfig::from_yaml_str(yaml).unwrap();
+        // Overlapping `198.18.0.0/16` & `198.16.0.0/13` and broad `0.0.0.0/1` are automatically
+        // filtered out; remaining CIDRs are canonicalized (`192.168.1.55/16` -> `192.168.0.0/16`)
+        // and deduplicated!
+        assert_eq!(
+            parsed.tun.route_exclude_address,
+            vec!["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fc00::/7",]
+        );
+        let eff = parsed
+            .tun
+            .effective_route_exclude_cidrs(parsed.dns.parsed_fake_ip_net().unwrap());
+        assert_eq!(eff.len(), 4);
+
+        // Invalid CIDR string must fail `validate()`.
+        let bad_yaml = r#"
+mode: rule
+tun:
+  enable: true
+  route-exclude-address:
+    - "not-a-cidr"
+rules:
+  - MATCH,DIRECT
+"#;
+        let err = ClashConfig::from_yaml_str(bad_yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("tun.route-exclude-address"),
+            "unexpected validation error: {err}"
+        );
+    }
+
+    #[test]
+    fn sniffer_quic_and_skip_dst_address_and_system_dns_yaml_parsing() {
+        let def = ClashConfig::default();
+        assert!(def.sniffer.should_sniff_quic_port(443));
+        assert!(!def.sniffer.should_sniff_quic_port(8443));
+        assert!(
+            def.sniffer
+                .should_sniff_real_ip_udp("104.16.132.229".parse().unwrap(), 443)
+        );
+        assert!(
+            !def.sniffer
+                .should_sniff_real_ip_udp("192.168.1.1".parse().unwrap(), 443)
+        );
+
+        let yaml = r#"
+mode: rule
+dns:
+  enable: true
+  direct-nameserver: system
+  nameserver:
+    - 1.1.1.1:53
+  nameserver-policy:
+    "+.bestechnic.com": system
+    "+.lan": dhcp://system
+    "+.local":
+      - system
+sniffer:
+  enable: true
+  override-destination: true
+  skip-dst-address:
+    - 10.0.0.0/8
+    - 198.51.100.0/24
+    - 2001:db8:abcd::/48
+  sniff:
+    QUIC:
+      ports: [443, "8443-8444"]
+      override-destination: true
+  skip-domain:
+    - "+.skip-quic.test"
+  force-domain:
+    - "force.skip-quic.test"
+rules:
+  - MATCH,DIRECT
+"#;
+        let parsed = ClashConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(parsed.dns.direct_nameserver, vec!["system"]);
+        assert_eq!(
+            parsed.dns.nameserver_policy.get("+.bestechnic.com"),
+            Some(&vec!["system".to_string()])
+        );
+        assert_eq!(
+            parsed.dns.nameserver_policy.get("+.lan"),
+            Some(&vec!["dhcp://system".to_string()])
+        );
+        assert!(parsed.sniffer.should_sniff_quic_port(443));
+        assert!(parsed.sniffer.should_sniff_quic_port(8444));
+        assert!(!parsed.sniffer.should_sniff_quic_port(8445));
+        assert!(
+            !parsed
+                .sniffer
+                .should_sniff_real_ip_tcp("198.51.100.7".parse().unwrap(), 443),
+            "skip-dst-address must skip real-IP TCP sniffing"
+        );
+        assert!(
+            !parsed
+                .sniffer
+                .should_sniff_real_ip_udp("198.51.100.7".parse().unwrap(), 443),
+            "skip-dst-address must skip real-IP UDP QUIC sniffing"
+        );
+        assert!(
+            !parsed
+                .sniffer
+                .should_sniff_real_ip_udp("2001:db8:abcd::1".parse().unwrap(), 443),
+            "IPv6 skip-dst-address must skip real-IP UDP QUIC sniffing"
+        );
+        assert!(
+            parsed
+                .sniffer
+                .should_sniff_real_ip_udp("104.16.132.229".parse().unwrap(), 443)
+        );
+        assert!(!parsed.sniffer.should_override_destination(
+            crate::inbound::sniff::SniffedProtocol::Quic,
+            "a.skip-quic.test"
+        ));
+        assert!(parsed.sniffer.should_override_destination(
+            crate::inbound::sniff::SniffedProtocol::Quic,
+            "force.skip-quic.test"
+        ));
+
+        let bad_skip_dst = r#"
+mode: rule
+sniffer:
+  enable: true
+  skip-dst-address:
+    - "invalid-cidr"
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(
+            ClashConfig::from_yaml_str(bad_skip_dst)
+                .unwrap_err()
+                .to_string()
+                .contains("sniffer.skip-dst-address")
+        );
     }
 }

@@ -906,9 +906,12 @@ fn summarize_recent_connections(entries: &[Value]) -> Value {
     let mut by_exit: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut by_network: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    let mut by_rule_type: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut zero_download_tcp_count = 0usize;
     let mut tun_fake_ip_count = 0usize;
     let mut tun_real_ip_count = 0usize;
+    let mut sniffer_hit_count = 0usize;
 
     for item in entries {
         match item.get("status").and_then(|v| v.as_str()).unwrap_or("") {
@@ -925,6 +928,13 @@ fn summarize_recent_connections(entries: &[Value]) -> Value {
             .unwrap_or("UNKNOWN");
         *by_exit.entry(exit.to_string()).or_insert(0) += 1;
 
+        let rule_type = item
+            .get("rule")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("UNKNOWN");
+        *by_rule_type.entry(rule_type.to_string()).or_insert(0) += 1;
+
         let net = item
             .get("metadata")
             .and_then(|m| m.get("network"))
@@ -937,6 +947,15 @@ fn summarize_recent_connections(entries: &[Value]) -> Value {
         let download = item.get("download").and_then(|v| v.as_u64()).unwrap_or(0);
         if net.eq_ignore_ascii_case("tcp") && upload > 0 && download == 0 {
             zero_download_tcp_count += 1;
+        }
+
+        if item
+            .get("metadata")
+            .and_then(|m| m.get("sniffed"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            sniffer_hit_count += 1;
         }
 
         let inbound = item
@@ -968,27 +987,39 @@ fn summarize_recent_connections(entries: &[Value]) -> Value {
         },
         "by_exit_type": by_exit,
         "by_network": by_network,
+        "by_rule_type": by_rule_type,
         "zero_download_tcp_count": zero_download_tcp_count,
         "tun_fake_ip_count": tun_fake_ip_count,
         "tun_real_ip_count": tun_real_ip_count,
+        "sniffer_hit_count": sniffer_hit_count,
     })
 }
 
 fn redact_network_tokens_in_log(text: &str) -> String {
     text.split_whitespace()
         .map(|tok| {
-            let trimmed = tok.trim_matches(|c: char| {
-                matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '\'' | '"')
+            // Preserve `[...]` brackets on the first pass so bracketed IPv6 SocketAddrs such as
+            // `[2001:db8::1]:443` parse cleanly via `SocketAddr::parse`.
+            let outer = tok.trim_matches(|c: char| {
+                matches!(c, '(' | ')' | ',' | ';' | '\'' | '"' | '<' | '>')
             });
-            let looks_like_endpoint = trimmed.parse::<std::net::IpAddr>().is_ok()
-                || trimmed.parse::<std::net::SocketAddr>().is_ok()
-                || trimmed.starts_with("http://")
-                || trimmed.starts_with("https://")
-                || (trimmed.contains('.')
-                    && trimmed.contains(':')
-                    && trimmed
-                        .rsplit_once(':')
-                        .is_some_and(|(_, p)| p.parse::<u16>().is_ok()));
+            let inner = outer.trim_matches(|c: char| matches!(c, '[' | ']'));
+            let is_domain_port = |s: &str| -> bool {
+                s.contains('.')
+                    && s.contains(':')
+                    && s.rsplit_once(':')
+                        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok())
+            };
+            let looks_like_endpoint = outer.parse::<std::net::SocketAddr>().is_ok()
+                || outer.parse::<std::net::IpAddr>().is_ok()
+                || inner.parse::<std::net::SocketAddr>().is_ok()
+                || inner.parse::<std::net::IpAddr>().is_ok()
+                || outer.starts_with("http://")
+                || outer.starts_with("https://")
+                || inner.starts_with("http://")
+                || inner.starts_with("https://")
+                || is_domain_port(outer)
+                || is_domain_port(inner);
             if looks_like_endpoint {
                 "[redacted-endpoint]"
             } else {
@@ -999,8 +1030,49 @@ fn redact_network_tokens_in_log(text: &str) -> String {
         .join(" ")
 }
 
-fn extract_recent_warn_error_logs(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFilterLevel {
+    Error,
+    Warn,
+    Info,
+    All,
+}
+
+impl LogFilterLevel {
+    fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "error" | "err" => Ok(Self::Error),
+            "warn" | "warning" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "invalid log level '{other}': expected one of 'error', 'warn', 'info', or 'all'"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::All => "all",
+        }
+    }
+
+    fn matches(self, entry_level: &str) -> bool {
+        match self {
+            Self::Error => matches!(entry_level, "error" | "err"),
+            Self::Warn => matches!(entry_level, "warn" | "warning" | "error" | "err"),
+            Self::Info => matches!(entry_level, "info" | "warn" | "warning" | "error" | "err"),
+            Self::All => true,
+        }
+    }
+}
+
+fn extract_recent_logs_filtered(
     logs_val: Option<&Value>,
+    filter_level: LogFilterLevel,
     limit: usize,
     include_network_metadata: bool,
 ) -> Value {
@@ -1010,6 +1082,7 @@ fn extract_recent_warn_error_logs(
     else {
         return json!([]);
     };
+    let cap = limit.clamp(1, 100);
     let mut out = Vec::new();
     for entry in arr.iter().rev() {
         let level = entry
@@ -1018,7 +1091,7 @@ fn extract_recent_warn_error_logs(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if !matches!(level.as_str(), "warn" | "warning" | "error") {
+        if !filter_level.matches(&level) {
             continue;
         }
         let raw_msg = entry.get("payload").and_then(|v| v.as_str()).unwrap_or("");
@@ -1033,11 +1106,24 @@ fn extract_recent_warn_error_logs(
             "level": level,
             "payload": msg,
         }));
-        if out.len() >= limit {
+        if out.len() >= cap {
             break;
         }
     }
     Value::Array(out)
+}
+
+fn extract_recent_warn_error_logs(
+    logs_val: Option<&Value>,
+    limit: usize,
+    include_network_metadata: bool,
+) -> Value {
+    extract_recent_logs_filtered(
+        logs_val,
+        LogFilterLevel::Warn,
+        limit,
+        include_network_metadata,
+    )
 }
 
 fn build_tools_list(allow_mutations: bool) -> Vec<Value> {
@@ -1125,10 +1211,31 @@ fn build_tools_list(allow_mutations: bool) -> Vec<Value> {
         }),
         json!({
             "name": "get_proxy_status",
-            "description": "Return credential-redacted active proxy status, routing mode, effective outbound chain, selector group states, and privacy-filtered recent connection failure diagnostics.",
+            "description": "Return credential-redacted active proxy status, routing mode, effective outbound chain, selector group states, privacy-filtered recent connection failure diagnostics, rule/sniffer distribution summary, and recent warnings/errors.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "get_recent_logs",
+            "description": "Return credential- and endpoint-redacted recent daemon logs filtered by minimum severity (`error`, `warn`, `info`, or `all`). Launch `rust-clash mcp --include-network-metadata` to retain raw network endpoints.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "string",
+                        "enum": ["error", "warn", "info", "all"],
+                        "description": "Minimum severity filter: 'error', 'warn' (warn+error, default), 'info' (info+warn+error), or 'all'."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum number of newest log entries to return (default 30, max 100)."
+                    }
+                },
                 "additionalProperties": false
             }
         }),
@@ -1681,7 +1788,7 @@ async fn execute_tool_call_with_state_dir(
                         .ok()
                         .and_then(|(st, v)| (st == 200).then_some(v));
                     let logs_val = c
-                        .request_json("GET", "/logs", None, Duration::from_secs(2))
+                        .request_json("GET", "/logs?level=warn", None, Duration::from_secs(2))
                         .await
                         .ok()
                         .and_then(|(st, v)| (st == 200).then_some(v));
@@ -1807,6 +1914,95 @@ async fn execute_tool_call_with_state_dir(
                 },
                 Err(e) => mcp_tool_result(
                     &json!({ "error": redact_sensitive_text(&e.to_string()) }),
+                    true,
+                ),
+            }
+        }
+
+        "get_recent_logs" => {
+            let parsed_level = match args.get("level") {
+                None | Some(Value::Null) => LogFilterLevel::Warn,
+                Some(Value::String(raw)) => match LogFilterLevel::parse(raw) {
+                    Ok(lv) => lv,
+                    Err(msg) => return mcp_tool_result(&json!({ "error": msg }), true),
+                },
+                Some(_) => {
+                    return mcp_tool_result(
+                        &json!({ "error": "invalid 'level': expected string ('error', 'warn', 'info', or 'all')" }),
+                        true,
+                    );
+                }
+            };
+            let limit = match args.get("limit") {
+                None | Some(Value::Null) => 30usize,
+                Some(v) => match v.as_u64() {
+                    Some(n) => (n as usize).clamp(1, 100),
+                    None => {
+                        return mcp_tool_result(
+                            &json!({ "error": "invalid 'limit': expected integer between 1 and 100" }),
+                            true,
+                        );
+                    }
+                },
+            };
+
+            let path = format!("/logs?level={}", parsed_level.as_str());
+            match request_live_controller_json(
+                &ctrl_clients,
+                "GET",
+                &path,
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+            {
+                LiveControllerOutcome::Response {
+                    client: c,
+                    status: 200,
+                    body: logs_val,
+                } => {
+                    let logs = extract_recent_logs_filtered(
+                        Some(&logs_val),
+                        parsed_level,
+                        limit,
+                        opts.include_network_metadata,
+                    );
+                    let count = logs.as_array().map_or(0, Vec::len);
+                    mcp_tool_result(
+                        &json!({
+                            "daemon_connected": true,
+                            "metadata_privacy_mode": if opts.include_network_metadata { "full" } else { "redacted" },
+                            "controller": if opts.include_network_metadata { json!(c.host_port) } else { json!("<redacted>") },
+                            "level": parsed_level.as_str(),
+                            "limit": limit,
+                            "count": count,
+                            "logs": logs,
+                        }),
+                        false,
+                    )
+                }
+                LiveControllerOutcome::AuthRejected { status } => mcp_tool_result(
+                    &json!({
+                        "daemon_connected": false,
+                        "auth_error": true,
+                        "http_status": status,
+                        "error": auth_rejected_note(status),
+                    }),
+                    true,
+                ),
+                LiveControllerOutcome::Response { status, .. } => mcp_tool_result(
+                    &json!({
+                        "daemon_connected": false,
+                        "http_status": status,
+                        "error": format!("Live controller returned HTTP {status} for {path}"),
+                    }),
+                    true,
+                ),
+                LiveControllerOutcome::Unreachable => mcp_tool_result(
+                    &json!({
+                        "daemon_connected": false,
+                        "error": "No live rust-clash controller responded; recent runtime logs require a running daemon.",
+                    }),
                     true,
                 ),
             }
@@ -2379,6 +2575,7 @@ mod tests {
         assert!(ro_names.contains(&"probe_waterfall"));
         assert!(ro_names.contains(&"probe_ai_matrix"));
         assert!(ro_names.contains(&"get_proxy_status"));
+        assert!(ro_names.contains(&"get_recent_logs"));
         assert!(!ro_names.contains(&"switch_proxy_selector"));
 
         // Verify raw `yaml` is excluded from audit_config_security schema
@@ -3659,6 +3856,335 @@ rules:
                 && g["member_count"] == 2),
             "get_proxy_status must include LoadBalance groups: {groups:?}"
         );
+
+        let _ = shutdown_tx.send(true);
+        engine.shutdown_async().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn get_proxy_status_reports_by_rule_type_and_sniffer_hit_count_without_leaking_hosts() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustclash-mcp-sniffer-summary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut cfg = ClashConfig::from_yaml_str(
+            r#"
+mixed-port: 0
+external-controller: ""
+mode: rule
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        cfg.dns.enable = false;
+        let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+            .await
+            .unwrap();
+
+        let hub = engine.hub();
+        let direct_ob = proxy_core::outbound::DirectOutbound::new("DIRECT");
+
+        // 1. Sniffed TUN TCP real-IP -> DomainSuffix
+        let sniffed_tcp_target =
+            proxy_core::addr::TargetAddr::new_domain("claude.secret-test.example", 443).unwrap();
+        let g1 = hub.register_connection_with_outbound_guard_sniffed(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &sniffed_tcp_target,
+            None,
+            "DomainSuffix",
+            "secret-test.example",
+            vec!["PROXY".to_string()],
+            &direct_ob,
+            true,
+        );
+        g1.mark_established();
+        hub.record_download(g1.connection(), 1024);
+        drop(g1);
+
+        // 2. Sniffed TUN UDP QUIC real-IP -> GeoSite
+        let sniffed_udp_target =
+            proxy_core::addr::TargetAddr::new_domain("quic.secret-test.example", 443).unwrap();
+        let g2 = hub.register_connection_with_outbound_guard_sniffed(
+            "TUN(smoltcp)",
+            "udp",
+            None,
+            &sniffed_udp_target,
+            None,
+            "GeoSite",
+            "google",
+            vec!["PROXY".to_string()],
+            &direct_ob,
+            true,
+        );
+        g2.mark_established();
+        hub.record_download(g2.connection(), 2048);
+        drop(g2);
+
+        // 3. Unsniffed Fake-IP TUN TCP -> GeoSite
+        let fake_ip_target =
+            proxy_core::addr::TargetAddr::new_domain("www.baidu.com", 443).unwrap();
+        let g3 = hub.register_connection_with_outbound_guard_sniffed(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &fake_ip_target,
+            Some("198.18.0.42".to_string()),
+            "GeoSite",
+            "cn",
+            vec!["DIRECT".to_string()],
+            &direct_ob,
+            false,
+        );
+        g3.mark_established();
+        hub.record_download(g3.connection(), 4096);
+        drop(g3);
+
+        // 4. Unsniffed real-IP -> GeoIP
+        let raw_ip_target =
+            proxy_core::addr::TargetAddr::new_ip("198.51.100.55".parse().unwrap(), 80);
+        let g4 = hub.register_connection_with_outbound_guard_sniffed(
+            "TUN(smoltcp)",
+            "tcp",
+            None,
+            &raw_ip_target,
+            None,
+            "GeoIP",
+            "CN",
+            vec!["DIRECT".to_string()],
+            &direct_ob,
+            false,
+        );
+        g4.mark_established();
+        hub.record_download(g4.connection(), 512);
+        drop(g4);
+
+        // 5. Unsniffed mixed inbound -> Match
+        let match_target =
+            proxy_core::addr::TargetAddr::new_domain("fallback.example.org", 443).unwrap();
+        let g5 = hub.register_connection_with_outbound_guard_sniffed(
+            "HTTP CONNECT",
+            "tcp",
+            None,
+            &match_target,
+            None,
+            "Match",
+            "",
+            vec!["PROXY".to_string()],
+            &direct_ob,
+            false,
+        );
+        g5.mark_established();
+        hub.record_download(g5.connection(), 256);
+        drop(g5);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_addr, api_task) =
+            proxy_core::api::spawn_api_server("127.0.0.1:0", engine.clone(), shutdown_rx)
+                .await
+                .expect("spawn api server");
+        engine
+            .publish_controller_discovery(state_dir.clone(), bound_addr)
+            .expect("write controller discovery");
+
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: None,
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let res =
+            execute_tool_call_with_state_dir("get_proxy_status", &json!({}), &opts, &state_dir)
+                .await;
+        assert_eq!(res["isError"], false);
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("claude.secret-test.example")
+                && !text.contains("quic.secret-test.example")
+                && !text.contains("198.51.100.55"),
+            "default privacy mode must not expose sniffed domains or target IPs: {text}"
+        );
+
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let summary = &parsed["recent_connections_summary"];
+        assert_eq!(summary["sampled_count"], 5);
+        assert_eq!(summary["sniffer_hit_count"], 2);
+        assert_eq!(summary["tun_fake_ip_count"], 1);
+        assert_eq!(summary["tun_real_ip_count"], 3);
+        assert_eq!(summary["by_rule_type"]["GeoSite"], 2);
+        assert_eq!(summary["by_rule_type"]["DomainSuffix"], 1);
+        assert_eq!(summary["by_rule_type"]["GeoIP"], 1);
+        assert_eq!(summary["by_rule_type"]["Match"], 1);
+
+        let _ = shutdown_tx.send(true);
+        engine.shutdown_async().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn get_recent_logs_filters_levels_clamps_limit_retains_warnings_and_redacts_endpoints() {
+        let state_dir =
+            std::env::temp_dir().join(format!("rustclash-mcp-logs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut cfg = ClashConfig::from_yaml_str(
+            r#"
+mixed-port: 0
+external-controller: ""
+mode: rule
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        cfg.dns.enable = false;
+        let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+            .await
+            .unwrap();
+
+        let hub = engine.hub();
+        hub.push_log(
+            "error",
+            "Upstream dial failed to 198.51.100.77:443 and [2001:db8::1]:443 with password=SuperSecretPw123",
+        );
+        hub.push_log(
+            "warn",
+            "Slow handshake to secret.corp.example:8443 via https://internal.example/api?token=Tok9988",
+        );
+        // Flood routine info logs (>250) to verify warn/error entries survive in important_logs().
+        for idx in 0..260 {
+            hub.push_log(
+                "info",
+                format!("Routine info log #{idx} targeting 203.0.113.10:80"),
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_addr, api_task) =
+            proxy_core::api::spawn_api_server("127.0.0.1:0", engine.clone(), shutdown_rx)
+                .await
+                .expect("spawn api server");
+        engine
+            .publish_controller_discovery(state_dir.clone(), bound_addr)
+            .expect("write controller discovery");
+
+        let redacted_opts = McpServerOptions {
+            config_path: None,
+            controller: None,
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. Default call (`level: warn`, `limit: 30`): surfaces warn + error even after 260 info logs,
+        // and redacts BOTH credentials AND IPv4 / bracketed IPv6 / host:port / URLs.
+        let warn_res = execute_tool_call_with_state_dir(
+            "get_recent_logs",
+            &json!({}),
+            &redacted_opts,
+            &state_dir,
+        )
+        .await;
+        assert_eq!(warn_res["isError"], false);
+        let warn_text = warn_res["content"][0]["text"].as_str().unwrap();
+        assert!(!warn_text.contains("SuperSecretPw123"));
+        assert!(!warn_text.contains("Tok9988"));
+        assert!(!warn_text.contains("198.51.100.77"));
+        assert!(!warn_text.contains("2001:db8::1"));
+        assert!(!warn_text.contains("secret.corp.example"));
+        assert!(!warn_text.contains("internal.example"));
+        assert!(!warn_text.contains(&bound_addr.to_string()));
+
+        let warn_parsed: Value = serde_json::from_str(warn_text).unwrap();
+        assert_eq!(warn_parsed["daemon_connected"], true);
+        assert_eq!(warn_parsed["level"], "warn");
+        assert_eq!(warn_parsed["limit"], 30);
+        assert_eq!(warn_parsed["controller"], "<redacted>");
+        let warn_logs = warn_parsed["logs"].as_array().unwrap();
+        assert!(warn_logs.len() >= 2);
+        assert!(warn_logs.iter().all(|l| l["level"] != "info"));
+        assert!(warn_logs.iter().any(|l| {
+            l["level"] == "error"
+                && l["payload"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("[redacted-endpoint]")
+        }));
+
+        // 2. `level: error` returns only error entries.
+        let err_res = execute_tool_call_with_state_dir(
+            "get_recent_logs",
+            &json!({ "level": "error" }),
+            &redacted_opts,
+            &state_dir,
+        )
+        .await;
+        assert_eq!(err_res["isError"], false);
+        let err_parsed: Value =
+            serde_json::from_str(err_res["content"][0]["text"].as_str().unwrap()).unwrap();
+        let err_logs = err_parsed["logs"].as_array().unwrap();
+        assert!(!err_logs.is_empty());
+        assert!(err_logs.iter().all(|l| l["level"] == "error"));
+
+        // 3. `level: all` with `limit: 500` clamps limit to 100 and returns info logs with endpoints redacted.
+        let all_res = execute_tool_call_with_state_dir(
+            "get_recent_logs",
+            &json!({ "level": "all", "limit": 500 }),
+            &redacted_opts,
+            &state_dir,
+        )
+        .await;
+        assert_eq!(all_res["isError"], false);
+        let all_text = all_res["content"][0]["text"].as_str().unwrap();
+        assert!(!all_text.contains("203.0.113.10"));
+        let all_parsed: Value = serde_json::from_str(all_text).unwrap();
+        assert_eq!(all_parsed["limit"], 100);
+        assert_eq!(all_parsed["count"], 100);
+        assert!(
+            all_parsed["logs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["level"] == "info")
+        );
+
+        // 4. Invalid level returns `isError: true`.
+        let bad_res = execute_tool_call_with_state_dir(
+            "get_recent_logs",
+            &json!({ "level": "verbose" }),
+            &redacted_opts,
+            &state_dir,
+        )
+        .await;
+        assert_eq!(bad_res["isError"], true);
+
+        // 5. `--include-network-metadata` retains endpoints while STILL redacting secrets.
+        let full_opts = McpServerOptions {
+            include_network_metadata: true,
+            ..redacted_opts
+        };
+        let full_res = execute_tool_call_with_state_dir(
+            "get_recent_logs",
+            &json!({ "level": "warn", "limit": 10 }),
+            &full_opts,
+            &state_dir,
+        )
+        .await;
+        assert_eq!(full_res["isError"], false);
+        let full_text = full_res["content"][0]["text"].as_str().unwrap();
+        assert!(full_text.contains("198.51.100.77:443"));
+        assert!(full_text.contains("[2001:db8::1]:443"));
+        assert!(full_text.contains("secret.corp.example:8443"));
+        assert!(!full_text.contains("SuperSecretPw123"));
+        assert!(!full_text.contains("Tok9988"));
 
         let _ = shutdown_tx.send(true);
         engine.shutdown_async().await;

@@ -149,6 +149,9 @@ pub struct ConnectionMetadata {
     /// Optional local client process executable name (e.g. `curl`, `chrome.exe`) when resolvable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
+    /// True when a real-IP connection's hostname was recovered via protocol sniffing (TLS SNI / HTTP Host / QUIC SNI).
+    #[serde(default)]
+    pub sniffed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -494,6 +497,7 @@ impl TelemetryHub {
             protocol,
             exit_type,
             remote_endpoint,
+            false,
         )
     }
 
@@ -510,6 +514,34 @@ impl TelemetryHub {
         chains: Vec<String>,
         outbound: &dyn OutboundHandler,
     ) -> Arc<ActiveConnection> {
+        self.register_connection_with_outbound_sniffed(
+            inbound_type,
+            network,
+            source,
+            target,
+            fake_ip,
+            rule,
+            rule_payload,
+            chains,
+            outbound,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_connection_with_outbound_sniffed(
+        &self,
+        inbound_type: impl Into<String>,
+        network: impl Into<String>,
+        source: Option<SocketAddr>,
+        target: &TargetAddr,
+        fake_ip: Option<String>,
+        rule: impl Into<String>,
+        rule_payload: impl Into<String>,
+        chains: Vec<String>,
+        outbound: &dyn OutboundHandler,
+        sniffed: bool,
+    ) -> Arc<ActiveConnection> {
         self.register_connection_detailed(
             inbound_type,
             network,
@@ -523,6 +555,7 @@ impl TelemetryHub {
             outbound.protocol().to_string(),
             outbound.exit_category().to_string(),
             outbound.remote_endpoint(target),
+            sniffed,
         )
     }
 
@@ -564,7 +597,7 @@ impl TelemetryHub {
         chains: Vec<String>,
         outbound: &dyn OutboundHandler,
     ) -> ConnectionGuard {
-        let conn = self.register_connection_with_outbound(
+        self.register_connection_with_outbound_guard_sniffed(
             inbound_type,
             network,
             source,
@@ -574,6 +607,35 @@ impl TelemetryHub {
             rule_payload,
             chains,
             outbound,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_connection_with_outbound_guard_sniffed(
+        self: &Arc<Self>,
+        inbound_type: impl Into<String>,
+        network: impl Into<String>,
+        source: Option<SocketAddr>,
+        target: &TargetAddr,
+        fake_ip: Option<String>,
+        rule: impl Into<String>,
+        rule_payload: impl Into<String>,
+        chains: Vec<String>,
+        outbound: &dyn OutboundHandler,
+        sniffed: bool,
+    ) -> ConnectionGuard {
+        let conn = self.register_connection_with_outbound_sniffed(
+            inbound_type,
+            network,
+            source,
+            target,
+            fake_ip,
+            rule,
+            rule_payload,
+            chains,
+            outbound,
+            sniffed,
         );
         ConnectionGuard::new(Arc::clone(self), conn)
     }
@@ -593,6 +655,7 @@ impl TelemetryHub {
         effective_protocol: String,
         exit_type: String,
         remote_endpoint: String,
+        sniffed: bool,
     ) -> Arc<ActiveConnection> {
         self.total_connections.fetch_add(1, Ordering::Relaxed);
         let id = uuid::Uuid::new_v4().to_string();
@@ -610,6 +673,7 @@ impl TelemetryHub {
             host: target.host.to_string(),
             fake_ip,
             process,
+            sniffed,
         };
         let conn = Arc::new(ActiveConnection {
             id: id.clone(),
@@ -742,6 +806,36 @@ impl TelemetryHub {
         outbound: &dyn OutboundHandler,
         raw_reason: &str,
     ) {
+        self.record_instant_failed_diagnostic_sniffed(
+            inbound_type,
+            network,
+            source,
+            target,
+            fake_ip,
+            rule,
+            rule_payload,
+            chains,
+            outbound,
+            raw_reason,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_instant_failed_diagnostic_sniffed(
+        &self,
+        inbound_type: impl Into<String>,
+        network: impl Into<String>,
+        source: Option<SocketAddr>,
+        target: &TargetAddr,
+        fake_ip: Option<String>,
+        rule: impl Into<String>,
+        rule_payload: impl Into<String>,
+        chains: Vec<String>,
+        outbound: &dyn OutboundHandler,
+        raw_reason: &str,
+        sniffed: bool,
+    ) {
         self.total_connections.fetch_add(1, Ordering::Relaxed);
         let now = Self::now_ms();
         let id = uuid::Uuid::new_v4().to_string();
@@ -762,6 +856,7 @@ impl TelemetryHub {
                 host: target.host.to_string(),
                 fake_ip,
                 process,
+                sniffed,
             },
             upload: 0,
             download: 0,
@@ -1268,6 +1363,10 @@ impl TelemetryHub {
         self.recent_logs.lock().iter().cloned().collect()
     }
 
+    pub fn important_logs(&self) -> Vec<LogEntry> {
+        self.important_logs.lock().iter().cloned().collect()
+    }
+
     pub fn logs_since(&self, since_epoch_ms: u64, limit: usize) -> Vec<LogEntry> {
         self.logs_in_window(since_epoch_ms, u64::MAX, limit)
     }
@@ -1676,6 +1775,7 @@ mod tests {
                 host: "api.openai.com".to_string(),
                 fake_ip: Some("198.18.0.42".to_string()),
                 process: None,
+                sniffed: false,
             },
             upload: 0,
             download: 0,
@@ -1786,6 +1886,7 @@ mod tests {
                     host: format!("{id}.example.com"),
                     fake_ip: Some("198.18.0.42".to_string()),
                     process: None,
+                    sniffed: false,
                 },
                 upload: 128,
                 download: if status == "failed" { 0 } else { 512 },

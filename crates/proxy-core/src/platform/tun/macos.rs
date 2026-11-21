@@ -171,6 +171,124 @@ pub fn build_macos_bypass_route_commands(
     cmds
 }
 
+/// Build `(add_args, delete_args)` pairs for `/sbin/route` covering `tun.route-exclude-address`
+/// IPv4 (`-net <cidr> <v4_gw>`) and IPv6 (`-inet6 -net <cidr> <v6_gw>`) bypass routes over the
+/// active physical gateway.
+pub fn build_macos_exclude_route_commands(
+    exclude_cidrs: &[ipnet::IpNet],
+    fake_ip_net: ipnet::Ipv4Net,
+    tun_ipv6_cidr: ipnet::Ipv6Net,
+    enable_ipv6: bool,
+    v4_gw: Option<&str>,
+    v6_gw: Option<&str>,
+) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut cmds = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for &cidr in exclude_cidrs {
+        match cidr {
+            ipnet::IpNet::V4(v4net) => {
+                let net = v4net.trunc();
+                if net.prefix_len() <= 1 || crate::config::ipv4_nets_overlap(net, fake_ip_net) {
+                    continue;
+                }
+                if let Some(gw) = v4_gw.filter(|s| !s.is_empty()) {
+                    let net_s = net.to_string();
+                    if seen.contains(&net_s) {
+                        continue;
+                    }
+                    seen.push(net_s.clone());
+                    let add_args = vec![
+                        "-n".to_string(),
+                        "add".to_string(),
+                        "-net".to_string(),
+                        net_s.clone(),
+                        gw.to_string(),
+                    ];
+                    let del_args = vec![
+                        "-n".to_string(),
+                        "delete".to_string(),
+                        "-net".to_string(),
+                        net_s,
+                        gw.to_string(),
+                    ];
+                    cmds.push((add_args, del_args));
+                }
+            }
+            ipnet::IpNet::V6(v6net) => {
+                if !enable_ipv6 {
+                    continue;
+                }
+                let net = v6net.trunc();
+                if net.prefix_len() <= 1
+                    || (net.prefix_len() >= tun_ipv6_cidr.prefix_len()
+                        && crate::config::ipv6_nets_overlap(net, tun_ipv6_cidr))
+                {
+                    continue;
+                }
+                if let Some(gw6) = v6_gw.filter(|s| !s.is_empty()) {
+                    let net_s = net.to_string();
+                    if seen.contains(&net_s) {
+                        continue;
+                    }
+                    seen.push(net_s.clone());
+                    let add_args = vec![
+                        "-n".to_string(),
+                        "add".to_string(),
+                        "-inet6".to_string(),
+                        "-net".to_string(),
+                        net_s.clone(),
+                        gw6.to_string(),
+                    ];
+                    let del_args = vec![
+                        "-n".to_string(),
+                        "delete".to_string(),
+                        "-inet6".to_string(),
+                        "-net".to_string(),
+                        net_s,
+                        gw6.to_string(),
+                    ];
+                    cmds.push((add_args, del_args));
+                }
+            }
+        }
+    }
+    cmds
+}
+
+/// Parse macOS `ipconfig getoption <ifname> domain_name_server` output into unique `IpAddr`s.
+pub fn parse_ipconfig_dns_output(output: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for tok in output.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let clean = tok.trim().split('%').next().unwrap_or("").trim();
+        if let Ok(ip) = clean.parse::<IpAddr>()
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// Parse macOS `scutil --dns` output to extract `nameserver[N] : <ip>` entries.
+pub fn parse_scutil_dns_output(output: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("nameserver[") {
+            continue;
+        }
+        if let Some((_, rhs)) = trimmed.split_once(':') {
+            let clean = rhs.trim().split('%').next().unwrap_or("").trim();
+            if let Ok(ip) = clean.parse::<IpAddr>()
+                && !out.contains(&ip)
+            {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
 /// Parse `networksetup -listnetworkserviceorder` output to map BSD device `en0` -> macOS Service `"Wi-Fi"`.
 pub fn map_bsd_device_to_network_service(output: &str, bsd_device: &str) -> Option<String> {
     let mut last_service: Option<String> = None;
@@ -346,12 +464,12 @@ mod darwin_impl {
     use std::{
         ffi::CString,
         io,
-        net::Ipv4Addr,
+        net::{IpAddr, Ipv4Addr},
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
         path::Path,
         process::Command,
         sync::{
-            Arc,
+            Arc, LazyLock,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread::JoinHandle,
@@ -361,12 +479,20 @@ mod darwin_impl {
     use parking_lot::Mutex;
 
     use super::{
-        build_macos_bypass_route_commands, decode_darwin_utun_packet, encode_darwin_utun_packet,
-        is_utun_split_route_del_arg, map_bsd_device_to_network_service,
-        merge_macos_protector_indices, normalize_macos_ipv6_gateway, parse_macos_route_get_default,
-        resolve_macos_default_egress_outputs, restore_macos_dns_backups_with_runner,
-        rollback_macos_record_with_runner, select_macos_physical_bypass_ips,
+        build_macos_bypass_route_commands, build_macos_exclude_route_commands,
+        decode_darwin_utun_packet, encode_darwin_utun_packet, is_utun_split_route_del_arg,
+        map_bsd_device_to_network_service, merge_macos_protector_indices,
+        normalize_macos_ipv6_gateway, parse_ipconfig_dns_output, parse_macos_route_get_default,
+        parse_scutil_dns_output, resolve_macos_default_egress_outputs,
+        restore_macos_dns_backups_with_runner, rollback_macos_record_with_runner,
+        select_macos_physical_bypass_ips,
     };
+
+    /// Snapshot of pre-TUN physical network service DNS servers captured before `MacOsUtunSession`
+    /// points the primary service at `198.18.x.x` / `198.19.x.x`, used by `system` / `dhcp://system`
+    /// DNS upstreams when `networksetup` static DNS overrides DHCP.
+    static SAVED_PHYSICAL_DNS: LazyLock<Mutex<Vec<IpAddr>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
     use crate::{
         inbound::tun::VirtualTunHandle,
         platform::{
@@ -664,6 +790,11 @@ mod darwin_impl {
                         .filter(|l| !l.is_empty() && !l.contains("There aren't any DNS Servers"))
                         .map(ToOwned::to_owned)
                         .collect();
+                    let parsed_prev: Vec<IpAddr> = prev_servers
+                        .iter()
+                        .filter_map(|s| s.parse::<IpAddr>().ok())
+                        .collect();
+                    *SAVED_PHYSICAL_DNS.lock() = parsed_prev;
                     rec.dns_backups.push(MacOsDnsBackup {
                         service_name: svc.clone(),
                         previous_servers: prev_servers,
@@ -683,6 +814,50 @@ mod darwin_impl {
         }
     }
 
+    /// Discover physical default-egress DNS servers on macOS for `system` / `dhcp://system` DNS upstreams.
+    /// Reads DHCP DNS directly from the active BSD interface (`ipconfig getoption <if> domain_name_server`),
+    /// includes any pre-TUN static DNS snapshot, and falls back to `scutil --dns` and `/etc/resolv.conf`.
+    pub fn discover_macos_physical_dns_servers() -> Vec<IpAddr> {
+        fn extend_unique(out: &mut Vec<IpAddr>, ips: Vec<IpAddr>) {
+            for ip in ips {
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+
+        // 1. Prefer pre-TUN static DNS backed up before pointing the service at Fake-IP DNS.
+        extend_unique(&mut out, SAVED_PHYSICAL_DNS.lock().clone());
+
+        // 2. Query active physical interface DHCP DNS directly (`ipconfig getoption en0 domain_name_server`).
+        let egress = detect_macos_dual_stack_egress();
+        if let Some(ref if_name) = egress.primary_if
+            && let Ok(ipcfg_out) = run_cmd(
+                "/usr/sbin/ipconfig",
+                &["getoption", if_name, "domain_name_server"],
+            )
+        {
+            extend_unique(&mut out, parse_ipconfig_dns_output(&ipcfg_out));
+        }
+
+        // 3. Fallback to `scutil --dns` and `/etc/resolv.conf`.
+        if let Ok(scutil_out) = run_cmd("/usr/sbin/scutil", &["--dns"]) {
+            extend_unique(&mut out, parse_scutil_dns_output(&scutil_out));
+        }
+        if out.is_empty()
+            && let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf")
+        {
+            extend_unique(
+                &mut out,
+                crate::platform::tun::linux::parse_resolv_conf_nameservers(&contents),
+            );
+        }
+
+        out
+    }
+
     fn install_macos_bypass_routes(
         spec: &TunLaunchSpec,
         egress: &MacOsDualStackEgress,
@@ -697,13 +872,21 @@ mod darwin_impl {
             has_v4_bound_if,
             has_v6_bound_if,
         );
-        let cmds = build_macos_bypass_route_commands(
+        let mut cmds = build_macos_bypass_route_commands(
             &effective_bypass,
             spec.fake_ip_net,
             spec.tun_ipv6_cidr,
             egress.v4_gw.as_deref(),
             egress.v6_gw.as_deref(),
         );
+        cmds.extend(build_macos_exclude_route_commands(
+            &spec.route_exclude_cidrs,
+            spec.fake_ip_net,
+            spec.tun_ipv6_cidr,
+            spec.enable_ipv6,
+            egress.v4_gw.as_deref(),
+            egress.v6_gw.as_deref(),
+        ));
         for (add_args, del_args) in cmds {
             let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
             if run_cmd("/sbin/route", &add_refs).is_ok() {
@@ -1094,7 +1277,8 @@ mod darwin_impl {
                             let mut rec_guard = rec_watch.lock();
                             if gw_changed
                                 && (!spec_watch.bypass_ips.is_empty()
-                                    || !spec_watch.dns_bypass_ips.is_empty())
+                                    || !spec_watch.dns_bypass_ips.is_empty()
+                                    || !spec_watch.route_exclude_cidrs.is_empty())
                             {
                                 let mut split_routes =
                                     Vec::with_capacity(rec_guard.owned_route_del_args.len());
@@ -1242,6 +1426,7 @@ mod darwin_impl {
             }
 
             let rec_final = self.recovery_record.lock().clone();
+            SAVED_PHYSICAL_DNS.lock().clear();
             clear_global_socket_protector();
             let outcome = rollback_macos_record_and_finalize(&rec_final, &self.spec.state_dir);
             if !outcome.warnings.is_empty() {
@@ -1310,7 +1495,10 @@ mod darwin_impl {
 }
 
 #[cfg(target_os = "macos")]
-pub use darwin_impl::{MacOsUtunSession, detect_macos_default_egress, preflight_macos_tun};
+pub use darwin_impl::{
+    MacOsUtunSession, detect_macos_default_egress, discover_macos_physical_dns_servers,
+    preflight_macos_tun,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1547,5 +1735,64 @@ mod tests {
         assert_eq!(merge_macos_protector_indices(5, 8, 6, 0), (6, 8));
         assert_eq!(merge_macos_protector_indices(5, 8, 0, 0), (5, 8));
         assert_eq!(merge_macos_protector_indices(0, 0, 4, 7), (4, 7));
+    }
+
+    #[test]
+    fn build_macos_exclude_routes_and_parse_dns_outputs() {
+        let fake_net: ipnet::Ipv4Net = "198.18.0.0/15".parse().unwrap();
+        let tun_v6: ipnet::Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
+        let cidrs: Vec<ipnet::IpNet> = vec![
+            "192.168.0.0/16".parse().unwrap(),
+            "198.18.10.0/24".parse().unwrap(), // overlaps fake-ip -> skipped
+            "fc00::/7".parse().unwrap(),
+            "fdfe:dcba:9876::/126".parse().unwrap(), // exact tun v6 -> skipped
+        ];
+        let cmds = build_macos_exclude_route_commands(
+            &cidrs,
+            fake_net,
+            tun_v6,
+            true,
+            Some("192.168.1.1"),
+            Some("fe80::1%en0"),
+        );
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[0].0,
+            vec!["-n", "add", "-net", "192.168.0.0/16", "192.168.1.1"]
+        );
+        assert_eq!(
+            cmds[0].1,
+            vec!["-n", "delete", "-net", "192.168.0.0/16", "192.168.1.1"]
+        );
+        assert_eq!(
+            cmds[1].0,
+            vec!["-n", "add", "-inet6", "-net", "fc00::/7", "fe80::1%en0"]
+        );
+
+        let ipcfg = parse_ipconfig_dns_output("192.168.1.1\n10.0.0.53\n192.168.1.1\n");
+        assert_eq!(
+            ipcfg,
+            vec![
+                "192.168.1.1".parse::<IpAddr>().unwrap(),
+                "10.0.0.53".parse::<IpAddr>().unwrap(),
+            ]
+        );
+
+        let scutil = "\
+DNS configuration
+resolver #1
+  nameserver[0] : 198.19.255.254
+  nameserver[1] : 192.168.50.1
+  nameserver[2] : fe80::1%en0
+";
+        let sc = parse_scutil_dns_output(scutil);
+        assert_eq!(
+            sc,
+            vec![
+                "198.19.255.254".parse::<IpAddr>().unwrap(),
+                "192.168.50.1".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 }

@@ -320,6 +320,7 @@ pub async fn run_tun_benchmark(args: BenchTunArgs) -> Result<()> {
             inet6_address: None,
             wintun_path: None,
             mtu: args.mtu,
+            route_exclude_address: Vec::new(),
         },
         proxies: vec![ProxyNodeConfig::Ss {
             name: "Bench-SS2022".into(),
