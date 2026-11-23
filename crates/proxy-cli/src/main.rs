@@ -256,6 +256,12 @@ enum ServerCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    proxy_core::platform::crash_log::install_panic_hook(
+        "rust-clash-cli",
+        env!("CARGO_PKG_VERSION"),
+        proxy_core::platform::recovery::default_state_dir(),
+    );
+
     let cli = Cli::parse();
     let stderr_tracing = matches!(
         &cli.command,

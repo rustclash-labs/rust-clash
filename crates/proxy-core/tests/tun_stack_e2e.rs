@@ -497,3 +497,354 @@ async fn smoltcp_tun_real_ip_sni_override_two_segment_pq_client_hello_over_vless
 
     let _ = shutdown_tx.send(true);
 }
+
+#[tokio::test]
+async fn smoltcp_tun_high_backpressure_multi_mb_upload_zero_window_reorder_retransmit_stress() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use proxy_core::{
+        addr::TargetAddr,
+        outbound::{BoxedStream, OutboundHandler},
+    };
+    use smoltcp::wire::TcpPacket;
+
+    // 3 MiB + odd tail (777 bytes) to exercise both multi-MB streaming and odd-byte window-scale edges
+    const TOTAL_UPLOAD_BYTES: usize = 3 * 1024 * 1024 + 777;
+
+    let mut payload = Vec::with_capacity(TOTAL_UPLOAD_BYTES);
+    let mut state: u32 = 0x1357_9BDF;
+    for _ in 0..TOTAL_UPLOAD_BYTES {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        payload.push((state >> 24) as u8);
+    }
+    let expected_hash = blake3::hash(&payload).to_hex().to_string();
+
+    struct ThrottledUploadOutbound {
+        expected_len: usize,
+        received_bytes: Arc<AtomicUsize>,
+        release_initial_stall: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl OutboundHandler for ThrottledUploadOutbound {
+        fn name(&self) -> &str {
+            "THROTTLED-UPLOAD"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "mock-throttled"
+        }
+
+        async fn connect_tcp(&self, _target: &TargetAddr) -> std::io::Result<BoxedStream> {
+            // Small duplex buffer forces `writer_fut` to block immediately, saturating both
+            // `to_remote_tx` (64 slots) and `smoltcp`'s 64 KiB RX buffer -> real TCP zero-window!
+            let (client_side, mut server_side) = tokio::io::duplex(8 * 1024);
+            let expected_len = self.expected_len;
+            let received_bytes = Arc::clone(&self.received_bytes);
+            let release_initial_stall = Arc::clone(&self.release_initial_stall);
+
+            tokio::spawn(async move {
+                // Phase 1: Wait until the TUN stack advertises zero-window (or max 500ms) so we
+                // deterministically saturate both `to_remote_tx` and `smoltcp`'s 64 KiB RX buffer.
+                let stall_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+                while !release_initial_stall.load(Ordering::Acquire)
+                    && tokio::time::Instant::now() < stall_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // Hold full saturation slightly longer to elicit zero-window probes / dup ACKs
+                tokio::time::sleep(Duration::from_millis(40)).await;
+
+                let mut hasher = blake3::Hasher::new();
+                let mut total = 0usize;
+                let mut buf = vec![0u8; 4099]; // odd read chunk size
+                let mut throttled_pause_bucket = 0usize;
+
+                while total < expected_len {
+                    match server_side.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            hasher.update(&buf[..n]);
+                            total += n;
+                            received_bytes.store(total, Ordering::Release);
+
+                            // Phase 2 (first ~2.0 MiB): pace reads with periodic backpressure pauses
+                            // to force repeated zero-window <-> window-update cycles.
+                            // Phase 3 (final ~1.0 MiB): drain unthrottled to verify full throughput recovery.
+                            if total < 2 * 1024 * 1024 {
+                                throttled_pause_bucket += n;
+                                if throttled_pause_bucket >= 192 * 1024 {
+                                    throttled_pause_bucket = 0;
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                } else if throttled_pause_bucket % (32 * 1024) < n {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let digest = hasher.finalize().to_hex().to_string();
+                let reply = format!("UPLOAD-OK:{total}:{digest}");
+                let _ = server_side.write_all(reply.as_bytes()).await;
+                let _ = server_side.flush().await;
+                let _ = server_side.shutdown().await;
+            });
+
+            Ok(Box::new(client_side))
+        }
+    }
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let received_bytes = Arc::new(AtomicUsize::new(0));
+    let release_initial_stall = Arc::new(AtomicBool::new(false));
+    let throttled_ob: DynOutbound = Arc::new(ThrottledUploadOutbound {
+        expected_len: TOTAL_UPLOAD_BYTES,
+        received_bytes: Arc::clone(&received_bytes),
+        release_initial_stall: Arc::clone(&release_initial_stall),
+    });
+
+    let dns_engine = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+    let mut outbounds = HashMap::new();
+    outbounds.insert("THROTTLED-UPLOAD".to_string(), throttled_ob);
+    let rules = vec!["MATCH,THROTTLED-UPLOAD".to_string()];
+    let router = Arc::new(
+        Router::new(
+            RunMode::Rule,
+            outbounds,
+            &[],
+            &rules,
+            Arc::clone(&dns_engine),
+        )
+        .unwrap(),
+    );
+    let router_slot = Arc::new(RwLock::new(router));
+    let hub = Arc::new(TelemetryHub::new());
+    let (mut vtun, tun_task) =
+        spawn_userspace_tun(1500, router_slot, Arc::clone(&hub), shutdown_rx.clone());
+
+    let mut guest_dev = GuestDevice {
+        rx: VecDeque::new(),
+        tx: VecDeque::new(),
+    };
+    let mut cfg = IfaceConfig::new(HardwareAddress::Ip);
+    cfg.random_seed = 0x5151_A5A5;
+    let boot = std::time::Instant::now();
+    let now_smol = || SmolInstant::from_micros(boot.elapsed().as_micros() as i64);
+
+    let mut guest_iface = Interface::new(cfg, &mut guest_dev, now_smol());
+    guest_iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Addr::new(10, 0, 0, 2)), 24));
+    });
+    let _ = guest_iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Addr::new(10, 0, 0, 1));
+
+    let mut guest_sockets = SocketSet::new(vec![]);
+    // Large guest TX buffer (128 KiB) + 64 KiB RX buffer negotiates RFC 1323 window scaling
+    let mut guest_tcp = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 128 * 1024]),
+    );
+    guest_tcp.set_nagle_enabled(false);
+    let guest_handle = guest_sockets.add(guest_tcp);
+    {
+        let sock = guest_sockets.get_mut::<tcp::Socket>(guest_handle);
+        sock.connect(
+            guest_iface.context(),
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::new(198, 51, 100, 42)), 8443),
+            54321,
+        )
+        .unwrap();
+    }
+
+    let mut sent_offset = 0usize;
+    let mut fin_sent = false;
+    let mut received_reply = Vec::new();
+    let mut data_pkt_idx = 0usize;
+    let mut held_reorder: Option<(Vec<u8>, u8)> = None;
+    let mut reordered_count = 0usize;
+    let mut duplicated_count = 0usize;
+    let mut dropped_count = 0usize;
+    let mut zero_window_count = 0usize;
+    let mut window_reopen_count = 0usize;
+    let mut prev_window_was_zero = false;
+    let mut dup_ack_count = 0usize;
+    let mut last_ack_num: Option<u32> = None;
+    let mut phase3_started_at: Option<tokio::time::Instant> = None;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    while tokio::time::Instant::now() < deadline {
+        let _ = guest_iface.poll(now_smol(), &mut guest_dev, &mut guest_sockets);
+
+        // Feed guest -> TUN packets while deterministically injecting out-of-order delivery,
+        // duplicate segments, and controlled packet drops to exercise retransmission & SACK.
+        let mut forwarded_any = false;
+        while let Some(out_pkt) = guest_dev.tx.pop_front() {
+            forwarded_any = true;
+            let is_pure_data_pkt = Ipv4Packet::new_checked(&out_pkt)
+                .ok()
+                .and_then(|ip| TcpPacket::new_checked(ip.payload()).ok())
+                .is_some_and(|tcp| {
+                    !tcp.syn() && !tcp.fin() && !tcp.rst() && !tcp.payload().is_empty()
+                });
+
+            if is_pure_data_pkt {
+                data_pkt_idx += 1;
+
+                // Controlled drop (up to 6 drops across the upload) to force real TCP retransmit
+                if dropped_count < 6 && data_pkt_idx % 211 == 17 {
+                    dropped_count += 1;
+                    continue;
+                }
+
+                // Hold 1 packet back by 2 packets to force out-of-order RX + duplicate ACK
+                if held_reorder.is_none() && data_pkt_idx % 37 == 5 {
+                    held_reorder = Some((out_pkt, 2));
+                    continue;
+                }
+
+                // Duplicate selected packets to stress out-of-window / already-ACKed RX handling
+                if data_pkt_idx % 53 == 11 {
+                    duplicated_count += 1;
+                    let _ = vtun.ingress_tx.send(out_pkt.clone()).await;
+                }
+            }
+
+            vtun.ingress_tx.send(out_pkt).await.unwrap();
+
+            if let Some((held_pkt, remaining)) = held_reorder.take() {
+                if remaining <= 1 {
+                    reordered_count += 1;
+                    vtun.ingress_tx.send(held_pkt).await.unwrap();
+                } else {
+                    held_reorder = Some((held_pkt, remaining - 1));
+                }
+            }
+        }
+
+        // Flush any held out-of-order packet once guest finishes pushing a burst
+        if !forwarded_any && let Some((held_pkt, _)) = held_reorder.take() {
+            reordered_count += 1;
+            vtun.ingress_tx.send(held_pkt).await.unwrap();
+        }
+
+        // Drain TUN -> guest packets and observe TCP receive-window transitions & duplicate ACKs
+        let mut received_egress = false;
+        while let Ok(in_pkt) = vtun.egress_rx.try_recv() {
+            received_egress = true;
+            if let Ok(ip) = Ipv4Packet::new_checked(&in_pkt)
+                && let Ok(tcp_pkt) = TcpPacket::new_checked(ip.payload())
+                && tcp_pkt.ack()
+                && !tcp_pkt.syn()
+            {
+                let win = tcp_pkt.window_len();
+                if win == 0 {
+                    zero_window_count += 1;
+                    prev_window_was_zero = true;
+                    release_initial_stall.store(true, Ordering::Release);
+                } else if prev_window_was_zero {
+                    window_reopen_count += 1;
+                    prev_window_was_zero = false;
+                }
+                let ack = tcp_pkt.ack_number().0 as u32;
+                if last_ack_num == Some(ack) && tcp_pkt.payload().is_empty() {
+                    dup_ack_count += 1;
+                }
+                last_ack_num = Some(ack);
+            }
+            guest_dev.rx.push_back(in_pkt);
+        }
+
+        let _ = guest_iface.poll(now_smol(), &mut guest_dev, &mut guest_sockets);
+
+        let sock = guest_sockets.get_mut::<tcp::Socket>(guest_handle);
+        if sock.can_send() && sent_offset < payload.len() {
+            // Alternate odd write sizes (4099 / 1459 / 16381) so segment boundaries never stay even
+            let step = match (sent_offset / 4099) % 3 {
+                0 => 4099,
+                1 => 1459,
+                _ => 16381,
+            };
+            let end = (sent_offset + step).min(payload.len());
+            let n = sock.send_slice(&payload[sent_offset..end]).unwrap();
+            sent_offset += n;
+            if sent_offset >= 2 * 1024 * 1024 && phase3_started_at.is_none() {
+                phase3_started_at = Some(tokio::time::Instant::now());
+            }
+        } else if sent_offset == payload.len() && !fin_sent && sock.send_queue() == 0 {
+            sock.close();
+            fin_sent = true;
+        }
+
+        if sock.can_recv() {
+            let _ = sock.recv(|data| {
+                received_reply.extend_from_slice(data);
+                (data.len(), ())
+            });
+            if received_reply.len()
+                >= format!("UPLOAD-OK:{TOTAL_UPLOAD_BYTES}:{expected_hash}").len()
+            {
+                break;
+            }
+        }
+
+        if !forwarded_any && !received_egress {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let expected_reply = format!("UPLOAD-OK:{TOTAL_UPLOAD_BYTES}:{expected_hash}");
+    assert_eq!(
+        String::from_utf8_lossy(&received_reply),
+        expected_reply,
+        "Full ~3 MiB upload must arrive bit-for-bit intact under heavy backpressure (sent={sent_offset}/{TOTAL_UPLOAD_BYTES}, received_by_outbound={}, zero_win={zero_window_count}, reopen={window_reopen_count}, dup_ack={dup_ack_count}, reordered={reordered_count}, dup_pkt={duplicated_count}, dropped={dropped_count})",
+        received_bytes.load(Ordering::Acquire)
+    );
+    assert!(
+        zero_window_count > 0,
+        "stress test must saturate smoltcp RX buffer and trigger zero-window advertisements"
+    );
+    assert!(
+        window_reopen_count > 0,
+        "stress test must observe TCP receive window reopening after zero-window backpressure"
+    );
+    assert!(
+        reordered_count > 0 && duplicated_count > 0 && dropped_count > 0 && dup_ack_count > 0,
+        "stress test must exercise out-of-order ({reordered_count}), duplicate packets ({duplicated_count}), drops ({dropped_count}), and duplicate ACKs ({dup_ack_count})"
+    );
+    if let Some(t3) = phase3_started_at {
+        assert!(
+            t3.elapsed() < Duration::from_secs(10),
+            "throughput must recover promptly once outbound throttling lifts (phase 3 took {:?})",
+            t3.elapsed()
+        );
+    }
+
+    let panic_logs: Vec<_> = hub
+        .recent_logs()
+        .into_iter()
+        .filter(|entry| {
+            entry.level == "error"
+                && (entry.payload.contains("Isolated smoltcp panic")
+                    || entry.payload.contains("Isolated panic in TCP flow"))
+        })
+        .collect();
+    assert!(
+        panic_logs.is_empty(),
+        "smoltcp 0.14 must complete high-backpressure upload with ZERO isolated panics, got: {panic_logs:?}"
+    );
+    assert!(
+        !tun_task.is_finished(),
+        "TUN event loop task must remain healthy and running after high-backpressure upload"
+    );
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), tun_task)
+        .await
+        .expect("TUN task must exit promptly on shutdown")
+        .expect("TUN task must exit cleanly without panicking");
+}

@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use proxy_core::{config::uri::redact_sensitive_text, platform::recovery::default_state_dir};
+use proxy_core::{
+    config::uri::redact_sensitive_text,
+    platform::{crash_log::install_panic_hook, recovery::default_state_dir},
+};
 use rust_clash_tauri_lib::{
     parse_desktop_launch_options, parse_elevated_tun_helper_args, run_desktop_app_with_options,
     run_elevated_tun_helper, write_startup_crash_log,
@@ -59,6 +62,12 @@ fn report_fatal_error(err: &anyhow::Error) {
 }
 
 fn main() {
+    install_panic_hook(
+        "rust-clash-desktop",
+        env!("CARGO_PKG_VERSION"),
+        default_state_dir(),
+    );
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,smoltcp=warn"));
     let _ = tracing_subscriber::fmt()
