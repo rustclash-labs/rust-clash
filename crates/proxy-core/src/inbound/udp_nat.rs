@@ -290,6 +290,7 @@ pub struct UdpNatManager {
     closed: AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     evict_lock: Mutex<()>,
+    fast_route_evict_lock: Mutex<u64>,
     sessions: Arc<DashMap<NatSessionKey, NatSessionEntry>>,
     fast_routes: Arc<DashMap<(SocketAddr, SocketAddr), CachedUdpRoute>>,
     hub: Arc<TelemetryHub>,
@@ -344,6 +345,7 @@ impl UdpNatManager {
             closed: AtomicBool::new(false),
             shutdown_tx,
             evict_lock: Mutex::new(()),
+            fast_route_evict_lock: Mutex::new(0),
             sessions: Arc::new(DashMap::new()),
             fast_routes: Arc::new(DashMap::new()),
             hub: Arc::clone(&hub),
@@ -450,27 +452,57 @@ impl UdpNatManager {
         let HostName::Ip(dst_ip) = raw_dst.host else {
             return;
         };
-        let route_key = (client_src, SocketAddr::new(dst_ip, raw_dst.port));
         let cap = self.max_sessions.saturating_mul(4);
+        if cap == 0 {
+            return;
+        }
+        let route_key = (client_src, SocketAddr::new(dst_ip, raw_dst.port));
+        let cached = CachedUdpRoute {
+            outbound_name: outbound_name.to_string(),
+            fake_ip_scope,
+            resolved_target: resolved_target.clone(),
+            was_fake_ip,
+            router_epoch,
+        };
+
+        // Fast path: updating an existing same-epoch cached route in place never grows
+        // `fast_routes` and avoids eviction-lock contention on hot flows.
+        if let Some(mut existing) = self.fast_routes.get_mut(&route_key)
+            && existing.router_epoch == router_epoch
+        {
+            *existing = cached;
+            return;
+        }
+
+        // Serialize new-key admission and capacity eviction under `fast_route_evict_lock`
+        // (never acquired while holding any DashMap guard and never held across `.await`)
+        // so concurrent threads cannot race on the same victim and overflow `cap`.
+        // The mutex stores `single_epoch`: non-zero `E` means every entry currently in
+        // `fast_routes` has `router_epoch == E`; `0` means empty or potentially mixed epochs.
+        let mut single_epoch = self.fast_route_evict_lock.lock();
+        if self.fast_routes.is_empty() {
+            *single_epoch = router_epoch;
+        }
         if self.fast_routes.len() >= cap && !self.fast_routes.contains_key(&route_key) {
-            self.fast_routes
-                .retain(|_, v| v.router_epoch == router_epoch);
-            if self.fast_routes.len() >= cap
-                && let Some(victim) = self.fast_routes.iter().next().map(|e| *e.key())
-            {
+            if *single_epoch != router_epoch {
+                self.fast_routes
+                    .retain(|_, v| v.router_epoch == router_epoch);
+                *single_epoch = router_epoch;
+            }
+            while self.fast_routes.len() >= cap {
+                // Compute victim in an inner scope so the DashMap shard read guard is
+                // explicitly dropped before calling `remove(&victim)` (avoids Rust 2024
+                // temporary-lifetime self-deadlock on the same shard).
+                let victim = { self.fast_routes.iter().next().map(|e| *e.key()) };
+                let Some(victim) = victim else {
+                    break;
+                };
                 self.fast_routes.remove(&victim);
             }
+        } else if *single_epoch != router_epoch {
+            *single_epoch = 0;
         }
-        self.fast_routes.insert(
-            route_key,
-            CachedUdpRoute {
-                outbound_name: outbound_name.to_string(),
-                fake_ip_scope,
-                resolved_target: resolved_target.clone(),
-                was_fake_ip,
-                router_epoch,
-            },
-        );
+        self.fast_routes.insert(route_key, cached);
     }
 
     /// O(1) synchronous zero-spawn fast path for established UDP flows when `router_epoch` is unchanged.
@@ -1070,30 +1102,14 @@ impl UdpNatManager {
             let rev_dl = Arc::clone(&reverse_map);
             let reader_last = Arc::clone(&last_active_ms);
             let reader_last_wall = Arc::clone(&last_active_wall_ms);
-            let reader_timeout = Arc::clone(&idle_timeout_ms);
             let shutdown_rx_reader = shutdown_rx.clone();
             let reader = async move {
                 loop {
                     if conn_dl.is_closed() || *shutdown_rx_reader.borrow() {
                         break;
                     }
-                    let timeout_ms = reader_timeout.load(Ordering::Relaxed);
-                    let now_mono = boot.elapsed().as_millis() as u64;
-                    let now_wall = TelemetryHub::now_ms();
-                    let mono_idle = now_mono.saturating_sub(reader_last.load(Ordering::Relaxed));
-                    let wall_idle =
-                        now_wall.saturating_sub(reader_last_wall.load(Ordering::Relaxed));
-                    if mono_idle >= timeout_ms || wall_idle >= timeout_ms {
-                        break;
-                    }
-                    let sleep_ms = (timeout_ms - mono_idle).min(timeout_ms - wall_idle).max(1);
-                    match tokio::time::timeout(
-                        Duration::from_millis(sleep_ms),
-                        session_rx.recv_from(),
-                    )
-                    .await
-                    {
-                        Ok(Ok((resp, remote_src))) => {
+                    match session_rx.recv_from().await {
+                        Ok((resp, remote_src)) => {
                             if conn_dl.is_closed() || *shutdown_rx_reader.borrow() {
                                 break;
                             }
@@ -1103,20 +1119,28 @@ impl UdpNatManager {
                             let eff_target = rev_dl.read().map_return_source(&remote_src);
                             sink(client_src, eff_target, resp);
                         }
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            let timeout_ms = reader_timeout.load(Ordering::Relaxed);
-                            let now_mono = boot.elapsed().as_millis() as u64;
-                            let now_wall = TelemetryHub::now_ms();
-                            if now_mono.saturating_sub(reader_last.load(Ordering::Relaxed))
-                                >= timeout_ms
-                                || now_wall.saturating_sub(reader_last_wall.load(Ordering::Relaxed))
-                                    >= timeout_ms
-                            {
-                                break;
-                            }
-                        }
+                        Err(_) => break,
                     }
+                }
+            };
+
+            // Monitor monotonic and wall-clock idle expiry in an independent future so active
+            // sessions with refreshed `last_active_ms` never cancel `session_rx.recv_from()`.
+            let idle_last = Arc::clone(&last_active_ms);
+            let idle_last_wall = Arc::clone(&last_active_wall_ms);
+            let idle_timeout = Arc::clone(&idle_timeout_ms);
+            let idle_watchdog = async move {
+                loop {
+                    let timeout_ms = idle_timeout.load(Ordering::Relaxed);
+                    let now_mono = boot.elapsed().as_millis() as u64;
+                    let now_wall = TelemetryHub::now_ms();
+                    let mono_idle = now_mono.saturating_sub(idle_last.load(Ordering::Relaxed));
+                    let wall_idle = now_wall.saturating_sub(idle_last_wall.load(Ordering::Relaxed));
+                    if mono_idle >= timeout_ms || wall_idle >= timeout_ms {
+                        break;
+                    }
+                    let sleep_ms = (timeout_ms - mono_idle).min(timeout_ms - wall_idle).max(1);
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 }
             };
 
@@ -1126,6 +1150,7 @@ impl UdpNatManager {
                 _ = wait_for_shutdown(&mut shutdown_rx) => {}
                 _ = writer => {}
                 _ = reader => {}
+                _ = idle_watchdog => {}
             }
 
             conn_entry.request_close();
@@ -2604,5 +2629,357 @@ mod tests {
         );
 
         mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cache_fast_route_eviction_does_not_deadlock_at_capacity() {
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, _) = watch::channel(false);
+        let mgr_small = Arc::new(UdpNatManager {
+            inbound_label: "test-fast-route-cap4",
+            max_sessions: 1, // cap = max_sessions * 4 = 4
+            idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
+            boot: Instant::now(),
+            closed: AtomicBool::new(false),
+            shutdown_tx,
+            evict_lock: Mutex::new(()),
+            fast_route_evict_lock: Mutex::new(0),
+            sessions: Arc::new(DashMap::new()),
+            fast_routes: Arc::new(DashMap::new()),
+            hub: Arc::clone(&hub),
+            reply_sink: Arc::new(|_, _, _| {}),
+        });
+
+        let mgr_small_run = Arc::clone(&mgr_small);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                for i in 0u16..10 {
+                    let src: SocketAddr = format!("198.18.0.2:{}", 40_000 + i).parse().unwrap();
+                    let dst: TargetAddr = format!("93.184.216.{}:443", 10 + i).parse().unwrap();
+                    mgr_small_run.cache_fast_route(src, &dst, "DIRECT", None, &dst, false, 1);
+                }
+            }),
+        )
+        .await
+        .expect("cache_fast_route must not self-deadlock on DashMap shard eviction")
+        .unwrap();
+        assert!(
+            mgr_small.fast_routes.len() <= 4,
+            "fast_routes must remain bounded to cap=4, got {}",
+            mgr_small.fast_routes.len()
+        );
+        assert_eq!(mgr_small.fast_routes.len(), 4);
+
+        // Also exercise the public constructor floor (`max_sessions.max(16)` -> cap = 64).
+        let mgr_pub = UdpNatManager::new("test-fast-route-pub", 1, hub, Arc::new(|_, _, _| {}));
+        let mgr_pub_run = Arc::clone(&mgr_pub);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                for i in 0u16..80 {
+                    let src: SocketAddr = format!("198.18.0.3:{}", 41_000 + i).parse().unwrap();
+                    let dst: TargetAddr = format!("1.1.1.{}:443", 1 + (i % 200)).parse().unwrap();
+                    mgr_pub_run.cache_fast_route(src, &dst, "DIRECT", None, &dst, false, 2);
+                }
+            }),
+        )
+        .await
+        .expect("public UdpNatManager cache_fast_route eviction must not deadlock")
+        .unwrap();
+        assert!(mgr_pub.fast_routes.len() <= 64);
+        assert_eq!(mgr_pub.fast_routes.len(), 64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn cache_fast_route_multithread_stress_stays_bounded_without_deadlock() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mgr = UdpNatManager::new("test-mt-fast-route", 16, hub, Arc::new(|_, _, _| {}));
+        let cap = 16usize * 4; // 64
+        let done = Arc::new(AtomicBool::new(false));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+
+        // Concurrent observer taking linearizable `fast_routes.len()` snapshots under
+        // `fast_route_evict_lock` mid-flight to verify the hard bound holds continuously
+        // (not merely at quiescence) without torn cross-shard `DashMap::len()` sums.
+        let mgr_obs = Arc::clone(&mgr);
+        let done_obs = Arc::clone(&done);
+        let max_obs = Arc::clone(&max_observed);
+        let observer = tokio::spawn(async move {
+            let mut samples = 0usize;
+            while !done_obs.load(Ordering::Acquire) {
+                let len = {
+                    let _guard = mgr_obs.fast_route_evict_lock.lock();
+                    mgr_obs.fast_routes.len()
+                };
+                max_obs.fetch_max(len, Ordering::AcqRel);
+                samples += 1;
+                tokio::task::yield_now().await;
+            }
+            samples
+        });
+
+        let mut tasks = Vec::with_capacity(16);
+        for worker in 0usize..16 {
+            let mgr_w = Arc::clone(&mgr);
+            tasks.push(tokio::spawn(async move {
+                let src: SocketAddr = format!("198.18.0.{}:{}", 10 + worker, 40_000 + worker)
+                    .parse()
+                    .unwrap();
+                for i in 0u32..1000 {
+                    let octet3 = ((worker * 4) + ((i / 250) as usize)) as u8;
+                    let octet4 = ((i % 250) + 1) as u8;
+                    let dst_sock: SocketAddr = format!(
+                        "10.{}.{}.{}:{}",
+                        worker + 1,
+                        octet3,
+                        octet4,
+                        1000 + (i % 500)
+                    )
+                    .parse()
+                    .unwrap();
+                    let dst = TargetAddr::from(dst_sock);
+                    mgr_w.cache_fast_route(src, &dst, "DIRECT", None, &dst, false, 1);
+                    // Interleave concurrent `try_send_fast` reads on the hot path.
+                    let _ = mgr_w.try_send_fast(src, dst_sock, 1, vec![0x42]);
+                }
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for t in tasks {
+                t.await.expect("worker task must not panic");
+            }
+        })
+        .await
+        .expect("16-task multi-threaded cache_fast_route + try_send_fast must not deadlock");
+
+        done.store(true, Ordering::Release);
+        let samples = observer.await.expect("observer task must not panic");
+        assert!(
+            samples > 0,
+            "observer must record mid-flight linearizable snapshots during concurrent stress"
+        );
+
+        let live_cached_routes = mgr.fast_routes.len();
+        assert!(
+            live_cached_routes <= cap,
+            "fast_routes overflowed cap={cap}: observed live_cached_routes={live_cached_routes}"
+        );
+        assert_eq!(
+            live_cached_routes, cap,
+            "cache should stay populated up to cap={cap}, got {live_cached_routes}"
+        );
+        let peak = max_observed.load(Ordering::Acquire);
+        assert!(
+            peak <= cap,
+            "fast_routes transiently exceeded cap={cap} mid-flight: peak={peak}"
+        );
+
+        // Verify epoch bump under concurrency clears stale epoch-1 routes and stays bounded.
+        let mut epoch2_tasks = Vec::with_capacity(8);
+        for worker in 0usize..8 {
+            let mgr_w = Arc::clone(&mgr);
+            epoch2_tasks.push(tokio::spawn(async move {
+                let src: SocketAddr = format!("198.18.1.{}:{}", 10 + worker, 45_000 + worker)
+                    .parse()
+                    .unwrap();
+                for i in 0u32..100 {
+                    let dst_sock: SocketAddr =
+                        format!("172.16.{}.{}:443", worker + 1, (i % 250) + 1)
+                            .parse()
+                            .unwrap();
+                    let dst = TargetAddr::from(dst_sock);
+                    mgr_w.cache_fast_route(src, &dst, "DIRECT", None, &dst, false, 2);
+                    let _ = mgr_w.try_send_fast(src, dst_sock, 2, vec![0x24]);
+                }
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for t in epoch2_tasks {
+                t.await.expect("epoch2 worker must not panic");
+            }
+        })
+        .await
+        .expect("concurrent epoch-2 cache_fast_route must not deadlock");
+
+        assert!(
+            mgr.fast_routes.len() <= cap,
+            "epoch-2 fast_routes overflowed cap={cap}: got {}",
+            mgr.fast_routes.len()
+        );
+        assert!(
+            mgr.fast_routes.iter().all(|e| e.value().router_epoch == 2),
+            "stale epoch-1 routes must be evicted once epoch-2 hits capacity"
+        );
+    }
+
+    struct CancelCountingUdpSession {
+        send_count: Arc<AtomicUsize>,
+        recv_started: Arc<AtomicUsize>,
+        recv_cancellations: Arc<AtomicUsize>,
+        recv_gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundUdpSession for CancelCountingUdpSession {
+        async fn send_to(&self, _payload: &[u8], _target: &TargetAddr) -> std::io::Result<()> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn recv_from(&self) -> std::io::Result<(Vec<u8>, TargetAddr)> {
+            struct CancelGuard {
+                armed: bool,
+                cancellations: Arc<AtomicUsize>,
+            }
+            impl Drop for CancelGuard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.cancellations.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+
+            self.recv_started.fetch_add(1, Ordering::SeqCst);
+            let mut guard = CancelGuard {
+                armed: true,
+                cancellations: Arc::clone(&self.recv_cancellations),
+            };
+            self.recv_gate.notified().await;
+            guard.armed = false;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed",
+            ))
+        }
+    }
+
+    struct CancelCountingUdpOutbound {
+        send_count: Arc<AtomicUsize>,
+        recv_started: Arc<AtomicUsize>,
+        recv_cancellations: Arc<AtomicUsize>,
+        recv_gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for CancelCountingUdpOutbound {
+        fn name(&self) -> &str {
+            "cancel-counting-uot"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "anytls"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(&self, _target: &TargetAddr) -> std::io::Result<BoxedStream> {
+            Err(std::io::Error::other("unused"))
+        }
+
+        async fn open_udp_session(&self) -> std::io::Result<Box<dyn OutboundUdpSession>> {
+            Ok(Box::new(CancelCountingUdpSession {
+                send_count: Arc::clone(&self.send_count),
+                recv_started: Arc::clone(&self.recv_started),
+                recv_cancellations: Arc::clone(&self.recv_cancellations),
+                recv_gate: Arc::clone(&self.recv_gate),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_nat_active_session_does_not_cancel_recv_from_before_real_idle_expiry() {
+        let hub = Arc::new(TelemetryHub::new());
+        let idle_timeout = Duration::from_millis(80);
+        let mgr = UdpNatManager::with_idle_timeout(
+            "test-idle-watchdog",
+            16,
+            idle_timeout,
+            Arc::clone(&hub),
+            Arc::new(|_, _, _| {}),
+        );
+
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let recv_started = Arc::new(AtomicUsize::new(0));
+        let recv_cancellations = Arc::new(AtomicUsize::new(0));
+        let recv_gate = Arc::new(tokio::sync::Notify::new());
+        let outbound: DynOutbound = Arc::new(CancelCountingUdpOutbound {
+            send_count: Arc::clone(&send_count),
+            recv_started: Arc::clone(&recv_started),
+            recv_cancellations: Arc::clone(&recv_cancellations),
+            recv_gate: Arc::clone(&recv_gate),
+        });
+
+        let src: SocketAddr = "198.18.0.2:57001".parse().unwrap();
+        let dst: TargetAddr = "1.1.1.1:443".parse().unwrap();
+
+        mgr.send_datagram(
+            src,
+            dst.clone(),
+            None,
+            dst.clone(),
+            "MATCH",
+            "",
+            vec!["cancel-counting-uot".into()],
+            Arc::clone(&outbound),
+            vec![1],
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recv_started.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("reader must start awaiting recv_from");
+
+        // Continuously refresh activity well past the 80ms idle timeout (~240ms total).
+        for seq in 2u8..=9 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            mgr.send_datagram(
+                src,
+                dst.clone(),
+                None,
+                dst.clone(),
+                "MATCH",
+                "",
+                vec!["cancel-counting-uot".into()],
+                Arc::clone(&outbound),
+                vec![seq],
+            )
+            .await;
+        }
+
+        assert_eq!(
+            recv_cancellations.load(Ordering::SeqCst),
+            0,
+            "active UDP session must NEVER cancel session_rx.recv_from() while activity refreshes idle watchdog"
+        );
+        assert_eq!(
+            recv_started.load(Ordering::SeqCst),
+            1,
+            "recv_from() must stay continuously pending without restart while active"
+        );
+        assert_eq!(mgr.active_session_count(), 1);
+        assert!(send_count.load(Ordering::SeqCst) >= 8);
+
+        // Once genuinely idle past 80ms, idle_watchdog must cleanly tear down the session.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while mgr.active_session_count() != 0 || hub.active_connection_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("truly idle UDP session must expire cleanly after idle_timeout");
+
+        assert_eq!(
+            recv_cancellations.load(Ordering::SeqCst),
+            1,
+            "recv_from() should be cancelled exactly once at true idle teardown"
+        );
     }
 }

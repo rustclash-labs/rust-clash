@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Wake, Waker, ready},
     time::Duration,
 };
 
@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::{
     addr::{HostName, TargetAddr},
     outbound::{
-        BoxedStream, DirectOutbound, OutboundHandler, OutboundUdpSession, hash_write_prefix,
+        BoxedStream, DirectOutbound, OutboundHandler, OutboundUdpSession,
         quic_common::{
             CachedQuicSlot, QuicBiStream, QuicCongestionControl, QuicSessionLease, QuicWorkLease,
             bind_quinn_server_endpoint, build_quinn_server_config, build_quinn_transport_config,
@@ -443,38 +443,85 @@ impl TuicDefragger {
     }
 }
 
+/// Fan-out waker waking two independent tasks when `TuicClientStream` is split via
+/// `tokio::io::split` and `poll_read` drives `inner`'s write/flush path for server-speaks-first.
+struct FanoutWaker {
+    primary: Waker,
+    secondary: Waker,
+}
+
+impl Wake for FanoutWaker {
+    fn wake(self: Arc<Self>) {
+        self.primary.wake_by_ref();
+        self.secondary.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.primary.wake_by_ref();
+        self.secondary.wake_by_ref();
+    }
+}
+
+fn with_fanout_waker<R>(
+    primary: &Waker,
+    secondary: Option<&Waker>,
+    f: impl FnOnce(&mut Context<'_>) -> R,
+) -> R {
+    if let Some(sec) = secondary
+        && !primary.will_wake(sec)
+    {
+        let combined = Waker::from(Arc::new(FanoutWaker {
+            primary: primary.clone(),
+            secondary: sec.clone(),
+        }));
+        let mut cx = Context::from_waker(&combined);
+        return f(&mut cx);
+    }
+    let mut cx = Context::from_waker(primary);
+    f(&mut cx)
+}
+
 /// Coalesces TUIC v5 `Connect` header (`[0x05, 0x01, addr]`) onto the first write (or flushes on first read).
 pub struct TuicClientStream<S> {
     inner: S,
-    pending_hdr: BytesMut,
+    pending_buf: BytesMut,
+    hdr_remaining: usize,
     hdr_flushed: bool,
-    pending_write: Option<(usize, u64)>,
+    first_write_coalesced: bool,
+    any_read_bytes: bool,
+    write_waker: Option<Waker>,
+    read_flush_waker: Option<Waker>,
 }
 
 impl<S> TuicClientStream<S> {
     pub fn new(inner: S, connect_hdr: BytesMut) -> Self {
+        let hdr_remaining = connect_hdr.len();
         Self {
             inner,
-            pending_hdr: connect_hdr,
+            pending_buf: connect_hdr,
+            hdr_remaining,
             hdr_flushed: false,
-            pending_write: None,
+            first_write_coalesced: false,
+            any_read_bytes: false,
+            write_waker: None,
+            read_flush_waker: None,
         }
     }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> TuicClientStream<S> {
-    fn poll_drain_hdr(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while !self.pending_hdr.is_empty() {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending_hdr))?;
+    fn poll_drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.pending_buf.is_empty() {
+            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending_buf))?;
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
-                    "TUIC stream closed while flushing Connect header",
+                    "TUIC stream closed while flushing buffered Connect header",
                 )));
             }
-            self.pending_hdr.advance(n);
+            self.pending_buf.advance(n);
+            self.hdr_remaining = self.hdr_remaining.saturating_sub(n);
         }
-        self.hdr_flushed = true;
         Poll::Ready(Ok(()))
     }
 }
@@ -485,11 +532,115 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TuicClientStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.hdr_flushed {
-            ready!(self.poll_drain_hdr(cx))?;
-            ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+
+        let mut flush_err: Option<io::Error> = None;
+        let mut flush_pending = false;
+
+        if !self.hdr_flushed {
+            let saved_write_waker = self.write_waker.clone();
+            let was_non_empty = !self.pending_buf.is_empty();
+            let drain_res = with_fanout_waker(cx.waker(), saved_write_waker.as_ref(), |ccx| {
+                self.poll_drain_pending(ccx)
+            });
+            match drain_res {
+                Poll::Ready(Ok(())) => {
+                    let flush_res =
+                        with_fanout_waker(cx.waker(), saved_write_waker.as_ref(), |ccx| {
+                            Pin::new(&mut self.inner).poll_flush(ccx)
+                        });
+                    match flush_res {
+                        Poll::Ready(Ok(())) => {
+                            self.hdr_flushed = true;
+                            self.read_flush_waker = None;
+                            if let Some(w) = self.write_waker.take() {
+                                w.wake();
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            self.read_flush_waker = None;
+                            if let Some(w) = self.write_waker.take() {
+                                w.wake();
+                            }
+                            flush_err = Some(e);
+                        }
+                        Poll::Pending => {
+                            if was_non_empty
+                                && self.pending_buf.is_empty()
+                                && let Some(w) = self.write_waker.as_ref()
+                            {
+                                w.wake_by_ref();
+                            }
+                            flush_pending = true;
+                        }
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    self.read_flush_waker = None;
+                    if let Some(w) = self.write_waker.take() {
+                        w.wake();
+                    }
+                    if self.hdr_remaining > 0 {
+                        // Connect header itself could not be sent; surface the error promptly
+                        // so server-speaks-first reads cannot hang on a dead uplink.
+                        return Poll::Ready(Err(e));
+                    }
+                    flush_err = Some(e);
+                }
+                Poll::Pending => {
+                    // Never early-return `Poll::Pending` when `pending_buf` is saturated:
+                    // fall through to `inner.poll_read` so full-duplex responses can be read
+                    // even before the server drains our initial coalesced upload.
+                    flush_pending = true;
+                }
+            }
+        }
+
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let got_bytes = buf.filled().len() > before;
+                self.read_flush_waker = None;
+                if got_bytes {
+                    self.any_read_bytes = true;
+                    if flush_err.is_some() {
+                        // Server already responded after receiving Connect header; stop
+                        // retrying the failed uplink from `poll_read`.
+                        self.hdr_flushed = true;
+                    }
+                    Poll::Ready(Ok(()))
+                } else if let Some(e) = flush_err {
+                    if self.any_read_bytes {
+                        self.hdr_flushed = true;
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(e))
+                    }
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            Poll::Ready(Err(e)) => {
+                self.read_flush_waker = None;
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                if let Some(e) = flush_err {
+                    if self.any_read_bytes {
+                        self.hdr_flushed = true;
+                        self.read_flush_waker = None;
+                        return Poll::Pending;
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                if flush_pending {
+                    self.read_flush_waker = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -502,50 +653,195 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TuicClientStream<S> {
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if let Some((orig_len, orig_hash)) = self.pending_write {
-            let check = orig_len.min(data.len());
-            if data.len() < orig_len || hash_write_prefix(&data[..check]) != orig_hash {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "TUIC poll_write retried with mismatched buffer",
-                )));
-            }
-            ready!(self.poll_drain_hdr(cx))?;
-            self.pending_write = None;
-            return Poll::Ready(Ok(orig_len));
-        }
-        if !self.hdr_flushed {
+
+        let saved_read_waker = if self.hdr_flushed {
+            None
+        } else {
+            self.read_flush_waker.clone()
+        };
+
+        // First write coalescing path: append up to 16 KiB directly behind the TUIC Connect
+        // header, opportunistically drain, and immediately report `coal_len` accepted so
+        // cancelling a subsequent `Pending` write never leaves unacknowledged bytes.
+        if !self.first_write_coalesced && !self.hdr_flushed {
+            self.first_write_coalesced = true;
             let coal_len = data.len().min(16 * 1024);
-            let h = hash_write_prefix(&data[..coal_len]);
-            self.pending_hdr.extend_from_slice(&data[..coal_len]);
-            self.pending_write = Some((coal_len, h));
-            match self.poll_drain_hdr(cx) {
+            self.pending_buf.extend_from_slice(&data[..coal_len]);
+            let drain_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+                self.poll_drain_pending(ccx)
+            });
+            return match drain_res {
                 Poll::Ready(Ok(())) => {
-                    self.pending_write = None;
-                    return Poll::Ready(Ok(coal_len));
+                    self.write_waker = None;
+                    if let Some(w) = self.read_flush_waker.as_ref() {
+                        w.wake_by_ref();
+                    }
+                    Poll::Ready(Ok(coal_len))
                 }
                 Poll::Ready(Err(e)) => {
-                    self.pending_write = None;
+                    self.write_waker = None;
+                    if let Some(w) = self.read_flush_waker.take() {
+                        w.wake();
+                    }
+                    Poll::Ready(Err(e))
+                }
+                Poll::Pending => {
+                    // Returning `Ready(Ok(coal_len))` immediately — do not register `cx` as
+                    // `write_waker`, while `with_fanout_waker` already preserved `read_flush_waker`.
+                    self.write_waker = None;
+                    Poll::Ready(Ok(coal_len))
+                }
+            };
+        }
+
+        // Pre-drain any residual buffered bytes BEFORE consuming new bytes from `data`.
+        if !self.pending_buf.is_empty() {
+            let drain_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+                self.poll_drain_pending(ccx)
+            });
+            match drain_res {
+                Poll::Ready(Ok(())) => {
+                    self.write_waker = None;
+                    if let Some(w) = self.read_flush_waker.as_ref() {
+                        w.wake_by_ref();
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    self.write_waker = None;
+                    if let Some(w) = self.read_flush_waker.take() {
+                        w.wake();
+                    }
                     return Poll::Ready(Err(e));
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    self.write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
             }
         }
-        Pin::new(&mut self.inner).poll_write(cx, data)
+
+        let write_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+            Pin::new(&mut self.inner).poll_write(ccx, data)
+        });
+        match write_res {
+            Poll::Pending => {
+                self.write_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => {
+                self.write_waker = None;
+                if let Some(w) = self.read_flush_waker.take() {
+                    w.wake();
+                }
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Ok(n)) => {
+                self.write_waker = None;
+                Poll::Ready(Ok(n))
+            }
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.hdr_flushed {
-            ready!(self.poll_drain_hdr(cx))?;
+        let saved_read_waker = if self.hdr_flushed {
+            None
+        } else {
+            self.read_flush_waker.clone()
+        };
+        if !self.pending_buf.is_empty() {
+            let drain_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+                self.poll_drain_pending(ccx)
+            });
+            match drain_res {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    self.write_waker = None;
+                    if let Some(w) = self.read_flush_waker.take() {
+                        w.wake();
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    self.write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
         }
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let flush_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+            Pin::new(&mut self.inner).poll_flush(ccx)
+        });
+        match flush_res {
+            Poll::Ready(Ok(())) => {
+                self.hdr_flushed = true;
+                self.write_waker = None;
+                if let Some(w) = self.read_flush_waker.take() {
+                    w.wake();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                self.write_waker = None;
+                if let Some(w) = self.read_flush_waker.take() {
+                    w.wake();
+                }
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                self.write_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.hdr_flushed {
-            ready!(self.poll_drain_hdr(cx))?;
+        let saved_read_waker = if self.hdr_flushed {
+            None
+        } else {
+            self.read_flush_waker.clone()
+        };
+        if !self.pending_buf.is_empty() {
+            let drain_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+                self.poll_drain_pending(ccx)
+            });
+            match drain_res {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    self.write_waker = None;
+                    if let Some(w) = self.read_flush_waker.take() {
+                        w.wake();
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    self.write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
         }
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let shut_res = with_fanout_waker(cx.waker(), saved_read_waker.as_ref(), |ccx| {
+            Pin::new(&mut self.inner).poll_shutdown(ccx)
+        });
+        match shut_res {
+            Poll::Ready(Ok(())) => {
+                self.hdr_flushed = true;
+                self.write_waker = None;
+                if let Some(w) = self.read_flush_waker.take() {
+                    w.wake();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                self.write_waker = None;
+                if let Some(w) = self.read_flush_waker.take() {
+                    w.wake();
+                }
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                self.write_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -590,15 +886,14 @@ pub struct TuicOutbound {
 
 impl TuicInner {
     fn sni_host(&self) -> &str {
-        if self.cfg.disable_sni {
-            "localhost"
-        } else {
-            self.cfg
-                .servername
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(self.cfg.server.as_str())
-        }
+        // Keep returning the real servername/server even when `disable_sni` is true:
+        // `tls_cfg.enable_sni = false` suppresses sending SNI on the wire while rustls
+        // still verifies the server certificate SAN against this hostname.
+        self.cfg
+            .servername
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(self.cfg.server.as_str())
     }
 
     fn reap_idle_for_low_power(&self) {
@@ -691,7 +986,7 @@ impl TuicInner {
     }
 
     async fn dial_fresh_session(self: &Arc<Self>) -> io::Result<Arc<TuicAuthenticatedConn>> {
-        let (endpoint, conn, _, pre_epoch) = dial_protected_quic_connection(
+        let (endpoint, conn, zero_rtt_accepted, pre_epoch) = dial_protected_quic_connection(
             &self.cfg.server,
             self.cfg.port,
             self.sni_host(),
@@ -707,29 +1002,34 @@ impl TuicInner {
         let conn_auth = conn.clone();
 
         // Perform TUIC v5 `Authenticate` (`[0x05, 0x00, uuid(16B), token(32B)]`).
-        // Note: if 0-RTT was used, `export_keying_material` requires 1-RTT handshake keys;
-        // if not yet ready, await handshake completion before sending Authenticate.
+        // Note: if 0-RTT was entered, `export_keying_material` requires 1-RTT handshake keys;
+        // await `ZeroRttAccepted` (bounded by the full handshake timeout) instead of polling.
         let auth_res: io::Result<()> =
             crate::outbound::with_handshake_timeout("TUIC v5 Authenticate", async move {
                 let mut token = [0u8; 32];
-                if conn_auth
-                    .export_keying_material(&mut token, uuid.as_bytes(), &pw_bytes)
-                    .is_err()
+                if let Err(first_err) =
+                    conn_auth.export_keying_material(&mut token, uuid.as_bytes(), &pw_bytes)
                 {
-                    // Wait until 1-RTT TLS keys are available
-                    for _ in 0..50 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        if conn_auth
-                            .export_keying_material(&mut token, uuid.as_bytes(), &pw_bytes)
-                            .is_ok()
-                        {
-                            break;
-                        }
+                    let Some(zero_rtt) = zero_rtt_accepted else {
+                        return Err(io::Error::other(format!(
+                            "TUIC TLS 1.3 keying material export failed: {first_err:?}"
+                        )));
+                    };
+                    let _accepted = zero_rtt.await;
+                    if let Some(reason) = conn_auth.close_reason() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!(
+                                "TUIC QUIC 0-RTT handshake closed before Authenticate: {reason}"
+                            ),
+                        ));
                     }
                     conn_auth
                         .export_keying_material(&mut token, uuid.as_bytes(), &pw_bytes)
-                        .map_err(|_| {
-                            io::Error::other("TUIC TLS 1.3 keying material export failed")
+                        .map_err(|e| {
+                            io::Error::other(format!(
+                                "TUIC TLS 1.3 keying material export failed after 0-RTT handshake: {e:?}"
+                            ))
                         })?;
                 }
                 let mut uni = conn_auth
@@ -771,6 +1071,8 @@ impl TuicInner {
                     udp_dgram_map.remove_if(&aid, |_, cur| cur.same_channel(&tx));
                 }
             }
+            // Drop all mpsc::Senders when QUIC disconnects so awaiting `recv_from()` wakes.
+            udp_dgram_map.clear();
         });
 
         let udp_uni_map = Arc::clone(&udp_sessions);
@@ -793,6 +1095,8 @@ impl TuicInner {
                     }
                 });
             }
+            // Drop all mpsc::Senders when QUIC disconnects so awaiting `recv_from()` wakes.
+            udp_uni_map.clear();
         });
 
         let hb_interval = self.cfg.heartbeat_interval.max(Duration::from_secs(5));
@@ -875,17 +1179,14 @@ impl TuicOutbound {
             Duration::from_secs(60),
             true,
         );
-        let mut base_tls = (*crate::crypto::tls::build_tls_client_config(
+        let tls_cfg = crate::crypto::tls::build_quic_tls_client_config(
             cfg.skip_cert_verify,
             &cfg.extra_ca_der,
             effective_alpn,
-        )?)
-        .clone();
-        base_tls.enable_early_data = cfg.zero_rtt_handshake;
-        if cfg.disable_sni {
-            base_tls.enable_sni = false;
-        }
-        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(base_tls))
+            cfg.zero_rtt_handshake,
+            cfg.disable_sni,
+        )?;
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg)
             .map_err(|e| io::Error::other(format!("failed building TUIC Quinn config: {e}")))?;
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
         client_cfg.transport_config(transport);
@@ -999,11 +1300,23 @@ impl OutboundUdpSession for TuicUdpSession {
         })?;
         let mut rx = rx_mutex.lock().await;
         loop {
-            let Some(pkt) = rx.recv().await else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "TUIC UDP session closed",
-                ));
+            let pkt = tokio::select! {
+                biased;
+                res = rx.recv() => match res {
+                    Some(pkt) => pkt,
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "TUIC UDP session closed",
+                        ));
+                    }
+                },
+                _ = self.conn.lease.conn.closed() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "TUIC QUIC connection closed",
+                    ));
+                }
             };
             let assembled = self.defragger.lock().feed(pkt);
             if let Some(res) = assembled {
@@ -1087,6 +1400,14 @@ impl OutboundHandler for TuicOutbound {
         let assoc_id = sess.next_assoc_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(128);
         sess.udp_sessions.insert(assoc_id, tx);
+        if sess.lease.conn.close_reason().is_some() {
+            sess.udp_sessions.remove(&assoc_id);
+            self.inner.cached_conn.evict_if_same(&sess);
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "TUIC QUIC connection closed while opening UDP session",
+            ));
+        }
         Ok(Box::new(TuicUdpSession {
             conn: sess,
             assoc_id,
@@ -1552,5 +1873,868 @@ mod tests {
         assert_eq!(echoed, b"still-alive");
 
         srv.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tuic_udp_recv_from_wakes_on_disconnect_and_releases_work_lease() {
+        let sni = "tuic.udp.disconnect.test";
+        let (tls_cfg, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let uuid = Uuid::new_v4();
+        let password = "tuic-disconnect-pw";
+        let srv = spawn_tuic_server(
+            "127.0.0.1:0".parse().unwrap(),
+            uuid,
+            password.to_string(),
+            tls_cfg,
+        )
+        .await
+        .unwrap();
+
+        let outbound = TuicOutbound::new(TuicOutboundConfig {
+            name: "tuic-udp-disconnect".into(),
+            server: "127.0.0.1".into(),
+            port: srv.listen_addr.port(),
+            uuid,
+            password: password.into(),
+            udp_relay_mode: TuicUdpRelayMode::Native,
+            congestion_control: QuicCongestionControl::Bbr,
+            zero_rtt_handshake: false,
+            disable_sni: false,
+            heartbeat_interval: Duration::from_secs(30),
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der],
+            udp: true,
+        })
+        .unwrap();
+
+        // Case 1: Local `on_network_change()` closes QUIC session while `recv_from()` is awaiting.
+        let udp_sess = outbound.open_udp_session().await.unwrap();
+        let auth_conn = outbound
+            .inner
+            .cached_conn
+            .get_if(|_| true)
+            .expect("cached TUIC session must exist");
+        assert_eq!(auth_conn.lease.active_work_count(), 1);
+
+        let recv_task = tokio::spawn(async move {
+            let res = udp_sess.recv_from().await;
+            (res, udp_sess)
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let start = std::time::Instant::now();
+        assert_eq!(outbound.on_network_change(), 1);
+        let (res, udp_sess) = tokio::time::timeout(Duration::from_millis(500), recv_task)
+            .await
+            .expect("TUIC UDP recv_from must not hang after on_network_change")
+            .unwrap();
+        assert!(
+            res.is_err(),
+            "TUIC UDP recv_from must return Err on QUIC disconnect"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "recv_from wakeup exceeded 500ms: {:?}",
+            start.elapsed()
+        );
+        drop(udp_sess);
+        assert_eq!(
+            auth_conn.lease.active_work_count(),
+            0,
+            "QuicWorkLease must drop to 0 once TuicUdpSession is dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            auth_conn.udp_sessions.is_empty(),
+            "TUIC dgram/uni tasks must clear udp_sessions on disconnect"
+        );
+
+        // Case 2: Remote server shutdown closes QUIC session while `recv_from()` is awaiting.
+        let udp_sess2 = outbound.open_udp_session().await.unwrap();
+        let auth_conn2 = outbound
+            .inner
+            .cached_conn
+            .get_if(|_| true)
+            .expect("fresh cached TUIC session must exist");
+        assert_eq!(auth_conn2.lease.active_work_count(), 1);
+
+        let recv_task2 = tokio::spawn(async move {
+            let res = udp_sess2.recv_from().await;
+            (res, udp_sess2)
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let start2 = std::time::Instant::now();
+        srv.shutdown().await;
+        let (res2, udp_sess2) = tokio::time::timeout(Duration::from_millis(500), recv_task2)
+            .await
+            .expect("TUIC UDP recv_from must not hang after server shutdown")
+            .unwrap();
+        assert!(
+            res2.is_err(),
+            "TUIC UDP recv_from must return Err on server shutdown"
+        );
+        assert!(
+            start2.elapsed() < Duration::from_millis(500),
+            "recv_from wakeup on server close exceeded 500ms: {:?}",
+            start2.elapsed()
+        );
+        drop(udp_sess2);
+        assert_eq!(
+            auth_conn2.lease.active_work_count(),
+            0,
+            "QuicWorkLease must drop to 0 after server-side disconnect and session drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn tuic_zero_rtt_authenticate_succeeds_when_handshake_exceeds_600ms() {
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::AsyncWriteExt;
+
+        // Local TCP echo target
+        let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    if let Ok(n) = s.read(&mut buf).await
+                        && n > 0
+                    {
+                        let _ = s.write_all(&buf[..n]).await;
+                    }
+                });
+            }
+        });
+
+        let sni = "tuic.slow0rtt.test";
+        let (tls_cfg, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let uuid = Uuid::new_v4();
+        let password = "tuic-slow-0rtt-secret";
+        let srv = spawn_tuic_server(
+            "127.0.0.1:0".parse().unwrap(),
+            uuid,
+            password.to_string(),
+            tls_cfg,
+        )
+        .await
+        .unwrap();
+        let srv_addr = srv.listen_addr;
+
+        // Local UDP forwarder that delays server -> client packets by `s2c_delay_ms`
+        // while preserving per-client packet ordering.
+        let front_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let proxy_addr = front_sock.local_addr().unwrap();
+        let s2c_delay_ms = Arc::new(AtomicU64::new(0));
+        let front_bg = Arc::clone(&front_sock);
+        let delay_bg = Arc::clone(&s2c_delay_ms);
+        let proxy_task = tokio::spawn(async move {
+            let mut client_backends: HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> =
+                HashMap::new();
+            let mut buf = [0u8; 4096];
+            while let Ok((n, client_addr)) = front_bg.recv_from(&mut buf).await {
+                let backend = if let Some(b) = client_backends.get(&client_addr) {
+                    Arc::clone(b)
+                } else {
+                    let b = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    let b_rx = Arc::clone(&b);
+                    let f_tx = Arc::clone(&front_bg);
+                    let d_cfg = Arc::clone(&delay_bg);
+                    let (delay_tx, mut delay_rx) =
+                        mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+                    tokio::spawn(async move {
+                        while let Some((release_at, pkt)) = delay_rx.recv().await {
+                            tokio::time::sleep_until(release_at).await;
+                            let _ = f_tx.send_to(&pkt, client_addr).await;
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let mut rbuf = [0u8; 4096];
+                        while let Ok((rn, _)) = b_rx.recv_from(&mut rbuf).await {
+                            let d = d_cfg.load(Ordering::Acquire);
+                            let release_at = tokio::time::Instant::now() + Duration::from_millis(d);
+                            if delay_tx.send((release_at, rbuf[..rn].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    client_backends.insert(client_addr, Arc::clone(&b));
+                    b
+                };
+                let _ = backend.send_to(&buf[..n], srv_addr).await;
+            }
+        });
+
+        let outbound = TuicOutbound::new(TuicOutboundConfig {
+            name: "tuic-slow-0rtt".into(),
+            server: "127.0.0.1".into(),
+            port: proxy_addr.port(),
+            uuid,
+            password: password.into(),
+            udp_relay_mode: TuicUdpRelayMode::Native,
+            congestion_control: QuicCongestionControl::Bbr,
+            zero_rtt_handshake: true,
+            disable_sni: false,
+            heartbeat_interval: Duration::from_secs(30),
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der],
+            udp: true,
+        })
+        .unwrap();
+
+        // Step 1: Warm a 0-RTT session ticket with 0ms delay.
+        let mut s1 = outbound
+            .connect_tcp(&TargetAddr::from(echo_addr))
+            .await
+            .expect("warm-up TUIC connect must succeed");
+        s1.write_all(b"warm-ticket").await.unwrap();
+        s1.flush().await.unwrap();
+        let mut r1 = [0u8; 11];
+        s1.read_exact(&mut r1).await.unwrap();
+        assert_eq!(&r1, b"warm-ticket");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(s1);
+
+        // Step 2: Inject 650ms server->client latency (> old 500ms polling limit!) and force
+        // a fresh 0-RTT reconnect via `on_network_change()`.
+        s2c_delay_ms.store(650, Ordering::Release);
+        assert_eq!(outbound.on_network_change(), 1);
+
+        let start = std::time::Instant::now();
+        let mut s2 = outbound
+            .connect_tcp(&TargetAddr::from(echo_addr))
+            .await
+            .expect(
+                "0-RTT TUIC Authenticate must await ZeroRttAccepted instead of failing at 500ms",
+            );
+        let auth_elapsed = start.elapsed();
+        assert!(
+            auth_elapsed >= Duration::from_millis(600),
+            "expected >=600ms delayed 0-RTT handshake completion, got {auth_elapsed:?}"
+        );
+        s2.write_all(b"after-650ms-0rtt").await.unwrap();
+        s2.flush().await.unwrap();
+        let mut r2 = [0u8; 16];
+        s2.read_exact(&mut r2).await.unwrap();
+        assert_eq!(&r2, b"after-650ms-0rtt");
+
+        drop(s2);
+        proxy_task.abort();
+        echo_task.abort();
+        srv.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tuic_disable_sni_verifies_real_servername_certificate() {
+        use tokio::io::AsyncWriteExt;
+
+        let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo_listener.accept().await {
+                let mut buf = [0u8; 128];
+                if let Ok(n) = s.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = s.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        // Self-signed cert ONLY valid for "tuic.example.test" (explicitly NOT "localhost"!).
+        let sni = "tuic.example.test";
+        let (tls_cfg, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let uuid = Uuid::new_v4();
+        let password = "tuic-disable-sni-secret";
+        let srv = spawn_tuic_server(
+            "127.0.0.1:0".parse().unwrap(),
+            uuid,
+            password.to_string(),
+            tls_cfg,
+        )
+        .await
+        .unwrap();
+
+        let outbound = TuicOutbound::new(TuicOutboundConfig {
+            name: "tuic-disable-sni-verified".into(),
+            server: "127.0.0.1".into(),
+            port: srv.listen_addr.port(),
+            uuid,
+            password: password.into(),
+            udp_relay_mode: TuicUdpRelayMode::Native,
+            congestion_control: QuicCongestionControl::Bbr,
+            zero_rtt_handshake: false,
+            disable_sni: true,
+            heartbeat_interval: Duration::from_secs(30),
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der],
+            udp: true,
+        })
+        .unwrap();
+        assert_eq!(outbound.inner.sni_host(), sni);
+
+        let mut stream = outbound
+            .connect_tcp(&TargetAddr::from(echo_addr))
+            .await
+            .expect("disable_sni=true with skip_cert_verify=false must verify servername SAN");
+        stream.write_all(b"disable-sni-ok").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut resp = [0u8; 14];
+        stream.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"disable-sni-ok");
+
+        drop(stream);
+        echo_task.abort();
+        srv.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tuic_client_stream_server_speaks_first_waits_for_pending_flush() {
+        struct PendingFlushMockStream {
+            written: Vec<u8>,
+            flush_calls: usize,
+            flushed: bool,
+            banner: BytesMut,
+            wake_scheduled: bool,
+        }
+
+        impl AsyncRead for PendingFlushMockStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if !self.flushed {
+                    // Server will not emit its banner until client Connect header is flushed!
+                    return Poll::Pending;
+                }
+                if self.banner.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                let n = self.banner.len().min(buf.remaining());
+                buf.put_slice(&self.banner.split_to(n));
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for PendingFlushMockStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                data: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.written.extend_from_slice(data);
+                Poll::Ready(Ok(data.len()))
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.flush_calls += 1;
+                if self.flush_calls == 1 {
+                    if !self.wake_scheduled {
+                        self.wake_scheduled = true;
+                        let waker = cx.waker().clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            waker.wake();
+                        });
+                    }
+                    return Poll::Pending;
+                }
+                self.flushed = true;
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let banner = b"220 SSH-2.0-TUIC-BANNER\r\n";
+        let mock = PendingFlushMockStream {
+            written: Vec::new(),
+            flush_calls: 0,
+            flushed: false,
+            banner: BytesMut::from(&banner[..]),
+            wake_scheduled: false,
+        };
+        let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x00\x16"[..]);
+        let mut stream = TuicClientStream::new(mock, connect_hdr.clone());
+
+        let mut got = vec![0u8; banner.len()];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut got))
+            .await
+            .expect("poll_read must retry poll_flush after Pending instead of deadlocking")
+            .unwrap();
+        assert_eq!(&got, banner);
+        assert_eq!(stream.inner.flush_calls, 2);
+        assert_eq!(stream.inner.written, connect_hdr.as_ref());
+        assert!(stream.hdr_flushed);
+    }
+
+    #[tokio::test]
+    async fn tuic_client_stream_split_concurrent_read_and_saturated_write_no_deadlock() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(256);
+        let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x01\xbb"[..]);
+        let stream = TuicClientStream::new(client_io, connect_hdr.clone());
+        let (mut rd, mut wr) = tokio::io::split(stream);
+
+        let payload = vec![0xABu8; 256 * 1024];
+        let payload_tx = payload.clone();
+
+        // 1. Writer saturates the 256B duplex pipe and parks on `Pending` while `hdr_flushed == false`.
+        let writer_task = tokio::spawn(async move {
+            wr.write_all(&payload_tx).await.unwrap();
+            wr.flush().await.unwrap();
+            wr.shutdown().await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // 2. Reader polls `poll_read` while `!hdr_flushed` and pipe is still saturated; without
+        //    `FanoutWaker`, Reader would overwrite Writer's waker and deadlock permanently.
+        let reader_task = tokio::spawn(async move {
+            let mut reply = Vec::new();
+            rd.read_to_end(&mut reply).await.unwrap();
+            reply
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // 3. Server drains `connect_hdr + 256 KiB` and then sends its reply.
+        let server_task = tokio::spawn(async move {
+            let mut expected = Vec::with_capacity(connect_hdr.len() + payload.len());
+            expected.extend_from_slice(&connect_hdr);
+            expected.extend_from_slice(&payload);
+            let mut received = Vec::with_capacity(expected.len());
+            server_io.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received.len(), expected.len());
+            assert_eq!(received, expected);
+            server_io.write_all(b"split-ok").await.unwrap();
+            server_io.shutdown().await.unwrap();
+        });
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            writer_task.await.unwrap();
+            server_task.await.unwrap();
+            reader_task.await.unwrap()
+        })
+        .await
+        .expect("split TuicClientStream concurrent read + saturated write must not deadlock");
+        assert_eq!(reply, b"split-ok");
+    }
+
+    #[tokio::test]
+    async fn tuic_client_stream_cancelled_pending_write_retries_with_smaller_buffer() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(64);
+        let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x00\x50"[..]);
+        let mut stream = TuicClientStream::new(client_io, connect_hdr.clone());
+
+        // First write saturates `duplex(64)` and leaves buffered bytes in `pending_buf`.
+        let first_chunk = vec![0x11u8; 4096];
+        let n1 = stream.write(&first_chunk).await.unwrap();
+        assert_eq!(n1, 4096);
+
+        // Second large write must return `Pending`; cancel it via timeout.
+        let cancelled_large = vec![0x22u8; 4096];
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(25), stream.write(&cancelled_large)).await;
+        assert!(
+            timed_out.is_err(),
+            "write to saturated duplex while pending_buf is non-empty must park Pending"
+        );
+
+        // Start draining server side concurrently, then retry with a SMALLER buffer `b"tiny"`.
+        let drain_task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            server_io.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        stream
+            .write_all(b"tiny")
+            .await
+            .expect("retrying with smaller buffer after cancelled Pending write must succeed");
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), drain_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = Vec::with_capacity(connect_hdr.len() + first_chunk.len() + 4);
+        expected.extend_from_slice(&connect_hdr);
+        expected.extend_from_slice(&first_chunk);
+        expected.extend_from_slice(b"tiny");
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn tuic_client_stream_full_duplex_reply_before_draining_coalesced_upload_no_deadlock() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(256);
+        let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x01\xbb"[..]);
+        let stream = TuicClientStream::new(client_io, connect_hdr.clone());
+        let (mut rd, mut wr) = tokio::io::split(stream);
+
+        let upload = vec![0xABu8; 16 * 1024];
+        let upload_tx = upload.clone();
+        let server_reply: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+        let server_reply_tx = server_reply.clone();
+
+        // Writer coalesces 16 KiB behind `connect_hdr` into `pending_buf`, saturating the
+        // 256-byte duplex while `hdr_flushed` remains `false`, then flushes & shuts down.
+        let writer_task = tokio::spawn(async move {
+            wr.write_all(&upload_tx).await.unwrap();
+            wr.flush().await.unwrap();
+            wr.shutdown().await.unwrap();
+        });
+
+        // Reader concurrently expects a 512-byte response (> 256B downlink duplex) BEFORE the
+        // server drains the remaining ~16 KiB upload.
+        let reader_task = tokio::spawn(async move {
+            let mut got = vec![0u8; 512];
+            rd.read_exact(&mut got).await.unwrap();
+            got
+        });
+
+        let hdr_expected = connect_hdr.clone();
+        let server_task = tokio::spawn(async move {
+            // 1. Read only the first 256 bytes (contains Connect header + initial payload).
+            let mut first = vec![0u8; 256];
+            server_io.read_exact(&mut first).await.unwrap();
+            assert_eq!(&first[..hdr_expected.len()], hdr_expected.as_ref());
+            assert!(
+                first[hdr_expected.len()..].iter().all(|&b| b == 0xAB),
+                "initial coalesced payload bytes after Connect header must match"
+            );
+
+            // 2. Write 512-byte response (> 256B downlink duplex!) BEFORE reading the rest of upload.
+            server_io.write_all(&server_reply_tx).await.unwrap();
+            server_io.flush().await.unwrap();
+
+            // 3. Drain remaining upload and verify byte-for-byte integrity.
+            let mut rest = Vec::new();
+            server_io.read_to_end(&mut rest).await.unwrap();
+            let mut full = first;
+            full.extend_from_slice(&rest);
+            let mut expected = Vec::with_capacity(hdr_expected.len() + upload.len());
+            expected.extend_from_slice(&hdr_expected);
+            expected.extend_from_slice(&upload);
+            assert_eq!(full, expected);
+        });
+
+        let got_reply = tokio::time::timeout(Duration::from_secs(2), async {
+            writer_task.await.unwrap();
+            server_task.await.unwrap();
+            reader_task.await.unwrap()
+        })
+        .await
+        .expect(
+            "TuicClientStream::poll_read must not deadlock behind saturated coalesced pending_buf",
+        );
+        assert_eq!(got_reply, server_reply);
+    }
+
+    #[tokio::test]
+    async fn tuic_client_stream_delivers_buffered_response_on_uplink_error_and_surfaces_unsent_header_error()
+     {
+        use tokio::io::AsyncWriteExt;
+
+        // Case 1: Server receives Connect header + initial bytes, sends 512-byte HTTP 413
+        // response, and closes uplink (BrokenPipe on further writes). Reader must still receive
+        // the entire buffered downlink response cleanly!
+        {
+            struct EarlyUplinkCloseStream {
+                allow_write_bytes: usize,
+                written: Vec<u8>,
+                downlink: BytesMut,
+            }
+
+            impl AsyncRead for EarlyUplinkCloseStream {
+                fn poll_read(
+                    mut self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    buf: &mut ReadBuf<'_>,
+                ) -> Poll<io::Result<()>> {
+                    if self.downlink.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    let take = self.downlink.len().min(buf.remaining()).min(128);
+                    buf.put_slice(&self.downlink.split_to(take));
+                    Poll::Ready(Ok(()))
+                }
+            }
+
+            impl AsyncWrite for EarlyUplinkCloseStream {
+                fn poll_write(
+                    mut self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    data: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    if self.allow_write_bytes == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "server closed uplink after sending HTTP 413",
+                        )));
+                    }
+                    let take = data.len().min(self.allow_write_bytes);
+                    self.written.extend_from_slice(&data[..take]);
+                    self.allow_write_bytes -= take;
+                    Poll::Ready(Ok(take))
+                }
+
+                fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "server closed uplink",
+                    )))
+                }
+
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+            }
+
+            let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x00\x50"[..]);
+            let mut resp =
+                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 480\r\n\r\n".to_vec();
+            resp.resize(512, b'X');
+            let mock = EarlyUplinkCloseStream {
+                allow_write_bytes: 256,
+                written: Vec::new(),
+                downlink: BytesMut::from(resp.as_slice()),
+            };
+            let mut stream = TuicClientStream::new(mock, connect_hdr.clone());
+
+            // First write pushes 256B (Connect header + 247B payload), then BrokenPipe on next write.
+            let err = stream.write(&vec![0xABu8; 16 * 1024]).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                &stream.inner.written[..connect_hdr.len()],
+                connect_hdr.as_ref()
+            );
+
+            // Reading must deliver the full buffered 512-byte response + clean EOF.
+            let mut got = Vec::new();
+            stream
+                .read_to_end(&mut got)
+                .await
+                .expect("buffered downlink response must be delivered despite uplink BrokenPipe");
+            assert_eq!(got, resp);
+        }
+
+        // Case 2a: Server-speaks-first where Connect header itself cannot be written (BrokenPipe)
+        // while inner.poll_read stays Pending forever -> poll_read MUST return Err immediately.
+        {
+            struct BrokenWritePendingReadStream {
+                fail_on_write: bool,
+            }
+
+            impl AsyncRead for BrokenWritePendingReadStream {
+                fn poll_read(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    _buf: &mut ReadBuf<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Poll::Pending
+                }
+            }
+
+            impl AsyncWrite for BrokenWritePendingReadStream {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    data: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    if self.fail_on_write {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "broken uplink during Connect header write",
+                        )))
+                    } else {
+                        Poll::Ready(Ok(data.len()))
+                    }
+                }
+
+                fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "broken uplink during Connect header flush",
+                    )))
+                }
+
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+            }
+
+            let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x00\x16"[..]);
+            let mut stream_w = TuicClientStream::new(
+                BrokenWritePendingReadStream {
+                    fail_on_write: true,
+                },
+                connect_hdr.clone(),
+            );
+            let mut b = [0u8; 16];
+            let err_w = tokio::time::timeout(Duration::from_millis(500), stream_w.read(&mut b))
+                .await
+                .expect("unsent Connect header write error must not hang poll_read")
+                .expect_err("expected BrokenPipe");
+            assert_eq!(err_w.kind(), io::ErrorKind::BrokenPipe);
+
+            // Case 2b: Header buffered into inner, but inner.poll_flush fails with BrokenPipe
+            // while inner.poll_read stays Pending -> poll_read MUST return Err immediately.
+            let mut stream_f = TuicClientStream::new(
+                BrokenWritePendingReadStream {
+                    fail_on_write: false,
+                },
+                connect_hdr,
+            );
+            let err_f = tokio::time::timeout(Duration::from_millis(500), stream_f.read(&mut b))
+                .await
+                .expect("failed Connect header flush must not hang server-speaks-first poll_read")
+                .expect_err("expected BrokenPipe");
+            assert_eq!(err_f.kind(), io::ErrorKind::BrokenPipe);
+        }
+    }
+
+    #[tokio::test]
+    async fn tuic_client_stream_noop_flush_wakes_writer_and_zero_byte_retry_safe() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingWaker(Arc<AtomicUsize>);
+        impl Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct NoopFlushSingleWriteWakerStream {
+            allow_bytes: usize,
+            stored_write_waker: Option<Waker>,
+            clear_waker_on_flush: bool,
+        }
+
+        impl AsyncRead for NoopFlushSingleWriteWakerStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for NoopFlushSingleWriteWakerStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.allow_bytes == 0 {
+                    self.stored_write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                let take = buf.len().min(self.allow_bytes);
+                self.allow_bytes -= take;
+                Poll::Ready(Ok(take))
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                if self.clear_waker_on_flush {
+                    self.stored_write_waker = None;
+                }
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Case A: First write fits exactly into `allow_bytes`, emptying `pending_buf` while
+        // `hdr_flushed == false`. Second write hits `Pending` on `inner.poll_write`. Concurrent
+        // `poll_read` runs no-op `inner.poll_flush -> Ready(Ok(()))` and MUST wake parked writer W!
+        let connect_hdr = BytesMut::from(&b"\x05\x01\x01\x7f\x00\x00\x01\x01\xbb"[..]);
+        let mock = NoopFlushSingleWriteWakerStream {
+            allow_bytes: connect_hdr.len() + 8,
+            stored_write_waker: None,
+            clear_waker_on_flush: true,
+        };
+        let mut stream = TuicClientStream::new(mock, connect_hdr.clone());
+
+        let w_hits = Arc::new(AtomicUsize::new(0));
+        let r_hits = Arc::new(AtomicUsize::new(0));
+        let waker_w = Waker::from(Arc::new(CountingWaker(Arc::clone(&w_hits))));
+        let waker_r = Waker::from(Arc::new(CountingWaker(Arc::clone(&r_hits))));
+        let mut cx_w = Context::from_waker(&waker_w);
+        let mut cx_r = Context::from_waker(&waker_r);
+
+        assert_eq!(
+            Pin::new(&mut stream)
+                .poll_write(&mut cx_w, b"12345678")
+                .map(|r| r.unwrap()),
+            Poll::Ready(8)
+        );
+        assert!(stream.pending_buf.is_empty());
+        assert!(!stream.hdr_flushed);
+
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx_w, b"blocked"),
+            Poll::Pending
+        ));
+
+        let mut out = [0u8; 16];
+        let mut rb = ReadBuf::new(&mut out);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx_r, &mut rb),
+            Poll::Pending
+        ));
+        assert!(stream.hdr_flushed);
+        assert_eq!(
+            w_hits.load(Ordering::SeqCst),
+            1,
+            "writer parked on Pending poll_write must be woken when poll_read completes no-op poll_flush"
+        );
+
+        // Case B: Retrying cancelled Pending write with a 0-byte buffer must return Ready(Ok(0))
+        // with zero panic / InvalidInput.
+        assert_eq!(
+            Pin::new(&mut stream)
+                .poll_write(&mut cx_w, &[])
+                .map(|r| r.unwrap()),
+            Poll::Ready(0)
+        );
     }
 }

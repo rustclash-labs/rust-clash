@@ -10,7 +10,7 @@ use proxy_core::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -2330,73 +2330,251 @@ const MAX_MCP_LINE_BYTES: usize = MAX_MCP_FRAME_BYTES + 1024;
 const MAX_MCP_HEADER_LINE_BYTES: usize = 16 * 1024;
 const MAX_MCP_HEADER_LINES: usize = 64;
 
-async fn read_bounded_line<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
-    buf: &mut String,
-    max_bytes: usize,
-) -> Result<usize> {
-    buf.clear();
-    let mut limited = (&mut *reader).take((max_bytes + 1) as u64);
-    let n = limited.read_line(buf).await?;
-    if n > max_bytes && !buf.ends_with('\n') {
-        return Err(anyhow!(
-            "MCP input line exceeds maximum allowed size ({max_bytes} bytes)"
-        ));
-    }
-    Ok(n)
+fn is_rfc7230_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
-async fn read_next_mcp_frame<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
+fn looks_like_header_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return false;
+    }
+    let Some((name, _val)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    !name.is_empty() && name.bytes().all(is_rfc7230_tchar)
+}
+
+/// Pure synchronous parser for buffered MCP frames (both header-framed `Content-Length`
+/// and `NewlineJson`). Only drains `buf` once a complete frame is available (except for
+/// completed leading whitespace-only lines), guaranteeing cancel safety across arbitrary
+/// `tokio::select!` cancellations of `McpFrameReader::read_next_frame`.
+fn try_parse_buffered_frame(
+    buf: &mut Vec<u8>,
     last_mode: &mut FrameMode,
+    eof: bool,
 ) -> Result<Option<(Value, FrameMode)>> {
-    let mut line = String::new();
-    loop {
-        let n = read_bounded_line(reader, &mut line, MAX_MCP_LINE_BYTES).await?;
-        if n == 0 {
+    // Discard any completed leading empty / whitespace-only lines (`\r\n`, `\n`, spaces).
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        if nl > MAX_MCP_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP input line exceeds maximum allowed size ({MAX_MCP_LINE_BYTES} bytes)"
+            ));
+        }
+        if buf[..nl].iter().all(|b| b.is_ascii_whitespace()) {
+            buf.drain(..=nl);
+        } else {
+            break;
+        }
+    }
+
+    let Some(first_nl) = buf.iter().position(|&b| b == b'\n') else {
+        if buf.len() > MAX_MCP_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP input line exceeds maximum allowed size ({MAX_MCP_LINE_BYTES} bytes)"
+            ));
+        }
+        if !eof {
             return Ok(None);
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            buf.clear();
+            return Ok(None);
+        }
+        let line_str = std::str::from_utf8(buf).context("MCP input is not valid UTF-8")?;
+        if looks_like_header_line(line_str) {
+            *last_mode = FrameMode::ContentLength;
+            return Err(anyhow!("unexpected EOF while reading MCP headers"));
+        }
+        *last_mode = FrameMode::NewlineJson;
+        let val: Value =
+            serde_json::from_str(line_str.trim()).context("invalid JSON-RPC line on stdin")?;
+        buf.clear();
+        return Ok(Some((val, FrameMode::NewlineJson)));
+    };
+
+    if first_nl > MAX_MCP_LINE_BYTES {
+        return Err(anyhow!(
+            "MCP input line exceeds maximum allowed size ({MAX_MCP_LINE_BYTES} bytes)"
+        ));
+    }
+
+    let first_line =
+        std::str::from_utf8(&buf[..first_nl]).context("MCP input is not valid UTF-8")?;
+
+    if !looks_like_header_line(first_line) {
+        *last_mode = FrameMode::NewlineJson;
+        let parsed = serde_json::from_str::<Value>(first_line.trim())
+            .context("invalid JSON-RPC line on stdin");
+        buf.drain(..=first_nl);
+        return Ok(Some((parsed?, FrameMode::NewlineJson)));
+    }
+
+    // Header-framed LSP/MCP message (`Content-Length`, `Content-Type`, etc. in any order).
+    *last_mode = FrameMode::ContentLength;
+    let mut cursor = 0usize;
+    let mut header_count = 0usize;
+    let mut content_length: Option<usize> = None;
+
+    let body_start = loop {
+        let remaining = &buf[cursor..];
+        let Some(rel_nl) = remaining.iter().position(|&b| b == b'\n') else {
+            if remaining.len() > MAX_MCP_HEADER_LINE_BYTES {
+                return Err(anyhow!(
+                    "MCP header line exceeds maximum allowed size ({MAX_MCP_HEADER_LINE_BYTES} bytes)"
+                ));
+            }
+            if eof {
+                return Err(anyhow!("unexpected EOF while reading MCP headers"));
+            }
+            return Ok(None);
+        };
+
+        if rel_nl > MAX_MCP_HEADER_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP header line exceeds maximum allowed size ({MAX_MCP_HEADER_LINE_BYTES} bytes)"
+            ));
         }
 
-        if let Some((hdr_name, hdr_val)) = trimmed.split_once(':')
-            && hdr_name.trim().eq_ignore_ascii_case("content-length")
-        {
-            *last_mode = FrameMode::ContentLength;
-            let content_len: usize = hdr_val
-                .trim()
+        let line_str = std::str::from_utf8(&remaining[..rel_nl])
+            .context("MCP header line is not valid UTF-8")?;
+        let trimmed = line_str.trim();
+        cursor += rel_nl + 1;
+
+        // Blank separator line (`\r\n` or `\n`) ends the header block.
+        if trimmed.is_empty() {
+            break cursor;
+        }
+
+        header_count += 1;
+        if header_count > MAX_MCP_HEADER_LINES {
+            return Err(anyhow!(
+                "MCP frame exceeded maximum header count ({MAX_MCP_HEADER_LINES})"
+            ));
+        }
+
+        let Some((raw_name, raw_val)) = trimmed.split_once(':') else {
+            return Err(anyhow!("malformed header line in MCP frame"));
+        };
+        let name = raw_name.trim();
+        if name.is_empty() || !name.bytes().all(is_rfc7230_tchar) {
+            return Err(anyhow!("invalid header name in MCP frame"));
+        }
+
+        if name.eq_ignore_ascii_case("content-length") {
+            let val_trimmed = raw_val.trim();
+            if val_trimmed.is_empty() || !val_trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(anyhow!("invalid Content-Length header in MCP stream"));
+            }
+            let parsed: usize = val_trimmed
                 .parse()
                 .context("invalid Content-Length header in MCP stream")?;
-            if content_len > MAX_MCP_FRAME_BYTES {
+            if parsed > MAX_MCP_FRAME_BYTES {
                 return Err(anyhow!("MCP frame exceeds 8 MiB safety cap"));
             }
-            // Consume remaining headers up to blank line with bounded header count and length.
-            let mut header_count = 1usize;
-            loop {
-                let mut hdr = String::new();
-                let hn = read_bounded_line(reader, &mut hdr, MAX_MCP_HEADER_LINE_BYTES).await?;
-                if hn == 0 || hdr.trim().is_empty() {
-                    break;
-                }
-                header_count += 1;
-                if header_count > MAX_MCP_HEADER_LINES {
+            if let Some(prev) = content_length {
+                if prev != parsed {
                     return Err(anyhow!(
-                        "MCP frame exceeded maximum header count ({MAX_MCP_HEADER_LINES})"
+                        "conflicting duplicate Content-Length headers in MCP frame"
                     ));
                 }
+            } else {
+                content_length = Some(parsed);
             }
-            let mut body = vec![0u8; content_len];
-            reader.read_exact(&mut body).await?;
-            let val: Value = serde_json::from_slice(&body)
-                .context("invalid JSON in Content-Length MCP frame")?;
-            return Ok(Some((val, FrameMode::ContentLength)));
         }
+    };
 
-        *last_mode = FrameMode::NewlineJson;
-        let val: Value = serde_json::from_str(trimmed).context("invalid JSON-RPC line on stdin")?;
-        return Ok(Some((val, FrameMode::NewlineJson)));
+    let Some(content_len) = content_length else {
+        return Err(anyhow!("missing Content-Length header in MCP frame"));
+    };
+
+    let frame_end = body_start
+        .checked_add(content_len)
+        .ok_or_else(|| anyhow!("MCP frame size overflow"))?;
+
+    if buf.len() < frame_end {
+        if eof {
+            return Err(anyhow!(
+                "unexpected EOF while reading MCP Content-Length body (expected {content_len} bytes, got {})",
+                buf.len().saturating_sub(body_start)
+            ));
+        }
+        return Ok(None);
+    }
+
+    let parsed = serde_json::from_slice::<Value>(&buf[body_start..frame_end])
+        .context("invalid JSON in Content-Length MCP frame");
+    buf.drain(..frame_end);
+    Ok(Some((parsed?, FrameMode::ContentLength)))
+}
+
+/// Stateful, cancel-safe MCP stream reader backed by an owned `Vec<u8>` buffer
+/// and Tokio's cancel-safe `AsyncReadExt::read_buf`.
+struct McpFrameReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    last_mode: FrameMode,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> McpFrameReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(4096),
+            last_mode: FrameMode::NewlineJson,
+            eof: false,
+        }
+    }
+
+    fn last_mode(&self) -> FrameMode {
+        self.last_mode
+    }
+
+    /// Reads the next complete MCP frame.
+    ///
+    /// Cancel safety: 100% cancel-safe for use inside `tokio::select!`. Bytes read
+    /// from `self.inner` are accumulated in `self.buf` via `AsyncReadExt::read_buf`
+    /// and are only drained once a full frame has been parsed.
+    async fn read_next_frame(&mut self) -> Result<Option<(Value, FrameMode)>> {
+        loop {
+            if let Some(frame) =
+                try_parse_buffered_frame(&mut self.buf, &mut self.last_mode, self.eof)?
+            {
+                if self.buf.is_empty() && self.buf.capacity() > 64 * 1024 {
+                    self.buf = Vec::with_capacity(16 * 1024);
+                }
+                return Ok(Some(frame));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            if self.buf.capacity().saturating_sub(self.buf.len()) < 4096 {
+                self.buf.reserve(4096);
+            }
+            let n = self.inner.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                self.eof = true;
+            }
+        }
     }
 }
 
@@ -2434,8 +2612,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = BufReader::new(input);
-    let mut last_mode = FrameMode::NewlineJson;
+    let mut reader = McpFrameReader::new(input);
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, FrameMode)>();
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -2446,7 +2623,7 @@ where
                 write_encoded_mcp_frame(&mut output, &encoded, mode).await?;
             }
             Some(_done) = tasks.join_next(), if !tasks.is_empty() => {}
-            frame_res = read_next_mcp_frame(&mut reader, &mut last_mode) => {
+            frame_res = reader.read_next_frame() => {
                 match frame_res {
                     Ok(Some((req, mode))) => {
                         if frame_contains_mutation(&req) {
@@ -2486,7 +2663,7 @@ where
                                 "message": format!("Parse error: {}", redact_sensitive_text(&err.to_string()))
                             }
                         });
-                        write_mcp_frame(&mut output, &err_resp, last_mode).await?;
+                        write_mcp_frame(&mut output, &err_resp, reader.last_mode()).await?;
                         return Ok(());
                     }
                 }
@@ -2518,6 +2695,7 @@ mod tests {
     use super::*;
     use proxy_core::api::spawn_api_server;
     use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::watch;
 
     #[tokio::test]
@@ -4190,5 +4368,393 @@ rules:
         engine.shutdown_async().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_frame_reader_is_cancel_safe_under_repeated_timeout_mid_header_and_body() {
+        let (mut writer, reader_io) = tokio::io::duplex(256);
+
+        let payload1 = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": { "note": "节点-🚀-cancel-safe-header-and-body" }
+        });
+        let body1 = serde_json::to_vec(&payload1).unwrap();
+        let mut frame1 = format!(
+            "\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+            body1.len()
+        )
+        .into_bytes();
+        frame1.extend_from_slice(&body1);
+
+        let payload2 = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": { "note": "换行JSON-流式取消安全" }
+        });
+        let mut frame2 = serde_json::to_vec(&payload2).unwrap();
+        frame2.push(b'\n');
+
+        let drip_task = tokio::spawn(async move {
+            for b in frame1.into_iter().chain(frame2.into_iter()) {
+                writer.write_all(&[b]).await.unwrap();
+                writer.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let mut frame_reader = McpFrameReader::new(reader_io);
+        let mut total_cancellations = 0usize;
+
+        async fn read_with_cancellations(
+            reader: &mut McpFrameReader<tokio::io::DuplexStream>,
+        ) -> (Option<(Value, FrameMode)>, usize) {
+            let mut cancels = 0usize;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(1), reader.read_next_frame()).await
+                {
+                    Ok(res) => return (res.unwrap(), cancels),
+                    Err(_) => {
+                        cancels += 1;
+                    }
+                }
+            }
+        }
+
+        let (f1, c1) = read_with_cancellations(&mut frame_reader).await;
+        total_cancellations += c1;
+        let (v1, m1) = f1.expect("first frame parsed");
+        assert_eq!(m1, FrameMode::ContentLength);
+        assert_eq!(v1, payload1);
+
+        let (f2, c2) = read_with_cancellations(&mut frame_reader).await;
+        total_cancellations += c2;
+        let (v2, m2) = f2.expect("second frame parsed");
+        assert_eq!(m2, FrameMode::NewlineJson);
+        assert_eq!(v2, payload2);
+
+        assert!(
+            total_cancellations >= 10,
+            "test must exercise repeated mid-frame cancellations (observed {total_cancellations})"
+        );
+
+        let (eof_frame, _) = read_with_cancellations(&mut frame_reader).await;
+        assert!(eof_frame.is_none(), "expected clean EOF after both frames");
+        drip_task.await.unwrap();
+    }
+
+    async fn run_serve_mcp_io_cancel_safety_case(use_content_length: bool) {
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        let (probe_started_tx, probe_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let slow_ctrl_task = tokio::spawn(async move {
+            let (mut sock, _) = slow_listener.accept().await.unwrap();
+            let mut req_buf = vec![0u8; 2048];
+            let _ = sock.read(&mut req_buf).await;
+            let _ = probe_started_tx.send(());
+            let _ = release_probe_rx.await;
+            let body = serde_json::to_vec(&json!({
+                "requested_proxy": "DIRECT",
+                "effective_outbound": "DIRECT",
+                "protocol": "direct",
+                "chains": ["DIRECT"],
+                "url": "https://example.com/",
+                "target_host": "example.com",
+                "target_port": 443,
+                "remote_dns": false,
+                "dns_mode": "local",
+                "total_ms": 10.0,
+                "overall_probe_duration_ms": 10.0,
+                "verdict": "reachable",
+                "cf_mitigated": false,
+                "note": "ok"
+            }))
+            .unwrap();
+            let head = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+
+        let encode_req = |val: &Value, content_type_first: bool| -> Vec<u8> {
+            let body = serde_json::to_vec(val).unwrap();
+            if use_content_length {
+                let hdr = if content_type_first {
+                    format!(
+                        "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!("Content-Length: {}\r\n\r\n", body.len())
+                };
+                let mut out = hdr.into_bytes();
+                out.extend_from_slice(&body);
+                out
+            } else {
+                let mut out = body;
+                out.push(b'\n');
+                out
+            }
+        };
+
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, client_out) = tokio::io::duplex(16 * 1024);
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: Some(slow_addr.to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let mcp_task = tokio::spawn(async move {
+            serve_mcp_io(server_in, server_out, opts).await.unwrap();
+        });
+
+        // 1. Send slow read-only request (id=501) so `resp_rx` will fire mid-read of request 2.
+        let req1 = json!({
+            "jsonrpc": "2.0",
+            "id": 501,
+            "method": "tools/call",
+            "params": {
+                "name": "probe_waterfall",
+                "arguments": { "proxy": "DIRECT", "url": "https://example.com/", "timeout_ms": 5000 }
+            }
+        });
+        client_in
+            .write_all(&encode_req(&req1, false))
+            .await
+            .unwrap();
+        client_in.flush().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), probe_started_rx)
+            .await
+            .expect("slow request started")
+            .unwrap();
+
+        // 2. Drip the first half of request 2 (id=502) byte-by-byte so `read_next_frame()`
+        //    has partially buffered request 2 and is awaiting more bytes.
+        let req2 = json!({
+            "jsonrpc": "2.0",
+            "id": 502,
+            "method": "ping"
+        });
+        let req2_bytes = encode_req(&req2, true);
+        let split_at = req2_bytes.len() / 2;
+        for &b in &req2_bytes[..split_at] {
+            client_in.write_all(&[b]).await.unwrap();
+            client_in.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Let `serve_mcp_io` consume the first half into `McpFrameReader.buf` and park on `read_buf`.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // 3. Release request 1 so `resp_rx.recv()` wins `tokio::select!` and CANCELS `read_next_frame()`!
+        let _ = release_probe_tx.send(());
+
+        let mut resp_reader = McpFrameReader::new(client_out);
+        let (first_resp, first_mode) =
+            tokio::time::timeout(Duration::from_secs(2), resp_reader.read_next_frame())
+                .await
+                .expect("request 1 response arrives while request 2 is half-sent")
+                .unwrap()
+                .expect("request 1 frame present");
+        assert_eq!(
+            first_mode,
+            if use_content_length {
+                FrameMode::ContentLength
+            } else {
+                FrameMode::NewlineJson
+            }
+        );
+        assert_eq!(first_resp["id"], 501);
+        assert!(
+            first_resp.get("error").is_none(),
+            "unexpected error on request 1: {first_resp}"
+        );
+
+        // 4. Now drip the remaining bytes of request 2 one byte every 1ms.
+        for &b in &req2_bytes[split_at..] {
+            client_in.write_all(&[b]).await.unwrap();
+            client_in.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let (second_resp, second_mode) =
+            tokio::time::timeout(Duration::from_secs(2), resp_reader.read_next_frame())
+                .await
+                .expect("request 2 response arrives with zero desync / -32700")
+                .unwrap()
+                .expect("request 2 frame present");
+        assert_eq!(
+            second_mode,
+            if use_content_length {
+                FrameMode::ContentLength
+            } else {
+                FrameMode::NewlineJson
+            }
+        );
+        assert_eq!(second_resp["id"], 502);
+        assert!(
+            second_resp.get("error").is_none(),
+            "must never produce -32700 parse error after select! cancellation: {second_resp}"
+        );
+        assert!(second_resp.get("result").is_some());
+
+        drop(client_in);
+        mcp_task.await.unwrap();
+        slow_ctrl_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_serve_io_survives_select_cancellation_mid_frame_in_both_framing_modes() {
+        run_serve_mcp_io_cancel_safety_case(true).await;
+        run_serve_mcp_io_cancel_safety_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_accepts_content_type_and_custom_headers_in_any_order_and_rejects_invalid_headers()
+    {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. `Content-Type` BEFORE `Content-Length`, custom headers around `Content-Length`,
+        //    LF-only headers, and identical duplicate `Content-Length` all dispatch cleanly!
+        let b1 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})).unwrap();
+        let b2 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})).unwrap();
+        let b3 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})).unwrap();
+        let b4 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 4, "method": "ping"})).unwrap();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(
+            format!(
+                "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                b1.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b1);
+
+        stream.extend_from_slice(
+            format!(
+                "X-Custom: foo\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                b2.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b2);
+
+        // LF-only header block
+        stream.extend_from_slice(
+            format!(
+                "\nContent-Type: application/json\nContent-Length: {}\n\n",
+                b3.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b3);
+
+        // Identical duplicate Content-Length
+        stream.extend_from_slice(
+            format!(
+                "Content-Length: {}\r\nContent-Length: {}\r\n\r\n",
+                b4.len(),
+                b4.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b4);
+
+        let mut out_bytes = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(stream),
+            &mut out_bytes,
+            ro_opts.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut resp_reader = McpFrameReader::new(std::io::Cursor::new(out_bytes));
+        let mut seen_ids = Vec::new();
+        while let Some((val, mode)) = resp_reader.read_next_frame().await.unwrap() {
+            assert_eq!(mode, FrameMode::ContentLength);
+            assert!(val.get("error").is_none(), "unexpected error: {val}");
+            seen_ids.push(val["id"].as_i64().unwrap());
+        }
+        seen_ids.sort_unstable();
+        assert_eq!(seen_ids, vec![1, 2, 3, 4]);
+
+        // 2. Header block missing `Content-Length` returns clean -32700 parse error with Content-Length framing.
+        let missing_cl =
+            b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n{}".to_vec();
+        let mut missing_out = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(missing_cl),
+            &mut missing_out,
+            ro_opts.clone(),
+        )
+        .await
+        .unwrap();
+        let missing_str = String::from_utf8(missing_out).unwrap();
+        assert!(
+            missing_str.starts_with("Content-Length: "),
+            "missing Content-Length error must preserve Content-Length framing: {missing_str}"
+        );
+        assert!(missing_str.contains("-32700"));
+        assert!(missing_str.contains("missing Content-Length"));
+
+        // 3. Conflicting duplicate `Content-Length` returns clean -32700 parse error.
+        let conflict_cl = b"Content-Length: 2\r\nContent-Length: 4\r\n\r\n{}".to_vec();
+        let mut conflict_out = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(conflict_cl),
+            &mut conflict_out,
+            ro_opts.clone(),
+        )
+        .await
+        .unwrap();
+        let conflict_str = String::from_utf8(conflict_out).unwrap();
+        assert!(conflict_str.starts_with("Content-Length: "));
+        assert!(conflict_str.contains("-32700"));
+        assert!(conflict_str.contains("conflicting duplicate Content-Length"));
+
+        // 4. Signed / non-numeric / oversized `Content-Length` and truncated body on EOF all return clean errors.
+        for bad_input in [
+            b"Content-Length: +2\r\n\r\n{}".as_slice(),
+            b"Content-Length: abc\r\n\r\n{}".as_slice(),
+            b"Content-Length: 99999999\r\n\r\n".as_slice(),
+            b"Content-Length: 20\r\n\r\n{\"partial\":".as_slice(),
+        ] {
+            let mut mode = FrameMode::NewlineJson;
+            let mut buf = bad_input.to_vec();
+            let err = try_parse_buffered_frame(&mut buf, &mut mode, true)
+                .expect_err("expected malformed/truncated header frame to fail");
+            assert_eq!(mode, FrameMode::ContentLength);
+            assert!(
+                !err.to_string().is_empty(),
+                "error message must not be empty"
+            );
+        }
+
+        // 5. Trailing NewlineJson without trailing `\n` at EOF still parses cleanly.
+        let no_nl = b"{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"ping\"}".to_vec();
+        let mut no_nl_out = Vec::new();
+        serve_mcp_io(std::io::Cursor::new(no_nl), &mut no_nl_out, ro_opts)
+            .await
+            .unwrap();
+        let no_nl_val: Value =
+            serde_json::from_str(String::from_utf8(no_nl_out).unwrap().trim()).unwrap();
+        assert_eq!(no_nl_val["id"], 77);
+        assert!(no_nl_val.get("result").is_some());
     }
 }

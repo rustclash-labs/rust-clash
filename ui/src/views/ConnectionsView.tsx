@@ -1,8 +1,15 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { clashApi } from "../api";
 import { CloseIcon, SearchIcon } from "../components/Icons";
 import { useI18n } from "../i18n";
-import type { ConnectionItem, ConnectionsResponse, TrafficPoint } from "../types";
+import type { ConnectionsResponse, TrafficPoint } from "../types";
+import {
+  EMPTY_CONNECTIONS,
+  type ConnectionsPauseState,
+  resolveDisplayedConnections,
+  resolveLiveConnections,
+  transitionConnectionsPauseState,
+} from "../utils/connectionsModel.mjs";
 import {
   extractBadgeInitial,
   formatAge,
@@ -24,20 +31,24 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
   const { tr } = useI18n();
 
   const [query, setQuery] = useState("");
-  const [paused, setPaused] = useState(false);
-  const [frozenItems, setFrozenItems] = useState<ConnectionItem[]>([]);
+  const [pauseState, setPauseState] = useState<ConnectionsPauseState>(() => ({
+    paused: false,
+    frozenItems: EMPTY_CONNECTIONS,
+  }));
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const liveItems = connections?.connections ?? [];
+  const { paused, frozenItems } = pauseState;
+  const liveItems = resolveLiveConnections(connections);
+  const sourceItems = resolveDisplayedConnections(
+    paused,
+    liveItems,
+    frozenItems,
+  );
 
-  useEffect(() => {
-    if (!paused) {
-      setFrozenItems(liveItems);
-    }
-  }, [paused, liveItems]);
-
-  const sourceItems = paused ? frozenItems : liveItems;
+  const handleTogglePause = () => {
+    setPauseState((prev) => transitionConnectionsPauseState(prev, liveItems));
+  };
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -212,7 +223,7 @@ export const ConnectionsView: React.FC<ConnectionsViewProps> = ({
             <button
               type="button"
               className={`btn btn-sm ${paused ? "btn-primary" : ""}`}
-              onClick={() => setPaused((v) => !v)}
+              onClick={handleTogglePause}
             >
               {paused ? tr("恢复刷新", "Resume") : tr("暂停列表", "Pause")}
             </button>

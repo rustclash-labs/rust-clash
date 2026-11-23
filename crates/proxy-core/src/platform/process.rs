@@ -1,6 +1,7 @@
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(unix, target_os = "windows"))]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     sync::LazyLock,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SocketTransport {
@@ -70,9 +71,25 @@ type ProcessCacheEntry = (Instant, Option<LocalProcessInfo>);
 static PROCESS_CACHE: LazyLock<Mutex<LruCache<ProcessCacheKey, ProcessCacheEntry>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(1024).expect("non-zero"))));
 
+const LOCAL_IFACE_IPS_TTL: Duration = Duration::from_secs(3);
+
+struct LocalInterfaceIpCache {
+    refreshed_at: Option<Instant>,
+    ips: HashSet<IpAddr>,
+}
+
+static LOCAL_IFACE_IPS: LazyLock<RwLock<LocalInterfaceIpCache>> = LazyLock::new(|| {
+    RwLock::new(LocalInterfaceIpCache {
+        refreshed_at: None,
+        ips: HashSet::new(),
+    })
+});
+
 /// Look up the owning local process for a client socket `local_addr`.
-/// Only queries OS socket tables when `local_addr.ip()` is loopback or link-local/host-local
-/// (remote LAN clients cannot have a local PID on the proxy host).
+/// Only queries OS socket tables when `local_addr.ip()` is a potentially local subnet
+/// (loopback, RFC 1918, CGNAT, link-local, RFC 2544 Fake-IP, ULA) or currently assigned to
+/// one of this host's own network interfaces (enabling global unicast IPv6 / public host IPs /
+/// custom TUN CIDRs while still rejecting remote WAN clients).
 pub fn find_local_process(
     transport: SocketTransport,
     local_addr: SocketAddr,
@@ -80,7 +97,7 @@ pub fn find_local_process(
     if local_addr.port() == 0 {
         return None;
     }
-    if !is_potentially_local_ip(local_addr.ip()) {
+    if !is_local_lookup_candidate_ip(local_addr.ip()) {
         return None;
     }
 
@@ -109,7 +126,7 @@ pub fn find_local_process_nonblocking(
 ) -> Option<LocalProcessInfo> {
     #[cfg(target_os = "macos")]
     {
-        if local_addr.port() == 0 || !is_potentially_local_ip(local_addr.ip()) {
+        if local_addr.port() == 0 || !is_local_lookup_candidate_ip(local_addr.ip()) {
             return None;
         }
         if let Some((ts, cached)) = PROCESS_CACHE.lock().get(&(transport, local_addr)).cloned()
@@ -132,6 +149,127 @@ pub fn find_local_process_nonblocking(
     }
 }
 
+fn is_local_lookup_candidate_ip(ip: IpAddr) -> bool {
+    is_potentially_local_ip(ip) || is_assigned_local_interface_ip(ip)
+}
+
+fn normalize_local_lookup_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+fn is_assigned_local_interface_ip(ip: IpAddr) -> bool {
+    let normalized = normalize_local_lookup_ip(ip);
+    {
+        let guard = LOCAL_IFACE_IPS.read();
+        if let Some(ts) = guard.refreshed_at
+            && ts.elapsed() < LOCAL_IFACE_IPS_TTL
+        {
+            return guard.ips.contains(&normalized);
+        }
+    }
+    let fresh = enumerate_local_interface_ips();
+    let found = fresh.contains(&normalized);
+    let mut guard = LOCAL_IFACE_IPS.write();
+    guard.ips = fresh;
+    guard.refreshed_at = Some(Instant::now());
+    found
+}
+
+#[cfg(unix)]
+fn enumerate_local_interface_ips() -> HashSet<IpAddr> {
+    let mut ips = HashSet::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` allocates a linked list of interface addresses released by `freeifaddrs`.
+    if unsafe { libc::getifaddrs(&raw mut head) } != 0 || head.is_null() {
+        return ips;
+    }
+
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` points to a valid `ifaddrs` node in the list returned by `getifaddrs`.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` is non-null; `read_unaligned` safely extracts `sa_family`.
+            let family = i32::from(unsafe { std::ptr::read_unaligned(ifa.ifa_addr).sa_family });
+            match family {
+                libc::AF_INET => {
+                    // SAFETY: `sa_family == AF_INET` guarantees `ifa_addr` points to a `sockaddr_in`.
+                    let sin = unsafe {
+                        std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in>())
+                    };
+                    let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    ips.insert(IpAddr::V4(ip));
+                }
+                libc::AF_INET6 => {
+                    // SAFETY: `sa_family == AF_INET6` guarantees `ifa_addr` points to a `sockaddr_in6`.
+                    let sin6 = unsafe {
+                        std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>())
+                    };
+                    let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                    ips.insert(normalize_local_lookup_ip(IpAddr::V6(ip)));
+                }
+                _ => {}
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+
+    // SAFETY: `head` was allocated by a successful `getifaddrs` call above.
+    unsafe { libc::freeifaddrs(head) };
+    ips
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_local_interface_ips() -> HashSet<IpAddr> {
+    use windows_sys::Win32::{
+        Foundation::NO_ERROR,
+        NetworkManagement::IpHelper::{
+            FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_ROW,
+            MIB_UNICASTIPADDRESS_TABLE,
+        },
+        Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC},
+    };
+
+    let mut ips = HashSet::new();
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    // SAFETY: `GetUnicastIpAddressTable` allocates `table` which is freed via `FreeMibTable` below.
+    unsafe {
+        let status = GetUnicastIpAddressTable(AF_UNSPEC, &raw mut table);
+        if status != NO_ERROR || table.is_null() {
+            return ips;
+        }
+        let num_entries = (*table).NumEntries as usize;
+        if num_entries > 0 {
+            let rows_ptr = table
+                .cast_const()
+                .cast::<u8>()
+                .add(std::mem::offset_of!(MIB_UNICASTIPADDRESS_TABLE, Table))
+                .cast::<MIB_UNICASTIPADDRESS_ROW>();
+            let rows = std::slice::from_raw_parts(rows_ptr, num_entries);
+            for row in rows {
+                let sa = &row.Address;
+                if sa.si_family == AF_INET {
+                    let bytes = sa.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes();
+                    ips.insert(IpAddr::V4(Ipv4Addr::from(bytes)));
+                } else if sa.si_family == AF_INET6 {
+                    let ip = Ipv6Addr::from(sa.Ipv6.sin6_addr.u.Byte);
+                    ips.insert(normalize_local_lookup_ip(IpAddr::V6(ip)));
+                }
+            }
+        }
+        FreeMibTable(table.cast_const().cast::<std::ffi::c_void>());
+    }
+    ips
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn enumerate_local_interface_ips() -> HashSet<IpAddr> {
+    HashSet::new()
+}
+
 fn is_potentially_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -139,6 +277,7 @@ fn is_potentially_local_ip(ip: IpAddr) -> bool {
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
                 || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
         }
         IpAddr::V6(v6) => {
@@ -150,6 +289,158 @@ fn is_potentially_local_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+/// Compute the safe number of MIB table rows that actually fit inside `byte_len` bytes,
+/// clamping the kernel-reported `claimed_entries` against buffer capacity.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn bounded_mib_row_count(
+    byte_len: usize,
+    row_offset: usize,
+    row_size: usize,
+    claimed_entries: u32,
+) -> usize {
+    if byte_len < row_offset || row_size == 0 {
+        return 0;
+    }
+    let max_rows = (byte_len - row_offset) / row_size;
+    (claimed_entries as usize).min(max_rows)
+}
+
+/// Fetch a variable-sized Windows IP Helper MIB table into 8-byte aligned `Vec<u64>` storage,
+/// retrying up to 5 times on `ERROR_INSUFFICIENT_BUFFER` with monotonic growth.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn query_aligned_mib_table<F>(
+    no_error: u32,
+    err_insufficient_buffer: u32,
+    mut fetch: F,
+) -> Option<(Vec<u64>, usize)>
+where
+    F: FnMut(*mut std::ffi::c_void, *mut u32) -> u32,
+{
+    const MAX_ATTEMPTS: usize = 5;
+    let mut size: u32 = 0;
+    let first_rc = fetch(std::ptr::null_mut(), &raw mut size);
+    if (first_rc != err_insufficient_buffer && first_rc != no_error) || size == 0 {
+        return None;
+    }
+
+    let mut prev_bytes: usize = 0;
+    for _ in 0..MAX_ATTEMPTS {
+        let base = (size as usize).max(prev_bytes);
+        let target_bytes = base.saturating_add(4096).saturating_add(base / 4);
+        let alloc_u64s = target_bytes.div_ceil(std::mem::size_of::<u64>()).max(1);
+        let alloc_bytes = alloc_u64s.saturating_mul(std::mem::size_of::<u64>());
+        if alloc_bytes > u32::MAX as usize {
+            return None;
+        }
+        let mut buf = vec![0u64; alloc_u64s];
+        let mut out_size = alloc_bytes as u32;
+        let rc = fetch(
+            buf.as_mut_ptr().cast::<std::ffi::c_void>(),
+            &raw mut out_size,
+        );
+        if rc == no_error {
+            let valid_bytes = (out_size as usize).min(alloc_bytes);
+            return Some((buf, valid_bytes));
+        }
+        if rc != err_insufficient_buffer {
+            return None;
+        }
+        prev_bytes = alloc_bytes;
+        size = out_size;
+    }
+    None
+}
+
+/// Extract a bounds-checked, properly aligned slice of MIB table rows from 8-byte aligned
+/// `Vec<u64>` storage filled by `GetExtendedTcpTable` / `GetExtendedUdpTable`.
+///
+/// # Safety
+/// `buf[..byte_len]` must contain valid initialized bytes representing a `Table` header
+/// (`dwNumEntries: u32` at `num_entries_offset`) followed by `Row` elements starting at
+/// `rows_offset` (which must be a multiple of `align_of::<Row>()`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+unsafe fn mib_table_rows<Table, Row>(
+    buf: &[u64],
+    byte_len: usize,
+    num_entries_offset: usize,
+    rows_offset: usize,
+) -> &[Row] {
+    const {
+        assert!(std::mem::align_of::<Table>() <= std::mem::align_of::<u64>());
+        assert!(std::mem::align_of::<Row>() <= std::mem::align_of::<u64>());
+    }
+    let avail_bytes = byte_len.min(buf.len().saturating_mul(std::mem::size_of::<u64>()));
+    if avail_bytes < num_entries_offset.saturating_add(std::mem::size_of::<u32>()) {
+        return &[];
+    }
+    if !rows_offset.is_multiple_of(std::mem::align_of::<Row>()) {
+        return &[];
+    }
+    let base = buf.as_ptr().cast::<u8>();
+    // SAFETY: `avail_bytes >= num_entries_offset + 4`, so reading `u32` at `num_entries_offset` is in bounds.
+    let claimed_entries =
+        unsafe { std::ptr::read_unaligned(base.add(num_entries_offset).cast::<u32>()) };
+    let count = bounded_mib_row_count(
+        avail_bytes,
+        rows_offset,
+        std::mem::size_of::<Row>(),
+        claimed_entries,
+    );
+    if count == 0 {
+        return &[];
+    }
+    // SAFETY: `buf` is 8-byte aligned (`>= align_of::<Row>()`), `rows_offset` is a multiple of
+    // `align_of::<Row>()`, and `bounded_mib_row_count` guarantees
+    // `rows_offset + count * size_of::<Row>() <= avail_bytes <= buf.len() * 8`.
+    unsafe { std::slice::from_raw_parts(base.add(rows_offset).cast::<Row>(), count) }
+}
+
+/// Select the owning PID from UDP table entries `(local_addr, local_port_be, owning_pid)`,
+/// preferring an exact local IP match over a wildcard (`0.0.0.0` / `::`) binding on the same port.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn select_udp_pid_preferring_exact<Addr: Copy + PartialEq>(
+    entries: impl IntoIterator<Item = (Addr, u16, u32)>,
+    want_addr: Addr,
+    wildcard_addr: Addr,
+    want_port_be: u16,
+) -> Option<u32> {
+    let mut wildcard_pid: Option<u32> = None;
+    for (addr, port_be, pid) in entries {
+        if port_be != want_port_be || pid == 0 {
+            continue;
+        }
+        if addr == want_addr {
+            return Some(pid);
+        }
+        if addr == wildcard_addr && wildcard_pid.is_none() {
+            wildcard_pid = Some(pid);
+        }
+    }
+    wildcard_pid
+}
+
+/// Resolve a UDP IPv4 socket against the IPv4 table first, falling back to the IPv6 table with
+/// the IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) for dual-stack `IPV6_V6ONLY = 0` sockets.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn resolve_udp4_with_dual_stack_fallback<F4, F6>(
+    v4: std::net::SocketAddrV4,
+    mut find_v4: F4,
+    mut find_v6: F6,
+) -> Option<u32>
+where
+    F4: FnMut(std::net::SocketAddrV4) -> Option<u32>,
+    F6: FnMut(std::net::SocketAddrV6) -> Option<u32>,
+{
+    find_v4(v4).or_else(|| {
+        find_v6(std::net::SocketAddrV6::new(
+            v4.ip().to_ipv6_mapped(),
+            v4.port(),
+            0,
+            0,
+        ))
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -325,9 +616,18 @@ fn platform_find_process(
     local_addr: SocketAddr,
 ) -> Option<LocalProcessInfo> {
     let pid = match (transport, local_addr) {
-        (SocketTransport::Tcp, SocketAddr::V4(v4)) => find_win_tcp4_pid(v4),
+        (SocketTransport::Tcp, SocketAddr::V4(v4)) => find_win_tcp4_pid(v4).or_else(|| {
+            find_win_tcp6_pid(std::net::SocketAddrV6::new(
+                v4.ip().to_ipv6_mapped(),
+                v4.port(),
+                0,
+                0,
+            ))
+        }),
         (SocketTransport::Tcp, SocketAddr::V6(v6)) => find_win_tcp6_pid(v6),
-        (SocketTransport::Udp, SocketAddr::V4(v4)) => find_win_udp4_pid(v4),
+        (SocketTransport::Udp, SocketAddr::V4(v4)) => {
+            resolve_udp4_with_dual_stack_fallback(v4, find_win_udp4_pid, find_win_udp6_pid)
+        }
         (SocketTransport::Udp, SocketAddr::V6(v6)) => find_win_udp6_pid(v6),
     }?;
     if pid == 0 {
@@ -388,46 +688,44 @@ fn query_win_process_info(pid: u32) -> Option<LocalProcessInfo> {
 #[cfg(target_os = "windows")]
 fn find_win_tcp4_pid(target: std::net::SocketAddrV4) -> Option<u32> {
     use windows_sys::Win32::{
-        Foundation::NO_ERROR,
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
         NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+            TCP_TABLE_OWNER_PID_ALL,
         },
         Networking::WinSock::AF_INET,
     };
-    let mut size: u32 = 0;
-    unsafe {
-        let _ = GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize + 256];
-        size = buf.len() as u32;
-        if GetExtendedTcpTable(
-            buf.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        ) != NO_ERROR
-        {
-            return None;
-        }
-        let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
-        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
-        let want_port_be = target.port().to_be();
-        let want_ip = u32::from_ne_bytes(target.ip().octets());
-        for row in rows {
-            if (row.dwLocalPort as u16) == want_port_be && row.dwLocalAddr == want_ip {
-                return Some(row.dwOwningPid);
+    let (buf, byte_len) =
+        query_aligned_mib_table(NO_ERROR, ERROR_INSUFFICIENT_BUFFER, |ptr, size_ptr| {
+            // SAFETY: `ptr` is either null (sizing probe) or points to `*size_ptr` writable bytes.
+            unsafe {
+                GetExtendedTcpTable(
+                    ptr,
+                    size_ptr,
+                    0,
+                    u32::from(AF_INET),
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
             }
+        })?;
+    // SAFETY: `buf[..byte_len]` was filled by `GetExtendedTcpTable(AF_INET, TCP_TABLE_OWNER_PID_ALL)`.
+    let rows = unsafe {
+        mib_table_rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(
+            &buf,
+            byte_len,
+            std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, dwNumEntries),
+            std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+        )
+    };
+    let want_port_be = target.port().to_be();
+    let want_ip = u32::from_ne_bytes(target.ip().octets());
+    for row in rows {
+        if row.dwOwningPid != 0
+            && (row.dwLocalPort as u16) == want_port_be
+            && row.dwLocalAddr == want_ip
+        {
+            return Some(row.dwOwningPid);
         }
     }
     None
@@ -436,46 +734,44 @@ fn find_win_tcp4_pid(target: std::net::SocketAddrV4) -> Option<u32> {
 #[cfg(target_os = "windows")]
 fn find_win_tcp6_pid(target: std::net::SocketAddrV6) -> Option<u32> {
     use windows_sys::Win32::{
-        Foundation::NO_ERROR,
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
         NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+            TCP_TABLE_OWNER_PID_ALL,
         },
         Networking::WinSock::AF_INET6,
     };
-    let mut size: u32 = 0;
-    unsafe {
-        let _ = GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET6 as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize + 256];
-        size = buf.len() as u32;
-        if GetExtendedTcpTable(
-            buf.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            AF_INET6 as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        ) != NO_ERROR
-        {
-            return None;
-        }
-        let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
-        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
-        let want_port_be = target.port().to_be();
-        let want_octets = target.ip().octets();
-        for row in rows {
-            if (row.dwLocalPort as u16) == want_port_be && row.ucLocalAddr == want_octets {
-                return Some(row.dwOwningPid);
+    let (buf, byte_len) =
+        query_aligned_mib_table(NO_ERROR, ERROR_INSUFFICIENT_BUFFER, |ptr, size_ptr| {
+            // SAFETY: `ptr` is either null (sizing probe) or points to `*size_ptr` writable bytes.
+            unsafe {
+                GetExtendedTcpTable(
+                    ptr,
+                    size_ptr,
+                    0,
+                    u32::from(AF_INET6),
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
             }
+        })?;
+    // SAFETY: `buf[..byte_len]` was filled by `GetExtendedTcpTable(AF_INET6, TCP_TABLE_OWNER_PID_ALL)`.
+    let rows = unsafe {
+        mib_table_rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(
+            &buf,
+            byte_len,
+            std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, dwNumEntries),
+            std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+        )
+    };
+    let want_port_be = target.port().to_be();
+    let want_octets = target.ip().octets();
+    for row in rows {
+        if row.dwOwningPid != 0
+            && (row.dwLocalPort as u16) == want_port_be
+            && row.ucLocalAddr == want_octets
+        {
+            return Some(row.dwOwningPid);
         }
     }
     None
@@ -484,101 +780,81 @@ fn find_win_tcp6_pid(target: std::net::SocketAddrV6) -> Option<u32> {
 #[cfg(target_os = "windows")]
 fn find_win_udp4_pid(target: std::net::SocketAddrV4) -> Option<u32> {
     use windows_sys::Win32::{
-        Foundation::NO_ERROR,
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
         NetworkManagement::IpHelper::{
-            GetExtendedUdpTable, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+            GetExtendedUdpTable, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
         },
         Networking::WinSock::AF_INET,
     };
-    let mut size: u32 = 0;
-    unsafe {
-        let _ = GetExtendedUdpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            UDP_TABLE_OWNER_PID,
-            0,
-        );
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize + 256];
-        size = buf.len() as u32;
-        if GetExtendedUdpTable(
-            buf.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            AF_INET as u32,
-            UDP_TABLE_OWNER_PID,
-            0,
-        ) != NO_ERROR
-        {
-            return None;
-        }
-        let table = &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
-        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
-        let want_port_be = target.port().to_be();
-        let want_ip = u32::from_ne_bytes(target.ip().octets());
-        for row in rows {
-            if (row.dwLocalPort as u16) == want_port_be
-                && (row.dwLocalAddr == want_ip || row.dwLocalAddr == 0)
-            {
-                return Some(row.dwOwningPid);
+    let (buf, byte_len) =
+        query_aligned_mib_table(NO_ERROR, ERROR_INSUFFICIENT_BUFFER, |ptr, size_ptr| {
+            // SAFETY: `ptr` is either null (sizing probe) or points to `*size_ptr` writable bytes.
+            unsafe {
+                GetExtendedUdpTable(ptr, size_ptr, 0, u32::from(AF_INET), UDP_TABLE_OWNER_PID, 0)
             }
-        }
-    }
-    None
+        })?;
+    // SAFETY: `buf[..byte_len]` was filled by `GetExtendedUdpTable(AF_INET, UDP_TABLE_OWNER_PID)`.
+    let rows = unsafe {
+        mib_table_rows::<MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID>(
+            &buf,
+            byte_len,
+            std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, dwNumEntries),
+            std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table),
+        )
+    };
+    let want_port_be = target.port().to_be();
+    let want_ip = u32::from_ne_bytes(target.ip().octets());
+    select_udp_pid_preferring_exact(
+        rows.iter()
+            .map(|row| (row.dwLocalAddr, row.dwLocalPort as u16, row.dwOwningPid)),
+        want_ip,
+        0u32,
+        want_port_be,
+    )
 }
 
 #[cfg(target_os = "windows")]
 fn find_win_udp6_pid(target: std::net::SocketAddrV6) -> Option<u32> {
     use windows_sys::Win32::{
-        Foundation::NO_ERROR,
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
         NetworkManagement::IpHelper::{
-            GetExtendedUdpTable, MIB_UDP6TABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+            GetExtendedUdpTable, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+            UDP_TABLE_OWNER_PID,
         },
         Networking::WinSock::AF_INET6,
     };
-    let mut size: u32 = 0;
-    unsafe {
-        let _ = GetExtendedUdpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET6 as u32,
-            UDP_TABLE_OWNER_PID,
-            0,
-        );
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize + 256];
-        size = buf.len() as u32;
-        if GetExtendedUdpTable(
-            buf.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            AF_INET6 as u32,
-            UDP_TABLE_OWNER_PID,
-            0,
-        ) != NO_ERROR
-        {
-            return None;
-        }
-        let table = &*(buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID);
-        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
-        let want_port_be = target.port().to_be();
-        let want_octets = target.ip().octets();
-        for row in rows {
-            if (row.dwLocalPort as u16) == want_port_be
-                && (row.ucLocalAddr == want_octets || row.ucLocalAddr == [0u8; 16])
-            {
-                return Some(row.dwOwningPid);
+    let (buf, byte_len) =
+        query_aligned_mib_table(NO_ERROR, ERROR_INSUFFICIENT_BUFFER, |ptr, size_ptr| {
+            // SAFETY: `ptr` is either null (sizing probe) or points to `*size_ptr` writable bytes.
+            unsafe {
+                GetExtendedUdpTable(
+                    ptr,
+                    size_ptr,
+                    0,
+                    u32::from(AF_INET6),
+                    UDP_TABLE_OWNER_PID,
+                    0,
+                )
             }
-        }
-    }
-    None
+        })?;
+    // SAFETY: `buf[..byte_len]` was filled by `GetExtendedUdpTable(AF_INET6, UDP_TABLE_OWNER_PID)`.
+    let rows = unsafe {
+        mib_table_rows::<MIB_UDP6TABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID>(
+            &buf,
+            byte_len,
+            std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, dwNumEntries),
+            std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table),
+        )
+    };
+    let want_port_be = target.port().to_be();
+    let want_octets = target.ip().octets();
+    select_udp_pid_preferring_exact(
+        rows.iter()
+            .map(|row| (row.ucLocalAddr, row.dwLocalPort as u16, row.dwOwningPid)),
+        want_octets,
+        [0u8; 16],
+        want_port_be,
+    )
 }
 
 // ============================================================================
@@ -926,6 +1202,276 @@ mod tests {
                 !is_potentially_local_ip(public_ip.parse().unwrap()),
                 "expected public IP {public_ip} NOT to be treated as local"
             );
+        }
+    }
+
+    #[test]
+    fn potentially_local_ip_accepts_cgnat_range_and_rejects_neighbors() {
+        for cgnat_ip in [
+            "100.64.0.0",
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.254",
+            "100.127.255.255",
+            "::ffff:100.64.0.1",
+            "::ffff:100.127.255.254",
+        ] {
+            assert!(
+                is_potentially_local_ip(cgnat_ip.parse().unwrap()),
+                "expected CGNAT IP {cgnat_ip} to be recognized as potentially local"
+            );
+        }
+
+        for outside_ip in [
+            "100.63.255.255",
+            "100.128.0.0",
+            "100.128.0.1",
+            "::ffff:100.63.255.255",
+            "::ffff:100.128.0.1",
+        ] {
+            assert!(
+                !is_potentially_local_ip(outside_ip.parse().unwrap()),
+                "expected non-CGNAT IP {outside_ip} NOT to be treated as local"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_mib_row_count_and_aligned_slice_clamp_excessive_and_truncated_buffers() {
+        assert_eq!(bounded_mib_row_count(0, 4, 24, 10), 0);
+        assert_eq!(bounded_mib_row_count(3, 4, 24, 10), 0);
+        assert_eq!(bounded_mib_row_count(4, 4, 24, 10), 0);
+        assert_eq!(bounded_mib_row_count(4 + 24 * 3, 4, 24, 10_000), 3);
+        assert_eq!(bounded_mib_row_count(4 + 24 * 2 + 15, 4, 24, 5), 2);
+        assert_eq!(bounded_mib_row_count(4 + 24 * 5, 4, 24, 2), 2);
+        assert_eq!(bounded_mib_row_count(1024, 4, 0, 5), 0);
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct MockUdpRow {
+            local_addr: u32,
+            local_port: u32,
+            owning_pid: u32,
+        }
+
+        #[repr(C)]
+        struct MockUdpTable {
+            num_entries: u32,
+            table: [MockUdpRow; 1],
+        }
+
+        // Write a table claiming 999 entries into aligned u64 storage that only holds 2 full rows.
+        let mut storage = vec![0u64; 8];
+        let base = storage.as_mut_ptr().cast::<u8>();
+        let row_offset = std::mem::offset_of!(MockUdpTable, table);
+        let row_size = std::mem::size_of::<MockUdpRow>();
+        let two_row_bytes = row_offset + row_size * 2;
+        unsafe {
+            std::ptr::write_unaligned(
+                base.add(std::mem::offset_of!(MockUdpTable, num_entries))
+                    .cast::<u32>(),
+                999u32,
+            );
+            std::ptr::write(
+                base.add(row_offset).cast::<MockUdpRow>(),
+                MockUdpRow {
+                    local_addr: 0,
+                    local_port: u32::from(5353u16.to_be()),
+                    owning_pid: 101,
+                },
+            );
+            std::ptr::write(
+                base.add(row_offset + row_size).cast::<MockUdpRow>(),
+                MockUdpRow {
+                    local_addr: u32::from_ne_bytes([192, 168, 1, 10]),
+                    local_port: u32::from(5353u16.to_be()),
+                    owning_pid: 202,
+                },
+            );
+        }
+
+        let clamped = unsafe {
+            mib_table_rows::<MockUdpTable, MockUdpRow>(
+                &storage,
+                two_row_bytes + 5,
+                std::mem::offset_of!(MockUdpTable, num_entries),
+                row_offset,
+            )
+        };
+        assert_eq!(clamped.len(), 2);
+        assert_eq!(clamped[0].owning_pid, 101);
+        assert_eq!(clamped[1].owning_pid, 202);
+
+        // Truncated header (< 4 bytes) must return an empty slice safely.
+        let truncated = unsafe {
+            mib_table_rows::<MockUdpTable, MockUdpRow>(
+                &storage,
+                2,
+                std::mem::offset_of!(MockUdpTable, num_entries),
+                row_offset,
+            )
+        };
+        assert!(truncated.is_empty());
+    }
+
+    #[test]
+    fn query_aligned_mib_table_retries_insufficient_buffer_with_aligned_growth() {
+        const NO_ERR: u32 = 0;
+        const INSUFF: u32 = 122;
+
+        let mut seen_sizes = Vec::new();
+        let mut call_num = 0usize;
+        let (buf, valid_bytes) = query_aligned_mib_table(NO_ERR, INSUFF, |ptr, size_ptr| {
+            call_num += 1;
+            if ptr.is_null() {
+                unsafe {
+                    *size_ptr = 128;
+                }
+                return INSUFF;
+            }
+            assert_eq!(
+                (ptr as usize) % std::mem::align_of::<u64>(),
+                0,
+                "MIB buffer pointer must be 8-byte aligned"
+            );
+            let offered = unsafe { *size_ptr };
+            seen_sizes.push(offered);
+            if call_num <= 3 {
+                // Simulate table growing faster than previous buffer on attempts 1 & 2.
+                unsafe {
+                    *size_ptr = offered.saturating_add(512);
+                }
+                return INSUFF;
+            }
+            unsafe {
+                *size_ptr = 256;
+            }
+            NO_ERR
+        })
+        .expect("should succeed on retry after ERROR_INSUFFICIENT_BUFFER");
+
+        assert_eq!(seen_sizes.len(), 3);
+        assert!(seen_sizes[1] > seen_sizes[0]);
+        assert!(seen_sizes[2] > seen_sizes[1]);
+        assert_eq!(valid_bytes, 256);
+        assert!(buf.len() * std::mem::size_of::<u64>() >= valid_bytes);
+
+        // Exhausting all 5 retry attempts returns None cleanly.
+        let mut attempts = 0usize;
+        let exhausted = query_aligned_mib_table(NO_ERR, INSUFF, |ptr, size_ptr| {
+            if ptr.is_null() {
+                unsafe {
+                    *size_ptr = 64;
+                }
+                return INSUFF;
+            }
+            attempts += 1;
+            INSUFF
+        });
+        assert!(exhausted.is_none());
+        assert_eq!(attempts, 5);
+    }
+
+    #[test]
+    fn udp_pid_selection_prefers_exact_ip_over_wildcard_and_supports_dual_stack_v4_mapped() {
+        let port_be = 5353u16.to_be();
+        let other_port_be = 8080u16.to_be();
+        let exact_v4 = u32::from_ne_bytes([192, 168, 1, 10]);
+
+        // Wildcard 0.0.0.0:5353 (PID 100) appears BEFORE exact 192.168.1.10:5353 (PID 200).
+        let v4_entries = [
+            (0u32, port_be, 0u32), // PID 0 ignored
+            (0u32, port_be, 100u32),
+            (exact_v4, other_port_be, 999u32),
+            (exact_v4, port_be, 200u32),
+        ];
+        assert_eq!(
+            select_udp_pid_preferring_exact(v4_entries, exact_v4, 0u32, port_be),
+            Some(200)
+        );
+        // When only wildcard matches the port, wildcard PID is returned.
+        assert_eq!(
+            select_udp_pid_preferring_exact(
+                v4_entries,
+                u32::from_ne_bytes([10, 0, 0, 5]),
+                0u32,
+                port_be
+            ),
+            Some(100)
+        );
+
+        // Dual-stack IPv4 query falls back to IPv6 table with IPv4-mapped `::ffff:192.168.1.10`.
+        let target_v4 = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 1, 10), 5353);
+        let mapped_octets = target_v4.ip().to_ipv6_mapped().octets();
+        let v6_entries_with_exact = [
+            ([0u8; 16], port_be, 300u32),
+            (mapped_octets, port_be, 400u32),
+        ];
+        let pid_exact = resolve_udp4_with_dual_stack_fallback(
+            target_v4,
+            |_| None,
+            |v6| {
+                assert_eq!(v6.ip().to_ipv4_mapped(), Some(*target_v4.ip()));
+                assert_eq!(v6.port(), 5353);
+                select_udp_pid_preferring_exact(
+                    v6_entries_with_exact,
+                    v6.ip().octets(),
+                    [0u8; 16],
+                    v6.port().to_be(),
+                )
+            },
+        );
+        assert_eq!(pid_exact, Some(400));
+
+        // Dual-stack socket bound to `[::]:5353` (`IPV6_V6ONLY = 0`) also matches IPv4 query.
+        let v6_entries_wildcard_only = [([0u8; 16], port_be, 300u32)];
+        let pid_wild = resolve_udp4_with_dual_stack_fallback(
+            target_v4,
+            |_| None,
+            |v6| {
+                select_udp_pid_preferring_exact(
+                    v6_entries_wildcard_only,
+                    v6.ip().octets(),
+                    [0u8; 16],
+                    v6.port().to_be(),
+                )
+            },
+        );
+        assert_eq!(pid_wild, Some(300));
+    }
+
+    #[tokio::test]
+    async fn assigned_local_interface_ip_cache_discovers_host_interfaces_and_resolves_live_socket()
+    {
+        let loopback_v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let mapped_loopback_v4: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let wan_v4: IpAddr = "8.8.8.8".parse().unwrap();
+        let wan_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+
+        if cfg!(any(unix, target_os = "windows")) {
+            assert!(
+                is_assigned_local_interface_ip(loopback_v4),
+                "127.0.0.1 must be discovered by OS interface enumeration"
+            );
+            assert!(
+                is_assigned_local_interface_ip(mapped_loopback_v4),
+                "::ffff:127.0.0.1 must match assigned 127.0.0.1 interface IP"
+            );
+            assert!(!is_assigned_local_interface_ip(wan_v4));
+            assert!(!is_assigned_local_interface_ip(wan_v6));
+        }
+
+        // Verify a live local UDP socket bound to an assigned interface IP resolves our own PID.
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = udp.local_addr().unwrap();
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        )) {
+            let info = find_local_process(SocketTransport::Udp, local_addr)
+                .expect("expected owning process for live local UDP socket");
+            assert_eq!(info.pid, std::process::id());
         }
     }
 }

@@ -442,6 +442,9 @@ impl Hysteria2Inner {
                     udp_map_bg.remove_if(&sid, |_, cur| cur.same_channel(&tx));
                 }
             }
+            // Drop all mpsc::Senders when the QUIC connection closes so awaiting
+            // `Hysteria2UdpSession::recv_from()` wakes promptly and releases `QuicWorkLease`.
+            udp_map_bg.clear();
         });
 
         let lease = QuicSessionLease::new_with_epoch(pre_epoch, endpoint, conn);
@@ -697,11 +700,23 @@ impl OutboundUdpSession for Hysteria2UdpSession {
         })?;
         let mut rx = rx_mutex.lock().await;
         loop {
-            let Some(frame) = rx.recv().await else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Hysteria2 QUIC UDP session closed",
-                ));
+            let frame = tokio::select! {
+                biased;
+                res = rx.recv() => match res {
+                    Some(frame) => frame,
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Hysteria2 QUIC UDP session closed",
+                        ));
+                    }
+                },
+                _ = self.conn.lease.conn.closed() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "Hysteria2 QUIC connection closed",
+                    ));
+                }
             };
             let assembled = self.defragger.lock().feed(frame);
             if let Some((data, addr_str)) = assembled {
@@ -794,6 +809,14 @@ impl OutboundHandler for Hysteria2Outbound {
         let session_id = sess.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(128);
         sess.udp_sessions.insert(session_id, tx);
+        if sess.lease.conn.close_reason().is_some() {
+            sess.udp_sessions.remove(&session_id);
+            self.inner.cached_conn.evict_if_same(&sess);
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Hysteria2 QUIC connection closed while opening UDP session",
+            ));
+        }
         Ok(Box::new(Hysteria2UdpSession {
             conn: sess,
             session_id,
@@ -1054,5 +1077,125 @@ async fn handle_hy2_server_tcp(
             let _ = send.finish();
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hysteria2_udp_recv_from_wakes_on_disconnect_and_releases_work_lease() {
+        let sni = "hy2.udp.disconnect.test";
+        let (tls_cfg, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let password = "hy2-disconnect-pw";
+        let srv = spawn_hysteria2_server(
+            "127.0.0.1:0".parse().unwrap(),
+            password.to_string(),
+            tls_cfg,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let outbound = Hysteria2Outbound::new(Hysteria2OutboundConfig {
+            name: "hy2-udp-disconnect".into(),
+            server: "127.0.0.1".into(),
+            port: srv.listen_addr.port(),
+            ports: None,
+            password: password.into(),
+            obfs_salamander_password: None,
+            up_bytes_per_sec: 0,
+            down_bytes_per_sec: 0,
+            servername: Some(sni.into()),
+            skip_cert_verify: false,
+            alpn: vec![b"h3".to_vec()],
+            extra_ca_der: vec![ca_der],
+            udp: true,
+        })
+        .unwrap();
+
+        // Case 1: Local `on_network_change()` closes QUIC session while `recv_from()` is awaiting.
+        let udp_sess = outbound.open_udp_session().await.unwrap();
+        let auth_conn = outbound
+            .inner
+            .cached_conn
+            .get_if(|_| true)
+            .expect("cached Hysteria2 session must exist");
+        assert_eq!(auth_conn.lease.active_work_count(), 1);
+
+        let recv_task = tokio::spawn(async move {
+            let res = udp_sess.recv_from().await;
+            (res, udp_sess)
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let start = std::time::Instant::now();
+        assert_eq!(outbound.on_network_change(), 1);
+        let (res, udp_sess) = tokio::time::timeout(Duration::from_millis(500), recv_task)
+            .await
+            .expect("Hysteria2 UDP recv_from must not hang after on_network_change")
+            .unwrap();
+        assert!(
+            res.is_err(),
+            "Hysteria2 UDP recv_from must return Err on QUIC disconnect"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "recv_from wakeup exceeded 500ms: {:?}",
+            start.elapsed()
+        );
+        drop(udp_sess);
+        assert_eq!(
+            auth_conn.lease.active_work_count(),
+            0,
+            "QuicWorkLease must drop to 0 once Hysteria2UdpSession is dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            auth_conn.udp_sessions.is_empty(),
+            "udp_demux_task must clear udp_sessions on disconnect"
+        );
+
+        // Case 2: Remote server shutdown closes QUIC session while `recv_from()` is awaiting.
+        let udp_sess2 = outbound.open_udp_session().await.unwrap();
+        let auth_conn2 = outbound
+            .inner
+            .cached_conn
+            .get_if(|_| true)
+            .expect("fresh cached Hysteria2 session must exist");
+        assert_eq!(auth_conn2.lease.active_work_count(), 1);
+
+        let recv_task2 = tokio::spawn(async move {
+            let res = udp_sess2.recv_from().await;
+            (res, udp_sess2)
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let start2 = std::time::Instant::now();
+        srv.shutdown().await;
+        let (res2, udp_sess2) = tokio::time::timeout(Duration::from_millis(500), recv_task2)
+            .await
+            .expect("Hysteria2 UDP recv_from must not hang after server shutdown")
+            .unwrap();
+        assert!(
+            res2.is_err(),
+            "Hysteria2 UDP recv_from must return Err on server shutdown"
+        );
+        assert!(
+            start2.elapsed() < Duration::from_millis(500),
+            "recv_from wakeup on server close exceeded 500ms: {:?}",
+            start2.elapsed()
+        );
+        drop(udp_sess2);
+        assert_eq!(
+            auth_conn2.lease.active_work_count(),
+            0,
+            "QuicWorkLease must drop to 0 after server-side disconnect and session drop"
+        );
     }
 }

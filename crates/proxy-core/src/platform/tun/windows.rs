@@ -394,8 +394,28 @@ pub fn plan_windows_physical_exclude_routes(
     routes
 }
 
+/// Classify a Win32 `CreateIpForwardEntry2` return code:
+/// - `0` (`NO_ERROR`): route was newly created and is owned by RustClash (`Ok(Some(record))`).
+/// - `5010` (`ERROR_OBJECT_ALREADY_EXISTS`): route pre-existed on the host and must NOT be
+///   recorded in `owned_routes` or deleted on handoff/teardown (`Ok(None)`).
+/// - Any other status: Win32 error (`Err`).
+pub fn classify_create_ip_forward_entry_status(
+    status: u32,
+    record: WindowsRouteRecord,
+) -> io::Result<Option<WindowsRouteRecord>> {
+    const WIN32_ERROR_OBJECT_ALREADY_EXISTS: u32 = 5010;
+    if status == 0 {
+        Ok(Some(record))
+    } else if status == WIN32_ERROR_OBJECT_ALREADY_EXISTS {
+        Ok(None)
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
 /// Install both `/32`/`/128` physical bypass routes and `route-exclude-address` CIDR routes via `add_route`,
-/// deduplicating identical `(interface_luid, dest, prefix_len, next_hop)` entries.
+/// deduplicating identical `(interface_luid, dest, prefix_len, next_hop)` entries and recording ONLY
+/// routes newly created by RustClash (`Ok(Some(rec))`).
 pub fn install_windows_physical_routes_with_ops<F>(
     egress: &PhysicalEgressInfo,
     bypass_ips: &[IpAddr],
@@ -406,7 +426,7 @@ pub fn install_windows_physical_routes_with_ops<F>(
     mut add_route: F,
 ) -> Vec<WindowsRouteRecord>
 where
-    F: FnMut(u64, IpAddr, u8, IpAddr, u32) -> io::Result<WindowsRouteRecord>,
+    F: FnMut(u64, IpAddr, u8, IpAddr, u32) -> io::Result<Option<WindowsRouteRecord>>,
 {
     let mut planned =
         plan_windows_physical_bypass_routes(egress, bypass_ips, fake_ip_net, tun_ipv6_cidr);
@@ -429,7 +449,7 @@ where
 
     let mut installed = Vec::with_capacity(planned.len());
     for route in planned {
-        if let Ok(rec) = add_route(
+        if let Ok(Some(rec)) = add_route(
             route.interface_luid,
             route.dest,
             route.prefix_len,
@@ -444,7 +464,7 @@ where
 
 /// Reconcile owned physical bypass + `route-exclude-address` routes on a Windows network handoff
 /// (`NotifyIpInterfaceChange`): preserves Wintun split/fake-ip routes on `adapter_luid`, deletes
-/// all prior physical NIC routes, and installs fresh physical routes on `effective_egress`.
+/// all prior owned physical NIC routes, and installs fresh physical routes on `effective_egress`.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_windows_handoff_routes_with_ops<D, A>(
     rec: &mut WindowsRecoveryRecord,
@@ -459,7 +479,7 @@ pub fn reconcile_windows_handoff_routes_with_ops<D, A>(
     add_route: A,
 ) where
     D: FnMut(&WindowsRouteRecord) -> io::Result<()>,
-    A: FnMut(u64, IpAddr, u8, IpAddr, u32) -> io::Result<WindowsRouteRecord>,
+    A: FnMut(u64, IpAddr, u8, IpAddr, u32) -> io::Result<Option<WindowsRouteRecord>>,
 {
     let mut kept_wintun_routes = Vec::with_capacity(rec.owned_routes.len());
     for r in rec.owned_routes.drain(..) {
@@ -834,8 +854,9 @@ mod win_impl {
     use super::{
         ForwardRouteCandidate, PhysicalEgressInfo, WINDOWS_SPLIT_IPV4_PREFIXES,
         WINDOWS_SPLIT_IPV6_PREFIXES, WindowsDnsOps, apply_windows_adapter_dns_transactional,
-        compute_wintun_route_metrics, format_braced_guid, install_windows_physical_routes_with_ops,
-        merge_non_zero_protector_indices, parse_braced_guid, parse_windows_dns_server_list,
+        classify_create_ip_forward_entry_status, compute_wintun_route_metrics, format_braced_guid,
+        install_windows_physical_routes_with_ops, merge_non_zero_protector_indices,
+        parse_braced_guid, parse_windows_dns_server_list,
         reconcile_windows_handoff_routes_with_ops, resolve_secure_wintun_dll_path,
         rollback_windows_record_with_ops, select_physical_default_egress,
         select_windows_physical_bypass_ips,
@@ -1286,9 +1307,12 @@ mod win_impl {
         prefix_len: u8,
         next_hop: IpAddr,
         metric: u32,
-    ) -> io::Result<WindowsRouteRecord> {
+    ) -> io::Result<Option<WindowsRouteRecord>> {
+        const {
+            assert!(ERROR_OBJECT_ALREADY_EXISTS == 5010);
+        }
         // SAFETY: `InitializeIpForwardEntry` initializes defaults before populating `MIB_IPFORWARD_ROW2`.
-        unsafe {
+        let status = unsafe {
             let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
             InitializeIpForwardEntry(&raw mut row);
             row.InterfaceLuid = NET_LUID_LH { Value: luid_val };
@@ -1299,17 +1323,17 @@ mod win_impl {
             row.DestinationPrefix.PrefixLength = prefix_len;
             row.NextHop = sockaddr_inet_from_ip(next_hop);
             row.Metric = metric;
-            let status = CreateIpForwardEntry2(&raw const row);
-            if status != 0 && status != ERROR_OBJECT_ALREADY_EXISTS {
-                return Err(io::Error::from_raw_os_error(status as i32));
-            }
-        }
-        Ok(WindowsRouteRecord {
-            destination_prefix: dest.to_string(),
-            prefix_length: prefix_len,
-            next_hop: next_hop.to_string(),
-            interface_luid: luid_val,
-        })
+            CreateIpForwardEntry2(&raw const row)
+        };
+        classify_create_ip_forward_entry_status(
+            status,
+            WindowsRouteRecord {
+                destination_prefix: dest.to_string(),
+                prefix_length: prefix_len,
+                next_hop: next_hop.to_string(),
+                interface_luid: luid_val,
+            },
+        )
     }
 
     fn delete_iphlpapi_route(rec: &WindowsRouteRecord) -> io::Result<()> {
@@ -1652,104 +1676,106 @@ mod win_impl {
         _row: *const MIB_IPINTERFACE_ROW,
         notification_type: i32,
     ) {
-        if caller_context.is_null() {
-            return;
-        }
-        if notification_type != MibParameterNotification
-            && notification_type != MibAddInstance
-            && notification_type != MibDeleteInstance
-        {
-            return;
-        }
-        // SAFETY: `caller_context` points to a heap-pinned `NetChangeCallbackCtx` kept alive until `CancelMibChangeNotify2` returns!
-        let ctx = unsafe { &*(caller_context.cast::<NetChangeCallbackCtx>()) };
-        let latest = detect_windows_physical_egress(ctx.adapter_luid);
-        if latest.v4_if_index == 0 && latest.v6_if_index == 0 {
-            return;
-        }
-
-        let (effective, routes_handoff_needed) = {
-            let mut guard = ctx.egress_state.lock();
-            let prev = guard.clone();
-            let (eff_v4_idx, eff_v6_idx) = merge_non_zero_protector_indices(
-                prev.v4_if_index,
-                prev.v6_if_index,
-                latest.v4_if_index,
-                latest.v6_if_index,
-            );
-            let effective = PhysicalEgressInfo {
-                v4_if_index: eff_v4_idx,
-                v4_luid: if latest.v4_if_index != 0 {
-                    latest.v4_luid
-                } else {
-                    prev.v4_luid
-                },
-                v4_gateway: if latest.v4_if_index != 0 {
-                    latest.v4_gateway
-                } else {
-                    prev.v4_gateway
-                },
-                v6_if_index: eff_v6_idx,
-                v6_luid: if latest.v6_if_index != 0 {
-                    latest.v6_luid
-                } else {
-                    prev.v6_luid
-                },
-                v6_gateway: if latest.v6_if_index != 0 {
-                    latest.v6_gateway
-                } else {
-                    prev.v6_gateway
-                },
-            };
-            if prev == effective {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if caller_context.is_null() {
                 return;
             }
-            let handoff = (prev.v4_luid, prev.v4_gateway)
-                != (effective.v4_luid, effective.v4_gateway)
-                || (prev.v6_luid, prev.v6_gateway) != (effective.v6_luid, effective.v6_gateway);
-            *guard = effective.clone();
-            (effective, handoff)
-        };
+            if notification_type != MibParameterNotification
+                && notification_type != MibAddInstance
+                && notification_type != MibDeleteInstance
+            {
+                return;
+            }
+            // SAFETY: `caller_context` points to a heap-pinned `NetChangeCallbackCtx` kept alive until `CancelMibChangeNotify2` returns!
+            let ctx = unsafe { &*(caller_context.cast::<NetChangeCallbackCtx>()) };
+            let latest = detect_windows_physical_egress(ctx.adapter_luid);
+            if latest.v4_if_index == 0 && latest.v6_if_index == 0 {
+                return;
+            }
 
-        // Never overwrite a valid non-zero interface index with `0` (which would turn
-        // `WindowsUnicastIfProtector` into a no-op and loop outbound sockets into Wintun!).
-        ctx.protector
-            .update_indices(effective.v4_if_index, effective.v6_if_index);
-
-        let effective_bypass = select_windows_physical_bypass_ips(
-            &ctx.proxy_bypass_ips,
-            &ctx.dns_bypass_ips,
-            ctx.dns_hijack,
-            effective.v4_if_index != 0,
-            effective.v6_if_index != 0,
-        );
-        if ctx.auto_route && routes_handoff_needed {
-            let rec_snap = {
-                let mut rec_guard = ctx.recovery_record.lock();
-                reconcile_windows_handoff_routes_with_ops(
-                    &mut rec_guard,
-                    ctx.adapter_luid,
-                    &effective,
-                    &effective_bypass,
-                    &ctx.route_exclude_cidrs,
-                    ctx.fake_ip_net,
-                    ctx.tun_ipv6_cidr,
-                    ctx.enable_ipv6,
-                    delete_iphlpapi_route,
-                    add_iphlpapi_route,
+            let (effective, routes_handoff_needed) = {
+                let mut guard = ctx.egress_state.lock();
+                let prev = guard.clone();
+                let (eff_v4_idx, eff_v6_idx) = merge_non_zero_protector_indices(
+                    prev.v4_if_index,
+                    prev.v6_if_index,
+                    latest.v4_if_index,
+                    latest.v6_if_index,
                 );
-                rec_guard.clone()
+                let effective = PhysicalEgressInfo {
+                    v4_if_index: eff_v4_idx,
+                    v4_luid: if latest.v4_if_index != 0 {
+                        latest.v4_luid
+                    } else {
+                        prev.v4_luid
+                    },
+                    v4_gateway: if latest.v4_if_index != 0 {
+                        latest.v4_gateway
+                    } else {
+                        prev.v4_gateway
+                    },
+                    v6_if_index: eff_v6_idx,
+                    v6_luid: if latest.v6_if_index != 0 {
+                        latest.v6_luid
+                    } else {
+                        prev.v6_luid
+                    },
+                    v6_gateway: if latest.v6_if_index != 0 {
+                        latest.v6_gateway
+                    } else {
+                        prev.v6_gateway
+                    },
+                };
+                if prev == effective {
+                    return;
+                }
+                let handoff = (prev.v4_luid, prev.v4_gateway)
+                    != (effective.v4_luid, effective.v4_gateway)
+                    || (prev.v6_luid, prev.v6_gateway) != (effective.v6_luid, effective.v6_gateway);
+                *guard = effective.clone();
+                (effective, handoff)
             };
-            let _ = update_current_journal(&ctx.state_dir, |j| j.windows_tun = Some(rec_snap));
-        }
 
-        flush_windows_dns_resolver_cache();
-        ctx.transitions.fetch_add(1, Ordering::Relaxed);
-        if let Some(hook) = &ctx.net_hook {
-            hook();
-        } else if let Some(dns) = &ctx.dns {
-            dns.flush_cache();
-        }
+            // Never overwrite a valid non-zero interface index with `0` (which would turn
+            // `WindowsUnicastIfProtector` into a no-op and loop outbound sockets into Wintun!).
+            ctx.protector
+                .update_indices(effective.v4_if_index, effective.v6_if_index);
+
+            let effective_bypass = select_windows_physical_bypass_ips(
+                &ctx.proxy_bypass_ips,
+                &ctx.dns_bypass_ips,
+                ctx.dns_hijack,
+                effective.v4_if_index != 0,
+                effective.v6_if_index != 0,
+            );
+            if ctx.auto_route && routes_handoff_needed {
+                let rec_snap = {
+                    let mut rec_guard = ctx.recovery_record.lock();
+                    reconcile_windows_handoff_routes_with_ops(
+                        &mut rec_guard,
+                        ctx.adapter_luid,
+                        &effective,
+                        &effective_bypass,
+                        &ctx.route_exclude_cidrs,
+                        ctx.fake_ip_net,
+                        ctx.tun_ipv6_cidr,
+                        ctx.enable_ipv6,
+                        delete_iphlpapi_route,
+                        add_iphlpapi_route,
+                    );
+                    rec_guard.clone()
+                };
+                let _ = update_current_journal(&ctx.state_dir, |j| j.windows_tun = Some(rec_snap));
+            }
+
+            flush_windows_dns_resolver_cache();
+            ctx.transitions.fetch_add(1, Ordering::Relaxed);
+            if let Some(hook) = &ctx.net_hook {
+                hook();
+            } else if let Some(dns) = &ctx.dns {
+                dns.flush_cache();
+            }
+        }));
     }
 
     #[derive(Clone, Copy)]
@@ -1919,23 +1945,25 @@ mod win_impl {
 
                 // Split-tunnel IPv4 (`0.0.0.0/1` + `128.0.0.0/1`) + Fake-IP subnet -> Wintun on-link
                 for &(prefix_str, plen) in WINDOWS_SPLIT_IPV4_PREFIXES {
-                    let r = add_iphlpapi_route(
+                    if let Some(r) = add_iphlpapi_route(
                         luid_val,
                         prefix_str.parse().unwrap(),
                         plen,
                         zero_v4,
                         route_metric,
-                    )?;
-                    rec.owned_routes.push(r);
+                    )? {
+                        rec.owned_routes.push(r);
+                    }
                 }
-                let r_fake = add_iphlpapi_route(
+                if let Some(r_fake) = add_iphlpapi_route(
                     luid_val,
                     IpAddr::V4(spec.fake_ip_net.network()),
                     spec.fake_ip_net.prefix_len(),
                     zero_v4,
                     route_metric,
-                )?;
-                rec.owned_routes.push(r_fake);
+                )? {
+                    rec.owned_routes.push(r_fake);
+                }
 
                 // Explicit `/32`/`/128` physical bypass routes + `tun.route-exclude-address` CIDR bypasses:
                 // keep literal proxy server IPs and user-excluded LAN CIDRs, but omit public/upstream
@@ -1962,14 +1990,15 @@ mod win_impl {
                 if spec.enable_ipv6 {
                     let zero_v6 = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
                     for &(prefix6_str, plen6) in WINDOWS_SPLIT_IPV6_PREFIXES {
-                        let r6 = add_iphlpapi_route(
+                        if let Some(r6) = add_iphlpapi_route(
                             luid_val,
                             prefix6_str.parse().unwrap(),
                             plen6,
                             zero_v6,
                             route_metric,
-                        )?;
-                        rec.owned_routes.push(r6);
+                        )? {
+                            rec.owned_routes.push(r6);
+                        }
                     }
                 }
 
@@ -3095,12 +3124,12 @@ mod tests {
             true,
             |luid, dest, plen, nh, metric| {
                 added_metrics.push((dest.to_string(), plen, metric));
-                Ok(WindowsRouteRecord {
+                Ok(Some(WindowsRouteRecord {
                     destination_prefix: dest.to_string(),
                     prefix_length: plen,
                     next_hop: nh.to_string(),
                     interface_luid: luid,
-                })
+                }))
             },
         );
         assert_eq!(initial_phys.len(), 5); // 1 proxy /32 + 3 IPv4 exclude + 1 IPv6 exclude
@@ -3131,12 +3160,12 @@ mod tests {
                 Ok(())
             },
             |luid, dest, plen, nh, _metric| {
-                Ok(WindowsRouteRecord {
+                Ok(Some(WindowsRouteRecord {
                     destination_prefix: dest.to_string(),
                     prefix_length: plen,
                     next_hop: nh.to_string(),
                     interface_luid: luid,
-                })
+                }))
             },
         );
         assert_eq!(deleted_handoff.len(), 5);
@@ -3202,5 +3231,152 @@ mod tests {
                 "2001:4860:4860::8888".parse::<IpAddr>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn preexisting_host_routes_are_not_recorded_or_deleted_on_handoff_or_rollback() {
+        let sample = WindowsRouteRecord {
+            destination_prefix: "10.0.0.0".to_string(),
+            prefix_length: 8,
+            next_hop: "192.168.1.1".to_string(),
+            interface_luid: 1001,
+        };
+        assert_eq!(
+            classify_create_ip_forward_entry_status(0, sample.clone()).unwrap(),
+            Some(sample.clone())
+        );
+        assert_eq!(
+            classify_create_ip_forward_entry_status(5010, sample.clone()).unwrap(),
+            None,
+            "ERROR_OBJECT_ALREADY_EXISTS (5010) must return Ok(None) so pre-existing host routes are not owned"
+        );
+        assert!(classify_create_ip_forward_entry_status(5, sample).is_err());
+
+        let fake_net: ipnet::Ipv4Net = "198.18.0.0/15".parse().unwrap();
+        let tun_v6: ipnet::Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
+        let wintun_luid = 9000u64;
+        let wifi_egress = PhysicalEgressInfo {
+            v4_if_index: 12,
+            v4_luid: 1001,
+            v4_gateway: Some("192.168.1.1".parse().unwrap()),
+            v6_if_index: 0,
+            v6_luid: 0,
+            v6_gateway: None,
+        };
+        let eth_egress = PhysicalEgressInfo {
+            v4_if_index: 20,
+            v4_luid: 2002,
+            v4_gateway: Some("10.10.0.1".parse().unwrap()),
+            v6_if_index: 0,
+            v6_luid: 0,
+            v6_gateway: None,
+        };
+
+        let bypass_ips: Vec<IpAddr> = vec!["203.0.113.5".parse().unwrap()];
+        let exclude_cidrs: Vec<ipnet::IpNet> = vec![
+            "10.0.0.0/8".parse().unwrap(), // pre-existing host corporate route -> Ok(None)
+            "192.168.0.0/16".parse().unwrap(), // newly created by RustClash -> Ok(Some)
+        ];
+
+        // 1. Install: 10.0.0.0/8 returns Ok(None) (already existed), 203.0.113.5/32 & 192.168.0.0/16 return Ok(Some).
+        let installed = install_windows_physical_routes_with_ops(
+            &wifi_egress,
+            &bypass_ips,
+            &exclude_cidrs,
+            fake_net,
+            tun_v6,
+            false,
+            |luid, dest, plen, nh, _metric| {
+                if dest == "10.0.0.0".parse::<IpAddr>().unwrap() && plen == 8 {
+                    return Ok(None);
+                }
+                Ok(Some(WindowsRouteRecord {
+                    destination_prefix: dest.to_string(),
+                    prefix_length: plen,
+                    next_hop: nh.to_string(),
+                    interface_luid: luid,
+                }))
+            },
+        );
+        assert_eq!(installed.len(), 2);
+        assert!(
+            installed.iter().all(|r| r.destination_prefix != "10.0.0.0"),
+            "pre-existing host route 10.0.0.0/8 must NOT be recorded in owned_routes"
+        );
+        assert!(
+            installed
+                .iter()
+                .any(|r| r.destination_prefix == "203.0.113.5" && r.prefix_length == 32)
+        );
+        assert!(
+            installed
+                .iter()
+                .any(|r| r.destination_prefix == "192.168.0.0" && r.prefix_length == 16)
+        );
+
+        let mut rec = WindowsRecoveryRecord {
+            adapter_name: "RustClash".to_string(),
+            adapter_luid: wintun_luid,
+            owned_routes: installed,
+            dns_interface_guid: None,
+            previous_dns_servers: None,
+            dns_backup: None,
+        };
+
+        // 2. Handoff: MUST delete only owned Wi-Fi routes (203.0.113.5 & 192.168.0.0), NEVER 10.0.0.0/8!
+        let mut deleted_handoff = Vec::new();
+        reconcile_windows_handoff_routes_with_ops(
+            &mut rec,
+            wintun_luid,
+            &eth_egress,
+            &bypass_ips,
+            &exclude_cidrs,
+            fake_net,
+            tun_v6,
+            false,
+            |r| {
+                deleted_handoff.push((r.destination_prefix.clone(), r.prefix_length));
+                Ok(())
+            },
+            |luid, dest, plen, nh, _metric| {
+                if dest == "10.0.0.0".parse::<IpAddr>().unwrap() && plen == 8 {
+                    return Ok(None);
+                }
+                Ok(Some(WindowsRouteRecord {
+                    destination_prefix: dest.to_string(),
+                    prefix_length: plen,
+                    next_hop: nh.to_string(),
+                    interface_luid: luid,
+                }))
+            },
+        );
+        assert_eq!(deleted_handoff.len(), 2);
+        assert!(
+            deleted_handoff.iter().all(|(d, _)| d != "10.0.0.0"),
+            "handoff must NEVER delete pre-existing host route 10.0.0.0/8"
+        );
+        assert_eq!(rec.owned_routes.len(), 2);
+        assert!(
+            rec.owned_routes
+                .iter()
+                .all(|r| r.destination_prefix != "10.0.0.0" && r.interface_luid == 2002)
+        );
+
+        // 3. Teardown rollback: MUST NEVER delete pre-existing 10.0.0.0/8!
+        let mut dns_ops = FaultInjectingDnsBackend::default();
+        let mut deleted_rollback = Vec::new();
+        let mut outcome = RecoveryOutcome::default();
+        let rem = rollback_windows_record_with_ops(
+            &rec,
+            &mut dns_ops,
+            |r| {
+                deleted_rollback.push((r.destination_prefix.clone(), r.prefix_length));
+                Ok(())
+            },
+            &mut outcome,
+        );
+        assert!(rem.is_none());
+        assert_eq!(deleted_rollback.len(), 2);
+        assert!(deleted_rollback.iter().all(|(d, _)| d != "10.0.0.0"));
     }
 }

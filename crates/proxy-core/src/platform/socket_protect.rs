@@ -265,7 +265,13 @@ impl MacOsBoundIfProtector {
             self.v4_if_index()
         };
         if idx == 0 {
-            return Ok(());
+            return Err(io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                format!(
+                    "no active physical {} interface index for macOS socket protection (refusing unprotected socket to prevent TUN routing loop)",
+                    if is_ipv6 { "IPv6" } else { "IPv4" }
+                ),
+            ));
         }
         #[cfg(target_os = "macos")]
         {
@@ -368,7 +374,13 @@ impl WindowsUnicastIfProtector {
             self.if_index_v4.load(Ordering::Acquire)
         };
         if idx == 0 {
-            return Ok(());
+            return Err(io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                format!(
+                    "no active physical {} interface index for Windows socket protection (refusing unprotected socket to prevent TUN routing loop)",
+                    if is_ipv6 { "IPv6" } else { "IPv4" }
+                ),
+            ));
         }
         #[cfg(windows)]
         {
@@ -778,7 +790,10 @@ pub async fn protected_tcp_connect_addr(remote: SocketAddr) -> io::Result<TcpStr
         Type::STREAM,
         Some(Protocol::TCP),
     )?;
-    global_socket_protector().protect_tcp(&sock, remote)?;
+    if let Err(err) = global_socket_protector().protect_tcp(&sock, remote) {
+        note_direct_addr_connect_result(remote, Err(&err));
+        return Err(err);
+    }
     sock.set_nonblocking(true)?;
     let _ = sock.set_nodelay(true);
     let keepalive = socket2::TcpKeepalive::new()
@@ -1155,12 +1170,21 @@ pub fn protected_udp_bind(
     bind_addr: SocketAddr,
     remote_hint: Option<SocketAddr>,
 ) -> io::Result<UdpSocket> {
+    let protector = global_socket_protector();
+    protected_udp_bind_with_protector(bind_addr, remote_hint, protector.as_ref())
+}
+
+fn protected_udp_bind_with_protector(
+    bind_addr: SocketAddr,
+    remote_hint: Option<SocketAddr>,
+    protector: &dyn SocketProtector,
+) -> io::Result<UdpSocket> {
     let sock = Socket::new(
         Domain::for_address(bind_addr),
         Type::DGRAM,
         Some(Protocol::UDP),
     )?;
-    global_socket_protector().protect_udp(&sock, remote_hint)?;
+    protector.protect_udp(&sock, remote_hint)?;
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawSocket;
@@ -1236,9 +1260,30 @@ pub async fn connect_protected_udp_addrs(
     }))
 }
 
+/// Probe IPv6 UDP reachability through a **protected** socket so the kernel evaluates physical
+/// egress routes instead of falsely succeeding via TUN's `::/1` + `8000::/1` split routes.
+fn probe_protected_ipv6_udp_reachability(
+    relay_addr: SocketAddr,
+    protector: &dyn SocketProtector,
+) -> io::Result<()> {
+    let probe = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    protector.protect_udp(&probe, Some(relay_addr))?;
+    probe.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())?;
+    probe.connect(&relay_addr.into())?;
+    Ok(())
+}
+
 /// Bind an unconnected protected UDP socket matching the first routable candidate relay `SocketAddr`
 /// ordered via Happy Eyeballs health/reachability rules (e.g. for SOCKS5 `UDP ASSOCIATE`).
 pub fn bind_protected_udp_addrs(addrs: &[SocketAddr]) -> io::Result<(UdpSocket, SocketAddr)> {
+    let protector = global_socket_protector();
+    bind_protected_udp_addrs_with_protector(addrs, protector.as_ref())
+}
+
+fn bind_protected_udp_addrs_with_protector(
+    addrs: &[SocketAddr],
+    protector: &dyn SocketProtector,
+) -> io::Result<(UdpSocket, SocketAddr)> {
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::HostUnreachable,
@@ -1252,9 +1297,7 @@ pub fn bind_protected_udp_addrs(addrs: &[SocketAddr]) -> io::Result<(UdpSocket, 
         if has_ipv4_fallback
             && let SocketAddr::V6(s6) = relay_addr
             && is_global_unicast_ipv6(*s6.ip())
-            && let Err(err) =
-                std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
-                    .and_then(|probe| probe.connect(relay_addr))
+            && let Err(err) = probe_protected_ipv6_udp_reachability(relay_addr, protector)
         {
             note_direct_addr_connect_result(relay_addr, Err(&err));
             last_err = Some(err);
@@ -1265,7 +1308,7 @@ pub fn bind_protected_udp_addrs(addrs: &[SocketAddr]) -> io::Result<(UdpSocket, 
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
-        match protected_udp_bind(local_bind, Some(relay_addr)) {
+        match protected_udp_bind_with_protector(local_bind, Some(relay_addr), protector) {
             Ok(sock) => return Ok((sock, relay_addr)),
             Err(err) => {
                 note_direct_addr_connect_result(relay_addr, Err(&err));
@@ -1691,5 +1734,174 @@ mod tests {
         dual.set_if_index(9);
         assert_eq!(dual.v4_if_index(), 9);
         assert_eq!(dual.v6_if_index(), 9);
+    }
+
+    #[test]
+    fn macos_and_windows_protectors_reject_zero_if_index_and_allow_loopback() {
+        let tcp4 = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let tcp6 = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let udp4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let udp6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+
+        let v4_global: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let v6_global: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let v4_loopback: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let v6_loopback: SocketAddr = "[::1]:443".parse().unwrap();
+        let v4_mapped_loopback: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
+
+        // IPv4-only physical link (`v4=5, v6=0`): IPv6 global MUST fail closed with NetworkUnreachable.
+        let mac = MacOsBoundIfProtector::new_dual_stack(5, 0);
+        let win = WindowsUnicastIfProtector::new(5, 0);
+
+        for (label, prot) in [
+            ("macos", &mac as &dyn SocketProtector),
+            ("windows", &win as &dyn SocketProtector),
+        ] {
+            let err_tcp6 = prot.protect_tcp(&tcp6, v6_global).expect_err(&format!(
+                "{label}: global IPv6 TCP must fail when v6_idx == 0"
+            ));
+            assert_eq!(err_tcp6.kind(), io::ErrorKind::NetworkUnreachable);
+
+            let err_udp6 = prot
+                .protect_udp(&udp6, Some(v6_global))
+                .expect_err(&format!(
+                    "{label}: global IPv6 UDP must fail when v6_idx == 0"
+                ));
+            assert_eq!(err_udp6.kind(), io::ErrorKind::NetworkUnreachable);
+
+            // Loopback ALWAYS bypasses interface binding even when the family's index is 0.
+            assert!(prot.protect_tcp(&tcp4, v4_loopback).is_ok());
+            assert!(prot.protect_udp(&udp4, Some(v4_loopback)).is_ok());
+            assert!(prot.protect_tcp(&tcp6, v6_loopback).is_ok());
+            assert!(prot.protect_udp(&udp6, Some(v6_loopback)).is_ok());
+            assert!(prot.protect_tcp(&tcp6, v4_mapped_loopback).is_ok());
+            assert!(prot.protect_udp(&udp6, Some(v4_mapped_loopback)).is_ok());
+        }
+
+        // Non-zero IPv4 index must not return NetworkUnreachable (and returns Ok(()) on non-target stubs).
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(mac.protect_tcp(&tcp4, v4_global).is_ok());
+            assert!(mac.protect_udp(&udp4, Some(v4_global)).is_ok());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = mac.protect_tcp(&tcp4, v4_global) {
+                assert_ne!(e.kind(), io::ErrorKind::NetworkUnreachable);
+            }
+            if let Err(e) = mac.protect_udp(&udp4, Some(v4_global)) {
+                assert_ne!(e.kind(), io::ErrorKind::NetworkUnreachable);
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(win.protect_tcp(&tcp4, v4_global).is_ok());
+            assert!(win.protect_udp(&udp4, Some(v4_global)).is_ok());
+        }
+        #[cfg(windows)]
+        {
+            if let Err(e) = win.protect_tcp(&tcp4, v4_global) {
+                assert_ne!(e.kind(), io::ErrorKind::NetworkUnreachable);
+            }
+            if let Err(e) = win.protect_udp(&udp4, Some(v4_global)) {
+                assert_ne!(e.kind(), io::ErrorKind::NetworkUnreachable);
+            }
+        }
+
+        // Also verify v4_idx == 0 rejects IPv4 global while allowing loopback.
+        let mac_zero = MacOsBoundIfProtector::new_dual_stack(0, 0);
+        let win_zero = WindowsUnicastIfProtector::new(0, 0);
+        for prot in [
+            &mac_zero as &dyn SocketProtector,
+            &win_zero as &dyn SocketProtector,
+        ] {
+            assert_eq!(
+                prot.protect_tcp(&tcp4, v4_global).unwrap_err().kind(),
+                io::ErrorKind::NetworkUnreachable
+            );
+            assert_eq!(
+                prot.protect_udp(&udp4, Some(v4_global)).unwrap_err().kind(),
+                io::ErrorKind::NetworkUnreachable
+            );
+            assert!(prot.protect_tcp(&tcp4, v4_loopback).is_ok());
+            assert!(prot.protect_tcp(&tcp6, v6_loopback).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_protected_udp_addrs_uses_protected_ipv6_probe_and_falls_back_to_ipv4() {
+        let _guard = lock_ipv6_reachability_for_test();
+
+        struct RejectV6Protector {
+            udp_hints: Mutex<Vec<Option<SocketAddr>>>,
+        }
+
+        impl SocketProtector for RejectV6Protector {
+            fn protect_tcp(&self, _sock: &Socket, _remote: SocketAddr) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn protect_udp(
+                &self,
+                _sock: &Socket,
+                remote_hint: Option<SocketAddr>,
+            ) -> io::Result<()> {
+                self.udp_hints.lock().push(remote_hint);
+                if remote_hint.is_some_and(|sa| sa.is_ipv6()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NetworkUnreachable,
+                        "injected IPv6 protect_udp failure",
+                    ));
+                }
+                Ok(())
+            }
+
+            fn description(&self) -> String {
+                "test-reject-v6".to_string()
+            }
+        }
+
+        let v6_global: SocketAddr = "[2606:4700:4700::1111]:1080".parse().unwrap();
+        let v4_addr: SocketAddr = "198.51.100.10:1080".parse().unwrap();
+        let protector = RejectV6Protector {
+            udp_hints: Mutex::new(Vec::new()),
+        };
+
+        let (sock, chosen) =
+            bind_protected_udp_addrs_with_protector(&[v6_global, v4_addr], &protector)
+                .expect("should skip unreachable IPv6 via protected probe and bind IPv4");
+        assert_eq!(chosen, v4_addr);
+        assert!(sock.local_addr().unwrap().is_ipv4());
+
+        let hints = protector.udp_hints.lock().clone();
+        assert_eq!(
+            hints,
+            vec![Some(v6_global), Some(v4_addr)],
+            "IPv6 probe MUST invoke protect_udp before bind/connect, then fall back to IPv4"
+        );
+        assert!(
+            !is_direct_ipv6_reachable(),
+            "protected IPv6 probe failure must open the direct IPv6 circuit-breaker"
+        );
+
+        // End-to-end synergy check on non-macOS/non-Windows with real MacOsBoundIfProtector(5, 0)
+        // and WindowsUnicastIfProtector(5, 0).
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            reset_direct_ipv6_reachability();
+            let mac = MacOsBoundIfProtector::new_dual_stack(5, 0);
+            let (_s1, chosen1) =
+                bind_protected_udp_addrs_with_protector(&[v6_global, v4_addr], &mac)
+                    .expect("MacOsBoundIfProtector(5, 0) must fall back to IPv4");
+            assert_eq!(chosen1, v4_addr);
+
+            reset_direct_ipv6_reachability();
+            let win = WindowsUnicastIfProtector::new(5, 0);
+            let (_s2, chosen2) =
+                bind_protected_udp_addrs_with_protector(&[v6_global, v4_addr], &win)
+                    .expect("WindowsUnicastIfProtector(5, 0) must fall back to IPv4");
+            assert_eq!(chosen2, v4_addr);
+        }
     }
 }

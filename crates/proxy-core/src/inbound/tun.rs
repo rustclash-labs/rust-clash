@@ -281,7 +281,17 @@ struct TunSmoltcpStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: HashMap<FourTuple, BridgeFlow>,
+    pending_remove_handles: Vec<SocketHandle>,
     panic_recoveries: u64,
+}
+
+fn drain_pending_removed_handles(
+    sockets: &mut SocketSet<'static>,
+    pending_remove_handles: &mut Vec<SocketHandle>,
+) {
+    for handle in pending_remove_handles.drain(..) {
+        sockets.remove(handle);
+    }
 }
 
 impl TunSmoltcpStack {
@@ -297,6 +307,7 @@ impl TunSmoltcpStack {
             iface,
             sockets: SocketSet::new(vec![]),
             flows: HashMap::new(),
+            pending_remove_handles: Vec::new(),
             panic_recoveries: 0,
         }
     }
@@ -332,6 +343,7 @@ impl TunSmoltcpStack {
         for (_, flow) in self.flows.drain() {
             flow.task_abort.abort();
         }
+        self.pending_remove_handles.clear();
         self.device.rx_queue.clear();
 
         let old_sockets = std::mem::replace(&mut self.sockets, SocketSet::new(vec![]));
@@ -366,9 +378,31 @@ impl TunSmoltcpStack {
         }
     }
 
+    /// Reap any flow whose `smoltcp` TCP socket reverted from `SynReceived` back to
+    /// `State::Listen` (e.g. after receiving an in-window TCP `RST` in `SynReceived`,
+    /// which clears `tuple = None` per RFC 793). Preserves the Single-Listen Isolation
+    /// Invariant so no stale wildcard `Listen` socket can ever survive to hijack a
+    /// subsequent client's `SYN`.
+    fn reap_reverted_listen_flows(&mut self) {
+        let mut reverted_keys = Vec::new();
+        for (tuple, flow) in &self.flows {
+            if self.sockets.get::<tcp::Socket>(flow.handle).state() == tcp::State::Listen {
+                reverted_keys.push(*tuple);
+            }
+        }
+        for tuple in reverted_keys {
+            if let Some(flow) = self.flows.remove(&tuple) {
+                flow.task_abort.abort();
+                self.sockets.remove(flow.handle);
+            }
+        }
+    }
+
     fn poll_guarded(&mut self, stage: &str, now: SmolInstant, hub: &TelemetryHub) -> bool {
         self.run_guarded(stage, now, hub, |s| {
             let _ = s.iface.poll(now, &mut s.device, &mut s.sockets);
+            drain_pending_removed_handles(&mut s.sockets, &mut s.pending_remove_handles);
+            s.reap_reverted_listen_flows();
         })
         .is_some()
     }
@@ -398,6 +432,7 @@ impl TunSmoltcpStack {
 
 struct SingleFlowStep {
     finished: bool,
+    reap_before_poll: bool,
     has_backpressured_rx: bool,
     has_more_ready_rx: bool,
 }
@@ -408,11 +443,26 @@ fn step_single_tun_flow(
     now: Instant,
     now_wall: u64,
 ) -> SingleFlowStep {
+    // A passive-open `smoltcp` socket in `SynReceived` that receives an in-window TCP `RST`
+    // reverts back to `State::Listen` with `tuple = None` (RFC 793). It cannot emit an RST
+    // on `iface.poll.post`; abort its flow task and reap it BEFORE the next `iface.poll()`
+    // so it can never hijack a subsequent client's SYN.
+    if sock.state() == tcp::State::Listen {
+        flow.task_abort.abort();
+        return SingleFlowStep {
+            finished: true,
+            reap_before_poll: true,
+            has_backpressured_rx: false,
+            has_more_ready_rx: false,
+        };
+    }
+
     // If outbound dial or REJECT rule failed, immediately emit TCP RST and reap!
     if flow.remote_failed.load(Ordering::Acquire) {
         sock.abort();
         return SingleFlowStep {
             finished: true,
+            reap_before_poll: false,
             has_backpressured_rx: false,
             has_more_ready_rx: false,
         };
@@ -458,6 +508,7 @@ fn step_single_tun_flow(
                         sock.abort();
                         return SingleFlowStep {
                             finished: true,
+                            reap_before_poll: false,
                             has_backpressured_rx: false,
                             has_more_ready_rx: false,
                         };
@@ -526,6 +577,7 @@ fn step_single_tun_flow(
         sock.abort();
         return SingleFlowStep {
             finished: true,
+            reap_before_poll: false,
             has_backpressured_rx,
             has_more_ready_rx,
         };
@@ -533,10 +585,12 @@ fn step_single_tun_flow(
 
     let finished = (flow.established && !sock.is_active())
         || sock.state() == tcp::State::Closed
-        || sock.state() == tcp::State::TimeWait;
+        || sock.state() == tcp::State::TimeWait
+        || sock.state() == tcp::State::Listen;
 
     SingleFlowStep {
         finished,
+        reap_before_poll: sock.state() == tcp::State::Listen,
         has_backpressured_rx,
         has_more_ready_rx,
     }
@@ -573,6 +627,7 @@ where
             flow.task_abort.abort();
             SingleFlowStep {
                 finished: true,
+                reap_before_poll: true,
                 has_backpressured_rx: false,
                 has_more_ready_rx: false,
             }
@@ -709,9 +764,8 @@ pub fn spawn_userspace_tun_with_options(
                                 &ipv6_enabled,
                                 drop_self_pid,
                                 &shutting_down,
-                                &mut s.device,
-                                &mut s.sockets,
-                                &mut s.flows,
+                                ts_in,
+                                s,
                                 &egress_tx,
                                 &udp_sem,
                                 &udp_nat,
@@ -736,9 +790,8 @@ pub fn spawn_userspace_tun_with_options(
                                                 &ipv6_enabled,
                                                 drop_self_pid,
                                                 &shutting_down,
-                                                &mut s.device,
-                                                &mut s.sockets,
-                                                &mut s.flows,
+                                                ts_more,
+                                                s,
                                                 &egress_tx,
                                                 &udp_sem,
                                                 &udp_nat,
@@ -775,6 +828,7 @@ pub fn spawn_userspace_tun_with_options(
             let now = Instant::now();
             let now_wall = TelemetryHub::now_ms();
             let mut finished_keys = Vec::new();
+            let mut immediate_remove_keys = Vec::new();
             let mut has_backpressured_rx = false;
             let mut has_more_ready_rx = false;
 
@@ -787,20 +841,30 @@ pub fn spawn_userspace_tun_with_options(
                     });
                     has_backpressured_rx |= step.has_backpressured_rx;
                     has_more_ready_rx |= step.has_more_ready_rx;
-                    if step.finished {
+                    if step.reap_before_poll {
+                        immediate_remove_keys.push(*tuple);
+                    } else if step.finished {
                         finished_keys.push(*tuple);
                     }
                 }
             }
 
-            if !stack.remove_finished_flows(finished_keys, now_smol(), &hub) {
+            // Reap any panicked or Listen-reverted socket BEFORE `iface.poll.post` so it
+            // cannot fault `smoltcp` or hijack a subsequent SYN.
+            if !stack.remove_finished_flows(immediate_remove_keys, now_smol(), &hub) {
                 next_delay = None;
                 continue;
             }
 
-            // Flush any segments (SYN-ACK, PSH, FIN, or RST) queued above immediately!
+            // Flush any segments (SYN-ACK, PSH, FIN, or RST from `sock.abort()`) BEFORE removing
+            // finished sockets from `SocketSet`, so aborted sockets actually emit their TCP RST!
             let ts_after = now_smol();
             if !stack.poll_guarded("iface.poll.post", ts_after, &hub) {
+                next_delay = None;
+                continue;
+            }
+
+            if !stack.remove_finished_flows(finished_keys, ts_after, &hub) {
                 next_delay = None;
                 continue;
             }
@@ -920,6 +984,11 @@ pub fn spawn_userspace_tun_with_options(
                 stack.sockets.remove(flow.handle);
             }));
         }
+        for handle in stack.pending_remove_handles.drain(..) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stack.sockets.remove(handle);
+            }));
+        }
         let _ = udp_nat.shutdown();
     });
 
@@ -963,14 +1032,95 @@ fn is_self_process_socket(transport: SocketTransport, local_addr: SocketAddr) ->
 }
 
 #[allow(clippy::too_many_arguments)]
+fn process_isolated_tcp_syn(
+    pkt: Vec<u8>,
+    tuple: FourTuple,
+    listen_ip: IpAddress,
+    fast_reject: bool,
+    drop_self_pid: bool,
+    now: SmolInstant,
+    stack: &mut TunSmoltcpStack,
+    wake_notify: &Arc<Notify>,
+    router: &Arc<RwLock<Arc<Router>>>,
+    hub: &Arc<TelemetryHub>,
+) {
+    // 1. Drain any queued non-SYN packets first so `rx_queue` is empty and zero
+    //    wildcard `Listen` sockets exist before handling this SYN.
+    if !stack.device.rx_queue.is_empty() {
+        let _ = stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        drain_pending_removed_handles(&mut stack.sockets, &mut stack.pending_remove_handles);
+    }
+    // 2. Sweep any flow whose socket reverted from `SynReceived` back to `State::Listen`
+    //    (e.g. from an in-window TCP `RST` drained in step 1 or an earlier poll) BEFORE
+    //    entering either `fast_reject` or `register_syn_flow`.
+    stack.reap_reverted_listen_flows();
+
+    if !stack.device.rx_queue.is_empty() || stack.device.rx_queue.len() >= TUN_DEVICE_RX_MAX_PACKETS
+    {
+        return;
+    }
+
+    if fast_reject {
+        // Zero `Listen` sockets exist right now -> `smoltcp` emits immediate `TCP RST|ACK`
+        // with zero chance of hijacking an accepted SYN's wildcard `Listen` socket.
+        stack.device.rx_queue.push_back(pkt);
+        let _ = stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        drain_pending_removed_handles(&mut stack.sockets, &mut stack.pending_remove_handles);
+        stack.reap_reverted_listen_flows();
+        if !stack.device.rx_queue.is_empty() {
+            let _ = stack.device.rx_queue.pop_back();
+        }
+        return;
+    }
+
+    // Per-SYN Single-Listen Isolation Invariant: create at most ONE wildcard `Listen` socket
+    // for this SYN, immediately feed only this SYN into `iface.poll()`, and verify it bound.
+    let newly_registered = if !stack.flows.contains_key(&tuple) {
+        register_syn_flow(
+            tuple,
+            listen_ip,
+            drop_self_pid,
+            &mut stack.sockets,
+            &mut stack.flows,
+            &mut stack.pending_remove_handles,
+            wake_notify,
+            router,
+            hub,
+        )
+    } else {
+        None
+    };
+
+    stack.device.rx_queue.push_back(pkt);
+    let _ = stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+    drain_pending_removed_handles(&mut stack.sockets, &mut stack.pending_remove_handles);
+
+    // If concurrent egress saturation prevented `smoltcp` from consuming the SYN, pop it.
+    if !stack.device.rx_queue.is_empty() {
+        let _ = stack.device.rx_queue.pop_back();
+    }
+
+    // If `smoltcp` rejected or did not consume the SYN, tear down the still-`Listen` socket
+    // immediately so zero orphan wildcard `Listen` sockets can survive to hijack future SYNs.
+    if let Some(handle) = newly_registered
+        && stack.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Listen
+    {
+        if let Some(flow) = stack.flows.remove(&tuple) {
+            flow.task_abort.abort();
+        }
+        stack.sockets.remove(handle);
+    }
+    stack.reap_reverted_listen_flows();
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_ingress_packet(
     pkt: Vec<u8>,
     ipv6_enabled: &Arc<AtomicBool>,
     drop_self_pid: bool,
     shutting_down: &Arc<AtomicBool>,
-    device: &mut VirtualIpDevice,
-    sockets: &mut SocketSet<'static>,
-    flows: &mut HashMap<FourTuple, BridgeFlow>,
+    now: SmolInstant,
+    stack: &mut TunSmoltcpStack,
     egress_tx: &mpsc::Sender<Vec<u8>>,
     udp_sem: &Arc<Semaphore>,
     udp_nat: &Arc<UdpNatManager>,
@@ -1044,21 +1194,31 @@ fn handle_ingress_packet(
                     if let Ok(tcp_pkt) = TcpPacket::new_checked(ip4.payload())
                         && tcp_pkt.syn()
                         && !tcp_pkt.ack()
+                        && !tcp_pkt.rst()
                     {
+                        if !ip4.verify_checksum()
+                            || !tcp_pkt
+                                .verify_checksum(&IpAddress::Ipv4(src_v4), &IpAddress::Ipv4(dst_v4))
+                        {
+                            return;
+                        }
                         let tuple = FourTuple {
                             src: SocketAddr::new(IpAddr::V4(src_v4), tcp_pkt.src_port()),
                             dst: SocketAddr::new(IpAddr::V4(dst_v4), tcp_pkt.dst_port()),
                         };
-                        register_syn_flow(
+                        process_isolated_tcp_syn(
+                            pkt,
                             tuple,
                             IpAddress::Ipv4(dst_v4),
+                            false,
                             drop_self_pid,
-                            sockets,
-                            flows,
+                            now,
+                            stack,
                             wake_notify,
                             router,
                             hub,
                         );
+                        return;
                     }
                 }
                 _ => {}
@@ -1076,9 +1236,29 @@ fn handle_ingress_packet(
             if should_drop_tun_ipv6_packet(src_v6, dst_v6) {
                 return;
             }
-            match ip6.next_header() {
+            // Mirror `smoltcp::iface::Interface::process_ipv6` by unwrapping a single
+            // IPv6 `HopByHop` extension header so crafted HopByHop-wrapped TCP SYNs cannot
+            // bypass `process_isolated_tcp_syn` and enter `rx_queue`.
+            let (ip6_next_header, ip6_payload) = if ip6.next_header() == IpProtocol::HopByHop {
+                let Ok(ext_hdr) = smoltcp::wire::Ipv6ExtHeader::new_checked(ip6.payload()) else {
+                    return;
+                };
+                let Ok(ext_repr) = smoltcp::wire::Ipv6ExtHeaderRepr::parse(&ext_hdr) else {
+                    return;
+                };
+                let Some(rest) = ip6
+                    .payload()
+                    .get(ext_repr.header_len() + ext_repr.data.len()..)
+                else {
+                    return;
+                };
+                (ext_repr.next_header, rest)
+            } else {
+                (ip6.next_header(), ip6.payload())
+            };
+            match ip6_next_header {
                 IpProtocol::Udp => {
-                    let Ok(udp) = UdpPacket::new_checked(ip6.payload()) else {
+                    let Ok(udp) = UdpPacket::new_checked(ip6_payload) else {
                         return;
                     };
                     if !udp.verify_checksum(&IpAddress::Ipv6(src_v6), &IpAddress::Ipv6(dst_v6)) {
@@ -1142,38 +1322,42 @@ fn handle_ingress_packet(
                     // `ICMPv6 Destination Unreachable (PortUnreachable)` back to `egress_tx`!
                 }
                 IpProtocol::Tcp => {
-                    if let Ok(tcp_pkt) = TcpPacket::new_checked(ip6.payload())
+                    if let Ok(tcp_pkt) = TcpPacket::new_checked(ip6_payload)
                         && tcp_pkt.syn()
                         && !tcp_pkt.ack()
+                        && !tcp_pkt.rst()
                     {
+                        if !tcp_pkt
+                            .verify_checksum(&IpAddress::Ipv6(src_v6), &IpAddress::Ipv6(dst_v6))
+                        {
+                            return;
+                        }
                         let src_addr = SocketAddr::new(IpAddr::V6(src_v6), tcp_pkt.src_port());
                         let dst_port = tcp_pkt.dst_port();
-                        if !should_fast_reject_unreachable_direct_ipv6(
+                        let fast_reject = should_fast_reject_unreachable_direct_ipv6(
                             src_addr,
                             dst_v6,
                             dst_port,
                             SocketTransport::Tcp,
                             router,
-                        ) {
-                            let tuple = FourTuple {
-                                src: src_addr,
-                                dst: SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
-                            };
-                            register_syn_flow(
-                                tuple,
-                                IpAddress::Ipv6(dst_v6),
-                                drop_self_pid,
-                                sockets,
-                                flows,
-                                wake_notify,
-                                router,
-                                hub,
-                            );
-                        }
-                        // When `should_fast_reject_unreachable_direct_ipv6` is `true`, skip
-                        // `register_syn_flow` and fall through to `device.rx_queue` so `smoltcp`
-                        // `iface.poll()` immediately emits `TCP RST|ACK` with zero socket allocation
-                        // and zero `TelemetryHub` failed-connection noise!
+                        );
+                        let tuple = FourTuple {
+                            src: src_addr,
+                            dst: SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
+                        };
+                        process_isolated_tcp_syn(
+                            pkt,
+                            tuple,
+                            IpAddress::Ipv6(dst_v6),
+                            fast_reject,
+                            drop_self_pid,
+                            now,
+                            stack,
+                            wake_notify,
+                            router,
+                            hub,
+                        );
+                        return;
                     }
                 }
                 _ => {}
@@ -1182,8 +1366,8 @@ fn handle_ingress_packet(
         _ => return,
     }
 
-    if device.rx_queue.len() < TUN_DEVICE_RX_MAX_PACKETS {
-        device.rx_queue.push_back(pkt);
+    if stack.device.rx_queue.len() < TUN_DEVICE_RX_MAX_PACKETS {
+        stack.device.rx_queue.push_back(pkt);
     }
 }
 
@@ -1338,12 +1522,13 @@ fn register_syn_flow(
     drop_self_pid: bool,
     sockets: &mut SocketSet<'static>,
     flows: &mut HashMap<FourTuple, BridgeFlow>,
+    pending_remove_handles: &mut Vec<SocketHandle>,
     wake_notify: &Arc<Notify>,
     router: &Arc<RwLock<Arc<Router>>>,
     hub: &Arc<TelemetryHub>,
-) {
+) -> Option<SocketHandle> {
     if flows.contains_key(&tuple) {
-        return;
+        return None;
     }
     let now = Instant::now();
     let now_wall = TelemetryHub::now_ms();
@@ -1359,7 +1544,8 @@ fn register_syn_flow(
         evicted.task_abort.abort();
         let evicted_sock = sockets.get_mut::<tcp::Socket>(evicted.handle);
         evicted_sock.abort();
-        sockets.remove(evicted.handle);
+        // Defer `sockets.remove` until immediately after the next `iface.poll()` emits TCP RST.
+        pending_remove_handles.push(evicted.handle);
     }
     if flows.len() >= MAX_TUN_TCP_FLOWS {
         if let Some(evict_tuple) = select_pressure_eviction_candidate(flows, now, now_wall)
@@ -1368,9 +1554,10 @@ fn register_syn_flow(
             evicted.task_abort.abort();
             let evicted_sock = sockets.get_mut::<tcp::Socket>(evicted.handle);
             evicted_sock.abort();
-            sockets.remove(evicted.handle);
+            // Defer `sockets.remove` until immediately after the next `iface.poll()` emits TCP RST.
+            pending_remove_handles.push(evicted.handle);
         } else {
-            return;
+            return None;
         }
     }
 
@@ -1387,7 +1574,7 @@ fn register_syn_flow(
         })
         .is_err()
     {
-        return;
+        return None;
     }
     let handle = sockets.add(sock);
 
@@ -1771,6 +1958,7 @@ fn register_syn_flow(
             task_abort: flow_task.abort_handle(),
         },
     );
+    Some(handle)
 }
 
 enum TcpSniffResult {
@@ -4073,5 +4261,1423 @@ mod tests {
             stack.panic_recoveries, 0,
             "smoltcp 0.14 must handle 64 KiB scaled window, odd chunks, overshoot, and zero-window FIN with zero panics"
         );
+    }
+
+    struct HangingMockOutbound;
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundHandler for HangingMockOutbound {
+        fn name(&self) -> &str {
+            "hanging-mock"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        async fn connect_tcp(
+            &self,
+            _target: &TargetAddr,
+        ) -> io::Result<crate::outbound::BoxedStream> {
+            std::future::pending().await
+        }
+    }
+
+    struct GatedFailingOutbound {
+        gate: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundHandler for GatedFailingOutbound {
+        fn name(&self) -> &str {
+            "gated-fail"
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        async fn connect_tcp(
+            &self,
+            _target: &TargetAddr,
+        ) -> io::Result<crate::outbound::BoxedStream> {
+            self.gate.notified().await;
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "simulated outbound failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_emits_tcp_rst_on_reject_rule_failing_dial_and_half_open_eviction() {
+        // Part A1: Flow routed to `REJECT` emits TCP RST on `egress_rx`.
+        {
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let router = Arc::new(
+                Router::new(
+                    crate::config::RunMode::Rule,
+                    HashMap::new(),
+                    &[],
+                    &["MATCH,REJECT".to_string()],
+                    dns,
+                )
+                .unwrap(),
+            );
+            let hub = Arc::new(TelemetryHub::new());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (mut vtun, tun_task) =
+                spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), hub, shutdown_rx);
+
+            // Non-sniffed port 8080 so flow_task immediately hits REJECT without sniff delay.
+            let client = (Ipv4Addr::new(198, 18, 0, 30), 55001u16);
+            let dst = (Ipv4Addr::new(93, 184, 216, 34), 8080u16);
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    1000,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+
+            let mut saw_rst = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                let Ok(Some(pkt)) =
+                    tokio::time::timeout(Duration::from_millis(200), vtun.egress_rx.recv()).await
+                else {
+                    break;
+                };
+                let ip4 = Ipv4Packet::new_checked(&pkt).unwrap();
+                let tcp = TcpPacket::new_checked(ip4.payload()).unwrap();
+                if tcp.rst() {
+                    assert_eq!(ip4.src_addr(), dst.0);
+                    assert_eq!(ip4.dst_addr(), client.0);
+                    assert_eq!(tcp.src_port(), dst.1);
+                    assert_eq!(tcp.dst_port(), client.1);
+                    saw_rst = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_rst,
+                "TUN REJECT rule must emit an actual TCP RST packet on egress_rx"
+            );
+
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+        }
+
+        // Part A2: Established TCP flow whose outbound dial fails emits TCP RST on `egress_rx`.
+        {
+            let fail_gate = Arc::new(Notify::new());
+            let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+            outbounds.insert(
+                "gated-fail".to_string(),
+                Arc::new(GatedFailingOutbound {
+                    gate: Arc::clone(&fail_gate),
+                }),
+            );
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let router = Arc::new(
+                Router::new(
+                    crate::config::RunMode::Rule,
+                    outbounds,
+                    &[],
+                    &["MATCH,gated-fail".to_string()],
+                    dns,
+                )
+                .unwrap(),
+            );
+            let hub = Arc::new(TelemetryHub::new());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (mut vtun, tun_task) =
+                spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), hub, shutdown_rx);
+
+            let client = (Ipv4Addr::new(198, 18, 0, 31), 55002u16);
+            let dst = (Ipv4Addr::new(93, 184, 216, 34), 8080u16);
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    2000,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+
+            let sa_raw = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let tcp_sa =
+                TcpPacket::new_checked(Ipv4Packet::new_checked(&sa_raw).unwrap().payload())
+                    .unwrap();
+            assert!(tcp_sa.syn() && tcp_sa.ack());
+            let server_next_seq = tcp_sa.seq_number().0.wrapping_add(1);
+
+            // Complete 3-way handshake to reach `Established`, then trigger outbound dial failure.
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::None,
+                    2001,
+                    Some(server_next_seq),
+                    &[],
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            fail_gate.notify_one();
+
+            let rst_raw = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                .await
+                .expect("established flow failing dial must emit TCP RST")
+                .expect("egress RST packet");
+            let ip4_rst = Ipv4Packet::new_checked(&rst_raw).unwrap();
+            let tcp_rst = TcpPacket::new_checked(ip4_rst.payload()).unwrap();
+            assert!(
+                tcp_rst.rst(),
+                "expected TCP RST after outbound dial failure, got syn={} ack={} fin={} rst={}",
+                tcp_rst.syn(),
+                tcp_rst.ack(),
+                tcp_rst.fin(),
+                tcp_rst.rst()
+            );
+
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+        }
+
+        // Part B: Half-open eviction in `register_syn_flow` defers socket removal past poll so
+        // the evicted flow emits TCP RST before its handle is removed.
+        {
+            let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+            outbounds.insert("hanging-mock".to_string(), Arc::new(HangingMockOutbound));
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let router = Arc::new(
+                Router::new(
+                    crate::config::RunMode::Rule,
+                    outbounds,
+                    &[],
+                    &["MATCH,hanging-mock".to_string()],
+                    dns,
+                )
+                .unwrap(),
+            );
+            let hub = Arc::new(TelemetryHub::new());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (mut vtun, tun_task) =
+                spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), hub, shutdown_rx);
+
+            let dst = (Ipv4Addr::new(93, 184, 216, 34), 8080u16);
+            let base_port = 40_000u16;
+            for i in 0..MAX_HALF_OPEN_SYN_FLOWS {
+                let client = (Ipv4Addr::new(198, 18, 0, 32), base_port + i as u16);
+                vtun.ingress_tx
+                    .send(build_ipv4_tcp_packet(
+                        client,
+                        dst,
+                        smoltcp::wire::TcpControl::Syn,
+                        10_000 + i as i32,
+                        None,
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+                let sa = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                    .await
+                    .expect("expected SYN-ACK for half-open flow")
+                    .expect("egress SYN-ACK");
+                let tcp_sa =
+                    TcpPacket::new_checked(Ipv4Packet::new_checked(&sa).unwrap().payload())
+                        .unwrap();
+                assert!(tcp_sa.syn() && tcp_sa.ack());
+            }
+
+            // 257th SYN triggers half-open eviction of oldest flow (`base_port`)!
+            let new_port = base_port + MAX_HALF_OPEN_SYN_FLOWS as u16;
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    (Ipv4Addr::new(198, 18, 0, 32), new_port),
+                    dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    20_000,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+
+            let mut saw_evicted_rst = false;
+            let mut saw_new_syn_ack = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while (!saw_evicted_rst || !saw_new_syn_ack) && tokio::time::Instant::now() < deadline {
+                let Ok(Some(pkt)) =
+                    tokio::time::timeout(Duration::from_millis(200), vtun.egress_rx.recv()).await
+                else {
+                    break;
+                };
+                let ip4 = Ipv4Packet::new_checked(&pkt).unwrap();
+                let tcp = TcpPacket::new_checked(ip4.payload()).unwrap();
+                if tcp.rst() && tcp.dst_port() == base_port {
+                    saw_evicted_rst = true;
+                } else if tcp.syn() && tcp.ack() && tcp.dst_port() == new_port {
+                    saw_new_syn_ack = true;
+                }
+            }
+            assert!(
+                saw_evicted_rst,
+                "half-open flow eviction must emit TCP RST for evicted client port {base_port}"
+            );
+            assert!(
+                saw_new_syn_ack,
+                "newly admitted SYN (port {new_port}) must still receive SYN-ACK"
+            );
+
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tun_syn_isolation_prevents_slot_reuse_collision_bad_checksum_orphans_and_ipv6_hijack()
+    {
+        // Part A: Bad-checksum SYNs leave 0 orphan Listen sockets, and back-to-back SYNs to the
+        // same `(dst_ip, dst_port)` after freeing an earlier SocketSet slot bind strictly to
+        // their own 4-tuple flows without order reversal.
+        {
+            let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<u8>>(64);
+            let hub = Arc::new(TelemetryHub::new());
+            let mut stack =
+                TunSmoltcpStack::new(1500, egress_tx.clone(), SmolInstant::from_millis(0));
+
+            // Create slot 0 and slot 1, then remove slot 0 so `SocketSet` has a free slot BEFORE
+            // existing sockets (classic slot-reuse order-reversal setup).
+            let slot0 = stack.sockets.add(tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 1024]),
+                tcp::SocketBuffer::new(vec![0u8; 1024]),
+            ));
+            let _slot1 = stack.sockets.add(tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 1024]),
+                tcp::SocketBuffer::new(vec![0u8; 1024]),
+            ));
+            stack.sockets.remove(slot0);
+
+            let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+            outbounds.insert("hanging-mock".to_string(), Arc::new(HangingMockOutbound));
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let router = Arc::new(RwLock::new(Arc::new(
+                Router::new(
+                    crate::config::RunMode::Rule,
+                    outbounds,
+                    &[],
+                    &["MATCH,hanging-mock".to_string()],
+                    dns,
+                )
+                .unwrap(),
+            )));
+            let ipv6_enabled = Arc::new(AtomicBool::new(true));
+            let shutting_down = Arc::new(AtomicBool::new(false));
+            let udp_sem = Arc::new(Semaphore::new(8));
+            let udp_nat =
+                UdpNatManager::new("test-tun", 16, Arc::clone(&hub), Arc::new(|_, _, _| {}));
+            let wake_notify = Arc::new(Notify::new());
+
+            let dst = (Ipv4Addr::new(93, 184, 216, 34), 443u16);
+            let src1 = (Ipv4Addr::new(198, 18, 0, 41), 51001u16);
+            let src2 = (Ipv4Addr::new(198, 18, 0, 42), 51002u16);
+
+            // 1. Corrupt TCP checksum SYN -> must NOT register a flow or orphan Listen socket!
+            let mut bad_tcp_csum_syn = build_ipv4_tcp_packet(
+                (Ipv4Addr::new(198, 18, 0, 40), 51000),
+                dst,
+                smoltcp::wire::TcpControl::Syn,
+                100,
+                None,
+                &[],
+            );
+            let last_idx = bad_tcp_csum_syn.len() - 1;
+            bad_tcp_csum_syn[last_idx] ^= 0xff;
+            handle_ingress_packet(
+                bad_tcp_csum_syn,
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(1),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            assert!(
+                stack.flows.is_empty(),
+                "bad-TCP-checksum SYN must not register any BridgeFlow"
+            );
+
+            // 2. Corrupt IPv4 header checksum SYN -> must NOT register a flow or orphan Listen socket!
+            let mut bad_ip_csum_syn = build_ipv4_tcp_packet(
+                (Ipv4Addr::new(198, 18, 0, 40), 51009),
+                dst,
+                smoltcp::wire::TcpControl::Syn,
+                101,
+                None,
+                &[],
+            );
+            bad_ip_csum_syn[10] ^= 0xff; // IPv4 header checksum byte
+            handle_ingress_packet(
+                bad_ip_csum_syn,
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(2),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            assert!(
+                stack.flows.is_empty(),
+                "bad-IPv4-checksum SYN must not register any BridgeFlow"
+            );
+            let listen_count_after_bad = stack
+                .sockets
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(s, smoltcp::socket::Socket::Tcp(t) if t.state() == tcp::State::Listen)
+                })
+                .count();
+            assert_eq!(
+                listen_count_after_bad, 0,
+                "bad-checksum SYNs must leave 0 orphan Listen sockets"
+            );
+
+            // 3. Two valid SYNs back-to-back to the EXACT SAME `(dst_ip, dst_port)` in one batch!
+            handle_ingress_packet(
+                build_ipv4_tcp_packet(src1, dst, smoltcp::wire::TcpControl::Syn, 1000, None, &[]),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(3),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            handle_ingress_packet(
+                build_ipv4_tcp_packet(src2, dst, smoltcp::wire::TcpControl::Syn, 2000, None, &[]),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(4),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+
+            let tuple1 = FourTuple {
+                src: SocketAddr::new(IpAddr::V4(src1.0), src1.1),
+                dst: SocketAddr::new(IpAddr::V4(dst.0), dst.1),
+            };
+            let tuple2 = FourTuple {
+                src: SocketAddr::new(IpAddr::V4(src2.0), src2.1),
+                dst: SocketAddr::new(IpAddr::V4(dst.0), dst.1),
+            };
+            let sock1 = stack
+                .sockets
+                .get::<tcp::Socket>(stack.flows[&tuple1].handle);
+            let sock2 = stack
+                .sockets
+                .get::<tcp::Socket>(stack.flows[&tuple2].handle);
+            assert_eq!(sock1.state(), tcp::State::SynReceived);
+            assert_eq!(sock2.state(), tcp::State::SynReceived);
+            assert_eq!(
+                sock1.remote_endpoint(),
+                Some(smoltcp::wire::IpEndpoint::new(
+                    IpAddress::Ipv4(src1.0),
+                    src1.1
+                )),
+                "tuple1 flow must be bound strictly to src1"
+            );
+            assert_eq!(
+                sock2.remote_endpoint(),
+                Some(smoltcp::wire::IpEndpoint::new(
+                    IpAddress::Ipv4(src2.0),
+                    src2.1
+                )),
+                "tuple2 flow must be bound strictly to src2"
+            );
+            let remaining_listen = stack
+                .sockets
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(s, smoltcp::socket::Socket::Tcp(t) if t.state() == tcp::State::Listen)
+                })
+                .count();
+            assert_eq!(remaining_listen, 0);
+
+            let mut syn_ack_ports = Vec::new();
+            while let Ok(pkt) = egress_rx.try_recv() {
+                let ip4 = Ipv4Packet::new_checked(&pkt).unwrap();
+                let tcp = TcpPacket::new_checked(ip4.payload()).unwrap();
+                if tcp.syn() && tcp.ack() {
+                    syn_ack_ports.push(tcp.dst_port());
+                }
+            }
+            assert_eq!(syn_ack_ports, vec![src1.1, src2.1]);
+
+            for (_, flow) in stack.flows.drain() {
+                flow.task_abort.abort();
+            }
+            let _ = udp_nat.shutdown();
+        }
+
+        // Part B: Fast-reject IPv6 SYN and accepted IPv6 SYN sharing the SAME `(dst_v6, dst_port)`
+        // back-to-back in one ingress batch must NEVER cross-wire!
+        {
+            let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+            crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(false));
+
+            let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<u8>>(64);
+            let hub = Arc::new(TelemetryHub::new());
+            let mut stack =
+                TunSmoltcpStack::new(1500, egress_tx.clone(), SmolInstant::from_millis(0));
+
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+            outbounds.insert("ProxyNode".to_string(), Arc::new(HangingMockOutbound));
+            // Same global-unicast IPv6 destination `2409:8c1e::1:443`:
+            // - `fd00::10` matches `SRC-IP-CIDR` -> DIRECT (fast-rejected when IPv6 unreachable)
+            // - `fd00::20` matches `MATCH,ProxyNode` -> PROXY (accepted)
+            let rules = vec![
+                "SRC-IP-CIDR,fd00::10/128,DIRECT".to_string(),
+                "MATCH,ProxyNode".to_string(),
+            ];
+            let router = Arc::new(RwLock::new(Arc::new(
+                Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+            )));
+            let ipv6_enabled = Arc::new(AtomicBool::new(true));
+            let shutting_down = Arc::new(AtomicBool::new(false));
+            let udp_sem = Arc::new(Semaphore::new(8));
+            let udp_nat =
+                UdpNatManager::new("test-tun-v6", 16, Arc::clone(&hub), Arc::new(|_, _, _| {}));
+            let wake_notify = Arc::new(Notify::new());
+
+            let direct_client: Ipv6Addr = "fd00::10".parse().unwrap();
+            let proxy_client: Ipv6Addr = "fd00::20".parse().unwrap();
+            let shared_dst: Ipv6Addr = "2409:8c1e::1".parse().unwrap();
+
+            // Send accepted PROXY SYN first, then fast-reject DIRECT SYN immediately after.
+            handle_ingress_packet(
+                build_ipv6_tcp_syn_packet(proxy_client, 52001, shared_dst, 443),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(10),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            handle_ingress_packet(
+                build_ipv6_tcp_syn_packet(direct_client, 52002, shared_dst, 443),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(11),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+
+            assert_eq!(stack.flows.len(), 1);
+            let proxy_tuple = FourTuple {
+                src: SocketAddr::new(IpAddr::V6(proxy_client), 52001),
+                dst: SocketAddr::new(IpAddr::V6(shared_dst), 443),
+            };
+            let proxy_sock = stack
+                .sockets
+                .get::<tcp::Socket>(stack.flows[&proxy_tuple].handle);
+            assert_eq!(
+                proxy_sock.remote_endpoint(),
+                Some(smoltcp::wire::IpEndpoint::new(
+                    IpAddress::Ipv6(proxy_client),
+                    52001
+                )),
+                "accepted IPv6 SYN socket must remain strictly bound to proxy_client"
+            );
+
+            let mut proxy_got_syn_ack = false;
+            let mut direct_got_rst = false;
+            while let Ok(pkt) = egress_rx.try_recv() {
+                let ip6 = Ipv6Packet::new_checked(&pkt).unwrap();
+                let tcp = TcpPacket::new_checked(ip6.payload()).unwrap();
+                if ip6.dst_addr() == proxy_client && tcp.syn() && tcp.ack() && !tcp.rst() {
+                    proxy_got_syn_ack = true;
+                } else if ip6.dst_addr() == direct_client && tcp.rst() && !tcp.syn() {
+                    direct_got_rst = true;
+                }
+            }
+            assert!(proxy_got_syn_ack, "proxy_client must receive SYN-ACK");
+            assert!(
+                direct_got_rst,
+                "fast-rejected direct_client must receive immediate RST|ACK without hijacking proxy_client's socket"
+            );
+
+            for (_, flow) in stack.flows.drain() {
+                flow.task_abort.abort();
+            }
+            let _ = udp_nat.shutdown();
+        }
+    }
+
+    struct RecordingTcpOutbound {
+        name: &'static str,
+        connects: Arc<std::sync::atomic::AtomicUsize>,
+        received: Arc<parking_lot::Mutex<Vec<u8>>>,
+        data_notify: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundHandler for RecordingTcpOutbound {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        async fn connect_tcp(
+            &self,
+            _target: &TargetAddr,
+        ) -> io::Result<crate::outbound::BoxedStream> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let (client_side, mut server_side) = tokio::io::duplex(16 * 1024);
+            let received = Arc::clone(&self.received);
+            let notify = Arc::clone(&self.data_notify);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = server_side.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    received.lock().extend_from_slice(&buf[..n]);
+                    notify.notify_waiters();
+                }
+            });
+            Ok(Box::new(client_side))
+        }
+    }
+
+    fn build_ipv6_tcp_packet(
+        src: (Ipv6Addr, u16),
+        dst: (Ipv6Addr, u16),
+        control: smoltcp::wire::TcpControl,
+        seq: i32,
+        ack: Option<i32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let checksum_caps = ChecksumCapabilities::default();
+        let is_syn = control == smoltcp::wire::TcpControl::Syn;
+        let tcp_repr = smoltcp::wire::TcpRepr {
+            src_port: src.1,
+            dst_port: dst.1,
+            control,
+            seq_number: smoltcp::wire::TcpSeqNumber(seq),
+            ack_number: ack.map(smoltcp::wire::TcpSeqNumber),
+            window_len: 65535,
+            window_scale: is_syn.then_some(7),
+            max_seg_size: is_syn.then_some(1440),
+            sack_permitted: is_syn,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        let tcp_len = tcp_repr.buffer_len();
+        let ip_repr = Ipv6Repr {
+            src_addr: src.0,
+            dst_addr: dst.0,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp_len,
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0u8; ip_repr.buffer_len() + tcp_len];
+        let mut ip_pkt = Ipv6Packet::new_unchecked(&mut bytes);
+        ip_repr.emit(&mut ip_pkt);
+        let mut tcp_pkt = TcpPacket::new_unchecked(ip_pkt.payload_mut());
+        tcp_repr.emit(
+            &mut tcp_pkt,
+            &IpAddress::Ipv6(src.0),
+            &IpAddress::Ipv6(dst.0),
+            &checksum_caps,
+        );
+        bytes
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tun_syn_received_rst_reaps_reverted_listen_socket_preventing_hijack() {
+        // Direct unit check: `step_single_tun_flow` immediately flags any `State::Listen`
+        // reverted socket as `finished && reap_before_poll` and aborts its flow task.
+        {
+            let mut sockets = SocketSet::new(vec![]);
+            let mut sock = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 4096]),
+                tcp::SocketBuffer::new(vec![0u8; 4096]),
+            );
+            sock.listen(IpListenEndpoint {
+                addr: Some(IpAddress::Ipv4(Ipv4Addr::new(93, 184, 216, 34))),
+                port: 443,
+            })
+            .unwrap();
+            let handle = sockets.add(sock);
+            let flow_task = tokio::spawn(std::future::pending::<()>());
+            let (to_tx, _to_rx) = mpsc::channel::<Vec<u8>>(4);
+            let (_from_tx, from_rx) = mpsc::channel::<Vec<u8>>(4);
+            let (_closed_tx, closed_rx) = watch::channel(());
+            let now = Instant::now();
+            let now_wall = TelemetryHub::now_ms();
+            let mut flow = BridgeFlow {
+                handle,
+                established: false,
+                remote_connected: Arc::new(AtomicBool::new(false)),
+                dial_timeout_notify: Arc::new(Notify::new()),
+                dial_timeout_notified_at: None,
+                created_at: now,
+                created_wall_ms: now_wall,
+                last_active: now,
+                last_active_wall_ms: now_wall,
+                fin_started_at: None,
+                fin_started_wall_ms: None,
+                pending_tx: BytesMut::new(),
+                from_remote_rx: from_rx,
+                to_remote_tx: Some(to_tx),
+                _bridge_closed_rx: closed_rx,
+                remote_eof: false,
+                remote_failed: Arc::new(AtomicBool::new(false)),
+                task_abort: flow_task.abort_handle(),
+            };
+            let step = step_single_tun_flow(
+                sockets.get_mut::<tcp::Socket>(handle),
+                &mut flow,
+                now,
+                now_wall,
+            );
+            assert!(
+                step.finished,
+                "reverted Listen socket must be marked finished"
+            );
+            assert!(
+                step.reap_before_poll,
+                "reverted Listen socket must be reaped BEFORE iface.poll.post"
+            );
+            assert!(
+                flow_task.await.unwrap_err().is_cancelled(),
+                "reverted Listen socket flow_task must be aborted immediately"
+            );
+        }
+
+        // Case A (across polls): Client A (`198.18.0.10` -> `outbound-a`) sends SYN -> gets
+        // SYN-ACK -> sends RST (`seq = syn_seq + 1`). Then Client B (`198.18.0.20` -> `outbound-b`)
+        // sends SYN + ACK + `b"SECRET-FROM-CLIENT-B"` to the exact same `(dst_ip, dst_port)`.
+        // `outbound-b` must receive `b"SECRET-FROM-CLIENT-B"` and `outbound-a` must receive 0
+        // connections and 0 bytes!
+        {
+            let a_connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let a_received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+            let a_notify = Arc::new(Notify::new());
+            let b_connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let b_received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+            let b_notify = Arc::new(Notify::new());
+
+            let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+            outbounds.insert(
+                "outbound-a".to_string(),
+                Arc::new(RecordingTcpOutbound {
+                    name: "outbound-a",
+                    connects: Arc::clone(&a_connects),
+                    received: Arc::clone(&a_received),
+                    data_notify: Arc::clone(&a_notify),
+                }),
+            );
+            outbounds.insert(
+                "outbound-b".to_string(),
+                Arc::new(RecordingTcpOutbound {
+                    name: "outbound-b",
+                    connects: Arc::clone(&b_connects),
+                    received: Arc::clone(&b_received),
+                    data_notify: Arc::clone(&b_notify),
+                }),
+            );
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let router = Arc::new(
+                Router::new(
+                    crate::config::RunMode::Rule,
+                    outbounds,
+                    &[],
+                    &[
+                        "SRC-IP-CIDR,198.18.0.10/32,outbound-a".to_string(),
+                        "SRC-IP-CIDR,198.18.0.20/32,outbound-b".to_string(),
+                        "MATCH,REJECT".to_string(),
+                    ],
+                    dns,
+                )
+                .unwrap(),
+            );
+            let hub = Arc::new(TelemetryHub::new());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (mut vtun, tun_task) =
+                spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), hub, shutdown_rx);
+
+            let client_a = (Ipv4Addr::new(198, 18, 0, 10), 40001u16);
+            let client_b = (Ipv4Addr::new(198, 18, 0, 20), 40002u16);
+            let shared_dst = (Ipv4Addr::new(93, 184, 216, 34), 443u16);
+
+            // 1. Client A sends SYN -> receives SYN-ACK -> sends RST (`seq = 1001`).
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client_a,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    1000,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            let sa_a = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                .await
+                .expect("Client A must receive SYN-ACK")
+                .expect("egress SYN-ACK for Client A");
+            let tcp_sa_a =
+                TcpPacket::new_checked(Ipv4Packet::new_checked(&sa_a).unwrap().payload()).unwrap();
+            assert!(tcp_sa_a.syn() && tcp_sa_a.ack() && tcp_sa_a.dst_port() == client_a.1);
+
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client_a,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::Rst,
+                    1001,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // 2. Client B connects to the exact same `(dst_ip, dst_port)` and sends secret payload.
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client_b,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    2000,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            let sa_b = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                .await
+                .expect("Client B must receive SYN-ACK")
+                .expect("egress SYN-ACK for Client B");
+            let tcp_sa_b =
+                TcpPacket::new_checked(Ipv4Packet::new_checked(&sa_b).unwrap().payload()).unwrap();
+            assert!(tcp_sa_b.syn() && tcp_sa_b.ack() && tcp_sa_b.dst_port() == client_b.1);
+            let server_b_ack = tcp_sa_b.seq_number().0.wrapping_add(1);
+
+            let secret = b"SECRET-FROM-CLIENT-B";
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client_b,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::None,
+                    2001,
+                    Some(server_b_ack),
+                    secret,
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if b_received.lock().as_slice() == secret {
+                        break;
+                    }
+                    b_notify.notified().await;
+                }
+            })
+            .await
+            .expect("outbound-b must receive Client B's secret payload");
+
+            // Wait past the 150ms sniff window to confirm flow_task_A was aborted and never dialed.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                b_connects.load(Ordering::SeqCst),
+                1,
+                "outbound-b must receive exactly 1 connection"
+            );
+            assert_eq!(b_received.lock().as_slice(), secret);
+            assert_eq!(
+                a_connects.load(Ordering::SeqCst),
+                0,
+                "Case A: aborted Client A flow must NOT hijack Client B or dial outbound-a"
+            );
+            assert!(
+                a_received.lock().is_empty(),
+                "Case A: outbound-a must receive 0 bytes"
+            );
+
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+        }
+
+        // Case B (intra-batch): `RST_A` followed immediately in the SAME ingress burst by `SYN_B`
+        // (while `RST_A` is still queued in `stack.device.rx_queue`) must reap Client A's reverted
+        // `Listen` socket before registering Client B, routing Client B strictly to `outbound-b`.
+        {
+            let a_connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let a_received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+            let a_notify = Arc::new(Notify::new());
+            let b_connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let b_received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+            let b_notify = Arc::new(Notify::new());
+
+            let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+            outbounds.insert(
+                "outbound-a".to_string(),
+                Arc::new(RecordingTcpOutbound {
+                    name: "outbound-a",
+                    connects: Arc::clone(&a_connects),
+                    received: Arc::clone(&a_received),
+                    data_notify: Arc::clone(&a_notify),
+                }),
+            );
+            outbounds.insert(
+                "outbound-b".to_string(),
+                Arc::new(RecordingTcpOutbound {
+                    name: "outbound-b",
+                    connects: Arc::clone(&b_connects),
+                    received: Arc::clone(&b_received),
+                    data_notify: Arc::clone(&b_notify),
+                }),
+            );
+            let dns = Arc::new(
+                crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+            );
+            let router = Arc::new(RwLock::new(Arc::new(
+                Router::new(
+                    crate::config::RunMode::Rule,
+                    outbounds,
+                    &[],
+                    &[
+                        "SRC-IP-CIDR,198.18.0.10/32,outbound-a".to_string(),
+                        "SRC-IP-CIDR,198.18.0.20/32,outbound-b".to_string(),
+                        "MATCH,REJECT".to_string(),
+                    ],
+                    dns,
+                )
+                .unwrap(),
+            )));
+            let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<u8>>(64);
+            let hub = Arc::new(TelemetryHub::new());
+            let mut stack =
+                TunSmoltcpStack::new(1500, egress_tx.clone(), SmolInstant::from_millis(0));
+            let ipv6_enabled = Arc::new(AtomicBool::new(true));
+            let shutting_down = Arc::new(AtomicBool::new(false));
+            let udp_sem = Arc::new(Semaphore::new(8));
+            let udp_nat = UdpNatManager::new(
+                "test-tun-intra-batch",
+                16,
+                Arc::clone(&hub),
+                Arc::new(|_, _, _| {}),
+            );
+            let wake_notify = Arc::new(Notify::new());
+
+            let client_a = (Ipv4Addr::new(198, 18, 0, 10), 41001u16);
+            let client_b = (Ipv4Addr::new(198, 18, 0, 20), 41002u16);
+            let shared_dst = (Ipv4Addr::new(93, 184, 216, 34), 443u16);
+
+            // Feed SYN_A, RST_A (queued in rx_queue), and SYN_B back-to-back in ONE burst!
+            handle_ingress_packet(
+                build_ipv4_tcp_packet(
+                    client_a,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    1000,
+                    None,
+                    &[],
+                ),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(1),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            handle_ingress_packet(
+                build_ipv4_tcp_packet(
+                    client_a,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::Rst,
+                    1001,
+                    None,
+                    &[],
+                ),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(2),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            assert_eq!(
+                stack.device.rx_queue.len(),
+                1,
+                "RST_A must be queued in rx_queue right before intra-batch SYN_B arrives"
+            );
+            handle_ingress_packet(
+                build_ipv4_tcp_packet(
+                    client_b,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    2000,
+                    None,
+                    &[],
+                ),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(3),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+
+            let tuple_a = FourTuple {
+                src: SocketAddr::new(IpAddr::V4(client_a.0), client_a.1),
+                dst: SocketAddr::new(IpAddr::V4(shared_dst.0), shared_dst.1),
+            };
+            let tuple_b = FourTuple {
+                src: SocketAddr::new(IpAddr::V4(client_b.0), client_b.1),
+                dst: SocketAddr::new(IpAddr::V4(shared_dst.0), shared_dst.1),
+            };
+            assert!(
+                !stack.flows.contains_key(&tuple_a),
+                "Case B: Client A reverted Listen flow must be reaped before SYN_B"
+            );
+            assert!(
+                stack.flows.contains_key(&tuple_b),
+                "Case B: Client B must own its own freshly registered flow"
+            );
+            let sock_b = stack
+                .sockets
+                .get::<tcp::Socket>(stack.flows[&tuple_b].handle);
+            assert_eq!(sock_b.state(), tcp::State::SynReceived);
+            assert_eq!(
+                sock_b.remote_endpoint(),
+                Some(smoltcp::wire::IpEndpoint::new(
+                    IpAddress::Ipv4(client_b.0),
+                    client_b.1
+                )),
+                "Case B: Client B socket must be strictly bound to client_b"
+            );
+            let remaining_listen = stack
+                .sockets
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(s, smoltcp::socket::Socket::Tcp(t) if t.state() == tcp::State::Listen)
+                })
+                .count();
+            assert_eq!(remaining_listen, 0);
+
+            // Extract SYN-ACK for Client B, send ACK + payload, and bridge into flow_task_B.
+            let mut server_b_ack = None;
+            while let Ok(pkt) = egress_rx.try_recv() {
+                let ip4 = Ipv4Packet::new_checked(&pkt).unwrap();
+                let tcp = TcpPacket::new_checked(ip4.payload()).unwrap();
+                if tcp.syn() && tcp.ack() && tcp.dst_port() == client_b.1 {
+                    server_b_ack = Some(tcp.seq_number().0.wrapping_add(1));
+                }
+            }
+            let server_b_ack = server_b_ack.expect("Client B must receive SYN-ACK");
+            let secret = b"SECRET-FROM-CLIENT-B";
+            handle_ingress_packet(
+                build_ipv4_tcp_packet(
+                    client_b,
+                    shared_dst,
+                    smoltcp::wire::TcpControl::None,
+                    2001,
+                    Some(server_b_ack),
+                    secret,
+                ),
+                &ipv6_enabled,
+                false,
+                &shutting_down,
+                SmolInstant::from_millis(4),
+                &mut stack,
+                &egress_tx,
+                &udp_sem,
+                &udp_nat,
+                &wake_notify,
+                &router,
+                &hub,
+            );
+            assert!(stack.poll_guarded("case_b.poll", SmolInstant::from_millis(5), &hub));
+            {
+                let flow_b = stack.flows.get_mut(&tuple_b).unwrap();
+                let sock_b_mut = stack.sockets.get_mut::<tcp::Socket>(flow_b.handle);
+                let _ = step_single_tun_flow(
+                    sock_b_mut,
+                    flow_b,
+                    Instant::now(),
+                    TelemetryHub::now_ms(),
+                );
+            }
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if b_received.lock().as_slice() == secret {
+                        break;
+                    }
+                    b_notify.notified().await;
+                }
+            })
+            .await
+            .expect("Case B: outbound-b must receive Client B's payload");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(b_connects.load(Ordering::SeqCst), 1);
+            assert_eq!(b_received.lock().as_slice(), secret);
+            assert_eq!(
+                a_connects.load(Ordering::SeqCst),
+                0,
+                "Case B: outbound-a must receive 0 connections (0 hijack)"
+            );
+            assert!(a_received.lock().is_empty());
+
+            for (_, flow) in stack.flows.drain() {
+                flow.task_abort.abort();
+            }
+            let _ = udp_nat.shutdown();
+        }
+
+        // Case C (IPv6 `fast_reject` after `SynReceived` + `RST`, both intra-batch and across
+        // polls): Client A (`fd00::10` -> `outbound-a`) sends IPv6 SYN -> SYN-ACK -> RST,
+        // followed by Client B (`fd00::20` -> `DIRECT`, `fast_reject == true`) sending IPv6 SYN
+        // to the same `(dst_v6, 443)` -> Client B must receive `RST|ACK` and `outbound-a` must
+        // get 0 connections and 0 bytes!
+        {
+            let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+            crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(false));
+
+            let client_a_v6: Ipv6Addr = "fd00::10".parse().unwrap();
+            let client_b_v6: Ipv6Addr = "fd00::20".parse().unwrap();
+            let shared_dst_v6: Ipv6Addr = "2409:8c1e::1".parse().unwrap();
+
+            // C1: Intra-batch IPv6 RST_A immediately followed by fast_reject SYN_B.
+            {
+                let a_connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let a_received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+                let a_notify = Arc::new(Notify::new());
+                let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+                outbounds.insert(
+                    "outbound-a".to_string(),
+                    Arc::new(RecordingTcpOutbound {
+                        name: "outbound-a",
+                        connects: Arc::clone(&a_connects),
+                        received: Arc::clone(&a_received),
+                        data_notify: Arc::clone(&a_notify),
+                    }),
+                );
+                let dns = Arc::new(
+                    crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+                );
+                let router = Arc::new(RwLock::new(Arc::new(
+                    Router::new(
+                        crate::config::RunMode::Rule,
+                        outbounds,
+                        &[],
+                        &[
+                            "SRC-IP-CIDR,fd00::10/128,outbound-a".to_string(),
+                            "SRC-IP-CIDR,fd00::20/128,DIRECT".to_string(),
+                            "MATCH,REJECT".to_string(),
+                        ],
+                        dns,
+                    )
+                    .unwrap(),
+                )));
+                let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<u8>>(64);
+                let hub = Arc::new(TelemetryHub::new());
+                let mut stack =
+                    TunSmoltcpStack::new(1500, egress_tx.clone(), SmolInstant::from_millis(0));
+                let ipv6_enabled = Arc::new(AtomicBool::new(true));
+                let shutting_down = Arc::new(AtomicBool::new(false));
+                let udp_sem = Arc::new(Semaphore::new(8));
+                let udp_nat = UdpNatManager::new(
+                    "test-tun-v6-rst-intra",
+                    16,
+                    Arc::clone(&hub),
+                    Arc::new(|_, _, _| {}),
+                );
+                let wake_notify = Arc::new(Notify::new());
+
+                handle_ingress_packet(
+                    build_ipv6_tcp_packet(
+                        (client_a_v6, 53001),
+                        (shared_dst_v6, 443),
+                        smoltcp::wire::TcpControl::Syn,
+                        1000,
+                        None,
+                        &[],
+                    ),
+                    &ipv6_enabled,
+                    false,
+                    &shutting_down,
+                    SmolInstant::from_millis(10),
+                    &mut stack,
+                    &egress_tx,
+                    &udp_sem,
+                    &udp_nat,
+                    &wake_notify,
+                    &router,
+                    &hub,
+                );
+                handle_ingress_packet(
+                    build_ipv6_tcp_packet(
+                        (client_a_v6, 53001),
+                        (shared_dst_v6, 443),
+                        smoltcp::wire::TcpControl::Rst,
+                        1001,
+                        None,
+                        &[],
+                    ),
+                    &ipv6_enabled,
+                    false,
+                    &shutting_down,
+                    SmolInstant::from_millis(11),
+                    &mut stack,
+                    &egress_tx,
+                    &udp_sem,
+                    &udp_nat,
+                    &wake_notify,
+                    &router,
+                    &hub,
+                );
+                handle_ingress_packet(
+                    build_ipv6_tcp_packet(
+                        (client_b_v6, 53002),
+                        (shared_dst_v6, 443),
+                        smoltcp::wire::TcpControl::Syn,
+                        2000,
+                        None,
+                        &[],
+                    ),
+                    &ipv6_enabled,
+                    false,
+                    &shutting_down,
+                    SmolInstant::from_millis(12),
+                    &mut stack,
+                    &egress_tx,
+                    &udp_sem,
+                    &udp_nat,
+                    &wake_notify,
+                    &router,
+                    &hub,
+                );
+
+                assert!(
+                    stack.flows.is_empty(),
+                    "Case C1: Client A flow must be reaped and fast-rejected Client B must not register any flow"
+                );
+                let mut client_b_got_rst_ack = false;
+                while let Ok(pkt) = egress_rx.try_recv() {
+                    let ip6 = Ipv6Packet::new_checked(&pkt).unwrap();
+                    let tcp = TcpPacket::new_checked(ip6.payload()).unwrap();
+                    if ip6.dst_addr() == client_b_v6
+                        && tcp.dst_port() == 53002
+                        && tcp.rst()
+                        && tcp.ack()
+                        && !tcp.syn()
+                    {
+                        client_b_got_rst_ack = true;
+                    }
+                }
+                assert!(
+                    client_b_got_rst_ack,
+                    "Case C1: fast-rejected IPv6 Client B must receive RST|ACK after Client A RST"
+                );
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(a_connects.load(Ordering::SeqCst), 0);
+                assert!(a_received.lock().is_empty());
+                let _ = udp_nat.shutdown();
+            }
+
+            // C2: Across polls via full `spawn_userspace_tun`.
+            {
+                let a_connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let a_received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+                let a_notify = Arc::new(Notify::new());
+                let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+                outbounds.insert(
+                    "outbound-a".to_string(),
+                    Arc::new(RecordingTcpOutbound {
+                        name: "outbound-a",
+                        connects: Arc::clone(&a_connects),
+                        received: Arc::clone(&a_received),
+                        data_notify: Arc::clone(&a_notify),
+                    }),
+                );
+                let dns = Arc::new(
+                    crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+                );
+                let router = Arc::new(
+                    Router::new(
+                        crate::config::RunMode::Rule,
+                        outbounds,
+                        &[],
+                        &[
+                            "SRC-IP-CIDR,fd00::10/128,outbound-a".to_string(),
+                            "SRC-IP-CIDR,fd00::20/128,DIRECT".to_string(),
+                            "MATCH,REJECT".to_string(),
+                        ],
+                        dns,
+                    )
+                    .unwrap(),
+                );
+                let hub = Arc::new(TelemetryHub::new());
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let (mut vtun, tun_task) =
+                    spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), hub, shutdown_rx);
+
+                vtun.ingress_tx
+                    .send(build_ipv6_tcp_packet(
+                        (client_a_v6, 54001),
+                        (shared_dst_v6, 443),
+                        smoltcp::wire::TcpControl::Syn,
+                        1000,
+                        None,
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+                let sa_a = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                    .await
+                    .expect("Case C2: Client A must receive SYN-ACK")
+                    .expect("egress IPv6 SYN-ACK");
+                let tcp_sa_a =
+                    TcpPacket::new_checked(Ipv6Packet::new_checked(&sa_a).unwrap().payload())
+                        .unwrap();
+                assert!(tcp_sa_a.syn() && tcp_sa_a.ack());
+
+                vtun.ingress_tx
+                    .send(build_ipv6_tcp_packet(
+                        (client_a_v6, 54001),
+                        (shared_dst_v6, 443),
+                        smoltcp::wire::TcpControl::Rst,
+                        1001,
+                        None,
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                vtun.ingress_tx
+                    .send(build_ipv6_tcp_packet(
+                        (client_b_v6, 54002),
+                        (shared_dst_v6, 443),
+                        smoltcp::wire::TcpControl::Syn,
+                        2000,
+                        None,
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+                let resp_b = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                    .await
+                    .expect("Case C2: fast-rejected IPv6 Client B must receive RST|ACK")
+                    .expect("egress IPv6 RST|ACK");
+                let ip6_b = Ipv6Packet::new_checked(&resp_b).unwrap();
+                let tcp_b = TcpPacket::new_checked(ip6_b.payload()).unwrap();
+                assert_eq!(ip6_b.dst_addr(), client_b_v6);
+                assert_eq!(tcp_b.dst_port(), 54002);
+                assert!(
+                    tcp_b.rst() && tcp_b.ack() && !tcp_b.syn(),
+                    "Case C2: expected RST|ACK for fast-rejected IPv6 Client B, got syn={} ack={} rst={}",
+                    tcp_b.syn(),
+                    tcp_b.ack(),
+                    tcp_b.rst()
+                );
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    a_connects.load(Ordering::SeqCst),
+                    0,
+                    "Case C2: outbound-a must receive 0 connections (0 hijack)"
+                );
+                assert!(a_received.lock().is_empty());
+
+                let _ = shutdown_tx.send(true);
+                let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+            }
+        }
     }
 }

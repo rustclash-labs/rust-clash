@@ -1107,7 +1107,8 @@ impl FakeIpDnsEngine {
     }
 
     /// Proactively warm or refresh `proxy_ip_cache` for a proxy server hostname when missing or `< 25s` TTL remains.
-    /// Preserves any still-usable positive entry if a proactive refresh encounters a transient network error.
+    /// Preserves any still-usable positive entry in-place so concurrent dials receive instant cache
+    /// hits and RFC 8767 `stale-if-error` fallback remains intact if upstream transiently fails.
     pub async fn prewarm_proxy_server_ips(&self, host: &str) -> Result<Vec<IpAddr>> {
         let want_ipv6 = self.direct_ipv6_enabled();
         let clean = host
@@ -1127,94 +1128,31 @@ impl FakeIpDnsEngine {
 
         let now = Instant::now();
         let now_wall = current_epoch_ms();
-        let fallback_entry = {
+        {
             let mut guard = self.proxy_ip_cache.lock();
-            match guard.get(&clean).cloned() {
-                Some(CachedIpResolution::Positive {
-                    expires_at,
-                    expires_wall_ms,
-                    stale_until,
-                    stale_until_wall_ms,
-                    ips,
-                }) => {
-                    if expires_at.saturating_duration_since(now) > Duration::from_secs(25)
-                        && expires_wall_ms.saturating_sub(now_wall) > 25_000
-                    {
-                        if want_ipv6 {
-                            return Ok(ips);
-                        }
-                        let v4_only: Vec<IpAddr> =
-                            ips.iter().copied().filter(IpAddr::is_ipv4).collect();
-                        if !v4_only.is_empty() {
-                            return Ok(v4_only);
-                        }
-                    }
-                    guard.pop(&clean);
-                    (stale_until > now && stale_until_wall_ms > now_wall).then_some((
-                        expires_at,
-                        expires_wall_ms,
-                        stale_until,
-                        stale_until_wall_ms,
-                        ips,
-                    ))
+            if let Some(CachedIpResolution::Positive {
+                expires_at,
+                expires_wall_ms,
+                ips,
+                ..
+            }) = guard.get(&clean).cloned()
+                && expires_at.saturating_duration_since(now) > Duration::from_secs(25)
+                && expires_wall_ms.saturating_sub(now_wall) > 25_000
+            {
+                if want_ipv6 {
+                    return Ok(ips);
                 }
-                Some(
-                    CachedIpResolution::Negative { .. }
-                    | CachedIpResolution::TransientFailure { .. },
-                ) => {
-                    guard.pop(&clean);
-                    None
+                let v4_only: Vec<IpAddr> = ips.iter().copied().filter(IpAddr::is_ipv4).collect();
+                if !v4_only.is_empty() {
+                    return Ok(v4_only);
                 }
-                None => None,
-            }
-        };
-
-        let start_epoch = self.current_cache_epoch();
-        match self.resolve_proxy_server_ips(host).await {
-            Ok(ips) => Ok(ips),
-            Err(e) => {
-                let now_after = Instant::now();
-                let now_wall_after = current_epoch_ms();
-                if let Some((expires_at, expires_wall_ms, stale_until, stale_until_wall_ms, ips)) =
-                    fallback_entry
-                    && now_after < stale_until
-                    && now_wall_after < stale_until_wall_ms
-                {
-                    let restored_expires = expires_at.max(
-                        (now_after + Duration::from_secs(STALE_IF_ERROR_GRACE_TTL_SECS))
-                            .min(stale_until),
-                    );
-                    let restored_expires_wall_ms = expires_wall_ms.max(
-                        now_wall_after
-                            .saturating_add(STALE_IF_ERROR_GRACE_TTL_SECS * 1_000)
-                            .min(stale_until_wall_ms),
-                    );
-                    let mut guard = self.proxy_ip_cache.lock();
-                    if self.cache_epoch.load(Ordering::Acquire) == start_epoch
-                        && !matches!(
-                            guard.peek(&clean),
-                            Some(
-                                CachedIpResolution::Positive { .. }
-                                    | CachedIpResolution::Negative { .. }
-                            )
-                        )
-                    {
-                        guard.put(
-                            clean,
-                            CachedIpResolution::Positive {
-                                expires_at: restored_expires,
-                                expires_wall_ms: restored_expires_wall_ms,
-                                stale_until,
-                                stale_until_wall_ms,
-                                ips: ips.clone(),
-                            },
-                        );
-                        return Ok(ips);
-                    }
-                }
-                Err(e)
             }
         }
+
+        // Do NOT pop the existing `Positive` entry before refreshing: pass `force_refresh = true`
+        // so upstream is queried while concurrent non-prewarm callers still hit the valid cache
+        // entry and `try_serve_stale_on_error` rescues transient upstream failures atomically.
+        self.resolve_proxy_server_ips_inner(host, true).await
     }
 
     #[inline]
@@ -1717,17 +1655,23 @@ impl FakeIpDnsEngine {
         now_wall_ms: u64,
     ) -> Option<Vec<IpAddr>> {
         let mut guard = cache.lock();
-        let (stale_until, stale_until_wall_ms, ips) = match guard.peek(normalized) {
-            Some(CachedIpResolution::Positive {
-                stale_until,
-                stale_until_wall_ms,
-                ips,
-                ..
-            }) if now < *stale_until && now_wall_ms < *stale_until_wall_ms => {
-                (*stale_until, *stale_until_wall_ms, ips.clone())
-            }
-            _ => return None,
-        };
+        let (expires_at, expires_wall_ms, stale_until, stale_until_wall_ms, ips) =
+            match guard.peek(normalized) {
+                Some(CachedIpResolution::Positive {
+                    expires_at,
+                    expires_wall_ms,
+                    stale_until,
+                    stale_until_wall_ms,
+                    ips,
+                }) if now < *stale_until && now_wall_ms < *stale_until_wall_ms => (
+                    *expires_at,
+                    *expires_wall_ms,
+                    *stale_until,
+                    *stale_until_wall_ms,
+                    ips.clone(),
+                ),
+                _ => return None,
+            };
         let usable = if want_ipv6 {
             ips.clone()
         } else {
@@ -1743,11 +1687,13 @@ impl FakeIpDnsEngine {
         if usable.is_empty() {
             return None;
         }
-        let grace_expires =
-            (now + Duration::from_secs(STALE_IF_ERROR_GRACE_TTL_SECS)).min(stale_until);
-        let grace_expires_wall_ms = now_wall_ms
-            .saturating_add(STALE_IF_ERROR_GRACE_TTL_SECS * 1_000)
-            .min(stale_until_wall_ms);
+        let grace_expires = expires_at
+            .max((now + Duration::from_secs(STALE_IF_ERROR_GRACE_TTL_SECS)).min(stale_until));
+        let grace_expires_wall_ms = expires_wall_ms.max(
+            now_wall_ms
+                .saturating_add(STALE_IF_ERROR_GRACE_TTL_SECS * 1_000)
+                .min(stale_until_wall_ms),
+        );
         guard.put(
             normalized.to_string(),
             CachedIpResolution::Positive {
@@ -2727,6 +2673,14 @@ impl FakeIpDnsEngine {
     /// 5. `nameserver` / `fallback` & `direct-nameserver`
     /// 6. `default-nameserver` -> OS fallback (while strictly rejecting Fake-IPs)
     pub async fn resolve_proxy_server_ips(&self, host: &str) -> Result<Vec<IpAddr>> {
+        self.resolve_proxy_server_ips_inner(host, false).await
+    }
+
+    async fn resolve_proxy_server_ips_inner(
+        &self,
+        host: &str,
+        force_refresh: bool,
+    ) -> Result<Vec<IpAddr>> {
         let want_ipv6 = self.direct_ipv6_enabled();
         let clean = host
             .trim()
@@ -2753,9 +2707,10 @@ impl FakeIpDnsEngine {
             return Ok(static_ips);
         }
 
-        if let Some(cached) = self
-            .lookup_cached_ips_paced(&self.proxy_ip_cache, &clean, want_ipv6, true)
-            .await
+        if !force_refresh
+            && let Some(cached) = self
+                .lookup_cached_ips_paced(&self.proxy_ip_cache, &clean, want_ipv6, true)
+                .await
         {
             self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
@@ -2774,8 +2729,9 @@ impl FakeIpDnsEngine {
                     return outcome;
                 }
                 start_epoch = self.current_cache_epoch();
-                if let Some(cached) =
-                    Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
+                if !force_refresh
+                    && let Some(cached) =
+                        Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
                 {
                     return cached;
                 }
@@ -2783,7 +2739,9 @@ impl FakeIpDnsEngine {
             }
         };
 
-        if let Some(cached) = Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
+        if !force_refresh
+            && let Some(cached) =
+                Self::lookup_cached_ips(&self.proxy_ip_cache, &clean, want_ipv6, true)
         {
             if let Some(g) = inflight_guard {
                 g.finish(&cached);
@@ -2824,12 +2782,14 @@ impl FakeIpDnsEngine {
                         CachedIpResolution::new_negative(ttl, is_nx),
                     );
                 } else {
-                    if let Some(stale_ips) = Self::try_serve_stale_on_error(
-                        &self.proxy_ip_cache,
-                        &clean,
-                        want_ipv6,
-                        true,
-                    ) {
+                    if self.current_cache_epoch() == start_epoch
+                        && let Some(stale_ips) = Self::try_serve_stale_on_error(
+                            &self.proxy_ip_cache,
+                            &clean,
+                            want_ipv6,
+                            true,
+                        )
+                    {
                         self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(stale_ips);
                     }
@@ -2864,12 +2824,14 @@ impl FakeIpDnsEngine {
                         CachedIpResolution::new_negative(ttl, is_nx),
                     );
                 } else {
-                    if let Some(stale_ips) = Self::try_serve_stale_on_error(
-                        &self.proxy_ip_cache,
-                        &clean,
-                        want_ipv6,
-                        true,
-                    ) {
+                    if self.current_cache_epoch() == start_epoch
+                        && let Some(stale_ips) = Self::try_serve_stale_on_error(
+                            &self.proxy_ip_cache,
+                            &clean,
+                            want_ipv6,
+                            true,
+                        )
+                    {
                         self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(stale_ips);
                     }
@@ -2903,12 +2865,14 @@ impl FakeIpDnsEngine {
                         CachedIpResolution::new_negative(ttl, is_nx),
                     );
                 } else {
-                    if let Some(stale_ips) = Self::try_serve_stale_on_error(
-                        &self.proxy_ip_cache,
-                        &clean,
-                        want_ipv6,
-                        true,
-                    ) {
+                    if self.current_cache_epoch() == start_epoch
+                        && let Some(stale_ips) = Self::try_serve_stale_on_error(
+                            &self.proxy_ip_cache,
+                            &clean,
+                            want_ipv6,
+                            true,
+                        )
+                    {
                         self.resolver_cache_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(stale_ips);
                     }
@@ -2977,6 +2941,7 @@ impl FakeIpDnsEngine {
                     Some(CachedIpResolution::Negative { .. })
                 );
                 if !authoritative_neg
+                    && self.current_cache_epoch() == start_epoch
                     && let Some(stale_ips) = Self::try_serve_stale_on_error(
                         &self.proxy_ip_cache,
                         &clean,
@@ -3503,10 +3468,10 @@ async fn handle_local_tcp_dns_conn(
             _ => break,
         };
         let mut req = vec![0u8; len];
-        if tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut req))
-            .await
-            .is_err()
-        {
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut req)).await,
+            Ok(Ok(_))
+        ) {
             break;
         }
         let resp = engine.handle_dns_packet(&req).await?;
@@ -3516,10 +3481,10 @@ async fn handle_local_tcp_dns_conn(
         let mut out = BytesMut::with_capacity(2 + resp.len());
         out.put_u16(resp.len() as u16);
         out.put_slice(&resp);
-        if tokio::time::timeout(Duration::from_secs(5), stream.write_all(&out))
-            .await
-            .is_err()
-        {
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), stream.write_all(&out)).await,
+            Ok(Ok(_))
+        ) {
             break;
         }
     }
@@ -5685,5 +5650,234 @@ dns:
         task_a.abort();
         task_b.abort();
         task_pub.abort();
+    }
+
+    #[tokio::test]
+    async fn local_tcp_dns_server_breaks_cleanly_on_truncated_frame_eof_without_bogus_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let engine = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tcp_addr, server_jh) = Arc::clone(&engine)
+            .spawn_tcp_server("127.0.0.1:0", shutdown_rx)
+            .await
+            .unwrap();
+
+        // Send a 2-byte length prefix claiming 50 bytes, followed by only 4 bytes and immediate FIN.
+        // The server must treat `Ok(Err(UnexpectedEof))` from `timeout(..., read_exact)` as EOF
+        // and close cleanly with zero response bytes (never feeding zero-padded garbage to handle_dns_packet).
+        {
+            let mut client = TcpStream::connect(tcp_addr).await.unwrap();
+            let mut truncated = Vec::with_capacity(6);
+            truncated.extend_from_slice(&50u16.to_be_bytes());
+            truncated.extend_from_slice(&[0x12, 0x34, 0x01, 0x00]);
+            client.write_all(&truncated).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let mut resp = Vec::new();
+            let read_n =
+                tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut resp))
+                    .await
+                    .expect("TCP DNS server must close promptly after truncated frame EOF")
+                    .unwrap();
+            assert_eq!(
+                read_n, 0,
+                "truncated TCP DNS frame must produce zero response bytes, got: {resp:?}"
+            );
+            assert!(resp.is_empty());
+            assert_eq!(engine.entry_count(), 0);
+        }
+
+        // Verify a well-formed TCP DNS query on a subsequent connection still works normally.
+        {
+            let mut client = TcpStream::connect(tcp_addr).await.unwrap();
+            let q = build_dns_query(0x7788, "valid-tcp.example.com", QTYPE_A);
+            client.write_u16(q.len() as u16).await.unwrap();
+            client.write_all(&q).await.unwrap();
+            let resp_len = tokio::time::timeout(Duration::from_secs(2), client.read_u16())
+                .await
+                .unwrap()
+                .unwrap() as usize;
+            let mut resp = vec![0u8; resp_len];
+            client.read_exact(&mut resp).await.unwrap();
+            assert_eq!(dns_response_rcode(&resp).unwrap(), 0);
+            assert_eq!(extract_ip_answers(&resp).unwrap().len(), 1);
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server_jh).await;
+    }
+
+    #[tokio::test]
+    async fn prewarm_proxy_server_ips_preserves_positive_cache_for_concurrent_dials_and_stale_if_error()
+     {
+        let upstream_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+
+        let (q1_arrived_tx, q1_arrived_rx) = tokio::sync::oneshot::channel::<()>();
+        let (q1_release_tx, q1_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let q1_arrived = Arc::new(Mutex::new(Some(q1_arrived_tx)));
+        let q1_release = Arc::new(tokio::sync::Mutex::new(Some(q1_release_rx)));
+
+        let (q2_arrived_tx, q2_arrived_rx) = tokio::sync::oneshot::channel::<()>();
+        let (q2_release_tx, q2_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let q2_arrived = Arc::new(Mutex::new(Some(q2_arrived_tx)));
+        let q2_release = Arc::new(tokio::sync::Mutex::new(Some(q2_release_rx)));
+
+        let srv_sock = Arc::clone(&upstream_sock);
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = srv_sock.recv_from(&mut buf).await {
+                let req = buf[..n].to_vec();
+                let Ok(parsed) = DnsQueryPacket::parse(&req) else {
+                    continue;
+                };
+                let qname = parsed.question.name.to_ascii_lowercase();
+                let sock_tx = Arc::clone(&srv_sock);
+                let arr1 = Arc::clone(&q1_arrived);
+                let rel1 = Arc::clone(&q1_release);
+                let arr2 = Arc::clone(&q2_arrived);
+                let rel2 = Arc::clone(&q2_release);
+                tokio::spawn(async move {
+                    if qname == "hk01.example.com" {
+                        if let Some(tx) = arr1.lock().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = rel1.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    } else if qname == "hk02.example.com" {
+                        if let Some(tx) = arr2.lock().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = rel2.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    // Transient upstream failure (`SERVFAIL`, rcode = 2)
+                    let servfail = parsed.build_response(&req, 2, 0, &[]);
+                    let _ = sock_tx.send_to(&servfail, peer).await;
+                });
+            }
+        });
+
+        let cfg = DnsConfig {
+            enable: true,
+            ipv6: false,
+            enhanced_mode: "fake-ip".to_string(),
+            proxy_server_nameserver: vec![upstream_addr.to_string()],
+            ..DnsConfig::default()
+        };
+        let engine = Arc::new(FakeIpDnsEngine::new(&cfg).unwrap());
+
+        let cached_ip_1 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55));
+        let cached_ip_2 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 66));
+        let now = Instant::now();
+        let now_wall = current_epoch_ms();
+
+        // Case 1: Positive entry with ~10s TTL remaining (< 25s prewarm threshold).
+        engine.proxy_ip_cache.lock().put(
+            "hk01.example.com".to_string(),
+            CachedIpResolution::Positive {
+                expires_at: now + Duration::from_secs(10),
+                expires_wall_ms: now_wall + 10_000,
+                stale_until: now + Duration::from_secs(1810),
+                stale_until_wall_ms: now_wall + 1_810_000,
+                ips: vec![cached_ip_1],
+            },
+        );
+
+        let eng_prewarm = Arc::clone(&engine);
+        let prewarm_task = tokio::spawn(async move {
+            eng_prewarm
+                .prewarm_proxy_server_ips("hk01.example.com")
+                .await
+        });
+
+        // Wait until `prewarm_proxy_server_ips` is actively in-flight against the failing upstream.
+        tokio::time::timeout(Duration::from_secs(2), q1_arrived_rx)
+            .await
+            .expect("prewarm must query upstream when <25s TTL remains")
+            .unwrap();
+
+        // While prewarm is in-flight, a concurrent business dial gets an INSTANT cache hit because
+        // `prewarm_proxy_server_ips` did NOT pop the valid `Positive` entry!
+        let concurrent_dial = tokio::time::timeout(
+            Duration::from_millis(200),
+            engine.resolve_proxy_server_ips("hk01.example.com"),
+        )
+        .await
+        .expect("concurrent resolve_proxy_server_ips must hit intact Positive cache without blocking on prewarm")
+        .expect("concurrent dial must succeed with cached IP");
+        assert_eq!(concurrent_dial, vec![cached_ip_1]);
+
+        // Now release upstream `SERVFAIL`: prewarm must ALSO succeed via intact `stale-if-error`
+        // without caching `TransientFailure`!
+        let _ = q1_release_tx.send(());
+        let prewarm_res = tokio::time::timeout(Duration::from_secs(2), prewarm_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("prewarm must serve intact Positive entry on transient upstream failure");
+        assert_eq!(prewarm_res, vec![cached_ip_1]);
+
+        // Verify the cache entry is STILL a valid unexpired `Positive` entry (never popped or poisoned).
+        {
+            let guard = engine.proxy_ip_cache.lock();
+            match guard.peek("hk01.example.com") {
+                Some(CachedIpResolution::Positive {
+                    expires_at, ips, ..
+                }) => {
+                    assert_eq!(ips, &vec![cached_ip_1]);
+                    assert!(*expires_at > Instant::now());
+                }
+                other => panic!("expected intact Positive cache entry, got: {other:?}"),
+            }
+        }
+
+        // Case 2: Positive entry whose TTL just expired (still within stale-if-error window).
+        // Concurrent `prewarm_proxy_server_ips` + `resolve_proxy_server_ips` coalesce onto the
+        // same in-flight lookup, and BOTH must succeed via `try_serve_stale_on_error` when upstream fails!
+        engine.proxy_ip_cache.lock().put(
+            "hk02.example.com".to_string(),
+            CachedIpResolution::Positive {
+                expires_at: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+                expires_wall_ms: now_wall.saturating_sub(1_000),
+                stale_until: now + Duration::from_secs(1800),
+                stale_until_wall_ms: now_wall + 1_800_000,
+                ips: vec![cached_ip_2],
+            },
+        );
+
+        let eng_p2 = Arc::clone(&engine);
+        let p2_task =
+            tokio::spawn(async move { eng_p2.prewarm_proxy_server_ips("hk02.example.com").await });
+        tokio::time::timeout(Duration::from_secs(2), q2_arrived_rx)
+            .await
+            .expect("expired prewarm must query upstream")
+            .unwrap();
+
+        let eng_r2 = Arc::clone(&engine);
+        let r2_task =
+            tokio::spawn(async move { eng_r2.resolve_proxy_server_ips("hk02.example.com").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = q2_release_tx.send(());
+
+        let p2_res = tokio::time::timeout(Duration::from_secs(2), p2_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("expired prewarm must rescue stale Positive entry on SERVFAIL");
+        let r2_res = tokio::time::timeout(Duration::from_secs(2), r2_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect(
+                "coalesced concurrent resolve must ALSO receive stale Positive entry on SERVFAIL",
+            );
+        assert_eq!(p2_res, vec![cached_ip_2]);
+        assert_eq!(r2_res, vec![cached_ip_2]);
+
+        srv_task.abort();
     }
 }

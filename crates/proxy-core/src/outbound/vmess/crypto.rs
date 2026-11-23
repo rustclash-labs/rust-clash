@@ -714,6 +714,10 @@ impl VmessChunkCodec {
         !self.chunk_stream && matches!(self.aead, ChunkAeadKind::None)
     }
 
+    pub fn has_pending_chunk(&self) -> bool {
+        self.pending_chunk.is_some()
+    }
+
     fn next_nonce(&mut self) -> Nonce {
         let mut n = [0u8; 12];
         n[..2].copy_from_slice(&self.count.to_be_bytes());
@@ -815,6 +819,12 @@ impl VmessChunkCodec {
                     ));
                 }
                 let data_len = unmasked - pad;
+                if !matches!(self.aead, ChunkAeadKind::None) && data_len < VMESS_AEAD_TAG_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "VMess AEAD chunk shorter than 16-byte tag",
+                    ));
+                }
                 let _ = src.split_to(2);
                 self.pending_chunk = Some((data_len, pad));
                 (data_len, pad)
@@ -831,11 +841,10 @@ impl VmessChunkCodec {
             let _ = src.split_to(pad_len);
         }
 
-        if data_len == 0 {
-            return Ok(Some(None));
-        }
-
         if matches!(self.aead, ChunkAeadKind::None) {
+            if data_len == 0 {
+                return Ok(Some(None));
+            }
             Ok(Some(Some(chunk_body.to_vec())))
         } else {
             if chunk_body.len() < VMESS_AEAD_TAG_LEN {
@@ -942,5 +951,94 @@ mod tests {
                 assert!(eof.is_none());
             }
         }
+    }
+
+    #[test]
+    fn aead_rejects_forged_zero_len_while_accepting_authenticated_eof_and_none_zero_eof() {
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+
+        // 1. AEAD modes (both AES-128-GCM and ChaCha20-Poly1305) MUST reject forged data_len == 0
+        //    (both unmasked and masked+padded) with InvalidData, and ONLY accept authenticated
+        //    16-byte tag EOF chunks from `encode_eof_chunk`.
+        for sec in [VMESS_SEC_AES_128_GCM, VMESS_SEC_CHACHA20_POLY1305] {
+            for option in [
+                VMESS_OPT_CHUNK_STREAM,
+                VMESS_OPT_CHUNK_STREAM | VMESS_OPT_CHUNK_MASKING,
+                VMESS_OPT_CHUNK_STREAM | VMESS_OPT_CHUNK_MASKING | VMESS_OPT_GLOBAL_PADDING,
+            ] {
+                // Build a forged `data_len == 0` wire frame matching the decoder's Shake128 stream.
+                let mut shake = ShakeMaskStream::new(&iv);
+                let pad_len = if (option & VMESS_OPT_GLOBAL_PADDING) != 0 {
+                    (shake.next_u16() % 64) as usize
+                } else {
+                    0
+                };
+                let unmasked_len = pad_len as u16; // data_len = 0
+                let wire_len = if (option & VMESS_OPT_CHUNK_MASKING) != 0 {
+                    unmasked_len ^ shake.next_u16()
+                } else {
+                    unmasked_len
+                };
+
+                let mut forged = BytesMut::new();
+                forged.put_u16(wire_len);
+                forged.put_bytes(0xAA, pad_len);
+
+                let mut dec = VmessChunkCodec::new(&key, &iv, sec, option).unwrap();
+                let err = dec
+                    .try_decode_chunk(&mut forged)
+                    .expect_err("forged data_len == 0 in AEAD mode must be rejected");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+                // Genuine `encode_eof_chunk` (16-byte AEAD tag) must decode to clean EOF `Ok(Some(None))`.
+                let mut enc = VmessChunkCodec::new(&key, &iv, sec, option).unwrap();
+                let mut dec_valid = VmessChunkCodec::new(&key, &iv, sec, option).unwrap();
+                let mut eof_wire = BytesMut::new();
+                enc.encode_eof_chunk(&mut eof_wire).unwrap();
+                assert!(eof_wire.len() >= 2 + VMESS_AEAD_TAG_LEN);
+                let decoded = dec_valid.try_decode_chunk(&mut eof_wire).unwrap().unwrap();
+                assert!(decoded.is_none());
+                assert!(!dec_valid.has_pending_chunk());
+            }
+        }
+
+        // 2. `ChunkAeadKind::None` chunk stream MUST still accept `data_len == 0` as clean EOF.
+        let mut dec_none =
+            VmessChunkCodec::new(&key, &iv, VMESS_SEC_NONE, VMESS_OPT_CHUNK_STREAM).unwrap();
+        let mut zero_eof = BytesMut::from(&[0x00u8, 0x00u8][..]);
+        let decoded = dec_none.try_decode_chunk(&mut zero_eof).unwrap().unwrap();
+        assert!(decoded.is_none());
+
+        // 3. `has_pending_chunk()` accurately tracks mid-chunk state even when wire buffer is empty.
+        let mut enc = VmessChunkCodec::new(
+            &key,
+            &iv,
+            VMESS_SEC_AES_128_GCM,
+            VMESS_OPT_CHUNK_STREAM | VMESS_OPT_CHUNK_MASKING,
+        )
+        .unwrap();
+        let mut dec = VmessChunkCodec::new(
+            &key,
+            &iv,
+            VMESS_SEC_AES_128_GCM,
+            VMESS_OPT_CHUNK_STREAM | VMESS_OPT_CHUNK_MASKING,
+        )
+        .unwrap();
+        let mut full = BytesMut::new();
+        enc.encode_chunk(b"payload-bytes", &mut full).unwrap();
+
+        assert!(!dec.has_pending_chunk());
+        let mut hdr_only = full.split_to(2);
+        assert!(dec.try_decode_chunk(&mut hdr_only).unwrap().is_none());
+        assert!(hdr_only.is_empty());
+        assert!(
+            dec.has_pending_chunk(),
+            "after consuming 2-byte chunk length header, has_pending_chunk() must be true"
+        );
+
+        let decoded = dec.try_decode_chunk(&mut full).unwrap().unwrap().unwrap();
+        assert_eq!(decoded, b"payload-bytes");
+        assert!(!dec.has_pending_chunk());
     }
 }

@@ -8,10 +8,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
     sync::{Mutex as AsyncMutex, mpsc},
 };
 
@@ -127,43 +127,142 @@ pub async fn read_uot_v2_request<R: AsyncRead + Unpin>(
     Ok((is_connect, destination))
 }
 
-struct UotWriteHalf {
-    wr: WriteHalf<AnyTlsStream>,
+/// Parse a single complete `sing/common/uot` packet frame (`uot.AddrParser + u16 len + payload`)
+/// from `buf` without consuming ANY bytes until the entire frame is buffered.
+///
+/// Advances `buf` by `total_len` only once the complete frame is decoded, guaranteeing
+/// cancel-safety when driven by an `AsyncReadExt::read_buf` loop.
+pub fn try_parse_uot_frame(buf: &mut BytesMut) -> io::Result<Option<(Vec<u8>, TargetAddr)>> {
+    let slice = buf.as_ref();
+    if slice.is_empty() {
+        return Ok(None);
+    }
+
+    let (src_addr, addr_len) = match slice[0] {
+        UOT_AF_IPV4 => {
+            const LEN: usize = 1 + 4 + 2;
+            if slice.len() < LEN {
+                return Ok(None);
+            }
+            let octets = [slice[1], slice[2], slice[3], slice[4]];
+            let port = u16::from_be_bytes([slice[5], slice[6]]);
+            (
+                TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::from(octets)), port),
+                LEN,
+            )
+        }
+        UOT_AF_IPV6 => {
+            const LEN: usize = 1 + 16 + 2;
+            if slice.len() < LEN {
+                return Ok(None);
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&slice[1..17]);
+            let port = u16::from_be_bytes([slice[17], slice[18]]);
+            (
+                TargetAddr::new_ip(IpAddr::V6(Ipv6Addr::from(octets)), port),
+                LEN,
+            )
+        }
+        UOT_AF_FQDN => {
+            if slice.len() < 2 {
+                return Ok(None);
+            }
+            let domain_len = slice[1] as usize;
+            if domain_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty UoT FQDN length",
+                ));
+            }
+            let addr_len = 2 + domain_len + 2;
+            if slice.len() < addr_len {
+                return Ok(None);
+            }
+            let domain = std::str::from_utf8(&slice[2..2 + domain_len]).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in UoT FQDN")
+            })?;
+            let port = u16::from_be_bytes([slice[2 + domain_len], slice[2 + domain_len + 1]]);
+            let addr = if let Ok(ip) = domain.parse::<IpAddr>() {
+                TargetAddr::new_ip(ip, port)
+            } else {
+                TargetAddr::new_domain(domain, port)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            };
+            (addr, addr_len)
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected UoT address family byte 0x{other:02x}"),
+            ));
+        }
+    };
+
+    if slice.len() < addr_len + 2 {
+        return Ok(None);
+    }
+    let payload_len = u16::from_be_bytes([slice[addr_len], slice[addr_len + 1]]) as usize;
+    let total_len = addr_len + 2 + payload_len;
+    if slice.len() < total_len {
+        return Ok(None);
+    }
+
+    let payload = slice[addr_len + 2..total_len].to_vec();
+    buf.advance(total_len);
+    Ok(Some((payload, src_addr)))
+}
+
+struct UotWriteHalf<S> {
+    wr: WriteHalf<S>,
     header_sent: bool,
 }
 
-/// Persistent multi-destination `OutboundUdpSession` multiplexed over AnyTLS v2 using `sing/common/uot` v2 (`isConnect = 0`).
-pub struct AnyTlsUdpSession {
-    writer: AsyncMutex<UotWriteHalf>,
-    reader: AsyncMutex<ReadHalf<AnyTlsStream>>,
+struct UotReadHalf<S> {
+    rd: ReadHalf<S>,
+    buf: BytesMut,
 }
 
-impl AnyTlsUdpSession {
-    pub fn new(stream: AnyTlsStream) -> Self {
+/// Persistent multi-destination `OutboundUdpSession` multiplexed over AnyTLS v2 using `sing/common/uot` v2 (`isConnect = 0`).
+pub struct AnyTlsUdpSession<S = AnyTlsStream> {
+    writer: AsyncMutex<UotWriteHalf<S>>,
+    reader: AsyncMutex<UotReadHalf<S>>,
+}
+
+impl<S: AsyncRead + AsyncWrite> AnyTlsUdpSession<S> {
+    pub fn new(stream: S) -> Self {
         let (rd, wr) = tokio::io::split(stream);
         Self {
             writer: AsyncMutex::new(UotWriteHalf {
                 wr,
                 header_sent: false,
             }),
-            reader: AsyncMutex::new(rd),
+            reader: AsyncMutex::new(UotReadHalf {
+                rd,
+                buf: BytesMut::with_capacity(4096),
+            }),
         }
     }
 
-    pub fn new_pre_initialized(stream: AnyTlsStream) -> Self {
+    pub fn new_pre_initialized(stream: S) -> Self {
         let (rd, wr) = tokio::io::split(stream);
         Self {
             writer: AsyncMutex::new(UotWriteHalf {
                 wr,
                 header_sent: true,
             }),
-            reader: AsyncMutex::new(rd),
+            reader: AsyncMutex::new(UotReadHalf {
+                rd,
+                buf: BytesMut::with_capacity(4096),
+            }),
         }
     }
 }
 
 #[async_trait]
-impl OutboundUdpSession for AnyTlsUdpSession {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundUdpSession
+    for AnyTlsUdpSession<S>
+{
     async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
         if payload.len() > u16::MAX as usize {
             return Err(io::Error::new(
@@ -187,12 +286,20 @@ impl OutboundUdpSession for AnyTlsUdpSession {
     }
 
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
-        let mut rd = self.reader.lock().await;
-        let src_addr = read_uot_addr(&mut *rd).await?;
-        let len = rd.read_u16().await? as usize;
-        let mut data = vec![0u8; len];
-        rd.read_exact(&mut data).await?;
-        Ok((data, src_addr))
+        let mut guard = self.reader.lock().await;
+        loop {
+            if let Some(pkt) = try_parse_uot_frame(&mut guard.buf)? {
+                return Ok(pkt);
+            }
+            let UotReadHalf { rd, buf } = &mut *guard;
+            let n = rd.read_buf(buf).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "AnyTLS UoT stream closed",
+                ));
+            }
+        }
     }
 }
 
@@ -330,5 +437,125 @@ pub async fn handle_uot_server_stream(
 
     if writers_clone.remove(&sid).is_some() {
         let _ = tx_clone.send(Frame::empty(Command::Fin, sid));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_uot_frame(addr: &TargetAddr, payload: &[u8]) -> BytesMut {
+        let mut frame = BytesMut::with_capacity(32 + payload.len());
+        encode_uot_addr(addr, &mut frame).expect("encode_uot_addr");
+        frame.put_u16(payload.len() as u16);
+        frame.put_slice(payload);
+        frame
+    }
+
+    #[tokio::test]
+    async fn recv_from_is_cancel_safe_across_byte_by_byte_drip_and_timeouts() {
+        let (client, mut server) = tokio::io::duplex(256);
+        let sess = AnyTlsUdpSession::new_pre_initialized(client);
+
+        let cases = [
+            (
+                TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+                b"ipv4-uot-payload-0123456789".to_vec(),
+            ),
+            (
+                TargetAddr::new_ip(IpAddr::V6("2606:4700:4700::1111".parse().unwrap()), 443),
+                b"ipv6-uot-payload".to_vec(),
+            ),
+            (
+                TargetAddr::new_domain("dns.google", 853).unwrap(),
+                b"fqdn-uot-payload-cancel-safe".to_vec(),
+            ),
+            (
+                TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+                Vec::new(),
+            ),
+        ];
+
+        for (expected_addr, expected_payload) in &cases {
+            let wire = build_uot_frame(expected_addr, expected_payload);
+            assert!(wire.len() >= 9);
+
+            // Drip every byte except the final one, cancelling `recv_from()` after EACH byte
+            // (mid-ATYP, mid-address, mid-port, mid-u16-length, and mid-payload).
+            for byte in &wire[..wire.len() - 1] {
+                server.write_all(&[*byte]).await.unwrap();
+                let res = tokio::time::timeout(Duration::from_millis(1), sess.recv_from()).await;
+                assert!(
+                    res.is_err(),
+                    "incomplete UoT frame must time out and remain buffered without corruption"
+                );
+            }
+
+            // Deliver the final byte and verify the intact frame is returned.
+            server.write_all(&[*wire.last().unwrap()]).await.unwrap();
+            let (got_payload, got_addr) =
+                tokio::time::timeout(Duration::from_secs(1), sess.recv_from())
+                    .await
+                    .expect("complete UoT frame should arrive promptly")
+                    .expect("complete UoT frame must decode cleanly");
+            assert_eq!(got_addr, *expected_addr);
+            assert_eq!(got_payload, *expected_payload);
+        }
+
+        // Verify two pipelined frames written in a single burst are both returned in order.
+        let mut combined = build_uot_frame(&cases[0].0, b"first-burst");
+        combined.extend_from_slice(&build_uot_frame(&cases[2].0, b"second-burst"));
+        server.write_all(&combined).await.unwrap();
+
+        let (p1, a1) = sess.recv_from().await.unwrap();
+        let (p2, a2) = sess.recv_from().await.unwrap();
+        assert_eq!((p1, a1), (b"first-burst".to_vec(), cases[0].0.clone()));
+        assert_eq!((p2, a2), (b"second-burst".to_vec(), cases[2].0.clone()));
+
+        // Verify truncated frame followed by EOF returns `UnexpectedEof`.
+        server.write_all(&[UOT_AF_IPV4, 1, 2]).await.unwrap();
+        drop(server);
+        let err = sess
+            .recv_from()
+            .await
+            .expect_err("EOF on truncated UoT stream must return UnexpectedEof");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn try_parse_uot_frame_validates_errors_and_preserves_partial_bytes() {
+        let addr = TargetAddr::new_domain("example.com", 443).unwrap();
+        let full = build_uot_frame(&addr, b"hello");
+
+        // Partial prefixes must return `Ok(None)` without advancing/mutating `buf`.
+        for prefix_len in 0..full.len() {
+            let mut buf = BytesMut::from(&full[..prefix_len]);
+            assert!(try_parse_uot_frame(&mut buf).unwrap().is_none());
+            assert_eq!(buf.len(), prefix_len);
+        }
+
+        // Complete buffer consumes exact frame length.
+        let mut buf = full.clone();
+        buf.extend_from_slice(b"trailing");
+        let (payload, parsed_addr) = try_parse_uot_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(payload, b"hello");
+        assert_eq!(parsed_addr, addr);
+        assert_eq!(&buf[..], b"trailing");
+
+        // Invalid address family byte.
+        let mut bad_af = BytesMut::from(&[0x99u8, 1, 2, 3][..]);
+        let err = try_parse_uot_frame(&mut bad_af).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Empty FQDN length == 0.
+        let mut empty_fqdn = BytesMut::from(&[UOT_AF_FQDN, 0x00, 0x00, 0x35, 0x00, 0x00][..]);
+        let err = try_parse_uot_frame(&mut empty_fqdn).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Invalid UTF-8 in FQDN.
+        let mut bad_utf8 =
+            BytesMut::from(&[UOT_AF_FQDN, 0x02, 0xff, 0xfe, 0x00, 0x35, 0x00, 0x00][..]);
+        let err = try_parse_uot_frame(&mut bad_utf8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
