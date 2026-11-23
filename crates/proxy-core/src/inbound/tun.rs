@@ -256,12 +256,337 @@ fn fold_min_delay(acc: Option<Duration>, candidate: Duration) -> Option<Duration
     })
 }
 
+fn create_tun_smoltcp_iface(device: &mut VirtualIpDevice, now: SmolInstant) -> Interface {
+    let mut iface_cfg = IfaceConfig::new(smoltcp::wire::HardwareAddress::Ip);
+    iface_cfg.random_seed = rand::random();
+    let gw_v4 = Ipv4Address::new(198, 18, 0, 1);
+    let gw_v6 = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+    let mut iface = Interface::new(iface_cfg, device, now);
+    iface.set_any_ip(true);
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(gw_v4), 0));
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(gw_v6), 0));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gw_v4);
+    let _ = iface.routes_mut().add_default_ipv6_route(gw_v6);
+    iface
+}
+
+/// Self-healing userspace `smoltcp` TCP/IP state owned by the TUN event loop.
+/// Isolates unexpected panics inside `smoltcp` via `catch_unwind` and rebuilds the
+/// userspace `Interface` + `SocketSet` in-place while keeping the OS TUN session,
+/// routes, DNS hijack, and UDP NAT completely alive.
+struct TunSmoltcpStack {
+    device: VirtualIpDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    flows: HashMap<FourTuple, BridgeFlow>,
+    panic_recoveries: u64,
+}
+
+impl TunSmoltcpStack {
+    fn new(mtu: usize, egress_tx: mpsc::Sender<Vec<u8>>, now: SmolInstant) -> Self {
+        let mut device = VirtualIpDevice {
+            mtu: mtu.clamp(1280, 65535),
+            rx_queue: VecDeque::with_capacity(512),
+            tx_sender: egress_tx,
+        };
+        let iface = create_tun_smoltcp_iface(&mut device, now);
+        Self {
+            device,
+            iface,
+            sockets: SocketSet::new(vec![]),
+            flows: HashMap::new(),
+            panic_recoveries: 0,
+        }
+    }
+
+    fn rebuild_after_panic(
+        &mut self,
+        stage: &str,
+        panic_msg: &str,
+        now: SmolInstant,
+        hub: &TelemetryHub,
+    ) {
+        self.panic_recoveries = self.panic_recoveries.saturating_add(1);
+        let active_flows = self.flows.len();
+        let queued_rx = self.device.rx_queue.len();
+        let safe_msg = crate::platform::crash_log::sanitize_crash_text(panic_msg);
+
+        tracing::error!(
+            stage,
+            recovery_count = self.panic_recoveries,
+            active_flows,
+            queued_rx,
+            panic = %safe_msg,
+            "Isolated panic in smoltcp TUN stack; rebuilding userspace Interface and SocketSet"
+        );
+        hub.push_log(
+            "error",
+            format!(
+                "[TUN] Isolated smoltcp panic at {stage} (recovery #{}, active_flows={active_flows}, queued_rx={queued_rx}): {safe_msg}; rebuilt userspace TCP stack",
+                self.panic_recoveries
+            ),
+        );
+
+        for (_, flow) in self.flows.drain() {
+            flow.task_abort.abort();
+        }
+        self.device.rx_queue.clear();
+
+        let old_sockets = std::mem::replace(&mut self.sockets, SocketSet::new(vec![]));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            drop(old_sockets);
+        }));
+
+        let fresh_iface = create_tun_smoltcp_iface(&mut self.device, now);
+        let old_iface = std::mem::replace(&mut self.iface, fresh_iface);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            drop(old_iface);
+        }));
+    }
+
+    fn run_guarded<R, F>(
+        &mut self,
+        stage: &str,
+        now: SmolInstant,
+        hub: &TelemetryHub,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(val) => Some(val),
+            Err(payload) => {
+                let msg = crate::platform::crash_log::extract_panic_payload(payload.as_ref());
+                self.rebuild_after_panic(stage, &msg, now, hub);
+                None
+            }
+        }
+    }
+
+    fn poll_guarded(&mut self, stage: &str, now: SmolInstant, hub: &TelemetryHub) -> bool {
+        self.run_guarded(stage, now, hub, |s| {
+            let _ = s.iface.poll(now, &mut s.device, &mut s.sockets);
+        })
+        .is_some()
+    }
+
+    fn remove_finished_flows(
+        &mut self,
+        finished_keys: Vec<FourTuple>,
+        now: SmolInstant,
+        hub: &TelemetryHub,
+    ) -> bool {
+        if finished_keys.is_empty() {
+            return true;
+        }
+        self.run_guarded("sockets.remove", now, hub, |s| {
+            for k in finished_keys {
+                if let Some(flow) = s.flows.remove(&k) {
+                    if !flow.established {
+                        flow.task_abort.abort();
+                    }
+                    s.sockets.remove(flow.handle);
+                }
+            }
+        })
+        .is_some()
+    }
+}
+
+struct SingleFlowStep {
+    finished: bool,
+    has_backpressured_rx: bool,
+    has_more_ready_rx: bool,
+}
+
+fn step_single_tun_flow(
+    sock: &mut tcp::Socket<'static>,
+    flow: &mut BridgeFlow,
+    now: Instant,
+    now_wall: u64,
+) -> SingleFlowStep {
+    // If outbound dial or REJECT rule failed, immediately emit TCP RST and reap!
+    if flow.remote_failed.load(Ordering::Acquire) {
+        sock.abort();
+        return SingleFlowStep {
+            finished: true,
+            has_backpressured_rx: false,
+            has_more_ready_rx: false,
+        };
+    }
+
+    if matches!(
+        sock.state(),
+        tcp::State::Established | tcp::State::CloseWait
+    ) {
+        flow.established = true;
+    }
+
+    let mut has_backpressured_rx = false;
+    let mut has_more_ready_rx = false;
+
+    // Read client bytes from smoltcp ONLY when `to_remote_tx` has bounded capacity,
+    // preserving TCP receive-window backpressure inside `smoltcp`'s 64 KiB RX buffer!
+    if sock.can_recv() {
+        if let Some(tx) = &flow.to_remote_tx {
+            let mut drained_bytes = 0usize;
+            while sock.can_recv() && drained_bytes < 32 * 1024 {
+                match tx.try_reserve() {
+                    Ok(permit) => {
+                        let mut chunk = Vec::with_capacity(32 * 1024);
+                        let _ = sock.recv(|data| {
+                            let take = data.len().min(32 * 1024 - drained_bytes);
+                            chunk.extend_from_slice(&data[..take]);
+                            (take, ())
+                        });
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        drained_bytes += chunk.len();
+                        flow.last_active = now;
+                        flow.last_active_wall_ms = now_wall;
+                        permit.send(chunk);
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        has_backpressured_rx = true;
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        sock.abort();
+                        return SingleFlowStep {
+                            finished: true,
+                            has_backpressured_rx: false,
+                            has_more_ready_rx: false,
+                        };
+                    }
+                }
+            }
+            if sock.can_recv() && tx.capacity() > 0 {
+                has_more_ready_rx = true;
+            }
+        } else {
+            while sock.can_recv() {
+                let _ = sock.recv(|data| (data.len(), ()));
+            }
+        }
+    }
+    if !sock.can_recv() && flow.established && !sock.may_recv() && flow.to_remote_tx.is_some() {
+        flow.to_remote_tx.take();
+    }
+
+    // Flush any buffered bytes from remote outbound -> smoltcp TX buffer
+    if !flow.pending_tx.is_empty() && sock.can_send() {
+        let sent = sock.send_slice(&flow.pending_tx).unwrap_or(0);
+        if sent > 0 {
+            flow.last_active = now;
+            flow.last_active_wall_ms = now_wall;
+            flow.pending_tx.advance(sent);
+        }
+    }
+
+    // Read remote outbound bytes -> feed into smoltcp TX buffer
+    while flow.pending_tx.is_empty() && sock.can_send() {
+        match flow.from_remote_rx.try_recv() {
+            Ok(data) => {
+                let sent = sock.send_slice(&data).unwrap_or(0);
+                if sent > 0 {
+                    flow.last_active = now;
+                    flow.last_active_wall_ms = now_wall;
+                }
+                if sent < data.len() {
+                    flow.pending_tx.extend_from_slice(&data[sent..]);
+                    break;
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                if !flow.remote_eof {
+                    flow.remote_eof = true;
+                    flow.fin_started_at.get_or_insert(now);
+                    flow.fin_started_wall_ms.get_or_insert(now_wall);
+                    sock.close();
+                }
+                break;
+            }
+        }
+    }
+
+    // Signal `flow_task` when outbound connect exceeds 15s (monotonic or wall-clock)
+    // so `ConnectionGuard::record_failed` records the exact dial timeout before RST.
+    let _ = flow.notify_dial_timeout_if_needed(now, now_wall);
+
+    // Enforce SYN handshake timeout, hard dial backstop, half-close linger timeout,
+    // and idle timeout using both monotonic `Instant` and wall-clock epoch ms
+    // (for Android deep sleep).
+    if flow.is_timed_out(now, now_wall, sock.send_queue()) {
+        flow.task_abort.abort();
+        sock.abort();
+        return SingleFlowStep {
+            finished: true,
+            has_backpressured_rx,
+            has_more_ready_rx,
+        };
+    }
+
+    let finished = (flow.established && !sock.is_active())
+        || sock.state() == tcp::State::Closed
+        || sock.state() == tcp::State::TimeWait;
+
+    SingleFlowStep {
+        finished,
+        has_backpressured_rx,
+        has_more_ready_rx,
+    }
+}
+
+fn step_single_tun_flow_guarded<F>(
+    tuple: FourTuple,
+    flow: &mut BridgeFlow,
+    hub: &TelemetryHub,
+    f: F,
+) -> SingleFlowStep
+where
+    F: FnOnce(&mut BridgeFlow) -> SingleFlowStep,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(flow))) {
+        Ok(step) => step,
+        Err(payload) => {
+            let msg = crate::platform::crash_log::sanitize_crash_text(
+                &crate::platform::crash_log::extract_panic_payload(payload.as_ref()),
+            );
+            tracing::error!(
+                src = %tuple.src,
+                dst = %tuple.dst,
+                panic = %msg,
+                "Isolated panic in single TUN TCP flow; aborting and reaping flow"
+            );
+            hub.push_log(
+                "error",
+                format!(
+                    "[TUN] Isolated panic in TCP flow {} -> {}: {msg}; resetting flow",
+                    tuple.src, tuple.dst
+                ),
+            );
+            flow.task_abort.abort();
+            SingleFlowStep {
+                finished: true,
+                has_backpressured_rx: false,
+                has_more_ready_rx: false,
+            }
+        }
+    }
+}
+
 /// Spawn the `smoltcp` userspace `any_ip` transparent TUN stack with:
 /// - Event-driven `iface.poll_delay()` + `Notify` wakeups (0 Hz idle polling when inactive!)
 /// - Bounded ingress/egress/per-flow channels and TCP window backpressure
 /// - IPv4 & IPv6 `any:53` Fake-IP DNS hijack
 /// - Stateful multi-datagram IPv4 & IPv6 UDP NAT (`UdpNatManager`) for QUIC/HTTP3/WebRTC
 /// - TCP half-close, immediate `RST` on outbound/REJECT failure, and SYN/idle/linger timeouts
+/// - `catch_unwind` panic isolation around `smoltcp` polling and per-flow handling
 pub fn spawn_userspace_tun(
     mtu: usize,
     router: Arc<RwLock<Arc<Router>>>,
@@ -299,30 +624,10 @@ pub fn spawn_userspace_tun_with_options(
     let (egress_tx, egress_rx) = mpsc::channel::<Vec<u8>>(TUN_PACKET_QUEUE_CAPACITY);
 
     let task = tokio::spawn(async move {
-        let mut device = VirtualIpDevice {
-            mtu: mtu.clamp(1280, 65535),
-            rx_queue: VecDeque::with_capacity(512),
-            tx_sender: egress_tx.clone(),
-        };
-
-        let mut iface_cfg = IfaceConfig::new(smoltcp::wire::HardwareAddress::Ip);
-        iface_cfg.random_seed = rand::random();
         let boot = Instant::now();
         let now_smol = || SmolInstant::from_micros(boot.elapsed().as_micros() as i64);
 
-        let gw_v4 = Ipv4Address::new(198, 18, 0, 1);
-        let gw_v6 = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
-        let mut iface = Interface::new(iface_cfg, &mut device, now_smol());
-        iface.set_any_ip(true);
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(gw_v4), 0));
-            let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(gw_v6), 0));
-        });
-        let _ = iface.routes_mut().add_default_ipv4_route(gw_v4);
-        let _ = iface.routes_mut().add_default_ipv6_route(gw_v6);
-
-        let mut sockets = SocketSet::new(vec![]);
-        let mut flows: HashMap<FourTuple, BridgeFlow> = HashMap::new();
+        let mut stack = TunSmoltcpStack::new(mtu, egress_tx.clone(), now_smol());
         let udp_sem = Arc::new(Semaphore::new(MAX_TUN_UDP_INFLIGHT));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let wake_notify = Arc::new(Notify::new());
@@ -355,10 +660,10 @@ pub fn spawn_userspace_tun_with_options(
             }
 
             if next_delay == Some(Duration::ZERO) {
-                if device.tx_sender.is_closed() {
+                if stack.device.tx_sender.is_closed() {
                     break;
                 }
-                if device.tx_sender.capacity() == 0 {
+                if stack.device.tx_sender.capacity() == 0 {
                     consecutive_zero_delays = 0;
                     tokio::select! {
                         biased;
@@ -367,7 +672,7 @@ pub fn spawn_userspace_tun_with_options(
                                 break;
                             }
                         }
-                        res = device.tx_sender.reserve() => {
+                        res = stack.device.tx_sender.reserve() => {
                             if res.is_err() {
                                 break;
                             }
@@ -397,41 +702,56 @@ pub fn spawn_userspace_tun_with_options(
                         let Some(pkt) = maybe_pkt else {
                             break;
                         };
-                        handle_ingress_packet(
-                            pkt,
-                            &ipv6_enabled,
-                            drop_self_pid,
-                            &shutting_down,
-                            &mut device,
-                            &mut sockets,
-                            &mut flows,
-                            &egress_tx,
-                            &udp_sem,
-                            &udp_nat,
-                            &wake_notify,
-                            &router,
-                            &hub,
-                        );
+                        let ts_in = now_smol();
+                        let _ = stack.run_guarded("ingress_packet", ts_in, &hub, |s| {
+                            handle_ingress_packet(
+                                pkt,
+                                &ipv6_enabled,
+                                drop_self_pid,
+                                &shutting_down,
+                                &mut s.device,
+                                &mut s.sockets,
+                                &mut s.flows,
+                                &egress_tx,
+                                &udp_sem,
+                                &udp_nat,
+                                &wake_notify,
+                                &router,
+                                &hub,
+                            );
+                        });
                         for _ in 0..256 {
-                            if *shutdown.borrow() || device.rx_queue.len() >= TUN_DEVICE_RX_MAX_PACKETS {
+                            if *shutdown.borrow()
+                                || stack.device.rx_queue.len() >= TUN_DEVICE_RX_MAX_PACKETS
+                            {
                                 break;
                             }
                             match ingress_rx.try_recv() {
-                                Ok(more) => handle_ingress_packet(
-                                    more,
-                                    &ipv6_enabled,
-                                    drop_self_pid,
-                                    &shutting_down,
-                                    &mut device,
-                                    &mut sockets,
-                                    &mut flows,
-                                    &egress_tx,
-                                    &udp_sem,
-                                    &udp_nat,
-                                    &wake_notify,
-                                    &router,
-                                    &hub,
-                                ),
+                                Ok(more) => {
+                                    let ts_more = now_smol();
+                                    let ok = stack
+                                        .run_guarded("ingress_packet", ts_more, &hub, |s| {
+                                            handle_ingress_packet(
+                                                more,
+                                                &ipv6_enabled,
+                                                drop_self_pid,
+                                                &shutting_down,
+                                                &mut s.device,
+                                                &mut s.sockets,
+                                                &mut s.flows,
+                                                &egress_tx,
+                                                &udp_sem,
+                                                &udp_nat,
+                                                &wake_notify,
+                                                &router,
+                                                &hub,
+                                            );
+                                        })
+                                        .is_some();
+                                    if !ok {
+                                        break;
+                                    }
+                                }
                                 Err(_) => break,
                             }
                         }
@@ -447,7 +767,10 @@ pub fn spawn_userspace_tun_with_options(
             }
 
             let ts = now_smol();
-            let _ = iface.poll(ts, &mut device, &mut sockets);
+            if !stack.poll_guarded("iface.poll.pre", ts, &hub) {
+                next_delay = None;
+                continue;
+            }
 
             let now = Instant::now();
             let now_wall = TelemetryHub::now_ms();
@@ -455,247 +778,147 @@ pub fn spawn_userspace_tun_with_options(
             let mut has_backpressured_rx = false;
             let mut has_more_ready_rx = false;
 
-            for (tuple, flow) in flows.iter_mut() {
-                let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
-
-                // If outbound dial or REJECT rule failed, immediately emit TCP RST and reap!
-                if flow.remote_failed.load(Ordering::Acquire) {
-                    sock.abort();
-                    finished_keys.push(*tuple);
-                    continue;
-                }
-
-                if matches!(
-                    sock.state(),
-                    tcp::State::Established | tcp::State::CloseWait
-                ) {
-                    flow.established = true;
-                }
-
-                // Read client bytes from smoltcp ONLY when `to_remote_tx` has bounded capacity,
-                // preserving TCP receive-window backpressure inside `smoltcp`'s 64 KiB RX buffer!
-                if sock.can_recv() {
-                    if let Some(tx) = &flow.to_remote_tx {
-                        let mut aborted = false;
-                        let mut drained_bytes = 0usize;
-                        while sock.can_recv() && drained_bytes < 32 * 1024 {
-                            match tx.try_reserve() {
-                                Ok(permit) => {
-                                    let mut chunk = Vec::with_capacity(32 * 1024);
-                                    let _ = sock.recv(|data| {
-                                        let take = data.len().min(32 * 1024 - drained_bytes);
-                                        chunk.extend_from_slice(&data[..take]);
-                                        (take, ())
-                                    });
-                                    if chunk.is_empty() {
-                                        break;
-                                    }
-                                    drained_bytes += chunk.len();
-                                    flow.last_active = now;
-                                    flow.last_active_wall_ms = now_wall;
-                                    permit.send(chunk);
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    has_backpressured_rx = true;
-                                    break;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    sock.abort();
-                                    finished_keys.push(*tuple);
-                                    aborted = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if aborted {
-                            continue;
-                        }
-                        if sock.can_recv() && tx.capacity() > 0 {
-                            has_more_ready_rx = true;
-                        }
-                    } else {
-                        while sock.can_recv() {
-                            let _ = sock.recv(|data| (data.len(), ()));
-                        }
+            {
+                let sockets = &mut stack.sockets;
+                for (tuple, flow) in stack.flows.iter_mut() {
+                    let step = step_single_tun_flow_guarded(*tuple, flow, &hub, |flow| {
+                        let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
+                        step_single_tun_flow(sock, flow, now, now_wall)
+                    });
+                    has_backpressured_rx |= step.has_backpressured_rx;
+                    has_more_ready_rx |= step.has_more_ready_rx;
+                    if step.finished {
+                        finished_keys.push(*tuple);
                     }
-                }
-                if !sock.can_recv()
-                    && flow.established
-                    && !sock.may_recv()
-                    && flow.to_remote_tx.is_some()
-                {
-                    flow.to_remote_tx.take();
-                }
-
-                // Flush any buffered bytes from remote outbound -> smoltcp TX buffer
-                if !flow.pending_tx.is_empty() && sock.can_send() {
-                    let sent = sock.send_slice(&flow.pending_tx).unwrap_or(0);
-                    if sent > 0 {
-                        flow.last_active = now;
-                        flow.last_active_wall_ms = now_wall;
-                        flow.pending_tx.advance(sent);
-                    }
-                }
-
-                // Read remote outbound bytes -> feed into smoltcp TX buffer
-                while flow.pending_tx.is_empty() && sock.can_send() {
-                    match flow.from_remote_rx.try_recv() {
-                        Ok(data) => {
-                            let sent = sock.send_slice(&data).unwrap_or(0);
-                            if sent > 0 {
-                                flow.last_active = now;
-                                flow.last_active_wall_ms = now_wall;
-                            }
-                            if sent < data.len() {
-                                flow.pending_tx.extend_from_slice(&data[sent..]);
-                                break;
-                            }
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            if !flow.remote_eof {
-                                flow.remote_eof = true;
-                                flow.fin_started_at.get_or_insert(now);
-                                flow.fin_started_wall_ms.get_or_insert(now_wall);
-                                sock.close();
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                // Signal `flow_task` when outbound connect exceeds 15s (monotonic or wall-clock)
-                // so `ConnectionGuard::record_failed` records the exact dial timeout before RST.
-                let _ = flow.notify_dial_timeout_if_needed(now, now_wall);
-
-                // Enforce SYN handshake timeout, hard dial backstop, half-close linger timeout,
-                // and idle timeout using both monotonic `Instant` and wall-clock epoch ms
-                // (for Android deep sleep).
-                if flow.is_timed_out(now, now_wall, sock.send_queue()) {
-                    flow.task_abort.abort();
-                    sock.abort();
-                    finished_keys.push(*tuple);
-                    continue;
-                }
-
-                if (flow.established && !sock.is_active())
-                    || sock.state() == tcp::State::Closed
-                    || sock.state() == tcp::State::TimeWait
-                {
-                    finished_keys.push(*tuple);
                 }
             }
 
-            for k in finished_keys {
-                if let Some(flow) = flows.remove(&k) {
-                    if !flow.established {
-                        flow.task_abort.abort();
-                    }
-                    sockets.remove(flow.handle);
-                }
+            if !stack.remove_finished_flows(finished_keys, now_smol(), &hub) {
+                next_delay = None;
+                continue;
             }
 
             // Flush any segments (SYN-ACK, PSH, FIN, or RST) queued above immediately!
             let ts_after = now_smol();
-            let _ = iface.poll(ts_after, &mut device, &mut sockets);
+            if !stack.poll_guarded("iface.poll.post", ts_after, &hub) {
+                next_delay = None;
+                continue;
+            }
 
             // Compute exact event-driven next sleep deadline (`None` = 0 Hz pure idle wait!)
-            next_delay = iface
-                .poll_delay(ts_after, &sockets)
-                .map(|d| Duration::from_micros(d.total_micros()));
+            let Some(computed_delay) =
+                stack.run_guarded("schedule_next_delay", ts_after, &hub, |s| {
+                    let mut delay = s
+                        .iface
+                        .poll_delay(ts_after, &s.sockets)
+                        .map(|d| Duration::from_micros(d.total_micros()));
 
-            if !device.rx_queue.is_empty() || has_more_ready_rx {
-                next_delay = Some(Duration::ZERO);
-            } else {
-                if has_backpressured_rx {
-                    next_delay = fold_min_delay(next_delay, Duration::from_millis(5));
-                }
-                let check_now = Instant::now();
-                let check_now_wall = TelemetryHub::now_ms();
-                for flow in flows.values() {
-                    let remote_connected = flow.remote_connected.load(Ordering::Acquire);
-                    if !flow.established || !remote_connected {
-                        let (rem_mono, rem_wall) = if !flow.established {
-                            (
-                                TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(
-                                    check_now.saturating_duration_since(flow.created_at),
-                                ),
-                                TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(Duration::from_millis(
-                                    check_now_wall.saturating_sub(flow.created_wall_ms),
-                                )),
-                            )
-                        } else if let Some((notified_mono, notified_wall_ms)) =
-                            flow.dial_timeout_notified_at
-                        {
-                            (
-                                OUTBOUND_CONNECT_HARD_REAP_GRACE.saturating_sub(
-                                    check_now.saturating_duration_since(notified_mono),
-                                ),
-                                OUTBOUND_CONNECT_HARD_REAP_GRACE.saturating_sub(
-                                    Duration::from_millis(
-                                        check_now_wall.saturating_sub(notified_wall_ms),
+                    if !s.device.rx_queue.is_empty() || has_more_ready_rx {
+                        return Some(Duration::ZERO);
+                    }
+
+                    if has_backpressured_rx {
+                        delay = fold_min_delay(delay, Duration::from_millis(5));
+                    }
+                    let check_now = Instant::now();
+                    let check_now_wall = TelemetryHub::now_ms();
+                    for flow in s.flows.values() {
+                        let remote_connected = flow.remote_connected.load(Ordering::Acquire);
+                        if !flow.established || !remote_connected {
+                            let (rem_mono, rem_wall) = if !flow.established {
+                                (
+                                    TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(
+                                        check_now.saturating_duration_since(flow.created_at),
                                     ),
-                                ),
-                            )
-                        } else {
-                            (
-                                OUTBOUND_CONNECT_TIMEOUT.saturating_sub(
-                                    check_now.saturating_duration_since(flow.created_at),
-                                ),
-                                OUTBOUND_CONNECT_TIMEOUT.saturating_sub(Duration::from_millis(
-                                    check_now_wall.saturating_sub(flow.created_wall_ms),
-                                )),
-                            )
-                        };
-                        next_delay = fold_min_delay(
-                            next_delay,
-                            rem_mono.min(rem_wall).max(Duration::from_millis(1)),
-                        );
-                    }
-                    if remote_connected {
-                        let rem_idle_mono = TCP_IDLE_TIMEOUT
-                            .saturating_sub(check_now.saturating_duration_since(flow.last_active));
-                        let rem_idle_wall = TCP_IDLE_TIMEOUT.saturating_sub(Duration::from_millis(
-                            check_now_wall.saturating_sub(flow.last_active_wall_ms),
-                        ));
-                        next_delay = fold_min_delay(
-                            next_delay,
-                            rem_idle_mono
-                                .min(rem_idle_wall)
-                                .max(Duration::from_millis(1)),
-                        );
-                    }
-                    if let Some(fin_t) = flow.fin_started_at {
-                        let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
-                        if flow.pending_tx.is_empty() && sock.send_queue() == 0 {
-                            let mut rem_fin_age = TCP_HALF_CLOSE_TIMEOUT
-                                .saturating_sub(check_now.duration_since(fin_t));
-                            if let Some(fin_w) = flow.fin_started_wall_ms {
-                                let rem_fin_wall = TCP_HALF_CLOSE_TIMEOUT.saturating_sub(
-                                    Duration::from_millis(check_now_wall.saturating_sub(fin_w)),
-                                );
-                                rem_fin_age = rem_fin_age.min(rem_fin_wall);
-                            }
-                            let rem_fin_idle_mono = TCP_HALF_CLOSE_TIMEOUT
-                                .saturating_sub(check_now.duration_since(flow.last_active));
-                            let rem_fin_idle_wall =
-                                TCP_HALF_CLOSE_TIMEOUT.saturating_sub(Duration::from_millis(
+                                    TCP_SYN_HANDSHAKE_TIMEOUT.saturating_sub(
+                                        Duration::from_millis(
+                                            check_now_wall.saturating_sub(flow.created_wall_ms),
+                                        ),
+                                    ),
+                                )
+                            } else if let Some((notified_mono, notified_wall_ms)) =
+                                flow.dial_timeout_notified_at
+                            {
+                                (
+                                    OUTBOUND_CONNECT_HARD_REAP_GRACE.saturating_sub(
+                                        check_now.saturating_duration_since(notified_mono),
+                                    ),
+                                    OUTBOUND_CONNECT_HARD_REAP_GRACE.saturating_sub(
+                                        Duration::from_millis(
+                                            check_now_wall.saturating_sub(notified_wall_ms),
+                                        ),
+                                    ),
+                                )
+                            } else {
+                                (
+                                    OUTBOUND_CONNECT_TIMEOUT.saturating_sub(
+                                        check_now.saturating_duration_since(flow.created_at),
+                                    ),
+                                    OUTBOUND_CONNECT_TIMEOUT.saturating_sub(Duration::from_millis(
+                                        check_now_wall.saturating_sub(flow.created_wall_ms),
+                                    )),
+                                )
+                            };
+                            delay = fold_min_delay(
+                                delay,
+                                rem_mono.min(rem_wall).max(Duration::from_millis(1)),
+                            );
+                        }
+                        if remote_connected {
+                            let rem_idle_mono = TCP_IDLE_TIMEOUT.saturating_sub(
+                                check_now.saturating_duration_since(flow.last_active),
+                            );
+                            let rem_idle_wall =
+                                TCP_IDLE_TIMEOUT.saturating_sub(Duration::from_millis(
                                     check_now_wall.saturating_sub(flow.last_active_wall_ms),
                                 ));
-                            let rem_fin = rem_fin_age.max(rem_fin_idle_mono.min(rem_fin_idle_wall));
-                            next_delay =
-                                fold_min_delay(next_delay, rem_fin.max(Duration::from_millis(1)));
+                            delay = fold_min_delay(
+                                delay,
+                                rem_idle_mono
+                                    .min(rem_idle_wall)
+                                    .max(Duration::from_millis(1)),
+                            );
+                        }
+                        if let Some(fin_t) = flow.fin_started_at {
+                            let sock = s.sockets.get_mut::<tcp::Socket>(flow.handle);
+                            if flow.pending_tx.is_empty() && sock.send_queue() == 0 {
+                                let mut rem_fin_age = TCP_HALF_CLOSE_TIMEOUT
+                                    .saturating_sub(check_now.duration_since(fin_t));
+                                if let Some(fin_w) = flow.fin_started_wall_ms {
+                                    let rem_fin_wall = TCP_HALF_CLOSE_TIMEOUT.saturating_sub(
+                                        Duration::from_millis(check_now_wall.saturating_sub(fin_w)),
+                                    );
+                                    rem_fin_age = rem_fin_age.min(rem_fin_wall);
+                                }
+                                let rem_fin_idle_mono = TCP_HALF_CLOSE_TIMEOUT
+                                    .saturating_sub(check_now.duration_since(flow.last_active));
+                                let rem_fin_idle_wall =
+                                    TCP_HALF_CLOSE_TIMEOUT.saturating_sub(Duration::from_millis(
+                                        check_now_wall.saturating_sub(flow.last_active_wall_ms),
+                                    ));
+                                let rem_fin =
+                                    rem_fin_age.max(rem_fin_idle_mono.min(rem_fin_idle_wall));
+                                delay =
+                                    fold_min_delay(delay, rem_fin.max(Duration::from_millis(1)));
+                            }
                         }
                     }
-                }
-            }
+                    delay
+                })
+            else {
+                next_delay = None;
+                continue;
+            };
+            next_delay = computed_delay;
         }
 
         shutting_down.store(true, Ordering::Release);
         udp_sem.close();
-        for (_, flow) in flows.drain() {
+        for (_, flow) in stack.flows.drain() {
             flow.task_abort.abort();
-            sockets.remove(flow.handle);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stack.sockets.remove(flow.handle);
+            }));
         }
         let _ = udp_nat.shutdown();
     });
@@ -1431,6 +1654,7 @@ fn register_syn_flow(
         let tracked = conn_guard.into_tracked_stream(outbound);
         let (mut rd, mut wr) = tokio::io::split(tracked);
 
+        let wake_wr = Arc::clone(&wake_task);
         let writer_fut = async move {
             let drain_and_shutdown = async {
                 // If an initial payload was prefetched while recovering an unmapped Fake-IP,
@@ -1438,7 +1662,7 @@ fn register_syn_flow(
                 // to 15ms for 0-RTT proxy framing before flushing pending proxy headers.
                 let mut client_eof = false;
                 if let Some(first_chunk) = prefetched_first_payload {
-                    if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx)
+                    if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx, &wake_wr)
                         .await
                         .is_err()
                     {
@@ -1448,9 +1672,14 @@ fn register_syn_flow(
                     match tokio::time::timeout(Duration::from_millis(15), to_remote_rx.recv()).await
                     {
                         Ok(Some(first_chunk)) => {
-                            if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx)
-                                .await
-                                .is_err()
+                            if write_payload_batch(
+                                &mut wr,
+                                &first_chunk,
+                                &mut to_remote_rx,
+                                &wake_wr,
+                            )
+                            .await
+                            .is_err()
                             {
                                 return;
                             }
@@ -1470,7 +1699,7 @@ fn register_syn_flow(
                 }
                 if !client_eof {
                     while let Some(first_chunk) = to_remote_rx.recv().await {
-                        if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx)
+                        if write_payload_batch(&mut wr, &first_chunk, &mut to_remote_rx, &wake_wr)
                             .await
                             .is_err()
                         {
@@ -1604,10 +1833,13 @@ async fn write_payload_batch<W: AsyncWriteExt + Unpin>(
     wr: &mut W,
     first_chunk: &[u8],
     to_remote_rx: &mut mpsc::Receiver<Vec<u8>>,
+    wake_notify: &Notify,
 ) -> io::Result<()> {
     wr.write_all(first_chunk).await?;
+    wake_notify.notify_one();
     while let Ok(more) = to_remote_rx.try_recv() {
         wr.write_all(&more).await?;
+        wake_notify.notify_one();
     }
     wr.flush().await
 }
@@ -3517,5 +3749,329 @@ mod tests {
         );
         let _ = sd_tx_b.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), task_b).await;
+    }
+
+    #[tokio::test]
+    async fn tun_smoltcp_stack_panic_isolation_recovers_and_logs_without_aborting() {
+        let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<u8>>(64);
+        let hub = Arc::new(TelemetryHub::new());
+        let mut stack = TunSmoltcpStack::new(1500, egress_tx, SmolInstant::from_millis(0));
+
+        // Seed an active TCP socket, BridgeFlow with a live dummy task, and queued ingress packet
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]);
+        let handle = stack.sockets.add(tcp::Socket::new(rx_buf, tx_buf));
+        let dummy_task = tokio::spawn(std::future::pending::<()>());
+        let dummy_abort = dummy_task.abort_handle();
+        let (to_tx, _to_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_from_tx, from_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_closed_tx, closed_rx) = watch::channel(());
+        let tuple = FourTuple {
+            src: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 40001),
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 10)), 443),
+        };
+        let now = Instant::now();
+        let now_wall = TelemetryHub::now_ms();
+        stack.flows.insert(
+            tuple,
+            BridgeFlow {
+                handle,
+                established: true,
+                remote_connected: Arc::new(AtomicBool::new(true)),
+                dial_timeout_notify: Arc::new(Notify::new()),
+                dial_timeout_notified_at: None,
+                created_at: now,
+                created_wall_ms: now_wall,
+                last_active: now,
+                last_active_wall_ms: now_wall,
+                fin_started_at: None,
+                fin_started_wall_ms: None,
+                pending_tx: BytesMut::new(),
+                from_remote_rx: from_rx,
+                to_remote_tx: Some(to_tx),
+                _bridge_closed_rx: closed_rx,
+                remote_eof: false,
+                remote_failed: Arc::new(AtomicBool::new(false)),
+                task_abort: dummy_abort,
+            },
+        );
+        stack.device.rx_queue.push_back(vec![0x45; 40]);
+
+        // Inject a smoltcp-style panic inside the guarded boundary
+        let res: Option<()> =
+            stack.run_guarded("iface.poll.pre", SmolInstant::from_millis(10), &hub, |_| {
+                panic!("attempt to subtract sequence numbers with underflow");
+            });
+
+        assert!(
+            res.is_none(),
+            "run_guarded must catch injected panic and return None instead of terminating"
+        );
+        assert_eq!(stack.panic_recoveries, 1);
+        assert!(
+            stack.flows.is_empty(),
+            "active flows must be drained on stack rebuild"
+        );
+        assert!(
+            stack.device.rx_queue.is_empty(),
+            "queued ingress packets must be cleared on stack rebuild"
+        );
+        assert!(
+            dummy_task.await.unwrap_err().is_cancelled(),
+            "orphaned flow task must be aborted during stack rebuild"
+        );
+
+        let logs = hub.recent_logs();
+        assert!(
+            logs.iter().any(|entry| {
+                entry.level == "error"
+                    && entry.payload.contains("iface.poll.pre")
+                    && entry
+                        .payload
+                        .contains("attempt to subtract sequence numbers with underflow")
+            }),
+            "TelemetryHub must record diagnostic error log for caught smoltcp panic: {logs:?}"
+        );
+
+        // Verify the rebuilt Interface + SocketSet handles a fresh TCP SYN cleanly
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]),
+            tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]),
+        );
+        sock.listen(IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(Ipv4Addr::new(93, 184, 216, 34))),
+            port: 443,
+        })
+        .unwrap();
+        let _fresh_handle = stack.sockets.add(sock);
+        stack.device.rx_queue.push_back(build_ipv4_tcp_packet(
+            (Ipv4Addr::new(10, 0, 0, 2), 51234),
+            (Ipv4Addr::new(93, 184, 216, 34), 443),
+            smoltcp::wire::TcpControl::Syn,
+            1000,
+            None,
+            &[],
+        ));
+        assert!(stack.poll_guarded(
+            "iface.poll.post_recovery",
+            SmolInstant::from_millis(20),
+            &hub
+        ));
+
+        let syn_ack = egress_rx
+            .try_recv()
+            .expect("rebuilt smoltcp Interface must emit SYN-ACK for subsequent TCP connections");
+        let ip4 = Ipv4Packet::new_checked(&syn_ack).unwrap();
+        let tcp_pkt = TcpPacket::new_checked(ip4.payload()).unwrap();
+        assert!(tcp_pkt.syn() && tcp_pkt.ack());
+    }
+
+    #[tokio::test]
+    async fn tun_single_flow_panic_isolation_records_redacted_error_and_reaps_faulty_flow() {
+        let hub = Arc::new(TelemetryHub::new());
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 4096]),
+            tcp::SocketBuffer::new(vec![0u8; 4096]),
+        ));
+        let flow_task = tokio::spawn(std::future::pending::<()>());
+        let (to_tx, _to_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_from_tx, from_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_closed_tx, closed_rx) = watch::channel(());
+        let now = Instant::now();
+        let now_wall = TelemetryHub::now_ms();
+        let mut flow = BridgeFlow {
+            handle,
+            established: true,
+            remote_connected: Arc::new(AtomicBool::new(true)),
+            dial_timeout_notify: Arc::new(Notify::new()),
+            dial_timeout_notified_at: None,
+            created_at: now,
+            created_wall_ms: now_wall,
+            last_active: now,
+            last_active_wall_ms: now_wall,
+            fin_started_at: None,
+            fin_started_wall_ms: None,
+            pending_tx: BytesMut::new(),
+            from_remote_rx: from_rx,
+            to_remote_tx: Some(to_tx),
+            _bridge_closed_rx: closed_rx,
+            remote_eof: false,
+            remote_failed: Arc::new(AtomicBool::new(false)),
+            task_abort: flow_task.abort_handle(),
+        };
+        let tuple = FourTuple {
+            src: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 42222),
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
+        };
+
+        let step = step_single_tun_flow_guarded(tuple, &mut flow, &hub, |_| {
+            panic!("simulated flow panic with token=SUPERSECRET123");
+        });
+
+        assert!(
+            step.finished,
+            "panicked flow must be marked finished for reaping"
+        );
+        assert!(
+            flow_task.await.unwrap_err().is_cancelled(),
+            "panicked flow task must be aborted"
+        );
+        let logs = hub.recent_logs();
+        let err_log = logs
+            .iter()
+            .find(|e| e.level == "error" && e.payload.contains("Isolated panic in TCP flow"))
+            .expect("error log must be recorded for isolated single-flow panic");
+        assert!(
+            !err_log.payload.contains("SUPERSECRET123"),
+            "panic diagnostic log must redact sensitive tokens: {}",
+            err_log.payload
+        );
+    }
+
+    #[test]
+    fn smoltcp_64kib_window_scale_odd_bytes_and_zero_window_fin_never_underflows() {
+        let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<u8>>(256);
+        let hub = Arc::new(TelemetryHub::new());
+        let mut stack = TunSmoltcpStack::new(1500, egress_tx, SmolInstant::from_millis(0));
+
+        let client = (Ipv4Addr::new(10, 0, 0, 2), 55111u16);
+        let server = (Ipv4Addr::new(93, 184, 216, 34), 443u16);
+
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]),
+            tcp::SocketBuffer::new(vec![0u8; TUN_TCP_SOCKET_BUF_SIZE]),
+        );
+        sock.set_nagle_enabled(false);
+        sock.listen(IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(server.0)),
+            port: server.1,
+        })
+        .unwrap();
+        let handle = stack.sockets.add(sock);
+
+        let build_scaled_tcp = |control: smoltcp::wire::TcpControl,
+                                seq: i32,
+                                ack: Option<i32>,
+                                window_scale: Option<u8>,
+                                payload: &[u8]| {
+            let caps = ChecksumCapabilities::default();
+            let is_syn = control == smoltcp::wire::TcpControl::Syn;
+            let tcp_repr = smoltcp::wire::TcpRepr {
+                src_port: client.1,
+                dst_port: server.1,
+                control,
+                seq_number: smoltcp::wire::TcpSeqNumber(seq),
+                ack_number: ack.map(smoltcp::wire::TcpSeqNumber),
+                window_len: 65535,
+                window_scale,
+                max_seg_size: is_syn.then_some(1460),
+                sack_permitted: is_syn,
+                sack_ranges: [None, None, None],
+                timestamp: None,
+                payload,
+            };
+            let ip_repr = Ipv4Repr {
+                src_addr: client.0,
+                dst_addr: server.0,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp_repr.buffer_len(),
+                hop_limit: 64,
+            };
+            let mut buf = vec![0u8; ip_repr.buffer_len() + tcp_repr.buffer_len()];
+            let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
+            ip_repr.emit(&mut ip_pkt, &caps);
+            let mut tcp_pkt = TcpPacket::new_unchecked(ip_pkt.payload_mut());
+            tcp_repr.emit(
+                &mut tcp_pkt,
+                &IpAddress::Ipv4(client.0),
+                &IpAddress::Ipv4(server.0),
+                &caps,
+            );
+            buf
+        };
+
+        // 1. Handshake with RFC 1323 window scaling (so 64 KiB socket negotiates remote_win_shift = 1)
+        let mut t_ms = 1i64;
+        stack.device.rx_queue.push_back(build_scaled_tcp(
+            smoltcp::wire::TcpControl::Syn,
+            10_000,
+            None,
+            Some(7),
+            &[],
+        ));
+        assert!(stack.poll_guarded("syn", SmolInstant::from_millis(t_ms), &hub));
+        let sa = egress_rx.try_recv().expect("SYN-ACK expected");
+        let server_seq = TcpPacket::new_checked(Ipv4Packet::new_checked(&sa).unwrap().payload())
+            .unwrap()
+            .seq_number()
+            .0
+            .wrapping_add(1);
+
+        t_ms += 1;
+        stack.device.rx_queue.push_back(build_scaled_tcp(
+            smoltcp::wire::TcpControl::None,
+            10_001,
+            Some(server_seq),
+            None,
+            &[],
+        ));
+        assert!(stack.poll_guarded("ack", SmolInstant::from_millis(t_ms), &hub));
+
+        // 2. Fill the 64 KiB RX buffer with odd-sized chunks (inducing 2-byte window-scale rounding)
+        //    plus partial reads during delayed ACK and overshoot bytes past advertised right edge.
+        let mut client_seq = 10_001i32;
+        let odd_chunk = vec![0xABu8; 1459];
+        for i in 0..45 {
+            t_ms += 1;
+            stack.device.rx_queue.push_back(build_scaled_tcp(
+                smoltcp::wire::TcpControl::Psh,
+                client_seq,
+                Some(server_seq),
+                None,
+                &odd_chunk,
+            ));
+            assert!(
+                stack.poll_guarded("odd_upload", SmolInstant::from_millis(t_ms), &hub),
+                "iteration {i} must never panic"
+            );
+            client_seq = client_seq.wrapping_add(odd_chunk.len() as i32);
+            while egress_rx.try_recv().is_ok() {}
+
+            // Halfway through, drain a single odd byte while delayed ACK is armed (reproduces #1048/#1079)
+            if i == 22 {
+                let s = stack.sockets.get_mut::<tcp::Socket>(handle);
+                let _ = s.recv(|d| (d.len().min(1), ()));
+            }
+        }
+
+        // 3. Push past the 64 KiB edge (out-of-window data) and then send FIN at zero-window edge
+        let overshoot = vec![0xCDu8; 512];
+        t_ms += 1;
+        stack.device.rx_queue.push_back(build_scaled_tcp(
+            smoltcp::wire::TcpControl::Psh,
+            client_seq,
+            Some(server_seq),
+            None,
+            &overshoot,
+        ));
+        assert!(stack.poll_guarded("overshoot", SmolInstant::from_millis(t_ms), &hub));
+
+        // Send a FIN right at the current RX right edge while RX buffer is saturated
+        let rx_queued = stack.sockets.get::<tcp::Socket>(handle).recv_queue();
+        let fin_seq = 10_001i32.wrapping_add(1).wrapping_add(rx_queued as i32);
+        t_ms += 20;
+        stack.device.rx_queue.push_back(build_scaled_tcp(
+            smoltcp::wire::TcpControl::Fin,
+            fin_seq,
+            Some(server_seq),
+            None,
+            &[],
+        ));
+        assert!(stack.poll_guarded("zero_window_fin", SmolInstant::from_millis(t_ms), &hub));
+        assert_eq!(
+            stack.panic_recoveries, 0,
+            "smoltcp 0.14 must handle 64 KiB scaled window, odd chunks, overshoot, and zero-window FIN with zero panics"
+        );
     }
 }
