@@ -1396,6 +1396,23 @@ fn should_fast_reject_unreachable_direct_ipv6(
     )
 }
 
+fn truncate_tun_udp_dns_response(req: &[u8], dns_resp: Vec<u8>) -> Vec<u8> {
+    let max_udp = crate::dns::wire::extract_edns0_udp_payload_size(req);
+    if dns_resp.len() <= max_udp {
+        return dns_resp;
+    }
+    if let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(req) {
+        return crate::dns::wire::build_truncated_dns_header(req, &qp);
+    }
+    if dns_resp.len() >= 12 {
+        let mut hdr = dns_resp[..12].to_vec();
+        hdr[2] |= 0x82; // QR=1, TC=1
+        hdr[4..12].fill(0); // QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        return hdr;
+    }
+    dns_resp
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_tun_udp_handler(
     src: SocketAddr,
@@ -1432,33 +1449,25 @@ fn spawn_tun_udp_handler(
 
     tokio::spawn(async move {
         let _permit = permit;
-        // 1. Port 53 (`any:53`) Fake-IP DNS Hijack across both IPv4 and IPv6 when `tun.dns_hijack` is active!
-        if hijack_dns {
-            const MAX_TUN_UDP_DNS_PAYLOAD: usize = 1232;
-            if let Ok(dns_resp) = current_router.dns().handle_dns_packet(&payload).await {
-                let wire_out = if dns_resp.len() > MAX_TUN_UDP_DNS_PAYLOAD {
-                    if let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(&payload) {
-                        crate::dns::wire::build_truncated_dns_header(&payload, &qp)
-                    } else {
-                        dns_resp
-                    }
-                } else {
-                    dns_resp
-                };
-                if let Some(ip_pkt) = build_ip_udp_packet(dst, src, &wire_out) {
-                    let _ = egress.send(ip_pkt).await;
-                }
-            }
-            return;
-        }
-
-        // 2. Prevent any OS-level TUN routing loop caused by our own process's outbound sockets.
+        // 1. Prevent any OS-level TUN routing loop caused by our own process's outbound sockets,
+        //    including our own outbound UDP `:53` DNS queries before `:53` hijack!
         if drop_self_pid && is_self_process_socket(SocketTransport::Udp, src) {
             tracing::debug!(
                 %src,
                 %dst,
                 "Dropped self-originated UDP packet entering OS TUN to prevent routing loop"
             );
+            return;
+        }
+
+        // 2. Port 53 (`any:53`) Fake-IP DNS Hijack across both IPv4 and IPv6 when `tun.dns_hijack` is active!
+        if hijack_dns {
+            if let Ok(dns_resp) = current_router.dns().handle_dns_packet(&payload).await {
+                let wire_out = truncate_tun_udp_dns_response(&payload, dns_resp);
+                if let Some(ip_pkt) = build_ip_udp_packet(dst, src, &wire_out) {
+                    let _ = egress.send(ip_pkt).await;
+                }
+            }
             return;
         }
 
@@ -1594,6 +1603,19 @@ fn register_syn_flow(
     let current_router = Arc::clone(&router.read());
     let hub_clone = Arc::clone(hub);
     let flow_task = tokio::spawn(async move {
+        // Prevent any OS-level TUN routing loop caused by our own process's outbound TCP sockets,
+        // including our own outbound TCP `:53` DNS queries before `:53` hijack!
+        if drop_self_pid && is_self_process_socket(SocketTransport::Tcp, tuple.src) {
+            tracing::debug!(
+                src = %tuple.src,
+                dst = %tuple.dst,
+                "Aborted self-originated TCP SYN entering OS TUN to prevent routing loop"
+            );
+            remote_failed_task.store(true, Ordering::Release);
+            wake_task.notify_one();
+            return;
+        }
+
         // Port 53 (`any:53`) Fake-IP DNS-over-TCP Hijack (RFC 1035 / RFC 7766 2-byte length prefix).
         // Prevents Android/OS virtual VPN DNS (`198.18.0.2:53`) TCP fallback queries from hitting
         // `UNMAPPED-FAKE-IP` when UDP DNS responses are truncated (`TC=1`) or retried over TCP.
@@ -1607,18 +1629,6 @@ fn register_syn_flow(
                 wake_task,
             )
             .await;
-            return;
-        }
-
-        // Prevent any OS-level TUN routing loop caused by our own process's outbound TCP sockets.
-        if drop_self_pid && is_self_process_socket(SocketTransport::Tcp, tuple.src) {
-            tracing::debug!(
-                src = %tuple.src,
-                dst = %tuple.dst,
-                "Aborted self-originated TCP SYN entering OS TUN to prevent routing loop"
-            );
-            remote_failed_task.store(true, Ordering::Release);
-            wake_task.notify_one();
             return;
         }
 
@@ -5679,5 +5689,451 @@ mod tests {
                 let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tun_self_pid_guard_drops_own_process_dns_port_53_before_hijack() {
+        let own_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let own_udp_src = own_udp.local_addr().unwrap();
+        if !is_self_process_socket(SocketTransport::Udp, own_udp_src) {
+            // Skip only on restricted sandboxes where OS socket tables are hidden.
+            return;
+        }
+
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                HashMap::new(),
+                &[],
+                &rules,
+                Arc::clone(&dns),
+            )
+            .unwrap(),
+        );
+        assert!(router.tun_dns_hijack());
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, tun_task) = spawn_userspace_tun_with_options(
+            1500,
+            router_slot,
+            Arc::clone(&hub),
+            shutdown_rx,
+            Arc::new(AtomicBool::new(true)),
+            true,
+        );
+
+        // 1. Self-originated UDP `:53` query entering OS TUN with `drop_self_pid = true` MUST be
+        //    dropped BEFORE DNS hijack (no DNS reply emitted, no Fake-IP assigned).
+        let IpAddr::V4(own_ip) = own_udp_src.ip() else {
+            unreachable!()
+        };
+        let self_dns_query = crate::dns::wire::build_dns_query(
+            0x4242,
+            "self-loop.example.com",
+            crate::dns::wire::QTYPE_A,
+        );
+        let self_pkt = build_ipv4_udp_packet(
+            own_ip,
+            own_udp_src.port(),
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+            &self_dns_query,
+        )
+        .expect("valid v4 udp dns packet");
+        vtun.ingress_tx.send(self_pkt).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), vtun.egress_rx.recv())
+                .await
+                .is_err(),
+            "self-PID UDP :53 query must be dropped before DNS hijack instead of emitting a reply"
+        );
+        assert_eq!(
+            dns.lookup_ip("self-loop.example.com"),
+            None,
+            "self-PID UDP :53 query must never enter FakeIpDnsEngine"
+        );
+
+        // 2. Non-self guest UDP `:53` query on the SAME `drop_self_pid = true` TUN MUST still be
+        //    hijacked cleanly and receive a Fake-IP DNS reply.
+        let guest_ip = Ipv4Addr::new(198, 18, 0, 55);
+        let guest_port = 44444;
+        let guest_dns_query = crate::dns::wire::build_dns_query(
+            0x4343,
+            "guest-app.example.com",
+            crate::dns::wire::QTYPE_A,
+        );
+        let guest_pkt = build_ipv4_udp_packet(
+            guest_ip,
+            guest_port,
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+            &guest_dns_query,
+        )
+        .expect("valid guest v4 udp dns packet");
+        vtun.ingress_tx.send(guest_pkt).await.unwrap();
+
+        let egress_pkt = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("guest UDP :53 query must be hijacked and receive a DNS reply")
+            .expect("egress packet");
+        let ip4 = Ipv4Packet::new_checked(&egress_pkt).unwrap();
+        let udp = UdpPacket::new_checked(ip4.payload()).unwrap();
+        assert_eq!(ip4.src_addr(), Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(ip4.dst_addr(), guest_ip);
+        assert_eq!(udp.src_port(), 53);
+        assert_eq!(udp.dst_port(), guest_port);
+        let meta = crate::dns::wire::extract_dns_response_meta(udp.payload()).unwrap();
+        assert_eq!(meta.rcode, 0);
+        assert!(dns.lookup_ip("guest-app.example.com").is_some());
+
+        // 3. Sister TCP `:53` check: self-originated TCP SYN to `:53` must abort with RST instead
+        //    of being hijacked into `serve_tun_tcp_dns_flow`.
+        let own_tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own_tcp_src = own_tcp.local_addr().unwrap();
+        if is_self_process_socket(SocketTransport::Tcp, own_tcp_src) {
+            let IpAddr::V4(own_tcp_ip) = own_tcp_src.ip() else {
+                unreachable!()
+            };
+            let syn_pkt = build_ipv4_tcp_packet(
+                (own_tcp_ip, own_tcp_src.port()),
+                (Ipv4Addr::new(8, 8, 8, 8), 53),
+                smoltcp::wire::TcpControl::Syn,
+                1000,
+                None,
+                &[],
+            );
+            vtun.ingress_tx.send(syn_pkt).await.unwrap();
+
+            let mut saw_rst = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                let Ok(Some(pkt)) =
+                    tokio::time::timeout(Duration::from_millis(300), vtun.egress_rx.recv()).await
+                else {
+                    break;
+                };
+                if let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                    && ip4.next_header() == IpProtocol::Tcp
+                    && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                    && tcp.dst_port() == own_tcp_src.port()
+                    && tcp.rst()
+                {
+                    saw_rst = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_rst,
+                "self-PID TCP :53 SYN must be aborted with RST before TCP DNS hijack"
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+    }
+
+    #[tokio::test]
+    async fn tun_udp_dns_hijack_truncates_by_rfc1035_and_edns0_payload_size() {
+        // Mock upstream UDP DNS server returning a ~715-byte TXT response (3 * 220B TXT records)
+        // for `med-*.txt.example` and a ~1400-byte TXT response (6 * 220B TXT records) for
+        // `big.txt.example`.
+        let upstream_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, peer)) = upstream_sock.recv_from(&mut buf).await {
+                let req = &buf[..n];
+                let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(req) else {
+                    continue;
+                };
+                let count = if qp.question.name == "big.txt.example" {
+                    6
+                } else {
+                    3
+                };
+                let txt_chunk = "x".repeat(220);
+                let answers: Vec<crate::dns::wire::DnsAnswerData> = (0..count)
+                    .map(|_| crate::dns::wire::DnsAnswerData::Txt(txt_chunk.clone()))
+                    .collect();
+                let resp = qp.build_response(req, 0, 60, &answers);
+                let _ = upstream_sock.send_to(&resp, peer).await;
+            }
+        });
+
+        let dns_cfg = crate::config::DnsConfig {
+            nameserver: vec![upstream_addr.to_string()],
+            fallback: vec![],
+            default_nameserver: vec![],
+            ..crate::config::DnsConfig::default()
+        };
+        let dns = Arc::new(crate::dns::FakeIpDnsEngine::new(&dns_cfg).unwrap());
+        let rules = vec!["MATCH,DIRECT".to_string()];
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                HashMap::new(),
+                &[],
+                &rules,
+                Arc::clone(&dns),
+            )
+            .unwrap(),
+        );
+        assert!(router.tun_dns_hijack());
+        let router_slot = Arc::new(RwLock::new(router));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut vtun, tun_task) = spawn_userspace_tun(1500, router_slot, hub, shutdown_rx);
+
+        let append_edns0_opt = |mut pkt: Vec<u8>, udp_size: u16| -> Vec<u8> {
+            pkt[10] = 0;
+            pkt[11] = 1; // ARCOUNT = 1
+            pkt.push(0); // root owner name
+            pkt.extend_from_slice(&crate::dns::wire::QTYPE_OPT.to_be_bytes());
+            pkt.extend_from_slice(&udp_size.to_be_bytes());
+            pkt.extend_from_slice(&0u32.to_be_bytes()); // extended RCODE / flags
+            pkt.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+            pkt
+        };
+
+        let client_v4 = Ipv4Addr::new(198, 18, 0, 77);
+        let dns_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+        async fn send_v4_dns(
+            vtun: &mut VirtualTunHandle,
+            client_v4: Ipv4Addr,
+            dns_v4: Ipv4Addr,
+            port: u16,
+            query: &[u8],
+        ) -> Vec<u8> {
+            let pkt = build_ipv4_udp_packet(client_v4, port, dns_v4, 53, query)
+                .expect("valid v4 udp dns packet");
+            vtun.ingress_tx.send(pkt).await.unwrap();
+            let egress = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                .await
+                .expect("expected hijacked TUN UDP :53 reply")
+                .expect("egress packet");
+            let ip4 = Ipv4Packet::new_checked(&egress).unwrap();
+            let udp = UdpPacket::new_checked(ip4.payload()).unwrap();
+            assert_eq!(ip4.src_addr(), dns_v4);
+            assert_eq!(ip4.dst_addr(), client_v4);
+            assert_eq!(udp.src_port(), 53);
+            assert_eq!(udp.dst_port(), port);
+            udp.payload().to_vec()
+        }
+
+        // 1. Non-EDNS0 UDP :53 query for ~715B TXT response -> MUST return TC=1 (<= 512 bytes).
+        let q_plain = crate::dns::wire::build_dns_query(
+            0x5101,
+            "med-plain.txt.example",
+            crate::dns::wire::QTYPE_TXT,
+        );
+        let resp_plain = send_v4_dns(&mut vtun, client_v4, dns_v4, 51001, &q_plain).await;
+        let meta_plain = crate::dns::wire::extract_dns_response_meta(&resp_plain).unwrap();
+        assert_eq!(u16::from_be_bytes([resp_plain[0], resp_plain[1]]), 0x5101);
+        assert!(
+            meta_plain.truncated,
+            "non-EDNS0 TUN UDP :53 query must receive TC=1 when reply > 512B (got {}B)",
+            resp_plain.len()
+        );
+        assert!(
+            resp_plain.len() <= 512,
+            "truncated non-EDNS0 reply must be <= 512B (got {}B)",
+            resp_plain.len()
+        );
+        assert_eq!(meta_plain.ancount, 0);
+
+        // 2. EDNS0(600B) UDP :53 query for ~715B TXT response -> MUST return TC=1 (<= 600 bytes).
+        let q_600 = append_edns0_opt(
+            crate::dns::wire::build_dns_query(
+                0x5102,
+                "med-600.txt.example",
+                crate::dns::wire::QTYPE_TXT,
+            ),
+            600,
+        );
+        let resp_600 = send_v4_dns(&mut vtun, client_v4, dns_v4, 51002, &q_600).await;
+        let meta_600 = crate::dns::wire::extract_dns_response_meta(&resp_600).unwrap();
+        assert_eq!(u16::from_be_bytes([resp_600[0], resp_600[1]]), 0x5102);
+        assert!(
+            meta_600.truncated,
+            "EDNS0(600B) TUN UDP :53 query must receive TC=1 when reply > 600B (got {}B)",
+            resp_600.len()
+        );
+        assert!(
+            resp_600.len() <= 600,
+            "truncated EDNS0(600B) reply must be <= 600B (got {}B)",
+            resp_600.len()
+        );
+        assert_eq!(meta_600.ancount, 0);
+
+        // 3. EDNS0(1232B) UDP :53 query for ~715B TXT response -> MUST pass through untruncated!
+        let q_1232 = append_edns0_opt(
+            crate::dns::wire::build_dns_query(
+                0x5103,
+                "med-1232.txt.example",
+                crate::dns::wire::QTYPE_TXT,
+            ),
+            1232,
+        );
+        let resp_1232 = send_v4_dns(&mut vtun, client_v4, dns_v4, 51003, &q_1232).await;
+        let meta_1232 = crate::dns::wire::extract_dns_response_meta(&resp_1232).unwrap();
+        assert_eq!(u16::from_be_bytes([resp_1232[0], resp_1232[1]]), 0x5103);
+        assert!(
+            !meta_1232.truncated,
+            "EDNS0(1232B) TUN UDP :53 query must NOT truncate a ~715B reply (got {}B)",
+            resp_1232.len()
+        );
+        assert!(
+            resp_1232.len() > 650 && resp_1232.len() <= 1232,
+            "expected full ~715B TXT response, got {}B",
+            resp_1232.len()
+        );
+        assert_eq!(meta_1232.ancount, 3);
+
+        // 4. Cache-hit parity: re-querying `med-plain.txt.example` with EDNS0(1232B) returns the
+        //    full cached untruncated reply, while re-querying `med-1232.txt.example` without EDNS0
+        //    returns TC=1.
+        let q_cached_1232 = append_edns0_opt(
+            crate::dns::wire::build_dns_query(
+                0x5104,
+                "med-plain.txt.example",
+                crate::dns::wire::QTYPE_TXT,
+            ),
+            1232,
+        );
+        let resp_cached_1232 =
+            send_v4_dns(&mut vtun, client_v4, dns_v4, 51004, &q_cached_1232).await;
+        let meta_cached_1232 =
+            crate::dns::wire::extract_dns_response_meta(&resp_cached_1232).unwrap();
+        assert!(!meta_cached_1232.truncated);
+        assert!(resp_cached_1232.len() > 650 && resp_cached_1232.len() <= 1232);
+        assert_eq!(meta_cached_1232.ancount, 3);
+
+        let q_cached_plain = crate::dns::wire::build_dns_query(
+            0x5105,
+            "med-1232.txt.example",
+            crate::dns::wire::QTYPE_TXT,
+        );
+        let resp_cached_plain =
+            send_v4_dns(&mut vtun, client_v4, dns_v4, 51005, &q_cached_plain).await;
+        let meta_cached_plain =
+            crate::dns::wire::extract_dns_response_meta(&resp_cached_plain).unwrap();
+        assert!(meta_cached_plain.truncated);
+        assert!(resp_cached_plain.len() <= 512);
+        assert_eq!(meta_cached_plain.ancount, 0);
+
+        // 5. EDNS0(4096B) clamped to 1232B for ~1400B TXT response -> MUST return TC=1.
+        let q_4096 = append_edns0_opt(
+            crate::dns::wire::build_dns_query(
+                0x5106,
+                "big.txt.example",
+                crate::dns::wire::QTYPE_TXT,
+            ),
+            4096,
+        );
+        let resp_4096 = send_v4_dns(&mut vtun, client_v4, dns_v4, 51006, &q_4096).await;
+        let meta_4096 = crate::dns::wire::extract_dns_response_meta(&resp_4096).unwrap();
+        assert!(
+            meta_4096.truncated,
+            "EDNS0(4096B) clamped to 1232B must return TC=1 for ~1400B reply (got {}B)",
+            resp_4096.len()
+        );
+        assert!(resp_4096.len() <= 512);
+        assert_eq!(meta_4096.ancount, 0);
+
+        // 6. IPv6 TUN UDP :53 hijack follows the exact same RFC 1035 / EDNS0 truncation policy.
+        let client_v6: Ipv6Addr = "fd00::77".parse().unwrap();
+        let dns_v6: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
+        let q_v6_plain = crate::dns::wire::build_dns_query(
+            0x5107,
+            "med-v6.txt.example",
+            crate::dns::wire::QTYPE_TXT,
+        );
+        let pkt_v6_plain = build_ipv6_udp_packet(client_v6, 51007, dns_v6, 53, &q_v6_plain)
+            .expect("valid v6 udp dns packet");
+        vtun.ingress_tx.send(pkt_v6_plain).await.unwrap();
+        let egress_v6 = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+            .await
+            .expect("expected hijacked IPv6 TUN UDP :53 reply")
+            .expect("egress v6 packet");
+        let ip6 = Ipv6Packet::new_checked(&egress_v6).unwrap();
+        let udp6 = UdpPacket::new_checked(ip6.payload()).unwrap();
+        assert_eq!(ip6.src_addr(), dns_v6);
+        assert_eq!(ip6.dst_addr(), client_v6);
+        assert_eq!(udp6.src_port(), 53);
+        assert_eq!(udp6.dst_port(), 51007);
+        let meta_v6_plain = crate::dns::wire::extract_dns_response_meta(udp6.payload()).unwrap();
+        assert!(meta_v6_plain.truncated);
+        assert!(udp6.payload().len() <= 512);
+        assert_eq!(meta_v6_plain.ancount, 0);
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), tun_task).await;
+        upstream_task.abort();
+    }
+
+    #[test]
+    fn truncate_tun_udp_dns_response_unparseable_query_uses_12_byte_tc_fallback() {
+        // Unparseable query (QDCOUNT=0) with an oversized (>512B) response MUST fall back to a
+        // 12-byte QR=1|TC=1 zeroed-counts header rather than emitting the oversized UDP payload.
+        let unparseable_req = [
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut oversized_resp = vec![0x55u8; 700];
+        oversized_resp[0] = 0xAB;
+        oversized_resp[1] = 0xCD;
+        oversized_resp[2] = 0x01; // QR=0, TC=0, RD=1
+        oversized_resp[3] = 0x80; // RA=1
+        oversized_resp[4..12].copy_from_slice(&[0, 1, 0, 3, 0, 2, 0, 1]);
+
+        let out = truncate_tun_udp_dns_response(&unparseable_req, oversized_resp);
+        assert_eq!(out.len(), 12);
+        assert_eq!(&out[0..2], &[0xAB, 0xCD]);
+        assert_eq!(out[2] & 0x82, 0x82, "QR=1 and TC=1 must both be set");
+        assert_eq!(out[3], 0x80);
+        assert_eq!(
+            &out[4..12],
+            &[0u8; 8],
+            "QDCOUNT, ANCOUNT, NSCOUNT, and ARCOUNT must be zeroed"
+        );
+
+        // Exact boundary checks for non-EDNS0 (512B) and EDNS0(600B).
+        let plain_q = crate::dns::wire::build_dns_query(
+            0x1234,
+            "edge.example.com",
+            crate::dns::wire::QTYPE_TXT,
+        );
+        let resp_512 = vec![0u8; 512];
+        assert_eq!(
+            truncate_tun_udp_dns_response(&plain_q, resp_512.clone()).len(),
+            512
+        );
+        let resp_513 = vec![0u8; 513];
+        let trunc_513 = truncate_tun_udp_dns_response(&plain_q, resp_513);
+        assert_eq!(trunc_513[2] & 0x82, 0x82);
+        assert!(trunc_513.len() <= 512);
+
+        let mut edns_600_q = plain_q;
+        edns_600_q[10] = 0;
+        edns_600_q[11] = 1;
+        edns_600_q.push(0);
+        edns_600_q.extend_from_slice(&crate::dns::wire::QTYPE_OPT.to_be_bytes());
+        edns_600_q.extend_from_slice(&600u16.to_be_bytes());
+        edns_600_q.extend_from_slice(&0u32.to_be_bytes());
+        edns_600_q.extend_from_slice(&0u16.to_be_bytes());
+
+        assert_eq!(
+            truncate_tun_udp_dns_response(&edns_600_q, vec![0u8; 600]).len(),
+            600
+        );
+        let trunc_601 = truncate_tun_udp_dns_response(&edns_600_q, vec![0u8; 601]);
+        assert_eq!(trunc_601[2] & 0x82, 0x82);
+        assert!(trunc_601.len() <= 512);
     }
 }

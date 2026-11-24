@@ -2,6 +2,36 @@ package io.github.rustclashlabs.rustclash.vpn
 
 import io.github.rustclashlabs.rustclash.security.AndroidKeystoreVault
 
+internal class NativeLibraryLoader(
+    private val loadLibrary: () -> Boolean,
+    private val registerVaultKeyWrapper: () -> Unit,
+) {
+    private val loadLock = Any()
+
+    @Volatile
+    private var loadedState: Boolean? = null
+
+    val isLoadedFast: Boolean
+        get() = loadedState == true
+
+    fun ensureLoaded(): Boolean {
+        loadedState?.let { return it }
+        return synchronized(loadLock) {
+            loadedState?.let { return@synchronized it }
+            val loaded = try {
+                loadLibrary()
+            } catch (_: UnsatisfiedLinkError) {
+                false
+            }
+            if (loaded) {
+                runCatching { registerVaultKeyWrapper() }
+            }
+            loadedState = loaded
+            loaded
+        }
+    }
+}
+
 /**
  * JNI bridge to `libproxy_ffi.so` (`crates/proxy-ffi/src/android_jni.rs`).
  *
@@ -9,30 +39,40 @@ import io.github.rustclashlabs.rustclash.security.AndroidKeystoreVault
  * models on any host without requiring Android ART native libraries.
  */
 object NativeBridge {
-    @Volatile
-    private var loadedState: Boolean? = null
-
-    val isLoadedFast: Boolean
-        get() = loadedState == true
-
-    val isNativeLoaded: Boolean
-        get() = ensureLoaded()
-
-    @Synchronized
-    fun ensureLoaded(): Boolean {
-        loadedState?.let { return it }
-        val loaded = try {
+    private val loader = NativeLibraryLoader(
+        loadLibrary = {
             System.loadLibrary("proxy_ffi")
             true
-        } catch (_: UnsatisfiedLinkError) {
-            false
-        }
-        loadedState = loaded
-        if (loaded && AndroidKeystoreVault.isKeystoreAvailable()) {
-            runCatching { nativeRegisterVaultKeyWrapper(AndroidKeystoreVault) }
-        }
-        return loaded
-    }
+        },
+        registerVaultKeyWrapper = {
+            if (AndroidKeystoreVault.isKeystoreAvailable()) {
+                nativeRegisterVaultKeyWrapper(AndroidKeystoreVault)
+            }
+        },
+    )
+
+    /**
+     * Non-blocking volatile check for whether `libproxy_ffi.so` (and vault wrapper registration)
+     * has completed. Safe to call on the Android main thread.
+     */
+    val isLoadedFast: Boolean
+        get() = loader.isLoadedFast
+
+    /**
+     * Non-blocking readiness alias for [isLoadedFast]. Never triggers `System.loadLibrary` or
+     * Keystore IPC; callers that need to initialize the native library must call [ensureLoaded]
+     * from a background/IO dispatcher.
+     */
+    val isNativeLoaded: Boolean
+        get() = loader.isLoadedFast
+
+    /**
+     * Lazily loads `libproxy_ffi.so` and registers the Android Keystore vault wrapper once.
+     *
+     * Performs native library I/O (`dlopen`) and Keystore IPC on first call; invoke exclusively off
+     * the Android main thread (e.g. `Dispatchers.IO`).
+     */
+    fun ensureLoaded(): Boolean = loader.ensureLoaded()
 
     external fun nativeRegisterVaultKeyWrapper(vaultHelper: Any): Boolean
 

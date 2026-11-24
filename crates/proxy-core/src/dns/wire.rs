@@ -538,6 +538,91 @@ pub fn build_truncated_dns_header(raw_query: &[u8], query: &DnsQueryPacket) -> V
     out.to_vec()
 }
 
+/// Default RFC 1035 UDP DNS payload limit when no EDNS0 OPT record is advertised.
+const DEFAULT_DNS_UDP_PAYLOAD_SIZE: usize = 512;
+/// Maximum UDP DNS payload size clamped per DNS Flag Day 2020 (avoids IPv4/IPv6 fragmentation).
+const MAX_EDNS0_UDP_PAYLOAD_SIZE: usize = 1232;
+
+/// Extract the client's advertised EDNS0 UDP payload size from a raw DNS query packet's
+/// Additional section OPT record (RFC 6891 §6.1.2).
+///
+/// Returns `512` if the query has no valid OPT record or cannot be parsed cleanly.
+/// Otherwise clamps the advertised OPT UDP payload size to `512..=1232`.
+pub fn extract_edns0_udp_payload_size(req: &[u8]) -> usize {
+    if req.len() < 12 {
+        return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+    }
+    let qdcount = u16::from_be_bytes([req[4], req[5]]) as usize;
+    let ancount = u16::from_be_bytes([req[6], req[7]]) as usize;
+    let nscount = u16::from_be_bytes([req[8], req[9]]) as usize;
+    let arcount = u16::from_be_bytes([req[10], req[11]]) as usize;
+    if arcount == 0 {
+        return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+    }
+
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        let Ok((_, next)) = decode_domain_name(req, pos) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        let Some(q_end) = next.checked_add(4) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        if q_end > req.len() {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        }
+        pos = q_end;
+    }
+
+    for _ in 0..ancount.saturating_add(nscount) {
+        let Ok((_, next)) = decode_domain_name(req, pos) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        let Some(hdr_end) = next.checked_add(10) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        if hdr_end > req.len() {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        }
+        let rdlen = u16::from_be_bytes([req[next + 8], req[next + 9]]) as usize;
+        let Some(rdata_end) = hdr_end.checked_add(rdlen) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        if rdata_end > req.len() {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        }
+        pos = rdata_end;
+    }
+
+    for _ in 0..arcount {
+        let Ok((owner, next)) = decode_domain_name(req, pos) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        let Some(hdr_end) = next.checked_add(10) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        if hdr_end > req.len() {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        }
+        let rtype = u16::from_be_bytes([req[next], req[next + 1]]);
+        let rclass = u16::from_be_bytes([req[next + 2], req[next + 3]]);
+        let rdlen = u16::from_be_bytes([req[next + 8], req[next + 9]]) as usize;
+        let Some(rdata_end) = hdr_end.checked_add(rdlen) else {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        };
+        if rdata_end > req.len() {
+            return DEFAULT_DNS_UDP_PAYLOAD_SIZE;
+        }
+        if rtype == QTYPE_OPT && owner.is_empty() {
+            return (rclass as usize)
+                .clamp(DEFAULT_DNS_UDP_PAYLOAD_SIZE, MAX_EDNS0_UDP_PAYLOAD_SIZE);
+        }
+        pos = rdata_end;
+    }
+
+    DEFAULT_DNS_UDP_PAYLOAD_SIZE
+}
+
 /// Patch a cached DNS wire response for a new caller:
 /// 1. Overwrites Transaction ID (`[0..2]`) and mirrors the caller's `RD` bit (`0x0100`).
 /// 2. Echoes the caller's exact Question QNAME casing (`DNS-0x20` bit randomization safe) into
@@ -869,5 +954,117 @@ mod tests {
         let tc_meta = extract_dns_response_meta(&tc_pkt).unwrap();
         assert!(tc_meta.truncated);
         assert_eq!(&tc_pkt[12..25], &q_0x20[12..25]);
+    }
+
+    fn build_query_with_edns0(
+        domain: &str,
+        qtype: u16,
+        udp_size: u16,
+        opt_rdata: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = BytesMut::from(build_dns_query(0x5678, domain, qtype).as_slice());
+        // ARCOUNT = 1
+        pkt[10] = 0;
+        pkt[11] = 1;
+        // OPT RR: root owner (0x00), TYPE=41, CLASS=udp_size, TTL=0, RDLEN, RDATA
+        pkt.put_u8(0);
+        pkt.put_u16(QTYPE_OPT);
+        pkt.put_u16(udp_size);
+        pkt.put_u32(0);
+        pkt.put_u16(opt_rdata.len() as u16);
+        pkt.put_slice(opt_rdata);
+        pkt.to_vec()
+    }
+
+    #[test]
+    fn extract_edns0_udp_payload_size_handles_standard_clamped_and_malformed_queries() {
+        // Short / empty packets safely default to 512
+        assert_eq!(extract_edns0_udp_payload_size(&[]), 512);
+        assert_eq!(extract_edns0_udp_payload_size(&[0u8; 11]), 512);
+
+        // Plain RFC 1035 query without OPT RR -> 512
+        let plain = build_dns_query(0x1111, "example.com", QTYPE_A);
+        assert_eq!(extract_edns0_udp_payload_size(&plain), 512);
+
+        // OPT 4096 -> clamped down to 1232
+        let opt_4096 = build_query_with_edns0("example.com", QTYPE_TXT, 4096, &[]);
+        assert_eq!(extract_edns0_udp_payload_size(&opt_4096), 1232);
+
+        // OPT 256 -> clamped up to 512
+        let opt_256 = build_query_with_edns0("example.com", QTYPE_TXT, 256, &[]);
+        assert_eq!(extract_edns0_udp_payload_size(&opt_256), 512);
+
+        // OPT 1000 with option RDATA -> preserved as 1000
+        let opt_1000 =
+            build_query_with_edns0("example.com", QTYPE_TXT, 1000, &[0, 8, 0, 4, 1, 2, 3, 4]);
+        assert_eq!(extract_edns0_udp_payload_size(&opt_1000), 1000);
+
+        // Truncated OPT RR header -> rejected, returns 512
+        let trunc_hdr = &opt_4096[..opt_4096.len() - 2];
+        assert_eq!(extract_edns0_udp_payload_size(trunc_hdr), 512);
+
+        // Truncated OPT RDATA (declares 8 bytes, only 4 present) -> rejected, returns 512
+        let trunc_rdata = &opt_1000[..opt_1000.len() - 4];
+        assert_eq!(extract_edns0_udp_payload_size(trunc_rdata), 512);
+
+        // Malformed compression pointer in question -> rejected, returns 512
+        let mut bad_ptr = vec![0u8; 12];
+        bad_ptr[5] = 1; // QDCOUNT = 1
+        bad_ptr[11] = 1; // ARCOUNT = 1
+        bad_ptr.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
+        assert_eq!(extract_edns0_udp_payload_size(&bad_ptr), 512);
+
+        // OPT RR with non-root owner name is invalid per RFC 6891 §6.1.2 -> returns 512
+        let mut bad_owner_opt =
+            BytesMut::from(build_dns_query(0x2222, "example.com", QTYPE_A).as_slice());
+        bad_owner_opt[11] = 1;
+        encode_domain_name("notroot.example", &mut bad_owner_opt);
+        bad_owner_opt.put_u16(QTYPE_OPT);
+        bad_owner_opt.put_u16(1200);
+        bad_owner_opt.put_u32(0);
+        bad_owner_opt.put_u16(0);
+        assert_eq!(extract_edns0_udp_payload_size(&bad_owner_opt), 512);
+
+        // OPT RR following Answer + Authority + another Additional RR is still located accurately
+        let mut complex = BytesMut::new();
+        complex.put_u16(0x3333);
+        complex.put_u16(0x0100);
+        complex.put_u16(1); // QDCOUNT
+        complex.put_u16(1); // ANCOUNT
+        complex.put_u16(1); // NSCOUNT
+        complex.put_u16(2); // ARCOUNT (1 dummy A + 1 OPT)
+        encode_domain_name("multi.example.com", &mut complex);
+        complex.put_u16(QTYPE_A);
+        complex.put_u16(QCLASS_IN);
+        // Answer RR (compressed pointer to QNAME at offset 12)
+        complex.put_u16(0xC00C);
+        complex.put_u16(QTYPE_A);
+        complex.put_u16(QCLASS_IN);
+        complex.put_u32(60);
+        complex.put_u16(4);
+        complex.put_slice(&[1, 2, 3, 4]);
+        // Authority RR (NS)
+        complex.put_u16(0xC00C);
+        complex.put_u16(QTYPE_NS);
+        complex.put_u16(QCLASS_IN);
+        complex.put_u32(60);
+        let mut ns_rdata = BytesMut::new();
+        encode_domain_name("ns1.example.com", &mut ns_rdata);
+        complex.put_u16(ns_rdata.len() as u16);
+        complex.put_slice(&ns_rdata);
+        // Additional RR #1 (glue A)
+        encode_domain_name("ns1.example.com", &mut complex);
+        complex.put_u16(QTYPE_A);
+        complex.put_u16(QCLASS_IN);
+        complex.put_u32(60);
+        complex.put_u16(4);
+        complex.put_slice(&[5, 6, 7, 8]);
+        // Additional RR #2 (OPT 1100)
+        complex.put_u8(0);
+        complex.put_u16(QTYPE_OPT);
+        complex.put_u16(1100);
+        complex.put_u32(0);
+        complex.put_u16(0);
+        assert_eq!(extract_edns0_udp_payload_size(&complex), 1100);
     }
 }

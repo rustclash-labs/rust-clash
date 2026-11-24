@@ -327,7 +327,9 @@ impl GeoDataManager {
         }
 
         let arc_ds = Arc::new(dataset);
-        install_live_geodata(Arc::clone(&arc_ds));
+        if arc_ds.using_persisted_data || arc_ds.mmdb.is_some() {
+            install_live_geodata(Arc::clone(&arc_ds));
+        }
 
         Self {
             geodata_dir,
@@ -532,6 +534,11 @@ impl GeoDataManager {
                 let completed_ms = now_unix_ms();
                 *self.dataset.write() = Arc::clone(&new_ds);
                 install_live_geodata(new_ds);
+                if let Some(weak) = self.router_slot.read().clone()
+                    && let Some(slot) = weak.upgrade()
+                {
+                    slot.read().bump_epoch();
+                }
 
                 {
                     let mut m = self.manifest.lock();
@@ -1287,17 +1294,18 @@ mod tests {
         }
     }
 
+    static LIVE_GEODATA_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct LiveGeodataRestoreGuard(Arc<GeoDataset>);
+    impl Drop for LiveGeodataRestoreGuard {
+        fn drop(&mut self) {
+            install_live_geodata(Arc::clone(&self.0));
+        }
+    }
+
     #[test]
     fn geosite_dynamic_specificity_disambiguates_cn_ntp_from_proxy_ntp_suffix() {
-        static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        let _serial = TEST_LOCK.lock();
-
-        struct LiveGeodataRestoreGuard(Arc<GeoDataset>);
-        impl Drop for LiveGeodataRestoreGuard {
-            fn drop(&mut self) {
-                install_live_geodata(Arc::clone(&self.0));
-            }
-        }
+        let _serial = LIVE_GEODATA_TEST_LOCK.lock();
         let _restore = LiveGeodataRestoreGuard(current_geodata());
 
         let cn_builtin = lookup_builtin_geosite("cn").unwrap();
@@ -1541,5 +1549,55 @@ mod tests {
         }
 
         srv_task.abort();
+    }
+
+    #[test]
+    fn matches_geoip_dynamic_tracks_live_mmdb_updates_while_explicit_rule_mmdb_takes_precedence() {
+        use crate::router::mmdb::build_synthetic_country_mmdb;
+
+        let _serial = LIVE_GEODATA_TEST_LOCK.lock();
+        let _restore = LiveGeodataRestoreGuard(current_geodata());
+
+        let test_ip: IpAddr = "198.51.100.42".parse().unwrap();
+        let mmdb_jp = Arc::new(
+            MmdbReader::from_bytes(build_synthetic_country_mmdb(&[(
+                "198.51.100.0/24".parse().unwrap(),
+                "JP",
+            )]))
+            .unwrap(),
+        );
+        let mmdb_sg = Arc::new(
+            MmdbReader::from_bytes(build_synthetic_country_mmdb(&[(
+                "198.51.100.0/24".parse().unwrap(),
+                "SG",
+            )]))
+            .unwrap(),
+        );
+
+        let base = GeoDataset::builtin_only();
+        install_live_geodata(Arc::new(GeoDataset {
+            geosite_cn: base.geosite_cn.clone(),
+            geosite_non_cn: base.geosite_non_cn.clone(),
+            geoip_cn: base.geoip_cn.clone(),
+            mmdb: Some(Arc::clone(&mmdb_jp)),
+            using_persisted_data: true,
+        }));
+        assert!(matches_geoip_dynamic("JP", None, None, test_ip));
+        assert!(!matches_geoip_dynamic("SG", None, None, test_ip));
+
+        // Online update replaces LIVE_GEODATA with SG MMDB -> `rule_mmdb = None` sees SG immediately.
+        install_live_geodata(Arc::new(GeoDataset {
+            geosite_cn: base.geosite_cn,
+            geosite_non_cn: base.geosite_non_cn,
+            geoip_cn: base.geoip_cn,
+            mmdb: Some(Arc::clone(&mmdb_sg)),
+            using_persisted_data: true,
+        }));
+        assert!(!matches_geoip_dynamic("JP", None, None, test_ip));
+        assert!(matches_geoip_dynamic("SG", None, None, test_ip));
+
+        // Explicit `rule_mmdb` (`cfg.mmdb_path`) continues to override `LIVE_GEODATA`.
+        assert!(matches_geoip_dynamic("JP", None, Some(&mmdb_jp), test_ip));
+        assert!(!matches_geoip_dynamic("SG", None, Some(&mmdb_jp), test_ip));
     }
 }

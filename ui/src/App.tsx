@@ -6,6 +6,7 @@ import {
   clashApi,
   ensureRuntimeApiReady,
   loadControllerSettings,
+  probeControllerSettings,
   saveControllerSettings,
   toggleDemoMode,
 } from "./api";
@@ -40,6 +41,8 @@ import type {
   TrafficPoint,
   VersionInfo,
 } from "./types";
+import { createGuardedPoller } from "./utils/asyncGuards.mjs";
+import { verifyAndCommitControllerSecret } from "./utils/controllerAuth.mjs";
 import { formatBytes } from "./utils/format";
 import { ConnectionsView } from "./views/ConnectionsView";
 import { DashboardView } from "./views/DashboardView";
@@ -238,15 +241,31 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!apiReady) return;
+    let disposed = false;
     void refreshCore();
     void clashApi
       .getTrafficSnapshot()
-      .then((snap) => setTrafficHistory(snap.history))
-      .catch(handleApiError);
+      .then((snap) => {
+        if (disposed) return;
+        setTrafficHistory(snap.history);
+      })
+      .catch((err) => {
+        if (disposed) return;
+        handleApiError(err);
+      });
     void clashApi
       .getLogsSnapshot()
-      .then((snap) => setLogs(snap.logs))
-      .catch(handleApiError);
+      .then((snap) => {
+        if (disposed) return;
+        setLogs(snap.logs);
+      })
+      .catch((err) => {
+        if (disposed) return;
+        handleApiError(err);
+      });
+    return () => {
+      disposed = true;
+    };
   }, [apiReady, handleApiError, refreshCore, wsEpoch]);
 
   useEffect(() => {
@@ -264,41 +283,58 @@ export const App: React.FC = () => {
 
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
-    let fallbackInterval: number | null = null;
     let backoffMs = 1000;
     let disposed = false;
 
+    const poller = createGuardedPoller({
+      intervalMs: 2000,
+      isHidden: () => document.hidden,
+      poll: () => clashApi.getTrafficSnapshot(),
+      onSuccess: (snap) => {
+        if (disposed) return;
+        setTrafficHistory(snap.history);
+        setOnline(true);
+        setLoadError(null);
+      },
+      onError: (err) => {
+        if (disposed) return;
+        handleApiError(err);
+      },
+      setIntervalFn: (fn, ms) => window.setInterval(fn, ms),
+      clearIntervalFn: (id) => window.clearInterval(id),
+    });
+
     const startFallbackPolling = () => {
-      if (disposed || fallbackInterval !== null) return;
-      fallbackInterval = window.setInterval(() => {
-        if (document.hidden) return;
-        void clashApi
-          .getTrafficSnapshot()
-          .then((snap) => {
-            setTrafficHistory(snap.history);
-            setOnline(true);
-            setLoadError(null);
-          })
-          .catch(handleApiError);
-      }, 2000);
+      if (disposed) return;
+      poller.start();
     };
 
     const stopFallbackPolling = () => {
-      if (fallbackInterval !== null) {
-        window.clearInterval(fallbackInterval);
-        fallbackInterval = null;
-      }
+      poller.stop();
     };
 
     const connect = () => {
       if (disposed) return;
       try {
-        ws = new WebSocket(buildWsUrl("/traffic"));
-        ws.onopen = () => {
+        if (ws) {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          ws.close();
+          ws = null;
+        }
+        const socket = new WebSocket(buildWsUrl("/traffic"));
+        ws = socket;
+        socket.onopen = () => {
+          if (disposed) return;
+          if (ws !== socket) return;
           backoffMs = 1000;
           stopFallbackPolling();
         };
-        ws.onmessage = (ev) => {
+        socket.onmessage = (ev) => {
+          if (disposed) return;
+          if (ws !== socket) return;
           try {
             const pt = JSON.parse(String(ev.data)) as TrafficPoint;
             setTrafficHistory((prev) => [...prev.slice(-119), pt]);
@@ -306,12 +342,19 @@ export const App: React.FC = () => {
             // ignore malformed frame
           }
         };
-        ws.onerror = () => {
+        socket.onerror = () => {
+          if (disposed) return;
+          if (ws !== socket) return;
           startFallbackPolling();
         };
-        ws.onclose = () => {
+        socket.onclose = () => {
           if (disposed) return;
+          if (ws !== socket) return;
+          startFallbackPolling();
+          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
           reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            if (disposed) return;
             backoffMs = Math.min(backoffMs * 2, 10_000);
             connect();
           }, backoffMs);
@@ -325,9 +368,19 @@ export const App: React.FC = () => {
 
     return () => {
       disposed = true;
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      stopFallbackPolling();
-      if (ws) ws.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      poller.dispose();
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+      }
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch, handleApiError]);
 
@@ -337,43 +390,60 @@ export const App: React.FC = () => {
 
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
-    let fallbackInterval: number | null = null;
     let backoffMs = 1000;
     let disposed = false;
 
+    const poller = createGuardedPoller({
+      intervalMs: 2500,
+      isHidden: () => document.hidden,
+      poll: () => clashApi.getConnections(),
+      onSuccess: (c) => {
+        if (disposed) return;
+        setConnections(c);
+        setAuthRequired(false);
+        setOnline(true);
+        setLoadError(null);
+      },
+      onError: (err) => {
+        if (disposed) return;
+        handleApiError(err);
+      },
+      setIntervalFn: (fn, ms) => window.setInterval(fn, ms),
+      clearIntervalFn: (id) => window.clearInterval(id),
+    });
+
     const startFallbackPolling = () => {
-      if (disposed || fallbackInterval !== null) return;
-      fallbackInterval = window.setInterval(() => {
-        if (document.hidden) return;
-        void clashApi
-          .getConnections()
-          .then((c) => {
-            setConnections(c);
-            setAuthRequired(false);
-            setOnline(true);
-            setLoadError(null);
-          })
-          .catch(handleApiError);
-      }, 2500);
+      if (disposed) return;
+      poller.start();
     };
 
     const stopFallbackPolling = () => {
-      if (fallbackInterval !== null) {
-        window.clearInterval(fallbackInterval);
-        fallbackInterval = null;
-      }
+      poller.stop();
     };
 
     const connect = () => {
       if (disposed) return;
       try {
-        ws = new WebSocket(buildWsUrl("/connections"));
-        ws.onopen = () => {
+        if (ws) {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          ws.close();
+          ws = null;
+        }
+        const socket = new WebSocket(buildWsUrl("/connections"));
+        ws = socket;
+        socket.onopen = () => {
+          if (disposed) return;
+          if (ws !== socket) return;
           backoffMs = 1000;
           setOnline(true);
           stopFallbackPolling();
         };
-        ws.onmessage = (ev) => {
+        socket.onmessage = (ev) => {
+          if (disposed) return;
+          if (ws !== socket) return;
           try {
             const snap = JSON.parse(String(ev.data)) as ConnectionsResponse;
             setConnections(snap);
@@ -382,13 +452,19 @@ export const App: React.FC = () => {
             // ignore malformed frame
           }
         };
-        ws.onerror = () => {
+        socket.onerror = () => {
+          if (disposed) return;
+          if (ws !== socket) return;
           startFallbackPolling();
         };
-        ws.onclose = () => {
+        socket.onclose = () => {
           if (disposed) return;
+          if (ws !== socket) return;
           startFallbackPolling();
+          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
           reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            if (disposed) return;
             backoffMs = Math.min(backoffMs * 2, 10_000);
             connect();
           }, backoffMs);
@@ -402,9 +478,19 @@ export const App: React.FC = () => {
 
     return () => {
       disposed = true;
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      stopFallbackPolling();
-      if (ws) ws.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      poller.dispose();
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+      }
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch, handleApiError]);
 
@@ -420,11 +506,24 @@ export const App: React.FC = () => {
     const connect = () => {
       if (disposed) return;
       try {
-        ws = new WebSocket(buildWsUrl("/logs"));
-        ws.onopen = () => {
+        if (ws) {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          ws.close();
+          ws = null;
+        }
+        const socket = new WebSocket(buildWsUrl("/logs"));
+        ws = socket;
+        socket.onopen = () => {
+          if (disposed) return;
+          if (ws !== socket) return;
           backoffMs = 1000;
         };
-        ws.onmessage = (ev) => {
+        socket.onmessage = (ev) => {
+          if (disposed) return;
+          if (ws !== socket) return;
           try {
             const item = JSON.parse(String(ev.data)) as LogEntry;
             setLogs((prev) => {
@@ -440,9 +539,17 @@ export const App: React.FC = () => {
             // ignore malformed frame
           }
         };
-        ws.onclose = () => {
+        socket.onerror = () => {
           if (disposed) return;
+          if (ws !== socket) return;
+        };
+        socket.onclose = () => {
+          if (disposed) return;
+          if (ws !== socket) return;
+          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
           reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            if (disposed) return;
             backoffMs = Math.min(backoffMs * 2, 10_000);
             connect();
           }, backoffMs);
@@ -456,19 +563,33 @@ export const App: React.FC = () => {
 
     return () => {
       disposed = true;
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      if (ws) ws.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+      }
     };
   }, [apiReady, pageVisible, authRequired, wsEpoch]);
 
   const handleSaveSecret = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (authBusy) return;
     setAuthBusy(true);
     setAuthError(null);
-    const cur = loadControllerSettings();
-    saveControllerSettings({ ...cur, secret: secretInput });
     try {
-      await clashApi.getVersion();
+      await verifyAndCommitControllerSecret({
+        loadSettings: loadControllerSettings,
+        probeSettings: probeControllerSettings,
+        saveSettings: saveControllerSettings,
+        candidateSecret: secretInput,
+      });
       setAuthRequired(false);
       setWsEpoch((n) => n + 1);
       await refreshCore();

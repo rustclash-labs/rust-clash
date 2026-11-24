@@ -345,6 +345,30 @@ pub async fn handle_uot_server_stream(
     tx_clone: mpsc::UnboundedSender<Frame>,
     writers_clone: Arc<DashMap<u32, mpsc::UnboundedSender<Bytes>>>,
 ) {
+    handle_uot_server_stream_with_upstream(
+        uot_v2,
+        anytls_v2,
+        sid,
+        initial_payload,
+        srx,
+        tx_clone,
+        writers_clone,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_uot_server_stream_with_upstream(
+    uot_v2: bool,
+    anytls_v2: bool,
+    sid: u32,
+    initial_payload: Bytes,
+    srx: mpsc::UnboundedReceiver<Bytes>,
+    tx_clone: mpsc::UnboundedSender<Frame>,
+    writers_clone: Arc<DashMap<u32, mpsc::UnboundedSender<Bytes>>>,
+    custom_upstream: Option<Arc<Box<dyn OutboundUdpSession>>>,
+) {
     if anytls_v2 {
         let _ = tx_clone.send(Frame::empty(Command::SynAck, sid));
     }
@@ -371,14 +395,18 @@ pub async fn handle_uot_server_stream(
         )
     };
 
-    let direct = DirectOutbound::default();
-    let Ok(upstream) = direct.open_udp_session().await else {
-        if writers_clone.remove(&sid).is_some() {
-            let _ = tx_clone.send(Frame::empty(Command::Fin, sid));
-        }
-        return;
+    let upstream = if let Some(u) = custom_upstream {
+        u
+    } else {
+        let direct = DirectOutbound::default();
+        let Ok(opened) = direct.open_udp_session().await else {
+            if writers_clone.remove(&sid).is_some() {
+                let _ = tx_clone.send(Frame::empty(Command::Fin, sid));
+            }
+            return;
+        };
+        Arc::new(opened)
     };
-    let upstream = Arc::new(upstream);
     let upstream_rx = Arc::clone(&upstream);
     let tx_resp = tx_clone.clone();
 
@@ -421,10 +449,17 @@ pub async fn handle_uot_server_stream(
             }
             out.put_u16(resp.len() as u16);
             out.put_slice(&resp);
-            if tx_resp
-                .send(Frame::new(Command::Psh, sid, out.freeze()))
-                .is_err()
-            {
+            let mut send_err = false;
+            for chunk in out.chunks(u16::MAX as usize) {
+                if tx_resp
+                    .send(Frame::new(Command::Psh, sid, Bytes::copy_from_slice(chunk)))
+                    .is_err()
+                {
+                    send_err = true;
+                    break;
+                }
+            }
+            if send_err {
                 break;
             }
         }
@@ -557,5 +592,148 @@ mod tests {
             BytesMut::from(&[UOT_AF_FQDN, 0x02, 0xff, 0xfe, 0x00, 0x35, 0x00, 0x00][..]);
         let err = try_parse_uot_frame(&mut bad_utf8).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn server_uot_splits_full_65535_byte_udp_datagram_across_psh_frames_and_roundtrips() {
+        struct EchoUdpSession {
+            tx: mpsc::UnboundedSender<(Vec<u8>, TargetAddr)>,
+            rx: AsyncMutex<mpsc::UnboundedReceiver<(Vec<u8>, TargetAddr)>>,
+        }
+
+        #[async_trait]
+        impl OutboundUdpSession for EchoUdpSession {
+            async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
+                self.tx
+                    .send((payload.to_vec(), target.clone()))
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "echo closed"))
+            }
+
+            async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
+                let mut rx = self.rx.lock().await;
+                rx.recv()
+                    .await
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "echo eof"))
+            }
+        }
+
+        let (echo_tx, echo_rx) = mpsc::unbounded_channel();
+        let upstream: Arc<Box<dyn OutboundUdpSession>> = Arc::new(Box::new(EchoUdpSession {
+            tx: echo_tx,
+            rx: AsyncMutex::new(echo_rx),
+        }));
+
+        let sid = 7u32;
+        let (srv_in_tx, srv_in_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Frame>();
+        let writers = Arc::new(DashMap::new());
+        writers.insert(sid, srv_in_tx.clone());
+        let writers_c2s = Arc::clone(&writers);
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
+
+        // Pump client UoT writes from duplex into `srv_in_tx`.
+        let pump_c2s = tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match srv_rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if srv_in_tx.send(Bytes::copy_from_slice(&buf[..n])).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            writers_c2s.remove(&sid);
+        });
+
+        // Encode EVERY emitted server `Frame` via real `Frame::encode_into` (which strictly
+        // rejects `data.len() > u16::MAX`!) and decode via `Frame::try_decode` before piping
+        // `Command::Psh` payload bytes back to the client duplex stream.
+        let pump_s2c = tokio::spawn(async move {
+            let mut psh_frame_count = 0usize;
+            while let Some(frame) = frame_rx.recv().await {
+                assert!(
+                    frame.data.len() <= u16::MAX as usize,
+                    "server emitted AnyTLS frame exceeding u16::MAX: {} bytes",
+                    frame.data.len()
+                );
+                let mut wire = BytesMut::new();
+                frame
+                    .encode_into(&mut wire)
+                    .expect("Frame::encode_into must succeed for every UoT server frame");
+                let decoded = Frame::try_decode(&mut wire)
+                    .expect("Frame::try_decode must succeed")
+                    .expect("complete encoded frame must decode");
+                assert!(wire.is_empty());
+                if decoded.cmd == Command::Psh {
+                    psh_frame_count += 1;
+                    if srv_wr.write_all(&decoded.data).await.is_err() {
+                        break;
+                    }
+                    if srv_wr.flush().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            psh_frame_count
+        });
+
+        let srv_task = tokio::spawn(handle_uot_server_stream_with_upstream(
+            true,
+            true,
+            sid,
+            Bytes::new(),
+            srv_in_rx,
+            frame_tx,
+            writers,
+            Some(upstream),
+        ));
+
+        let client_sess = AnyTlsUdpSession::new(client_io);
+
+        // 1. Full 65,535-byte UDP datagram with IPv4 target (wire UoT packet = 7 + 2 + 65535 = 65544 B -> 2 Psh frames).
+        let max_payload: Vec<u8> = (0..u16::MAX as usize)
+            .map(|i| ((i.wrapping_mul(31).wrapping_add(17)) & 0xff) as u8)
+            .collect();
+        let targets = [
+            TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+            TargetAddr::new_ip(IpAddr::V6("2606:4700:4700::1111".parse().unwrap()), 443),
+            TargetAddr::new_domain(format!("{}.example.com", "a".repeat(180)), 8443).unwrap(),
+        ];
+
+        for target in &targets {
+            client_sess.send_to(&max_payload, target).await.unwrap();
+            let (got_payload, got_addr) =
+                tokio::time::timeout(Duration::from_secs(2), client_sess.recv_from())
+                    .await
+                    .expect("timed out receiving 65,535-byte UoT roundtrip")
+                    .expect("65,535-byte UoT roundtrip must succeed");
+            assert_eq!(got_addr, *target);
+            assert_eq!(got_payload.len(), u16::MAX as usize);
+            assert_eq!(got_payload, max_payload);
+        }
+
+        // 2. Follow-up small datagram confirms the stream remains healthy after chunked sends.
+        client_sess.send_to(b"tail-ok", &targets[0]).await.unwrap();
+        let (tail_payload, tail_addr) =
+            tokio::time::timeout(Duration::from_secs(2), client_sess.recv_from())
+                .await
+                .expect("timed out receiving tail UoT packet")
+                .expect("tail UoT packet must succeed");
+        assert_eq!(tail_addr, targets[0]);
+        assert_eq!(tail_payload, b"tail-ok");
+
+        drop(client_sess);
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server task timed out shutting down")
+            .unwrap();
+        pump_c2s.await.unwrap();
+        let psh_frames = pump_s2c.await.unwrap();
+        // 3 full 65,535-byte packets (2 Psh frames each) + 1 small packet (1 Psh frame) = 7 frames.
+        assert_eq!(psh_frames, 7);
     }
 }

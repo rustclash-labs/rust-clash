@@ -4,6 +4,7 @@ import android.content.ContextWrapper
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import io.github.rustclashlabs.rustclash.security.AndroidKeystoreVault
+import io.github.rustclashlabs.rustclash.ui.ActiveYamlExportRunner
 import io.github.rustclashlabs.rustclash.ui.RustClashViewModel
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.DiagnosticsFilter
@@ -12,6 +13,9 @@ import io.github.rustclashlabs.rustclash.ui.model.ProxyNodeItem
 import io.github.rustclashlabs.rustclash.ui.model.RoutingPresetUi
 import io.github.rustclashlabs.rustclash.ui.model.ThemePreference
 import io.github.rustclashlabs.rustclash.ui.model.UiJsonParsers
+import io.github.rustclashlabs.rustclash.vpn.NativeBridge
+import io.github.rustclashlabs.rustclash.vpn.NativeLibraryLoader
+import io.github.rustclashlabs.rustclash.vpn.NetworkCallbackLifecycle
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.PerAppMode
 import io.github.rustclashlabs.rustclash.vpn.PerAppVpnPolicy
@@ -24,17 +28,29 @@ import io.github.rustclashlabs.rustclash.vpn.VpnServiceLifecycleCoordinator
 import io.github.rustclashlabs.rustclash.vpn.VpnSessionConfig
 import io.github.rustclashlabs.rustclash.vpn.VpnStateTracker
 import io.github.rustclashlabs.rustclash.vpn.isGlobalUnicastIpv6Address
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
+import java.nio.file.Files
 import java.security.Key
 import java.security.KeyStore
 import java.security.KeyStoreSpi
@@ -42,11 +58,14 @@ import java.security.cert.Certificate
 import java.util.Collections
 import java.util.Date
 import java.util.Enumeration
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.spec.SecretKeySpec
 
 class VpnConfigAndLifecycleTest {
@@ -3069,5 +3088,1038 @@ class VpnConfigAndLifecycleTest {
         AndroidKeystoreVault.removeEncryptedKey(fakeContext, RustClashVpnService.VAULT_KEY_ACTIVE_YAML)
         assertFalse(backingStore.containsKey(RustClashVpnService.VAULT_KEY_ACTIVE_YAML))
         assertEquals("keep_me", backingStore["other_key"])
+    }
+
+    @Test
+    fun nativeBridgeNonBlockingFastCheckAndOrderedEnsureLoadedContract() {
+        // 1. Production singleton on pure JVM (no libproxy_ffi.so): fast checks are non-blocking
+        //    and never throw; ensureLoaded() caches false cleanly on UnsatisfiedLinkError.
+        assertFalse(NativeBridge.isLoadedFast)
+        assertFalse(NativeBridge.isNativeLoaded)
+        assertFalse(NativeBridge.ensureLoaded())
+        assertFalse(NativeBridge.isLoadedFast)
+        assertFalse(NativeBridge.isNativeLoaded)
+
+        // 2. Non-blocking fast check NEVER invokes blocking loader or vault registrar, and stays
+        //    false until BOTH loadLibrary() AND registerVaultKeyWrapper() have completed!
+        val loadCalls = AtomicInteger(0)
+        val vaultCalls = AtomicInteger(0)
+        val enteredVaultRegistration = CountDownLatch(1)
+        val allowVaultFinish = CountDownLatch(1)
+        val orderLog = Collections.synchronizedList(mutableListOf<String>())
+
+        val loader = NativeLibraryLoader(
+            loadLibrary = {
+                loadCalls.incrementAndGet()
+                orderLog.add("load")
+                true
+            },
+            registerVaultKeyWrapper = {
+                vaultCalls.incrementAndGet()
+                orderLog.add("vault-enter")
+                enteredVaultRegistration.countDown()
+                assertTrue(allowVaultFinish.await(5, TimeUnit.SECONDS))
+                orderLog.add("vault-exit")
+            },
+        )
+
+        assertFalse(loader.isLoadedFast)
+        assertEquals("isLoadedFast must never invoke loadLibrary", 0, loadCalls.get())
+        assertEquals("isLoadedFast must never invoke registerVaultKeyWrapper", 0, vaultCalls.get())
+
+        val executor = Executors.newFixedThreadPool(6)
+        try {
+            val barrier = CyclicBarrier(6)
+            val futures = (0 until 6).map {
+                executor.submit<Boolean> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    loader.ensureLoaded()
+                }
+            }
+            assertTrue(enteredVaultRegistration.await(5, TimeUnit.SECONDS))
+            // While thread #1 is blocked inside vault registration holding loadLock, isLoadedFast
+            // must return false IMMEDIATELY without blocking on loadLock!
+            assertFalse(
+                "isLoadedFast must stay false until vault registration completes",
+                loader.isLoadedFast,
+            )
+            allowVaultFinish.countDown()
+
+            val results = futures.map { it.get(5, TimeUnit.SECONDS) }
+            assertTrue("All concurrent ensureLoaded() callers must see true", results.all { it })
+            assertTrue(loader.isLoadedFast)
+            assertEquals("loadLibrary must run exactly once", 1, loadCalls.get())
+            assertEquals("registerVaultKeyWrapper must run exactly once", 1, vaultCalls.get())
+            assertEquals(listOf("load", "vault-enter", "vault-exit"), orderLog)
+        } finally {
+            executor.shutdownNow()
+        }
+
+        // 3. UnsatisfiedLinkError caches false cleanly without invoking vault registration
+        val failedLoadCalls = AtomicInteger(0)
+        val failedVaultCalls = AtomicInteger(0)
+        val missingLibLoader = NativeLibraryLoader(
+            loadLibrary = {
+                failedLoadCalls.incrementAndGet()
+                throw UnsatisfiedLinkError("libproxy_ffi.so missing")
+            },
+            registerVaultKeyWrapper = {
+                failedVaultCalls.incrementAndGet()
+            },
+        )
+        assertFalse(missingLibLoader.isLoadedFast)
+        assertFalse(missingLibLoader.ensureLoaded())
+        assertFalse(missingLibLoader.ensureLoaded())
+        assertFalse(missingLibLoader.isLoadedFast)
+        assertEquals(1, failedLoadCalls.get())
+        assertEquals(0, failedVaultCalls.get())
+
+        // 4. Non-fatal vault registration failure is caught safely while library stays loaded
+        val flakyVaultLoader = NativeLibraryLoader(
+            loadLibrary = { true },
+            registerVaultKeyWrapper = { throw IllegalStateException("Keystore unavailable") },
+        )
+        assertTrue(flakyVaultLoader.ensureLoaded())
+        assertTrue(flakyVaultLoader.isLoadedFast)
+    }
+
+    @Test
+    fun networkCallbackLifecycleRunsOnDedicatedBackgroundThreadAndTearsDownIdempotently() {
+        assertEquals("rc-net-cb", RustClashVpnService.NETWORK_CALLBACK_THREAD_NAME)
+
+        class FakeWorkerThread(name: String) {
+            private val queue = LinkedBlockingQueue<Runnable>()
+            private val running = AtomicBoolean(true)
+            val quitCount = AtomicInteger(0)
+            val thread: Thread = Thread(
+                {
+                    while (running.get() || queue.isNotEmpty()) {
+                        val task = queue.poll(20, TimeUnit.MILLISECONDS) ?: continue
+                        task.run()
+                    }
+                },
+                name,
+            ).apply { isDaemon = true }
+
+            fun start(): FakeWorkerThread {
+                thread.start()
+                return this
+            }
+
+            fun post(action: () -> Unit) {
+                if (running.get()) {
+                    queue.offer(Runnable(action))
+                }
+            }
+
+            fun quitSafely() {
+                quitCount.incrementAndGet()
+                running.set(false)
+            }
+
+            fun joinClosed() {
+                thread.join(3_000L)
+                assertFalse("Background callback thread must terminate after quitSafely()", thread.isAlive)
+            }
+        }
+
+        val callingThreadId = Thread.currentThread().id
+        val lifecycle = NetworkCallbackLifecycle<Long, FakeWorkerThread>()
+        val startedThreads = mutableListOf<FakeWorkerThread>()
+        val unregisteredGens = mutableListOf<Long>()
+        val deliveredOnThreadNames = Collections.synchronizedList(mutableListOf<String>())
+        val deliveredOrder = Collections.synchronizedList(mutableListOf<Int>())
+
+        // 1. First registration creates a dedicated background thread named "rc-net-cb" (not caller/main)
+        var firstGen = 0L
+        var firstThread: FakeWorkerThread? = null
+        val reg1 = lifecycle.register(
+            createAndStartThread = {
+                FakeWorkerThread(RustClashVpnService.NETWORK_CALLBACK_THREAD_NAME).start().also {
+                    startedThreads.add(it)
+                    firstThread = it
+                }
+            },
+            buildCallback = { gen ->
+                firstGen = gen
+                gen
+            },
+            registerWithOs = { _, _ -> true },
+            unregisterWithOs = { gen -> unregisteredGens.add(gen) },
+            quitThread = { it.quitSafely() },
+        )
+        assertTrue(reg1)
+        assertTrue(lifecycle.hasActiveRegistration)
+        assertTrue(lifecycle.isGenerationActive(firstGen))
+
+        // Dispatch FIFO network events on the dedicated background thread
+        val fifoLatch = CountDownLatch(3)
+        for (seq in 1..3) {
+            firstThread!!.post {
+                if (lifecycle.isGenerationActive(firstGen)) {
+                    assertNotEquals(callingThreadId, Thread.currentThread().id)
+                    deliveredOnThreadNames.add(Thread.currentThread().name)
+                    deliveredOrder.add(seq)
+                }
+                fifoLatch.countDown()
+            }
+        }
+        assertTrue(fifoLatch.await(5, TimeUnit.SECONDS))
+        assertEquals(listOf("rc-net-cb", "rc-net-cb", "rc-net-cb"), deliveredOnThreadNames)
+        assertEquals(listOf(1, 2, 3), deliveredOrder)
+
+        // 2. Clean teardown unregisters callback ONCE, quits thread ONCE, invalidates generation, and is idempotent
+        assertTrue(
+            lifecycle.unregister(
+                markDestroyed = false,
+                unregisterWithOs = { unregisteredGens.add(it) },
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertFalse(lifecycle.hasActiveRegistration)
+        assertFalse(lifecycle.isGenerationActive(firstGen))
+        assertEquals(listOf(firstGen), unregisteredGens)
+        assertEquals(1, firstThread!!.quitCount.get())
+        firstThread!!.joinClosed()
+
+        // Repeated unregister calls are strict no-ops
+        assertFalse(
+            lifecycle.unregister(
+                markDestroyed = false,
+                unregisterWithOs = { unregisteredGens.add(it) },
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertEquals(listOf(firstGen), unregisteredGens)
+        assertEquals(1, firstThread!!.quitCount.get())
+
+        // 3. Failed OS registration (SecurityException / RuntimeException / false) quits thread with ZERO leak
+        var failedThread1: FakeWorkerThread? = null
+        assertFalse(
+            lifecycle.register(
+                createAndStartThread = {
+                    FakeWorkerThread(RustClashVpnService.NETWORK_CALLBACK_THREAD_NAME).start().also {
+                        failedThread1 = it
+                    }
+                },
+                buildCallback = { it },
+                registerWithOs = { _, _ -> throw SecurityException("denied") },
+                unregisterWithOs = { fail("Must not unregister a callback that failed to register") },
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertFalse(lifecycle.hasActiveRegistration)
+        assertEquals(1, failedThread1!!.quitCount.get())
+        failedThread1!!.joinClosed()
+
+        var failedThread2: FakeWorkerThread? = null
+        assertFalse(
+            lifecycle.register(
+                createAndStartThread = {
+                    FakeWorkerThread(RustClashVpnService.NETWORK_CALLBACK_THREAD_NAME).start().also {
+                        failedThread2 = it
+                    }
+                },
+                buildCallback = { it },
+                registerWithOs = { _, _ -> false },
+                unregisterWithOs = { fail("Must not unregister when registerWithOs returned false") },
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertEquals(1, failedThread2!!.quitCount.get())
+        failedThread2!!.joinClosed()
+
+        // 4. Service reuse works until markDestroyed = true (onDestroy), after which registration is blocked
+        var secondThread: FakeWorkerThread? = null
+        var secondGen = 0L
+        assertTrue(
+            lifecycle.register(
+                createAndStartThread = {
+                    FakeWorkerThread(RustClashVpnService.NETWORK_CALLBACK_THREAD_NAME).start().also {
+                        secondThread = it
+                    }
+                },
+                buildCallback = { gen ->
+                    secondGen = gen
+                    gen
+                },
+                registerWithOs = { _, _ -> true },
+                unregisterWithOs = { unregisteredGens.add(it) },
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertTrue(secondGen > firstGen)
+        assertTrue(lifecycle.isGenerationActive(secondGen))
+
+        assertTrue(
+            lifecycle.unregister(
+                markDestroyed = true,
+                unregisterWithOs = { unregisteredGens.add(it) },
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertTrue(lifecycle.isDestroyed)
+        assertFalse(lifecycle.isGenerationActive(secondGen))
+        secondThread!!.joinClosed()
+
+        val postDestroyThreadStarts = AtomicInteger(0)
+        assertFalse(
+            lifecycle.register(
+                createAndStartThread = {
+                    postDestroyThreadStarts.incrementAndGet()
+                    FakeWorkerThread(RustClashVpnService.NETWORK_CALLBACK_THREAD_NAME).start()
+                },
+                buildCallback = { it },
+                registerWithOs = { _, _ -> true },
+                unregisterWithOs = {},
+                quitThread = { it.quitSafely() },
+            ),
+        )
+        assertEquals("Must never spawn a thread after onDestroy()", 0, postDestroyThreadStarts.get())
+
+        // 5. Concurrent register() vs onDestroy() stress test: zero leaked threads or OS callbacks
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            repeat(100) { round ->
+                val raceLifecycle = NetworkCallbackLifecycle<Int, AtomicBoolean>()
+                val startedCount = AtomicInteger(0)
+                val quitCount = AtomicInteger(0)
+                val osRegisteredCount = AtomicInteger(0)
+                val osUnregisteredCount = AtomicInteger(0)
+                val barrier = CyclicBarrier(2)
+
+                val f1 = executor.submit {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    raceLifecycle.register(
+                        createAndStartThread = {
+                            startedCount.incrementAndGet()
+                            AtomicBoolean(true)
+                        },
+                        buildCallback = { it.toInt() },
+                        registerWithOs = { _, _ ->
+                            osRegisteredCount.incrementAndGet()
+                            true
+                        },
+                        unregisterWithOs = { osUnregisteredCount.incrementAndGet() },
+                        quitThread = { t ->
+                            if (t.compareAndSet(true, false)) {
+                                quitCount.incrementAndGet()
+                            }
+                        },
+                    )
+                }
+                val f2 = executor.submit {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    raceLifecycle.unregister(
+                        markDestroyed = true,
+                        unregisterWithOs = { osUnregisteredCount.incrementAndGet() },
+                        quitThread = { t ->
+                            if (t.compareAndSet(true, false)) {
+                                quitCount.incrementAndGet()
+                            }
+                        },
+                    )
+                }
+
+                f1.get(5, TimeUnit.SECONDS)
+                f2.get(5, TimeUnit.SECONDS)
+
+                assertTrue("Round $round: lifecycle must be destroyed", raceLifecycle.isDestroyed)
+                assertFalse("Round $round: must not retain active registration", raceLifecycle.hasActiveRegistration)
+                assertEquals("Round $round: every started thread must be quit", startedCount.get(), quitCount.get())
+                assertEquals(
+                    "Round $round: every OS callback registered must be unregistered",
+                    osRegisteredCount.get(),
+                    osUnregisteredCount.get(),
+                )
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun mainActivityPendingFilePathsPersistUnconditionallyAndFailExportOnNullOutputStream() {
+        val tempDir = Files.createTempDirectory("rc-main-activity-state-test-").toFile()
+        try {
+            val qrFile = File(tempDir, "qr_captures/qr_scan_123.jpg")
+            val debugFile = File(tempDir, "debug_logs/report_456.txt")
+            val yamlContent = "mixed-port: 7890\nproxies:\n  - name: HK-01\n    type: ss\n    password: ***REDACTED***\n"
+
+            // 1. Stage pending YAML to private cache file and verify stale file pruning
+            val unrelatedFile = File(tempDir, "keep_unrelated.txt").apply { writeText("keep") }
+            val oldStaleYaml = File(
+                tempDir,
+                "${MainActivity.PENDING_YAML_EXPORT_PREFIX}1000_stale${MainActivity.PENDING_YAML_EXPORT_SUFFIX}",
+            ).apply {
+                writeText("old-stale")
+                setLastModified(1_000L)
+            }
+
+            val stagedYamlFile = MainActivity.stagePendingYamlExportFile(
+                cacheDir = tempDir,
+                yamlContent = yamlContent,
+                previousPendingFile = null,
+                nowMs = 10_000_000L,
+            )
+            assertTrue(stagedYamlFile.isFile)
+            assertTrue(stagedYamlFile.name.startsWith(MainActivity.PENDING_YAML_EXPORT_PREFIX))
+            assertTrue(stagedYamlFile.name.endsWith(MainActivity.PENDING_YAML_EXPORT_SUFFIX))
+            assertEquals(yamlContent, stagedYamlFile.readText(Charsets.UTF_8))
+            assertFalse("Stale pending YAML file must be cleaned up on new stage", oldStaleYaml.exists())
+            assertTrue("Unrelated cache files must never be deleted", unrelatedFile.isFile)
+
+            // Blank YAML must be rejected without creating a temp file
+            try {
+                MainActivity.stagePendingYamlExportFile(cacheDir = tempDir, yamlContent = "   ")
+                fail("Expected IllegalArgumentException for blank YAML")
+            } catch (_: IllegalArgumentException) {
+                // expected
+            }
+
+            // 2. Pending file paths roundtrip unconditionally (all 3 paths saved & restored cleanly)
+            val savedStore = mutableMapOf<String, String>()
+            val originalPending = MainActivity.PendingActivityFiles(
+                cameraQrFile = qrFile,
+                exportDebugFile = debugFile,
+                exportYamlFile = stagedYamlFile,
+            )
+            MainActivity.savePendingFilePaths(
+                putString = { k, v -> savedStore[k] = v },
+                pendingFiles = originalPending,
+            )
+            assertEquals(3, savedStore.size)
+            assertEquals(qrFile.absolutePath, savedStore[MainActivity.KEY_PENDING_CAMERA_QR_PATH])
+            assertEquals(debugFile.absolutePath, savedStore[MainActivity.KEY_PENDING_EXPORT_DEBUG_PATH])
+            assertEquals(stagedYamlFile.absolutePath, savedStore[MainActivity.KEY_PENDING_EXPORT_YAML_PATH])
+
+            val restored = MainActivity.restorePendingFilePaths(
+                getString = { k -> savedStore[k] },
+            )
+            assertEquals(qrFile.absolutePath, restored.cameraQrFile?.absolutePath)
+            assertEquals(debugFile.absolutePath, restored.exportDebugFile?.absolutePath)
+            assertEquals(stagedYamlFile.absolutePath, restored.exportYamlFile?.absolutePath)
+
+            // Empty/blank/null store restores cleanly to all nulls
+            val emptyRestored = MainActivity.restorePendingFilePaths(
+                getString = { key -> if (key == MainActivity.KEY_PENDING_CAMERA_QR_PATH) "   " else null },
+            )
+            assertNull(emptyRestored.cameraQrFile)
+            assertNull(emptyRestored.exportDebugFile)
+            assertNull(emptyRestored.exportYamlFile)
+
+            // 3. Stale cleanup preserves active restored pending YAML file AND fresh files, deletes expired ones
+            val expiredYaml = File(
+                tempDir,
+                "${MainActivity.PENDING_YAML_EXPORT_PREFIX}500_old${MainActivity.PENDING_YAML_EXPORT_SUFFIX}",
+            ).apply {
+                writeText("expired")
+                setLastModified(1_000L)
+            }
+            val recentYaml = File(
+                tempDir,
+                "${MainActivity.PENDING_YAML_EXPORT_PREFIX}999_recent${MainActivity.PENDING_YAML_EXPORT_SUFFIX}",
+            ).apply {
+                writeText("recent")
+                setLastModified(9_999_000L)
+            }
+            stagedYamlFile.setLastModified(1_000L) // Even if old, keepFile must NEVER be deleted!
+            MainActivity.cleanupStalePendingYamlExports(
+                cacheDir = tempDir,
+                keepFile = stagedYamlFile,
+                nowMs = 10_000_000L,
+                maxAgeMs = 3_600_000L,
+            )
+            assertTrue("Active keepFile must be preserved", stagedYamlFile.isFile)
+            assertTrue("Fresh staged file within maxAgeMs must be preserved", recentYaml.isFile)
+            assertFalse("Expired staged file must be deleted", expiredYaml.exists())
+            assertTrue("Unrelated file must remain untouched", unrelatedFile.isFile)
+
+            // 4. copyPendingFileToOutputStream: null OutputStream MUST return false (no false success toast!)
+            assertFalse(
+                "Null OutputStream from ContentResolver must fail export cleanly",
+                MainActivity.copyPendingFileToOutputStream(
+                    srcFile = stagedYamlFile,
+                    openOutputStream = { null },
+                ),
+            )
+
+            // Failing OutputStream (IOException) returns false cleanly
+            assertFalse(
+                "IOException during write must fail export cleanly",
+                MainActivity.copyPendingFileToOutputStream(
+                    srcFile = stagedYamlFile,
+                    openOutputStream = {
+                        object : OutputStream() {
+                            override fun write(b: Int) {
+                                throw IOException("simulated disk full")
+                            }
+                        }
+                    },
+                ),
+            )
+
+            // Missing source file returns false cleanly
+            assertFalse(
+                "Missing source file must fail export cleanly",
+                MainActivity.copyPendingFileToOutputStream(
+                    srcFile = File(tempDir, "does_not_exist.yaml"),
+                    openOutputStream = { ByteArrayOutputStream() },
+                ),
+            )
+
+            // Valid OutputStream succeeds and copies exact UTF-8 YAML bytes
+            val sink = ByteArrayOutputStream()
+            assertTrue(
+                "Valid OutputStream must export staged YAML cleanly",
+                MainActivity.copyPendingFileToOutputStream(
+                    srcFile = stagedYamlFile,
+                    openOutputStream = { sink },
+                ),
+            )
+            assertEquals(yamlContent, sink.toString(Charsets.UTF_8.name()))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun yamlExportRapidDoubleTapIsSingleFlightPreservesStagedFileAndLaunchesSafOnce() {
+        val tempDir = Files.createTempDirectory("rc-yaml-export-reentrancy-").toFile()
+        val mainExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "test-main") }
+        val ioExecutor = Executors.newFixedThreadPool(2) { r -> Thread(r, "test-io") }
+        val mainDispatcher = mainExecutor.asCoroutineDispatcher()
+        val ioDispatcher = ioExecutor.asCoroutineDispatcher()
+        val vmScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+        val activityScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+
+        fun <T> onMain(block: () -> T): T = mainExecutor.submit(block).get(5, TimeUnit.SECONDS)
+
+        try {
+            val yamlPayload = "mixed-port: 7890\nproxies:\n  - name: JP-01\n    type: ss\n    password: ***REDACTED***\n"
+            val yamlJson = """{"ok":true,"yaml":"mixed-port: 7890\nproxies:\n  - name: JP-01\n    type: ss\n    password: ***REDACTED***\n"}"""
+
+            val fetchCount = AtomicInteger(0)
+            val stageCount = AtomicInteger(0)
+            val safLaunchCount = AtomicInteger(0)
+            val messages = Collections.synchronizedList(mutableListOf<String>())
+
+            val ioEntered = AtomicReference(CountDownLatch(1))
+            val allowIoFinish = AtomicReference(CountDownLatch(1))
+            val stagingEntered = AtomicReference(CountDownLatch(1))
+            val allowStagingFinish = AtomicReference(CountDownLatch(1))
+            val safLaunched = AtomicReference(CountDownLatch(1))
+
+            val isStagingDuringLaunch = AtomicBoolean(false)
+            val pendingFileDuringLaunch = AtomicReference<File?>(null)
+            val launchedFileNames = Collections.synchronizedList(mutableListOf<String>())
+
+            val runner = ActiveYamlExportRunner(
+                scope = vmScope,
+                ioDispatcher = ioDispatcher,
+                ensureNativeLoaded = { true },
+                fetchActiveYamlJson = {
+                    fetchCount.incrementAndGet()
+                    ioEntered.get().countDown()
+                    assertTrue(allowIoFinish.get().await(5, TimeUnit.SECONDS))
+                    yamlJson
+                },
+                emitMessage = { messages.add(it) },
+            )
+
+            lateinit var coordinator: YamlExportSafCoordinator
+            coordinator = YamlExportSafCoordinator(
+                scope = activityScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = { false },
+                requestActiveYaml = { onReady, onFailure ->
+                    runner.start(onReady = onReady, onFailure = onFailure)
+                },
+                launchSafPicker = { suggestedName ->
+                    safLaunchCount.incrementAndGet()
+                    launchedFileNames.add(suggestedName)
+                    isStagingDuringLaunch.set(coordinator.isStagingYamlExport)
+                    pendingFileDuringLaunch.set(coordinator.pendingExportYamlFile)
+                    safLaunched.get().countDown()
+                },
+                emitMessage = { messages.add(it) },
+                stageFile = { dir, content, prev ->
+                    stageCount.incrementAndGet()
+                    stagingEntered.get().countDown()
+                    assertTrue(allowStagingFinish.get().await(5, TimeUnit.SECONDS))
+                    MainActivity.stagePendingYamlExportFile(
+                        cacheDir = dir,
+                        yamlContent = content,
+                        previousPendingFile = prev,
+                    )
+                },
+            )
+
+            // 1. Tap 1 sets isStagingYamlExport synchronously BEFORE IO finishes
+            onMain {
+                coordinator.onExportYamlClicked()
+                assertTrue(
+                    "isStagingYamlExport must be set synchronously on first tap",
+                    coordinator.isStagingYamlExport,
+                )
+                assertTrue(
+                    "ActiveYamlExportRunner must be marked in-flight synchronously",
+                    runner.isExportInFlight,
+                )
+            }
+            assertTrue("First IO fetch must start", ioEntered.get().await(5, TimeUnit.SECONDS))
+
+            // 2. Rapid double-tap & triple-tap while ViewModel IO is still running MUST be dropped
+            val directRejectReady = AtomicInteger(0)
+            val directRejectFailure = AtomicInteger(0)
+            onMain {
+                coordinator.onExportYamlClicked()
+                coordinator.onExportYamlClicked()
+                val directAccepted = runner.start(
+                    onReady = { directRejectReady.incrementAndGet() },
+                    onFailure = { directRejectFailure.incrementAndGet() },
+                )
+                assertFalse("Direct overlapping ViewModel export must be rejected", directAccepted)
+            }
+            assertEquals("Overlapping taps must NOT launch second IO fetch", 1, fetchCount.get())
+            assertEquals(0, directRejectReady.get())
+            assertEquals(0, directRejectFailure.get())
+
+            // 3. Let ViewModel IO finish; block inside disk staging and fire another rapid tap
+            allowIoFinish.get().countDown()
+            assertTrue("Disk staging must start", stagingEntered.get().await(5, TimeUnit.SECONDS))
+            onMain {
+                assertTrue(
+                    "isStagingYamlExport must remain true while staging YAML to cacheDir",
+                    coordinator.isStagingYamlExport,
+                )
+                coordinator.onExportYamlClicked()
+            }
+            assertEquals("Tap during disk staging must NOT trigger second fetch", 1, fetchCount.get())
+            assertEquals("Tap during disk staging must NOT trigger second stage", 1, stageCount.get())
+
+            // 4. Release staging and wait for SAF picker launch
+            allowStagingFinish.get().countDown()
+            assertTrue("SAF picker must be launched", safLaunched.get().await(5, TimeUnit.SECONDS))
+            // Drain main executor so finally block after launchSafPicker has executed
+            onMain { /* fence */ }
+
+            assertTrue(
+                "isStagingYamlExport must STILL be true during safExportYamlLauncher.launch(...)",
+                isStagingDuringLaunch.get(),
+            )
+            assertEquals(listOf("rustclash-config.yaml"), launchedFileNames)
+            assertEquals(1, fetchCount.get())
+            assertEquals(1, stageCount.get())
+            assertEquals(1, safLaunchCount.get())
+
+            val stagedFile1 = pendingFileDuringLaunch.get()
+            assertNotNull("Staged YAML file must be assigned before launching SAF picker", stagedFile1)
+            assertTrue("stagedFile1 must exist on disk", stagedFile1!!.isFile)
+            assertEquals(yamlPayload, stagedFile1.readText(Charsets.UTF_8))
+
+            // 5. After launchSafPicker returns: isStagingYamlExport is false, isSafPickerPending is true,
+            //    and a rapid tap right before onPause() MUST NOT delete stagedFile1 or stack a duplicate picker!
+            onMain {
+                assertFalse("isStagingYamlExport must reset in finally after launch", coordinator.isStagingYamlExport)
+                assertTrue("isSafPickerPending must guard the post-launch window", coordinator.isSafPickerPending)
+                assertSame(stagedFile1, coordinator.pendingExportYamlFile)
+
+                coordinator.onExportYamlClicked()
+
+                assertSame("stagedFile1 must remain assigned for onSaveInstanceState", stagedFile1, coordinator.pendingExportYamlFile)
+            }
+            assertTrue("stagedFile1 must NEVER be deleted by rejected rapid tap", stagedFile1.isFile)
+            assertEquals(1, fetchCount.get())
+            assertEquals(1, stageCount.get())
+            assertEquals("SAF picker must have been launched strictly once", 1, safLaunchCount.get())
+
+            // 6. SAF result callback consumes stagedFile1 and writes exact bytes
+            val consumedFile = onMain { coordinator.consumePendingFileForSafResult() }
+            assertSame(stagedFile1, consumedFile)
+            onMain {
+                assertNull(coordinator.pendingExportYamlFile)
+                assertFalse(coordinator.isSafPickerPending)
+            }
+            val exportedBytes = ByteArrayOutputStream()
+            assertTrue(
+                MainActivity.copyPendingFileToOutputStream(
+                    srcFile = consumedFile!!,
+                    openOutputStream = { exportedBytes },
+                ),
+            )
+            assertEquals(yamlPayload, exportedBytes.toString(Charsets.UTF_8.name()))
+
+            // 7. After SAF completes, a new user tap succeeds cleanly
+            ioEntered.set(CountDownLatch(1))
+            allowIoFinish.set(CountDownLatch(0))
+            stagingEntered.set(CountDownLatch(1))
+            allowStagingFinish.set(CountDownLatch(0))
+            safLaunched.set(CountDownLatch(1))
+
+            onMain { coordinator.onExportYamlClicked() }
+            assertTrue("Second export after completion must launch SAF", safLaunched.get().await(5, TimeUnit.SECONDS))
+            onMain { /* fence */ }
+            assertEquals(2, fetchCount.get())
+            assertEquals(2, stageCount.get())
+            assertEquals(2, safLaunchCount.get())
+            assertNotNull(onMain { coordinator.pendingExportYamlFile })
+
+            // 8. If SAF picker is abandoned without a callback, onActivityResumed() releases the pending-picker guard
+            safLaunched.set(CountDownLatch(1))
+            onMain {
+                assertTrue(coordinator.isSafPickerPending)
+                coordinator.onActivityResumed()
+                assertFalse(coordinator.isSafPickerPending)
+                coordinator.onExportYamlClicked()
+            }
+            assertTrue("Export after onActivityResumed() recovery must succeed", safLaunched.get().await(5, TimeUnit.SECONDS))
+            onMain { /* fence */ }
+            assertEquals(3, safLaunchCount.get())
+            assertTrue("No error messages expected on happy paths: $messages", messages.isEmpty())
+        } finally {
+            activityScope.cancel()
+            vmScope.cancel()
+            mainDispatcher.close()
+            ioDispatcher.close()
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun yamlExportFailuresEmptyPayloadExceptionsAndActivityDestructionResetGuardsCleanly() {
+        val tempDir = Files.createTempDirectory("rc-yaml-export-recovery-").toFile()
+        val mainExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "test-main-rec") }
+        val ioExecutor = Executors.newFixedThreadPool(2) { r -> Thread(r, "test-io-rec") }
+        val mainDispatcher = mainExecutor.asCoroutineDispatcher()
+        val ioDispatcher = ioExecutor.asCoroutineDispatcher()
+        val vmScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+        val activityScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+
+        fun <T> onMain(block: () -> T): T = mainExecutor.submit(block).get(5, TimeUnit.SECONDS)
+
+        try {
+            val nativeLoaded = AtomicBoolean(false)
+            val fetchBehavior = AtomicReference<() -> String> { """{"ok":true,"yaml":"port: 7890\n"}""" }
+            val activityInvalid = AtomicBoolean(false)
+            val throwOnLaunch = AtomicBoolean(false)
+            val messages = Collections.synchronizedList(mutableListOf<String>())
+            val safLaunchCount = AtomicInteger(0)
+            val failureNotified = AtomicReference(CountDownLatch(1))
+            val safLaunched = AtomicReference(CountDownLatch(1))
+
+            val runner = ActiveYamlExportRunner(
+                scope = vmScope,
+                ioDispatcher = ioDispatcher,
+                ensureNativeLoaded = { nativeLoaded.get() },
+                fetchActiveYamlJson = { fetchBehavior.get().invoke() },
+                emitMessage = { messages.add(it) },
+            )
+
+            val coordinator = YamlExportSafCoordinator(
+                scope = activityScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = { activityInvalid.get() },
+                requestActiveYaml = { onReady, onFailure ->
+                    runner.start(
+                        onReady = onReady,
+                        onFailure = {
+                            onFailure()
+                            failureNotified.get().countDown()
+                        },
+                    )
+                },
+                launchSafPicker = {
+                    if (throwOnLaunch.get()) {
+                        throw IllegalStateException("No SAF handler installed")
+                    }
+                    safLaunchCount.incrementAndGet()
+                    safLaunched.get().countDown()
+                },
+                emitMessage = { messages.add(it) },
+            )
+
+            // Case A: Native library not loaded -> invokes onFailure, resets guards, never launches SAF
+            failureNotified.set(CountDownLatch(1))
+            onMain { coordinator.onExportYamlClicked() }
+            assertTrue(failureNotified.get().await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse("Guard must reset when native library fails to load", coordinator.isStagingYamlExport)
+                assertFalse(coordinator.isSafPickerPending)
+                assertFalse(runner.isExportInFlight)
+                assertNull(coordinator.pendingExportYamlFile)
+            }
+            assertEquals(0, safLaunchCount.get())
+            assertEquals("Rust 核心库未加载", messages.last())
+
+            // Case B: Empty / blank YAML payload -> invokes onFailure, resets guards
+            nativeLoaded.set(true)
+            fetchBehavior.set { """{"ok":true,"yaml":"   "}""" }
+            failureNotified.set(CountDownLatch(1))
+            onMain { coordinator.onExportYamlClicked() }
+            assertTrue(failureNotified.get().await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse("Guard must reset on blank YAML", coordinator.isStagingYamlExport)
+                assertFalse(runner.isExportInFlight)
+            }
+            assertEquals(0, safLaunchCount.get())
+            assertEquals("无法导出当前 YAML 配置", messages.last())
+
+            // Case B2: Backend ok=false with explicit error message
+            fetchBehavior.set { """{"ok":false,"error":"profile not ready"}""" }
+            failureNotified.set(CountDownLatch(1))
+            onMain { coordinator.onExportYamlClicked() }
+            assertTrue(failureNotified.get().await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse(coordinator.isStagingYamlExport)
+                assertFalse(runner.isExportInFlight)
+            }
+            assertEquals("profile not ready", messages.last())
+
+            // Case C: IO exception thrown by native bridge -> caught cleanly, resets guards
+            fetchBehavior.set { throw RuntimeException("simulated JNI IO failure") }
+            failureNotified.set(CountDownLatch(1))
+            onMain { coordinator.onExportYamlClicked() }
+            assertTrue(failureNotified.get().await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse("Guard must reset after IO exception", coordinator.isStagingYamlExport)
+                assertFalse(runner.isExportInFlight)
+            }
+            assertEquals("无法导出当前 YAML 配置", messages.last())
+
+            // Case D: launchSafPicker throws -> deletes staged temp file, clears pendingExportYamlFile & guards
+            fetchBehavior.set { """{"ok":true,"yaml":"mixed-port: 7890\n"}""" }
+            throwOnLaunch.set(true)
+            val launchFailureMsg = CountDownLatch(1)
+            val failingLaunchCoordinator = YamlExportSafCoordinator(
+                scope = activityScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = { false },
+                requestActiveYaml = { onReady, onFailure ->
+                    runner.start(onReady = onReady, onFailure = onFailure)
+                },
+                launchSafPicker = { throw IllegalStateException("ActivityNotFoundException") },
+                emitMessage = {
+                    messages.add(it)
+                    launchFailureMsg.countDown()
+                },
+            )
+            onMain { failingLaunchCoordinator.onExportYamlClicked() }
+            assertTrue(launchFailureMsg.await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse(failingLaunchCoordinator.isStagingYamlExport)
+                assertFalse(failingLaunchCoordinator.isSafPickerPending)
+                assertNull(failingLaunchCoordinator.pendingExportYamlFile)
+            }
+            val leftoverAfterLaunchFail = tempDir.listFiles { f ->
+                f.name.startsWith(MainActivity.PENDING_YAML_EXPORT_PREFIX)
+            }.orEmpty()
+            assertEquals("Staged file must be deleted when SAF launch fails", 0, leftoverAfterLaunchFail.size)
+
+            // Retry after all prior failures MUST now succeed cleanly
+            throwOnLaunch.set(false)
+            safLaunched.set(CountDownLatch(1))
+            onMain { coordinator.onExportYamlClicked() }
+            assertTrue("Subsequent retry after failures must succeed", safLaunched.get().await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse(coordinator.isStagingYamlExport)
+                assertTrue(coordinator.isSafPickerPending)
+                assertNotNull(coordinator.pendingExportYamlFile)
+                coordinator.consumePendingFileForSafResult()?.delete()
+            }
+            assertEquals(1, safLaunchCount.get())
+
+            // Case E: Activity becomes isFinishing/isDestroyed mid-staging -> deletes staged file, never launches SAF
+            val stagingStarted = CountDownLatch(1)
+            val allowStageComplete = CountDownLatch(1)
+            val orphanDeleted = CountDownLatch(1)
+            val midDestroyInvalid = AtomicBoolean(false)
+            val midDestroySafCount = AtomicInteger(0)
+            val createdStagedRef = AtomicReference<File?>(null)
+
+            val midDestroyCoordinator = YamlExportSafCoordinator(
+                scope = activityScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = { midDestroyInvalid.get() },
+                requestActiveYaml = { onReady, onFailure ->
+                    runner.start(onReady = onReady, onFailure = onFailure)
+                },
+                launchSafPicker = { midDestroySafCount.incrementAndGet() },
+                emitMessage = { messages.add(it) },
+                stageFile = { dir, content, prev ->
+                    val file = MainActivity.stagePendingYamlExportFile(dir, content, prev)
+                    createdStagedRef.set(file)
+                    stagingStarted.countDown()
+                    assertTrue(allowStageComplete.await(5, TimeUnit.SECONDS))
+                    file
+                },
+                deleteFile = { f ->
+                    f.delete()
+                    orphanDeleted.countDown()
+                },
+            )
+            onMain { midDestroyCoordinator.onExportYamlClicked() }
+            assertTrue(stagingStarted.await(5, TimeUnit.SECONDS))
+            midDestroyInvalid.set(true)
+            allowStageComplete.countDown()
+            assertTrue("Orphan staged file must be deleted on Activity invalidation", orphanDeleted.await(5, TimeUnit.SECONDS))
+            // deleteFile runs on ioDispatcher inside withContext(NonCancellable + ioDispatcher);
+            // join activityScope's child coroutine(s) so finally { isStagingYamlExport = false }
+            // completes deterministically on mainDispatcher before asserting guard state.
+            runBlocking {
+                withTimeout(5_000) {
+                    activityScope.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+                }
+            }
+            onMain {
+                assertFalse(midDestroyCoordinator.isStagingYamlExport)
+                assertFalse(midDestroyCoordinator.isSafPickerPending)
+                assertNull(midDestroyCoordinator.pendingExportYamlFile)
+            }
+            assertEquals("SAF picker must NOT launch after Activity invalidation", 0, midDestroySafCount.get())
+            assertFalse("Staged file must no longer exist on disk", createdStagedRef.get()!!.exists())
+
+            // Case F: Activity scope cancelled mid-staging -> NonCancellable deletes orphan file, resets guard
+            val cancelScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+            val cancelStageStarted = CountDownLatch(1)
+            val cancelIssued = CountDownLatch(1)
+            val cancelOrphanDeleted = CountDownLatch(1)
+            val cancelSafCount = AtomicInteger(0)
+            val cancelFileRef = AtomicReference<File?>(null)
+            val cancelCoordinator = YamlExportSafCoordinator(
+                scope = cancelScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = { false },
+                requestActiveYaml = { onReady, onFailure ->
+                    runner.start(onReady = onReady, onFailure = onFailure)
+                },
+                launchSafPicker = { cancelSafCount.incrementAndGet() },
+                emitMessage = { messages.add(it) },
+                stageFile = { dir, content, prev ->
+                    val file = MainActivity.stagePendingYamlExportFile(dir, content, prev)
+                    cancelFileRef.set(file)
+                    cancelStageStarted.countDown()
+                    assertTrue(cancelIssued.await(5, TimeUnit.SECONDS))
+                    file
+                },
+                deleteFile = { f ->
+                    f.delete()
+                    cancelOrphanDeleted.countDown()
+                },
+            )
+            onMain { cancelCoordinator.onExportYamlClicked() }
+            assertTrue(cancelStageStarted.await(5, TimeUnit.SECONDS))
+            cancelScope.cancel()
+            cancelIssued.countDown()
+            assertTrue("Orphan staged file must be deleted when scope cancels mid-staging", cancelOrphanDeleted.await(5, TimeUnit.SECONDS))
+            // deleteFile runs on ioDispatcher inside withContext(NonCancellable + ioDispatcher);
+            // join cancelScope's cancelled Job so the staging coroutine's finally block completes
+            // deterministically on mainDispatcher before asserting guard state.
+            runBlocking {
+                withTimeout(5_000) {
+                    cancelScope.coroutineContext[Job]!!.join()
+                }
+            }
+            onMain {
+                assertFalse(cancelCoordinator.isStagingYamlExport)
+                assertNull(cancelCoordinator.pendingExportYamlFile)
+            }
+            assertEquals(0, cancelSafCount.get())
+            assertFalse(cancelFileRef.get()!!.exists())
+
+            // Case G: Cross-Activity rotation where runner is still busy from Activity1:
+            //         Activity2 tap must be rejected cleanly WITHOUT leaving Activity2.isStagingYamlExport stuck!
+            val slowIoEntered = CountDownLatch(1)
+            val allowSlowIoFinish = CountDownLatch(1)
+            val slowRunner = ActiveYamlExportRunner(
+                scope = vmScope,
+                ioDispatcher = ioDispatcher,
+                ensureNativeLoaded = { true },
+                fetchActiveYamlJson = {
+                    slowIoEntered.countDown()
+                    assertTrue(allowSlowIoFinish.await(5, TimeUnit.SECONDS))
+                    """{"ok":true,"yaml":"port: 7890\n"}"""
+                },
+                emitMessage = { messages.add(it) },
+            )
+            val activity1Invalid = AtomicBoolean(false)
+            val activity1ReadyHandled = CountDownLatch(1)
+            val activity1 = YamlExportSafCoordinator(
+                scope = activityScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = {
+                    val invalid = activity1Invalid.get()
+                    if (invalid) activity1ReadyHandled.countDown()
+                    invalid
+                },
+                requestActiveYaml = { onReady, onFailure -> slowRunner.start(onReady, onFailure) },
+                launchSafPicker = { fail("Destroyed Activity1 must never launch SAF") },
+                emitMessage = { messages.add(it) },
+            )
+            val activity2SafLaunched = CountDownLatch(1)
+            val activity2 = YamlExportSafCoordinator(
+                scope = activityScope,
+                ioDispatcher = ioDispatcher,
+                cacheDirProvider = { tempDir },
+                isActivityInvalid = { false },
+                requestActiveYaml = { onReady, onFailure -> slowRunner.start(onReady, onFailure) },
+                launchSafPicker = { activity2SafLaunched.countDown() },
+                emitMessage = { messages.add(it) },
+            )
+            onMain { activity1.onExportYamlClicked() }
+            assertTrue(slowIoEntered.await(5, TimeUnit.SECONDS))
+            activity1Invalid.set(true)
+
+            onMain {
+                // Activity2 taps while Activity1's ViewModel job is still active
+                activity2.onExportYamlClicked()
+                assertFalse(
+                    "Activity2 must reset isStagingYamlExport when runner rejects overlapping request",
+                    activity2.isStagingYamlExport,
+                )
+            }
+            allowSlowIoFinish.countDown()
+            assertTrue(activity1ReadyHandled.await(5, TimeUnit.SECONDS))
+            onMain {
+                assertFalse(activity1.isStagingYamlExport)
+                assertFalse(slowRunner.isExportInFlight)
+                activity2.onExportYamlClicked()
+            }
+            assertTrue("Activity2 retry after Activity1 IO completes must succeed", activity2SafLaunched.await(5, TimeUnit.SECONDS))
+            onMain { activity2.consumePendingFileForSafResult()?.delete() }
+
+            // Case H: stagePendingYamlExportFile preserves an active in-flight SAF copy file while pruning orphans
+            val activeCopy = MainActivity.stagePendingYamlExportFile(
+                cacheDir = tempDir,
+                yamlContent = "active: copy\n",
+                nowMs = 1_000L,
+            )
+            val staleOrphan = File(
+                tempDir,
+                "${MainActivity.PENDING_YAML_EXPORT_PREFIX}500_orphan${MainActivity.PENDING_YAML_EXPORT_SUFFIX}",
+            ).apply { writeText("orphan") }
+            val nextStaged = MainActivity.stagePendingYamlExportFile(
+                cacheDir = tempDir,
+                yamlContent = "next: export\n",
+                previousPendingFile = null,
+                nowMs = 2_000L,
+                keepActiveCopyFile = activeCopy,
+            )
+            assertTrue("In-flight copy file must be preserved while staging next export", activeCopy.isFile)
+            assertTrue("Newly staged file must exist", nextStaged.isFile)
+            assertFalse("Unrelated stale pending YAML must still be pruned", staleOrphan.exists())
+        } finally {
+            activityScope.cancel()
+            vmScope.cancel()
+            mainDispatcher.close()
+            ioDispatcher.close()
+            tempDir.deleteRecursively()
+        }
     }
 }

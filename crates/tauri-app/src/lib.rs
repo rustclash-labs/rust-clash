@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -115,6 +115,8 @@ const fn default_close_to_tray() -> bool {
     true
 }
 
+static PREFS_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Persistent desktop UX preferences stored at `state_dir/desktop_prefs.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopPrefs {
@@ -146,38 +148,108 @@ impl DesktopPrefs {
         serde_json::from_str(&raw).unwrap_or_default()
     }
 
-    pub fn save_to(&self, state_dir: &Path) -> io::Result<()> {
+    fn save_to_with_writer<F>(state_dir: &Path, write_fn: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut fs::File) -> io::Result<()>,
+    {
         fs::create_dir_all(state_dir)?;
         let final_path = Self::path_in(state_dir);
-        let tmp_path = state_dir.join(format!(
-            "{DESKTOP_PREFS_FILENAME}.tmp.{}",
-            std::process::id()
-        ));
-        let serialized = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        {
-            let mut opts = OpenOptions::new();
-            opts.create(true).write(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+
+        let (tmp_path, f) = {
+            let mut opened = None;
+            for _ in 0..8 {
+                let seq = PREFS_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let candidate = state_dir.join(format!(
+                    "{DESKTOP_PREFS_FILENAME}.tmp.{}.{seq}",
+                    std::process::id()
+                ));
+                let mut opts = OpenOptions::new();
+                opts.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                match opts.open(&candidate) {
+                    Ok(file) => {
+                        opened = Some((candidate, file));
+                        break;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(err),
+                }
             }
-            let mut f = opts.open(&tmp_path)?;
+            opened.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "failed to allocate unique temporary file for desktop_prefs.json",
+                )
+            })?
+        };
+
+        let write_res: io::Result<()> = {
+            let mut file = f;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(err) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                if let Err(err) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
                     tracing::warn!(
                         "Failed setting 0600 permissions on '{}': {err}",
                         tmp_path.display()
                     );
                 }
             }
-            f.write_all(&serialized)?;
-            f.sync_all()?;
+            write_fn(&mut file)
+        };
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
         }
-        fs::rename(&tmp_path, &final_path)?;
+
+        #[cfg(windows)]
+        let rename_res = {
+            let mut last_err = None;
+            for attempt in 0..8u32 {
+                match fs::rename(&tmp_path, &final_path) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(err)
+                        if attempt < 7
+                            && !final_path.is_dir()
+                            && (err.kind() == io::ErrorKind::PermissionDenied
+                                || matches!(err.raw_os_error(), Some(5 | 32))) =>
+                    {
+                        last_err = Some(err);
+                        std::thread::sleep(Duration::from_millis(2 * u64::from(attempt + 1)));
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        break;
+                    }
+                }
+            }
+            last_err.map_or(Ok(()), Err)
+        };
+        #[cfg(not(windows))]
+        let rename_res = fs::rename(&tmp_path, &final_path);
+
+        if let Err(err) = rename_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
         Ok(())
+    }
+
+    pub fn save_to(&self, state_dir: &Path) -> io::Result<()> {
+        let serialized = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        Self::save_to_with_writer(state_dir, |file| {
+            file.write_all(&serialized)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })
     }
 }
 
@@ -937,7 +1009,9 @@ impl DesktopAppState {
             Ok(bound) => bound,
             Err(_) => spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx).await?,
         };
-        if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
+        if instance_guard.is_some()
+            && let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr)
+        {
             tracing::warn!("Failed writing runtime controller discovery file (demo): {err}");
         }
         Ok(Self {
@@ -2138,6 +2212,7 @@ mod desktop_ipc {
         let setup_state = app_state.clone();
         let close_state = app_state.clone();
         let exit_state = app_state.clone();
+        let build_err_state = app_state.clone();
         let tray_active = Arc::new(AtomicBool::new(false));
         let tray_flag_setup = Arc::clone(&tray_active);
         let tray_flag_close = Arc::clone(&tray_active);
@@ -2223,7 +2298,10 @@ mod desktop_ipc {
                 relaunch_elevated_for_tun,
             ])
             .build(tauri::generate_context!())
-            .map_err(|e| anyhow::anyhow!("Tauri build error: {e}"))?;
+            .map_err(move |e| {
+                build_err_state.shutdown();
+                anyhow::anyhow!("Tauri build error: {e}")
+            })?;
 
         app.run(move |app_handle, event| match event {
             #[cfg(target_os = "macos")]
@@ -2405,11 +2483,14 @@ mod tests {
             assert_eq!(counter.load(Ordering::SeqCst), 2);
         }
 
-        // Clean shutdown removes `.ipc` and `.lock` so immediate re-launch succeeds!
+        // Clean shutdown removes `.ipc` and releases `.lock` so immediate re-launch succeeds!
         server.stop();
         drop(guard);
         assert!(!temp_dir.join(DESKTOP_IPC_FILENAME).exists());
+        #[cfg(not(unix))]
         assert!(!temp_dir.join("rust-clash.instance.lock").exists());
+        #[cfg(unix)]
+        assert!(temp_dir.join("rust-clash.instance.lock").exists());
         assert!(!try_signal_running_instance(&temp_dir));
 
         let reopened = match acquire_or_signal_instance(&temp_dir).expect("re-open immediately") {
@@ -2475,9 +2556,15 @@ mod tests {
                 .exists(),
             "shutdown() must remove rust-clash.controller.json"
         );
+        #[cfg(not(unix))]
         assert!(
             !temp_dir.join("rust-clash.instance.lock").exists(),
             "shutdown() must drop SingleInstanceGuard before process exit"
+        );
+        #[cfg(unix)]
+        assert!(
+            temp_dir.join("rust-clash.instance.lock").exists(),
+            "Unix SingleInstanceGuard keeps lockfile inode stable on drop to prevent flock races"
         );
 
         let reacquired =
@@ -2770,9 +2857,15 @@ mod tests {
             !ipc_path.exists(),
             "first shutdown() must remove the old instance's .ipc file"
         );
+        #[cfg(not(unix))]
         assert!(
             !temp_dir.join("rust-clash.instance.lock").exists(),
             "first shutdown() must release SingleInstanceGuard"
+        );
+        #[cfg(unix)]
+        assert!(
+            temp_dir.join("rust-clash.instance.lock").exists(),
+            "Unix SingleInstanceGuard keeps lockfile inode stable on drop to prevent flock races"
         );
 
         // Simulate a newly launched elevated replacement instance acquiring the lock and
@@ -3391,6 +3484,296 @@ mod tests {
         );
 
         engine.shutdown_async().await;
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn desktop_prefs_concurrent_save_to_stress_has_no_collisions_or_leftover_tmp_files() {
+        use std::sync::Barrier;
+
+        let temp_dir = unique_temp_dir("prefs-concurrent");
+        let thread_count = 8usize;
+        let saves_per_thread = 30usize;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        let mut handles = Vec::with_capacity(thread_count);
+        for tid in 0..thread_count {
+            let dir = temp_dir.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for iter in 0..saves_per_thread {
+                    let prefs = DesktopPrefs {
+                        close_to_tray: (tid + iter).is_multiple_of(2),
+                    };
+                    prefs.save_to(&dir).unwrap_or_else(|err| {
+                        panic!("thread {tid} iter {iter} DesktopPrefs::save_to failed: {err}")
+                    });
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("concurrent save_to worker panicked");
+        }
+
+        let final_path = DesktopPrefs::path_in(&temp_dir);
+        let raw = fs::read_to_string(&final_path).expect("read final desktop_prefs.json");
+        let parsed: DesktopPrefs =
+            serde_json::from_str(&raw).expect("final desktop_prefs.json must be valid JSON");
+        assert_eq!(DesktopPrefs::load_from(&temp_dir), parsed);
+
+        let leftovers: Vec<String> = fs::read_dir(&temp_dir)
+            .expect("read temp state dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "expected zero leftover .tmp.* files after concurrent saves, found: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn desktop_prefs_save_to_cleans_up_tmp_file_on_write_and_rename_errors() {
+        use std::io::Write;
+
+        // 1. Write/sync error must remove the temp file and leave prior valid prefs intact.
+        let write_err_dir = unique_temp_dir("prefs-write-err");
+        let initial = DesktopPrefs {
+            close_to_tray: false,
+        };
+        initial
+            .save_to(&write_err_dir)
+            .expect("seed initial valid desktop_prefs.json");
+
+        let write_err = DesktopPrefs::save_to_with_writer(&write_err_dir, |file| {
+            file.write_all(b"{\"close_to_tray\":")?;
+            Err(std::io::Error::other("simulated disk full"))
+        })
+        .expect_err("simulated write failure must return Err");
+        assert!(write_err.to_string().contains("simulated disk full"));
+        assert_eq!(
+            DesktopPrefs::load_from(&write_err_dir),
+            initial,
+            "failed write must preserve previous valid desktop_prefs.json"
+        );
+        let write_leftovers: Vec<String> = fs::read_dir(&write_err_dir)
+            .expect("read write_err_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            write_leftovers.is_empty(),
+            "failed write must not leave orphaned .tmp.* files: {write_leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&write_err_dir);
+
+        // 2. Rename error (target path is an existing directory) must clean up the temp file.
+        let rename_err_dir = unique_temp_dir("prefs-rename-err");
+        let blocking_dir = DesktopPrefs::path_in(&rename_err_dir);
+        fs::create_dir(&blocking_dir).expect("create blocking directory at desktop_prefs.json");
+
+        let rename_err = DesktopPrefs {
+            close_to_tray: true,
+        }
+        .save_to(&rename_err_dir)
+        .expect_err("rename over existing directory must fail");
+        let _ = rename_err;
+        assert!(blocking_dir.is_dir());
+
+        let rename_leftovers: Vec<String> = fs::read_dir(&rename_err_dir)
+            .expect("read rename_err_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            rename_leftovers.is_empty(),
+            "failed rename must not leave orphaned .tmp.* files: {rename_leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&rename_err_dir);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_demo_without_instance_guard_preserves_existing_controller_discovery() {
+        use super::DesktopLaunchOptions;
+        use proxy_core::platform::recovery::{
+            CONTROLLER_DISCOVERY_FILENAME, ControllerRuntimeEndpoint, read_controller_discovery,
+            write_controller_discovery,
+        };
+
+        let temp_dir = unique_temp_dir("demo-no-guard-discovery");
+
+        // Simulate a live non-demo daemon holding SingleInstanceGuard, wakeup IPC, and
+        // `rust-clash.controller.json` in `state_dir`. Using our own PID makes the post-shutdown
+        // assertion even stricter: an erroneous `cleanup_controller_discovery` call would match
+        // our PID and delete the file.
+        let live_guard =
+            SingleInstanceGuard::acquire(&temp_dir).expect("live daemon acquires instance lock");
+        let mut live_wakeup = DesktopWakeupServer::bind_in_state_dir(&temp_dir)
+            .expect("live daemon binds wakeup ipc");
+        let existing_live = ControllerRuntimeEndpoint {
+            pid: std::process::id(),
+            addr: "127.0.0.1:19090".to_string(),
+            secret: Some("live-daemon-secret".to_string()),
+        };
+        write_controller_discovery(&temp_dir, &existing_live)
+            .expect("seed pre-existing live daemon controller discovery");
+
+        let discovery_path = temp_dir.join(CONTROLLER_DISCOVERY_FILENAME);
+        let ipc_path = temp_dir.join(DESKTOP_IPC_FILENAME);
+        let initial_discovery_bytes =
+            fs::read(&discovery_path).expect("read seeded rust-clash.controller.json");
+        let initial_ipc_bytes = fs::read(&ipc_path).expect("read seeded rust-clash.desktop.ipc");
+
+        // Mirrors `DesktopAppState::bootstrap_demo()` non-fatal lock acquisition.
+        assert!(
+            SingleInstanceGuard::acquire(&temp_dir).ok().is_none(),
+            "secondary lock acquisition must return None while live daemon holds SingleInstanceGuard"
+        );
+
+        let demo_state = DesktopAppState::bootstrap_demo_with_guard_options(
+            temp_dir.clone(),
+            None,
+            DesktopLaunchOptions {
+                use_demo: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("co-located demo bootstrap without instance guard must succeed");
+
+        assert!(demo_state.status().demo_mode);
+        assert_eq!(
+            fs::read(&discovery_path).expect("read controller discovery while demo is running"),
+            initial_discovery_bytes,
+            "co-located demo bootstrap must leave rust-clash.controller.json byte-for-byte identical while running"
+        );
+        assert_eq!(
+            read_controller_discovery(&temp_dir),
+            Some(existing_live.clone())
+        );
+        assert_eq!(
+            fs::read(&ipc_path).expect("read wakeup ipc while demo is running"),
+            initial_ipc_bytes,
+            "co-located demo bootstrap must leave rust-clash.desktop.ipc byte-for-byte identical while running"
+        );
+
+        // Runtime discovery sync (e.g. YAML reload / secret rotation) must also be a no-op.
+        demo_state.engine.sync_controller_discovery();
+        assert_eq!(
+            fs::read(&discovery_path).expect("read controller discovery after sync"),
+            initial_discovery_bytes,
+            "co-located demo sync_controller_discovery() must not overwrite rust-clash.controller.json"
+        );
+
+        // Synchronous `shutdown()` must leave the live daemon's discovery and IPC files untouched.
+        demo_state.shutdown();
+        assert!(
+            discovery_path.exists(),
+            "co-located demo shutdown() must not remove live daemon's rust-clash.controller.json"
+        );
+        assert_eq!(
+            fs::read(&discovery_path).expect("read controller discovery after demo shutdown()"),
+            initial_discovery_bytes,
+            "co-located demo shutdown() must leave rust-clash.controller.json byte-for-byte identical"
+        );
+        assert_eq!(
+            fs::read(&ipc_path).expect("read wakeup ipc after demo shutdown()"),
+            initial_ipc_bytes,
+            "co-located demo shutdown() must leave rust-clash.desktop.ipc byte-for-byte identical"
+        );
+
+        // Also verify `shutdown_async()` leaves the live daemon's discovery file byte-for-byte identical.
+        let demo_state_async = DesktopAppState::bootstrap_demo_with_guard_options(
+            temp_dir.clone(),
+            None,
+            DesktopLaunchOptions {
+                use_demo: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("second co-located demo bootstrap must succeed");
+        assert_eq!(
+            fs::read(&discovery_path).expect("read controller discovery while 2nd demo runs"),
+            initial_discovery_bytes
+        );
+        demo_state_async.shutdown_async().await;
+        assert_eq!(
+            fs::read(&discovery_path)
+                .expect("read controller discovery after demo shutdown_async()"),
+            initial_discovery_bytes,
+            "co-located demo shutdown_async() must leave rust-clash.controller.json byte-for-byte identical"
+        );
+        assert_eq!(read_controller_discovery(&temp_dir), Some(existing_live));
+
+        live_wakeup.stop();
+        drop(live_guard);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_demo_with_instance_guard_publishes_and_cleans_up_controller_discovery() {
+        use super::DesktopLaunchOptions;
+        use proxy_core::platform::recovery::{
+            CONTROLLER_DISCOVERY_FILENAME, normalize_loopback_controller_addr,
+            read_controller_discovery,
+        };
+
+        let temp_dir = unique_temp_dir("demo-with-guard-discovery");
+        let guard = SingleInstanceGuard::acquire(&temp_dir)
+            .expect("acquire single-instance guard for sole demo desktop instance");
+
+        let demo_state = DesktopAppState::bootstrap_demo_with_guard_options(
+            temp_dir.clone(),
+            Some(guard),
+            DesktopLaunchOptions {
+                use_demo: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sole demo bootstrap with instance guard must succeed");
+
+        let status = demo_state.status();
+        assert!(status.demo_mode);
+        let expected_secret = status
+            .api_secret
+            .clone()
+            .expect("demo bootstrap must populate ephemeral api_secret");
+        let expected_addr = normalize_loopback_controller_addr(demo_state.api_addr)
+            .expect("demo api_addr must normalize to loopback");
+
+        let disc = read_controller_discovery(&temp_dir)
+            .expect("demo bootstrap with Some(guard) must publish rust-clash.controller.json");
+        assert_eq!(disc.pid, std::process::id());
+        assert_eq!(disc.addr, expected_addr);
+        assert_eq!(disc.secret.as_deref(), Some(expected_secret.as_str()));
+        assert!(
+            temp_dir.join(DESKTOP_IPC_FILENAME).exists(),
+            "demo bootstrap with Some(guard) must bind rust-clash.desktop.ipc"
+        );
+
+        demo_state.shutdown_async().await;
+        assert!(
+            !temp_dir.join(CONTROLLER_DISCOVERY_FILENAME).exists(),
+            "demo shutdown must remove its own rust-clash.controller.json"
+        );
+        assert!(
+            read_controller_discovery(&temp_dir).is_none(),
+            "read_controller_discovery must return None after demo shutdown"
+        );
+        assert!(
+            !temp_dir.join(DESKTOP_IPC_FILENAME).exists(),
+            "demo shutdown must remove its own rust-clash.desktop.ipc"
+        );
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

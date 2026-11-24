@@ -914,13 +914,82 @@ impl DnsService {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OsTunEffectiveInputs {
+    tun_config: TunConfig,
+    bypass_ips: Vec<IpAddr>,
+    dns_bypass_ips: Vec<IpAddr>,
+    fake_ip_net: ipnet::Ipv4Net,
+    gateway_ipv4: std::net::Ipv4Addr,
+    route_exclude_cidrs: Vec<ipnet::IpNet>,
+    local_dns_addr: Option<SocketAddr>,
+}
+
+impl OsTunEffectiveInputs {
+    fn from_config_and_dns(
+        cfg: &ClashConfig,
+        dns: &FakeIpDnsEngine,
+        local_dns_addr: Option<SocketAddr>,
+    ) -> Self {
+        let bypass_ips = collect_proxy_bypass_ips(cfg);
+        let dns_bypass_ips = collect_dns_bypass_ips(dns, &bypass_ips);
+        let fake_ip_net = dns.fake_ip_net();
+        let gateway_ipv4 = dns.gateway_ipv4();
+        let route_exclude_cidrs = cfg.tun.effective_route_exclude_cidrs(fake_ip_net);
+        Self {
+            tun_config: cfg.tun.clone(),
+            bypass_ips,
+            dns_bypass_ips,
+            fake_ip_net,
+            gateway_ipv4,
+            route_exclude_cidrs,
+            local_dns_addr,
+        }
+    }
+}
+
 struct TunService {
     config: TunConfig,
     mode: TunRuntimeMode,
+    os_inputs: Option<OsTunEffectiveInputs>,
     ipv6_enabled: Arc<std::sync::atomic::AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
     os_guard: Option<Arc<OsTunGuard>>,
+}
+
+fn evaluate_tun_transition(
+    current_tun: Option<&TunService>,
+    new_cfg: &ClashConfig,
+    new_dns: &FakeIpDnsEngine,
+    local_dns_addr: Option<SocketAddr>,
+) -> (bool, bool) {
+    // Keep an active virtual packet bridge (e.g. Android VpnService / macOS NEPacketTunnelProvider)
+    // alive across live profile/rule/node reloads even if `mtu` differs (host VPN session owns MTU).
+    let preserve_virtual_tun = matches!(
+        current_tun,
+        Some(t)
+            if t.mode == TunRuntimeMode::Virtual
+                && new_cfg.tun.enable
+                && !new_cfg.tun.auto_route
+    );
+    if preserve_virtual_tun {
+        return (true, false);
+    }
+    let need_tun_change = match current_tun {
+        Some(t) if t.mode == TunRuntimeMode::OsTun => {
+            if !new_cfg.tun.enable || !new_cfg.tun.auto_route {
+                true
+            } else {
+                let target_os_inputs =
+                    OsTunEffectiveInputs::from_config_and_dns(new_cfg, new_dns, local_dns_addr);
+                t.os_inputs.as_ref() != Some(&target_os_inputs)
+            }
+        }
+        Some(t) => !new_cfg.tun.enable || new_cfg.tun.auto_route || t.config != new_cfg.tun,
+        None => new_cfg.tun.enable,
+    };
+    (false, need_tun_change)
 }
 
 impl TunService {
@@ -980,22 +1049,24 @@ fn collect_proxy_bypass_ips(cfg: &ClashConfig) -> Vec<IpAddr> {
     for node in &cfg.proxies {
         let (srv, _) = node.server_port();
         let srv = srv.trim();
-        if let Ok(ip) = srv.parse::<IpAddr>()
-            && !ips.contains(&ip)
-        {
+        if let Ok(ip) = srv.parse::<IpAddr>() {
             ips.push(ip);
         }
     }
+    ips.sort_unstable();
+    ips.dedup();
     ips
 }
 
 fn collect_dns_bypass_ips(dns: &FakeIpDnsEngine, proxy_ips: &[IpAddr]) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     for ns_ip in dns.upstream_bypass_ips() {
-        if !proxy_ips.contains(&ns_ip) && !ips.contains(&ns_ip) {
+        if !proxy_ips.contains(&ns_ip) {
             ips.push(ns_ip);
         }
     }
+    ips.sort_unstable();
+    ips.dedup();
     ips
 }
 
@@ -1091,6 +1162,23 @@ fn config_uses_geodata(cfg: &ClashConfig) -> bool {
     })
 }
 
+fn truncate_udp_dns_response_if_needed(req: &[u8], resp: Vec<u8>) -> Vec<u8> {
+    let max_udp = crate::dns::wire::extract_edns0_udp_payload_size(req);
+    if resp.len() <= max_udp {
+        return resp;
+    }
+    if let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(req) {
+        return crate::dns::wire::build_truncated_dns_header(req, &qp);
+    }
+    if resp.len() >= 12 {
+        let mut fallback = resp[..12].to_vec();
+        fallback[2] |= 0x02; // TC=1
+        fallback[4..12].fill(0); // QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        return fallback;
+    }
+    resp
+}
+
 async fn spawn_dynamic_dns_server(
     listen_addr: &str,
     router_slot: Arc<RwLock<Arc<Router>>>,
@@ -1159,7 +1247,8 @@ async fn spawn_dynamic_dns_server(
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Ok(resp) = dns_engine.handle_dns_packet(&pkt).await {
-                            let _ = sock_clone.send_to(&resp, peer).await;
+                            let wire_resp = truncate_udp_dns_response_if_needed(&pkt, resp);
+                            let _ = sock_clone.send_to(&wire_resp, peer).await;
                         }
                     });
                 }
@@ -1202,13 +1291,14 @@ async fn spawn_dynamic_dns_server(
                                 _ => break,
                             };
                             let mut req = vec![0u8; len];
-                            if tokio::time::timeout(
-                                Duration::from_secs(5),
-                                stream.read_exact(&mut req),
-                            )
-                            .await
-                            .is_err()
-                            {
+                            if !matches!(
+                                tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    stream.read_exact(&mut req),
+                                )
+                                .await,
+                                Ok(Ok(_))
+                            ) {
                                 break;
                             }
                             let dns_engine = Arc::clone(router_conn.read().dns());
@@ -1221,13 +1311,14 @@ async fn spawn_dynamic_dns_server(
                             let mut frame = BytesMut::with_capacity(2 + resp.len());
                             frame.put_u16(resp.len() as u16);
                             frame.put_slice(&resp);
-                            if tokio::time::timeout(
-                                Duration::from_secs(5),
-                                stream.write_all(&frame),
-                            )
-                            .await
-                            .is_err()
-                            {
+                            if !matches!(
+                                tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    stream.write_all(&frame),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ) {
                                 break;
                             }
                         }
@@ -1300,10 +1391,9 @@ fn start_tun_service(
     );
 
     if cfg.tun.auto_route {
-        let bypass_ips = collect_proxy_bypass_ips(cfg);
-        let dns_bypass_ips = collect_dns_bypass_ips(dns, &bypass_ips);
-        let fake_ip_net = dns.fake_ip_net();
-        let gw_v4 = dns.gateway_ipv4();
+        let os_inputs = OsTunEffectiveInputs::from_config_and_dns(cfg, dns, local_dns_addr);
+        let fake_ip_net = os_inputs.fake_ip_net;
+        let gw_v4 = os_inputs.gateway_ipv4;
         let tun_ipv4_cidr =
             ipnet::Ipv4Net::new(gw_v4, fake_ip_net.prefix_len()).unwrap_or(fake_ip_net);
         let tun_ipv6_cidr = cfg
@@ -1338,13 +1428,15 @@ fn start_tun_service(
             fake_ip_net,
             tun_ipv4_cidr,
             tun_ipv6_cidr,
-            bypass_ips,
-            dns_bypass_ips,
-            route_exclude_cidrs: cfg.tun.effective_route_exclude_cidrs(fake_ip_net),
-            local_dns_addr,
+            bypass_ips: os_inputs.bypass_ips.clone(),
+            dns_bypass_ips: os_inputs.dns_bypass_ips.clone(),
+            route_exclude_cidrs: os_inputs.route_exclude_cidrs.clone(),
+            local_dns_addr: os_inputs.local_dns_addr,
             wintun_dll_path: cfg.tun.wintun_path.as_ref().map(PathBuf::from),
             state_dir,
-            dns_engine: Some(Arc::clone(dns)),
+            // Netwatch always flushes the live router's `FakeIpDnsEngine` via `network_change_hook`
+            // (which reads `router_slot`), so avoid pinning a stale pre-reload `FakeIpDnsEngine`.
+            dns_engine: None,
             network_change_hook: Some(net_change_hook),
         };
 
@@ -1361,6 +1453,7 @@ fn start_tun_service(
                     TunService {
                         config: cfg.tun.clone(),
                         mode: TunRuntimeMode::OsTun,
+                        os_inputs: Some(os_inputs),
                         ipv6_enabled,
                         shutdown_tx: tun_stop_tx,
                         task: t_tun,
@@ -1387,6 +1480,7 @@ fn start_tun_service(
             TunService {
                 config: cfg.tun.clone(),
                 mode: TunRuntimeMode::Virtual,
+                os_inputs: None,
                 ipv6_enabled,
                 shutdown_tx: tun_stop_tx,
                 task: t_tun,
@@ -1589,17 +1683,16 @@ impl ProxyEngine {
         cfg.validate()?;
         let state_dir = default_state_dir();
         let extra_ca_der: Vec<CertificateDer<'static>> = Vec::new();
-        let geodata_mgr = crate::router::geodata::GeoDataManager::new(&state_dir, Vec::new());
+        let _geodata_mgr = crate::router::geodata::GeoDataManager::new(&state_dir, Vec::new());
         let dns_engine = Arc::new(FakeIpDnsEngine::with_extra_ca(
             &cfg.dns_with_merged_hosts(),
             &extra_ca_der,
         )?);
         let outbounds =
             build_outbounds_with_dns(&cfg.proxies, &extra_ca_der, Some(Arc::clone(&dns_engine)))?;
-        let mmdb = match load_optional_mmdb(cfg)? {
-            Some(explicit) => Some(explicit),
-            None => geodata_mgr.mmdb_reader(),
-        };
+        // Only pin `rule_mmdb` when `cfg.mmdb_path` is explicitly configured; otherwise leave
+        // `None` so `matches_geoip_dynamic` dynamically reads `LIVE_GEODATA` on every lookup.
+        let mmdb = load_optional_mmdb(cfg)?;
         let router = Router::with_providers_mmdb_and_state_dir(
             cfg.mode,
             outbounds,
@@ -1690,10 +1783,9 @@ impl ProxyEngine {
         }
         let outbounds =
             build_outbounds_with_dns(&cfg.proxies, &extra_ca_der, Some(Arc::clone(&dns_engine)))?;
-        let mmdb = match load_optional_mmdb(&cfg)? {
-            Some(explicit) => Some(explicit),
-            None => geodata_mgr.as_ref().and_then(|g| g.mmdb_reader()),
-        };
+        // Only pin `rule_mmdb` when `cfg.mmdb_path` is explicitly configured; otherwise leave
+        // `None` so online `Country.mmdb` updates in `LIVE_GEODATA` take effect immediately.
+        let mmdb = load_optional_mmdb(&cfg)?;
         let initial_router = Arc::new(Router::with_providers_mmdb_and_state_dir(
             cfg.mode,
             outbounds,
@@ -3682,10 +3774,9 @@ impl ProxyEngine {
         self.persist_fake_ip_cache();
         let new_outbounds =
             build_outbounds_with_dns(&new_cfg.proxies, &extra_ca, Some(Arc::clone(&new_dns)))?;
-        let mmdb = match load_optional_mmdb(&new_cfg)? {
-            Some(explicit) => Some(explicit),
-            None => self.geodata_manager().and_then(|g| g.mmdb_reader()),
-        };
+        // Only pin `rule_mmdb` when `new_cfg.mmdb_path` is explicitly configured; otherwise leave
+        // `None` so online `Country.mmdb` updates in `LIVE_GEODATA` take effect immediately.
+        let mmdb = load_optional_mmdb(&new_cfg)?;
         let cur_state_dir = self.state_dir();
         let new_router = Arc::new(Router::with_providers_mmdb_and_state_dir(
             new_cfg.mode,
@@ -3734,23 +3825,6 @@ impl ProxyEngine {
         let need_dns_change = match &services.dns {
             Some(d) => !new_cfg.dns.enable || d.listen_spec != new_cfg.dns.listen,
             None => new_cfg.dns.enable,
-        };
-        // Keep an active virtual packet bridge (e.g. Android VpnService / macOS NEPacketTunnelProvider)
-        // alive across live profile/rule/node reloads even if `mtu` differs (host VPN session owns MTU).
-        let preserve_virtual_tun = matches!(
-            &services.tun,
-            Some(t)
-                if t.mode == TunRuntimeMode::Virtual
-                    && new_cfg.tun.enable
-                    && !new_cfg.tun.auto_route
-        );
-        let need_tun_change = if preserve_virtual_tun {
-            false
-        } else {
-            match &services.tun {
-                Some(t) => !new_cfg.tun.enable || t.config != new_cfg.tun,
-                None => new_cfg.tun.enable,
-            }
         };
 
         let mut rollback = TransitionRollbackState {
@@ -3970,7 +4044,15 @@ impl ProxyEngine {
             );
         }
 
-        // 4. Apply TUN transition with full rollback record (`stopped_old_tun_cfg`) using the updated `local_dns`
+        // 4. Evaluate TUN transition AFTER step 2 DNS rebind so `local_dns_addr` reflects the
+        // newly bound DNS listener, and apply with full rollback record (`stopped_old_tun_cfg`).
+        let post_rebind_dns_addr = services.dns.as_ref().map(|d| d.bound_addr);
+        let (preserve_virtual_tun, need_tun_change) = evaluate_tun_transition(
+            services.tun.as_ref(),
+            &new_cfg,
+            &new_dns,
+            post_rebind_dns_addr,
+        );
         if need_tun_change {
             if let Some(old_tun) = services.tun.take() {
                 rollback.stopped_old_tun_cfg = Some(old_tun.config.clone());
@@ -3983,7 +4065,7 @@ impl ProxyEngine {
                 st.snapshot = Arc::new(next_snap);
             }
             if new_cfg.tun.enable {
-                let local_dns = services.dns.as_ref().map(|d| d.bound_addr);
+                let local_dns = post_rebind_dns_addr;
                 match start_tun_service(
                     &new_cfg,
                     &new_dns,
@@ -5375,5 +5457,399 @@ mod tests {
         assert!(engine.extra_ca_der().is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn os_tun_effective_inputs_detect_all_bypass_dns_fakeip_and_local_dns_changes() {
+        let base_yaml = r#"
+mixed-port: 0
+mode: rule
+dns:
+  enable: true
+  listen: "127.0.0.1:5353"
+  enhanced-mode: fake-ip
+  fake-ip-range: "198.18.0.1/16"
+  nameserver:
+    - "1.1.1.1:53"
+tun:
+  enable: true
+  auto-route: true
+  strict-route: true
+  mtu: 1500
+  route-exclude-address:
+    - "192.168.0.0/16"
+proxies:
+  - name: "Node-A"
+    type: socks5
+    server: "203.0.113.10"
+    port: 1080
+  - name: "Node-B"
+    type: socks5
+    server: "198.51.100.20"
+    port: 1080
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["Node-A", "Node-B", "DIRECT"]
+rules:
+  - "MATCH,PROXY"
+"#;
+        let base_cfg = ClashConfig::from_yaml_str(base_yaml).unwrap();
+        let base_dns = FakeIpDnsEngine::new(&base_cfg.dns_with_merged_hosts()).unwrap();
+        let dns_addr_1: SocketAddr = "127.0.0.1:5353".parse().unwrap();
+        let base_inputs =
+            OsTunEffectiveInputs::from_config_and_dns(&base_cfg, &base_dns, Some(dns_addr_1));
+
+        // Verify bypass IPs are sorted and deduped deterministically.
+        assert_eq!(
+            base_inputs.bypass_ips,
+            vec![
+                "198.51.100.20".parse::<IpAddr>().unwrap(),
+                "203.0.113.10".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(
+            base_inputs
+                .dns_bypass_ips
+                .contains(&"1.1.1.1".parse::<IpAddr>().unwrap())
+        );
+        let mut sorted_dns = base_inputs.dns_bypass_ips.clone();
+        sorted_dns.sort_unstable();
+        sorted_dns.dedup();
+        assert_eq!(base_inputs.dns_bypass_ips, sorted_dns);
+
+        let (tx, _rx) = watch::channel(false);
+        let dummy_os_tun = TunService {
+            config: base_cfg.tun.clone(),
+            mode: TunRuntimeMode::OsTun,
+            os_inputs: Some(base_inputs.clone()),
+            ipv6_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_tx: tx,
+            task: tokio::spawn(async {}),
+            os_guard: None,
+        };
+
+        // 1. Reordering proxies with identical IP set and changing only rules must NOT restart OS TUN.
+        let mut reordered_cfg = base_cfg.clone();
+        reordered_cfg.proxies.reverse();
+        reordered_cfg.rules = vec![
+            "DOMAIN-SUFFIX,example.com,DIRECT".into(),
+            "MATCH,PROXY".into(),
+        ];
+        let reordered_dns = FakeIpDnsEngine::new(&reordered_cfg.dns_with_merged_hosts()).unwrap();
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_os_tun),
+                &reordered_cfg,
+                &reordered_dns,
+                Some(dns_addr_1),
+            ),
+            (false, false),
+            "reordering proxies or changing rules alone should not flap OS TUN"
+        );
+
+        // 2. Changing proxy server IP (identical `cfg.tun`) MUST trigger OS TUN restart.
+        let mut proxy_ip_cfg = base_cfg.clone();
+        if let ProxyNodeConfig::Socks5 { ref mut server, .. } = proxy_ip_cfg.proxies[0] {
+            *server = "203.0.113.99".to_string();
+        }
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_os_tun),
+                &proxy_ip_cfg,
+                &base_dns,
+                Some(dns_addr_1),
+            ),
+            (false, true),
+            "proxy server IP change must trigger OS TUN restart"
+        );
+
+        // 3. Changing upstream DNS IP (identical `cfg.tun`) MUST trigger OS TUN restart.
+        let mut dns_up_cfg = base_cfg.clone();
+        dns_up_cfg.dns.nameserver = vec!["9.9.9.9:53".to_string()];
+        let dns_up_engine = FakeIpDnsEngine::new(&dns_up_cfg.dns_with_merged_hosts()).unwrap();
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_os_tun),
+                &dns_up_cfg,
+                &dns_up_engine,
+                Some(dns_addr_1),
+            ),
+            (false, true),
+            "upstream DNS bypass IP change must trigger OS TUN restart"
+        );
+
+        // 4. Changing `dns.fake-ip-range` (identical `cfg.tun`) MUST trigger OS TUN restart.
+        let mut fakeip_cfg = base_cfg.clone();
+        fakeip_cfg.dns.fake_ip_range = "198.19.0.1/16".to_string();
+        let fakeip_engine = FakeIpDnsEngine::new(&fakeip_cfg.dns_with_merged_hosts()).unwrap();
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_os_tun),
+                &fakeip_cfg,
+                &fakeip_engine,
+                Some(dns_addr_1),
+            ),
+            (false, true),
+            "fake-ip-range change must trigger OS TUN restart"
+        );
+
+        // 5. Post-rebind `local_dns_addr` change (identical `cfg.tun`) MUST trigger OS TUN restart.
+        let dns_addr_2: SocketAddr = "127.0.0.1:5354".parse().unwrap();
+        assert_eq!(
+            evaluate_tun_transition(Some(&dummy_os_tun), &base_cfg, &base_dns, Some(dns_addr_2),),
+            (false, true),
+            "rebound local_dns_addr must trigger OS TUN restart"
+        );
+
+        // 6. Disabling TUN or switching `auto_route` off triggers TUN transition.
+        let mut disabled_cfg = base_cfg.clone();
+        disabled_cfg.tun.enable = false;
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_os_tun),
+                &disabled_cfg,
+                &base_dns,
+                Some(dns_addr_1),
+            ),
+            (false, true)
+        );
+        let mut virtual_target_cfg = base_cfg.clone();
+        virtual_target_cfg.tun.auto_route = false;
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_os_tun),
+                &virtual_target_cfg,
+                &base_dns,
+                Some(dns_addr_1),
+            ),
+            (false, true)
+        );
+
+        // 7. Active Virtual TUN is preserved across config transitions even when MTU/proxies change.
+        let (vtx, _vrx) = watch::channel(false);
+        let dummy_vtun = TunService {
+            config: virtual_target_cfg.tun.clone(),
+            mode: TunRuntimeMode::Virtual,
+            os_inputs: None,
+            ipv6_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_tx: vtx,
+            task: tokio::spawn(async {}),
+            os_guard: None,
+        };
+        let mut virtual_mtu_cfg = virtual_target_cfg.clone();
+        virtual_mtu_cfg.tun.mtu = 1400;
+        assert_eq!(
+            evaluate_tun_transition(
+                Some(&dummy_vtun),
+                &virtual_mtu_cfg,
+                &base_dns,
+                Some(dns_addr_2),
+            ),
+            (true, false),
+            "virtual TUN bridge must be preserved across reloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_dynamic_dns_server_truncates_oversized_udp_with_tc1_and_handles_tcp_io_errors() {
+        use bytes::{BufMut, BytesMut};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Unit-verify helper for standard 512B query, EDNS0 OPT query, and unparseable fallback.
+        let plain_q = crate::dns::wire::build_dns_query(0x1234, "big.example.com", 16); // TXT
+        let oversized_600 = vec![0xAB; 600];
+        let tc_plain = truncate_udp_dns_response_if_needed(&plain_q, oversized_600.clone());
+        assert!(tc_plain.len() <= 512);
+        let flags_plain = u16::from_be_bytes([tc_plain[2], tc_plain[3]]);
+        assert_ne!(
+            flags_plain & 0x0200,
+            0,
+            "non-EDNS0 >512B reply must set TC=1"
+        );
+
+        // Build query with EDNS0 OPT advertising 1024-byte UDP payload.
+        let mut edns_q = plain_q.clone();
+        edns_q[10] = 0;
+        edns_q[11] = 1; // ARCOUNT = 1
+        edns_q.push(0); // root owner
+        edns_q.extend_from_slice(&41u16.to_be_bytes()); // OPT
+        edns_q.extend_from_slice(&1024u16.to_be_bytes()); // UDP payload size 1024
+        edns_q.extend_from_slice(&0u32.to_be_bytes()); // ext RCODE + flags
+        edns_q.extend_from_slice(&0u16.to_be_bytes()); // RDLEN = 0
+
+        let passthrough = truncate_udp_dns_response_if_needed(&edns_q, oversized_600);
+        assert_eq!(
+            passthrough.len(),
+            600,
+            "600B reply fits within advertised 1024B EDNS0 UDP limit"
+        );
+        let oversized_1100 = vec![0xCD; 1100];
+        let tc_edns = truncate_udp_dns_response_if_needed(&edns_q, oversized_1100);
+        assert!(tc_edns.len() <= 512);
+        assert_ne!(
+            u16::from_be_bytes([tc_edns[2], tc_edns[3]]) & 0x0200,
+            0,
+            ">1024B reply must set TC=1"
+        );
+
+        // Unparseable query fallback still sets TC=1 and zeroes section counts safely.
+        let mut raw_resp = vec![0u8; 600];
+        raw_resp[0] = 0x42;
+        raw_resp[1] = 0x43;
+        raw_resp[5] = 1;
+        raw_resp[7] = 5;
+        let tc_fallback = truncate_udp_dns_response_if_needed(&[0u8; 4], raw_resp);
+        assert_eq!(tc_fallback.len(), 12);
+        assert_ne!(tc_fallback[2] & 0x02, 0);
+        assert_eq!(&tc_fallback[4..12], &[0u8; 8]);
+
+        // 2. Live UDP + TCP integration test against `spawn_dynamic_dns_server`:
+        // Mock upstream returns an oversized >600-byte TXT response on UDP/TCP.
+        let upstream_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_udp.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = upstream_udp.recv_from(&mut buf).await {
+                if n < 12 {
+                    continue;
+                }
+                if let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(&buf[..n]) {
+                    let mut resp = BytesMut::with_capacity(700);
+                    resp.put_u16(qp.id);
+                    resp.put_u16(0x8180); // QR=1, RD=1, RA=1, NOERROR
+                    resp.put_u16(1); // QDCOUNT = 1
+                    resp.put_u16(4); // ANCOUNT = 4 TXT records (>600 bytes total)
+                    resp.put_u16(0);
+                    resp.put_u16(0);
+                    resp.put_slice(&buf[12..qp.question.end_offset]);
+                    for _ in 0..4 {
+                        resp.put_u16(0xC00C); // pointer to question name
+                        resp.put_u16(16); // TXT
+                        resp.put_u16(1); // IN
+                        resp.put_u32(60); // TTL
+                        let txt_chunk = [b'x'; 160];
+                        resp.put_u16((1 + txt_chunk.len()) as u16);
+                        resp.put_u8(txt_chunk.len() as u8);
+                        resp.put_slice(&txt_chunk);
+                    }
+                    let _ = upstream_udp.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        let mut cfg = ClashConfig::from_yaml_str(
+            r#"
+mixed-port: 0
+mode: rule
+dns:
+  enable: true
+  listen: "127.0.0.1:0"
+  enhanced-mode: redir-host
+  nameserver: []
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        cfg.dns.nameserver = vec![upstream_addr.to_string()];
+        let dns_engine = Arc::new(FakeIpDnsEngine::new(&cfg.dns).unwrap());
+        let router = Arc::new(
+            Router::with_providers_mmdb_and_state_dir(
+                cfg.mode,
+                HashMap::new(),
+                &cfg.proxy_groups,
+                &cfg.rules,
+                &cfg.rule_providers,
+                None,
+                None,
+                Arc::clone(&dns_engine),
+            )
+            .unwrap(),
+        );
+        let router_slot = Arc::new(RwLock::new(router));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (dns_addr, udp_task, tcp_task) =
+            spawn_dynamic_dns_server("127.0.0.1:0", Arc::clone(&router_slot), stop_rx)
+                .await
+                .unwrap();
+
+        // UDP query without EDNS0 receives TC=1 truncated header (<= 512B) instead of >600B reply.
+        let cli_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cli_udp.send_to(&plain_q, dns_addr).await.unwrap();
+        let mut rbuf = [0u8; 2048];
+        let (rn, _) = tokio::time::timeout(Duration::from_secs(3), cli_udp.recv_from(&mut rbuf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rn <= 512,
+            "UDP reply without EDNS0 must be truncated to <=512B, got {rn}"
+        );
+        let rflags = u16::from_be_bytes([rbuf[2], rbuf[3]]);
+        assert_ne!(rflags & 0x0200, 0, "UDP truncated reply must have TC=1 set");
+
+        // TCP client disconnects mid-body (framing length=64, only 5 bytes sent): server must exit
+        // cleanly without feeding zero-filled partial packet into `handle_dns_packet`!
+        let queries_before_eof = dns_engine.total_queries();
+        {
+            let mut trunc_tcp = tokio::net::TcpStream::connect(dns_addr).await.unwrap();
+            let mut partial = Vec::new();
+            partial.extend_from_slice(&64u16.to_be_bytes());
+            partial.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0x00]);
+            trunc_tcp.write_all(&partial).await.unwrap();
+            trunc_tcp.shutdown().await.unwrap();
+            let mut drain = [0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(2), trunc_tcp.read(&mut drain))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "truncated TCP DNS frame must receive EOF without bogus reply"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            dns_engine.total_queries(),
+            queries_before_eof,
+            "premature EOF during TCP read_exact must NOT invoke handle_dns_packet"
+        );
+
+        // Valid TCP fallback query succeeds and delivers the full >600B untruncated TXT reply!
+        let mut ok_tcp = tokio::net::TcpStream::connect(dns_addr).await.unwrap();
+        let mut tcp_frame = BytesMut::with_capacity(2 + plain_q.len());
+        tcp_frame.put_u16(plain_q.len() as u16);
+        tcp_frame.put_slice(&plain_q);
+        ok_tcp.write_all(&tcp_frame).await.unwrap();
+        let resp_len = tokio::time::timeout(Duration::from_secs(3), ok_tcp.read_u16())
+            .await
+            .unwrap()
+            .unwrap() as usize;
+        assert!(
+            resp_len > 600,
+            "TCP DNS fallback must deliver full >600B reply, got {resp_len}"
+        );
+        let mut tcp_resp = vec![0u8; resp_len];
+        tokio::time::timeout(Duration::from_secs(3), ok_tcp.read_exact(&mut tcp_resp))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([tcp_resp[0], tcp_resp[1]]), 0x1234);
+        assert_eq!(
+            u16::from_be_bytes([tcp_resp[2], tcp_resp[3]]) & 0x0200,
+            0,
+            "TCP reply should not have TC=1"
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = udp_task.await;
+        let _ = tcp_task.await;
+        upstream_task.abort();
     }
 }

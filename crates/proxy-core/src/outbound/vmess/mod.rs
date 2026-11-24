@@ -907,7 +907,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessClientStream<S> {
     }
 }
 
-type UdpRecvItem = io::Result<(Vec<u8>, TargetAddr)>;
+type UdpRecvItem = (u64, io::Result<(Vec<u8>, TargetAddr)>);
 type VmessUdpEntry = (mpsc::Sender<Vec<u8>>, tokio::task::AbortHandle);
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -919,6 +919,7 @@ struct VmessUdpSession {
     rx_tx: mpsc::Sender<UdpRecvItem>,
     rx: AsyncMutex<mpsc::Receiver<UdpRecvItem>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VmessUdpSession {
@@ -930,6 +931,7 @@ impl VmessUdpSession {
             rx_tx,
             rx: AsyncMutex::new(rx),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -1023,6 +1025,18 @@ impl OutboundUdpSession for VmessUdpSession {
         }
 
         let (mut rd, mut wr) = tokio::io::split(transport);
+        // Bump generation BEFORE spawning the new reader whenever reconnecting (no live streams or
+        // previously closed), without ever locking `self.rx` (which `recv_from()` holds while
+        // awaiting `rx.recv()`). Any buffered `Err` from an earlier generation is discarded by
+        // `recv_from()`.
+        let stream_gen = if map.is_empty() || self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1
+        } else {
+            self.generation.load(std::sync::atomic::Ordering::Acquire)
+        };
         self.closed
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
@@ -1083,7 +1097,11 @@ impl OutboundUdpSession for VmessUdpSession {
                 };
                 match res {
                     Ok(Ok(Some(dgram))) => {
-                        if rx_tx.send(Ok((dgram, target_clone.clone()))).await.is_err() {
+                        if rx_tx
+                            .send((stream_gen, Ok((dgram, target_clone.clone()))))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -1102,22 +1120,20 @@ impl OutboundUdpSession for VmessUdpSession {
                 }
             }
             writer_abort.abort();
-            let no_live_streams = {
-                let mut m = streams_ref.lock().await;
-                let ended_tx = weak_pkt_tx.upgrade();
-                m.retain(|k, (tx, _)| {
-                    if k == &target_clone
-                        && ended_tx.as_ref().is_some_and(|mine| tx.same_channel(mine))
-                    {
-                        return false;
-                    }
-                    !tx.is_closed()
-                });
-                m.is_empty()
-            };
-            if no_live_streams && let Some(err) = end_err {
+            let mut m = streams_ref.lock().await;
+            let ended_tx = weak_pkt_tx.upgrade();
+            m.retain(|k, (tx, _)| {
+                if k == &target_clone && ended_tx.as_ref().is_some_and(|mine| tx.same_channel(mine))
+                {
+                    return false;
+                }
+                !tx.is_closed()
+            });
+            if m.is_empty()
+                && let Some(err) = end_err
+            {
                 closed_ref.store(true, std::sync::atomic::Ordering::SeqCst);
-                let _ = rx_tx.try_send(Err(err));
+                let _ = rx_tx.try_send((stream_gen, Err(err)));
             }
         });
 
@@ -1127,21 +1143,40 @@ impl OutboundUdpSession for VmessUdpSession {
 
     async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
         let mut rx = self.rx.lock().await;
-        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Ok(item) = rx.try_recv() {
-                return item;
+        loop {
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                match rx.try_recv() {
+                    Ok((_, Ok(pkt))) => return Ok(pkt),
+                    Ok((item_gen, Err(err))) => {
+                        if item_gen < self.generation.load(std::sync::atomic::Ordering::Acquire) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "VMess UDP stream closed",
+                        ));
+                    }
+                }
             }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "VMess UDP stream closed",
-            ));
+            match rx.recv().await {
+                Some((_, Ok(pkt))) => return Ok(pkt),
+                Some((item_gen, Err(err))) => {
+                    if item_gen < self.generation.load(std::sync::atomic::Ordering::Acquire) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "VMess UDP session closed",
+                    ));
+                }
+            }
         }
-        rx.recv().await.unwrap_or_else(|| {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "VMess UDP session closed",
-            ))
-        })
     }
 }
 
@@ -5145,5 +5180,198 @@ mod tests {
             "VmessClientStream<BufStream<duplex(256)>> pre-parked split Task R deadlocked after timeout-cancelled shutdown()",
         );
         assert_eq!(&reply, b"BUF-SHUT-OK!");
+    }
+
+    #[tokio::test]
+    async fn vmess_udp_session_reconnect_discards_stale_error_without_deadlock() {
+        let uuid = Uuid::parse_str("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let cmd_key = derive_cmd_key(&uuid);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            // Connection 1: return corrupted AEAD response header so the client reader queues
+            // an InvalidData error and marks the session closed.
+            {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
+                    .await
+                    .unwrap();
+                // Write 32 garbage bytes so `try_open_vmess_aead_response_header` fails with InvalidData.
+                sock.write_all(&[0xde; 32]).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+
+            // Connection 2: valid VMess UDP echo for the reconnected stream.
+            {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
+                    .await
+                    .unwrap();
+                let mut rd_codec =
+                    VmessChunkCodec::new(&hdr.req_key, &hdr.req_iv, hdr.security, hdr.option)
+                        .unwrap();
+                let (resp_key, resp_iv) = derive_response_key_and_iv(&hdr.req_key, &hdr.req_iv);
+                let mut wr_codec =
+                    VmessChunkCodec::new(&resp_key, &resp_iv, hdr.security, hdr.option).unwrap();
+                let mut wire_buf = BytesMut::new();
+                let mut tmp = [0u8; 4096];
+                let dgram = loop {
+                    if let Some(Some(pkt)) = rd_codec.try_decode_chunk(&mut wire_buf).unwrap() {
+                        break pkt;
+                    }
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    assert!(n > 0);
+                    wire_buf.extend_from_slice(&tmp[..n]);
+                };
+                assert_eq!(dgram, b"after-reconnect");
+
+                let mut resp =
+                    seal_vmess_aead_response_header(&resp_key, &resp_iv, hdr.resp_v, hdr.option)
+                        .unwrap();
+                wr_codec.encode_chunk(b"pong-gen2", &mut resp).unwrap();
+                wr_codec.encode_eof_chunk(&mut resp).unwrap();
+                sock.write_all(&resp).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+
+            // Connection 3: valid VMess UDP echo while recv_from() is already concurrently parked.
+            {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
+                    .await
+                    .unwrap();
+                let mut rd_codec =
+                    VmessChunkCodec::new(&hdr.req_key, &hdr.req_iv, hdr.security, hdr.option)
+                        .unwrap();
+                let (resp_key, resp_iv) = derive_response_key_and_iv(&hdr.req_key, &hdr.req_iv);
+                let mut wr_codec =
+                    VmessChunkCodec::new(&resp_key, &resp_iv, hdr.security, hdr.option).unwrap();
+                let mut wire_buf = BytesMut::new();
+                let mut tmp = [0u8; 4096];
+                let dgram = loop {
+                    if let Some(Some(pkt)) = rd_codec.try_decode_chunk(&mut wire_buf).unwrap() {
+                        break pkt;
+                    }
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    assert!(n > 0);
+                    wire_buf.extend_from_slice(&tmp[..n]);
+                };
+                assert_eq!(dgram, b"concurrent-send");
+
+                let mut resp =
+                    seal_vmess_aead_response_header(&resp_key, &resp_iv, hdr.resp_v, hdr.option)
+                        .unwrap();
+                wr_codec.encode_chunk(b"pong-gen3", &mut resp).unwrap();
+                wr_codec.encode_eof_chunk(&mut resp).unwrap();
+                sock.write_all(&resp).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+
+            // Connection 4: fails without reconnect -> current-generation error MUST surface!
+            {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
+                    .await
+                    .unwrap();
+                sock.write_all(&[0xfe; 32]).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+
+        let outbound = VmessOutbound::new(VmessOutboundConfig {
+            name: "vmess-udp-gen-test".into(),
+            server: "127.0.0.1".into(),
+            port: server_addr.port(),
+            uuid,
+            security: VmessSecurity::Aes128Gcm,
+            global_padding: false,
+            tls: false,
+            servername: None,
+            skip_cert_verify: false,
+            alpn: Vec::new(),
+            extra_ca_der: Vec::new(),
+            udp: true,
+        })
+        .unwrap();
+
+        let sess = Arc::new(VmessUdpSession::new(Arc::clone(&outbound.inner)));
+        let target = TargetAddr::new_ip(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+        );
+
+        // 1. Trigger Connection 1 error and wait until the reader marks `closed == true` and
+        //    buffers `(gen=1, Err(InvalidData))` inside `sess.rx`.
+        sess.send_to(b"first-fails", &target).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !sess.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Connection 1 error to close VmessUdpSession"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sess.generation.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        // 2. Reconnect via `send_to()` BEFORE calling `recv_from()`: generation advances to 2 and
+        //    `recv_from()` MUST discard the stale gen=1 error and deliver `"pong-gen2"`.
+        sess.send_to(b"after-reconnect", &target).await.unwrap();
+        assert_eq!(
+            sess.generation.load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+        let (resp2, src2) = tokio::time::timeout(Duration::from_secs(2), sess.recv_from())
+            .await
+            .expect("recv_from after reconnect timed out")
+            .expect("stale pre-reconnect error must be discarded");
+        assert_eq!(resp2, b"pong-gen2");
+        assert_eq!(src2, target);
+
+        // Wait briefly for Connection 2 EOF to clear `streams` cleanly before step 3.
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !sess.streams.lock().await.is_empty() {
+            assert!(tokio::time::Instant::now() < deadline2);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // 3. Park `recv_from()` (holding `self.rx.lock()`) FIRST, then call `send_to()` to
+        //    reconnect concurrently — proves `send_to()` NEVER locks `self.rx` (no deadlock!).
+        let sess_rx = Arc::clone(&sess);
+        let recv_task = tokio::spawn(async move { sess_rx.recv_from().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sess.send_to(b"concurrent-send", &target),
+        )
+        .await
+        .expect("send_to deadlocked against parked recv_from")
+        .unwrap();
+        let (resp3, src3) = tokio::time::timeout(Duration::from_secs(2), recv_task)
+            .await
+            .expect("parked recv_from timed out after concurrent send_to")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp3, b"pong-gen3");
+        assert_eq!(src3, target);
+
+        let deadline3 = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !sess.streams.lock().await.is_empty() {
+            assert!(tokio::time::Instant::now() < deadline3);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // 4. Error in current generation WITHOUT a subsequent reconnect MUST still be surfaced!
+        sess.send_to(b"final-fails", &target).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), sess.recv_from())
+            .await
+            .expect("recv_from timed out waiting for current-gen error")
+            .expect_err("current-generation error must not be discarded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        srv_task.await.unwrap();
     }
 }

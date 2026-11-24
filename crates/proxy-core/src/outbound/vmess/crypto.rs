@@ -520,7 +520,7 @@ pub async fn read_vmess_aead_request_header<R: AsyncRead + Unpin + ?Sized>(
             "VMess AuthID CRC mismatch",
         ));
     };
-    if (ts - current_unix_secs()).abs() > 120 {
+    if ts.abs_diff(current_unix_secs()) > 120 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "VMess AuthID timestamp skew exceeds 120s",
@@ -1040,5 +1040,33 @@ mod tests {
         let decoded = dec.try_decode_chunk(&mut full).unwrap().unwrap().unwrap();
         assert_eq!(decoded, b"payload-bytes");
         assert!(!dec.has_pending_chunk());
+    }
+
+    #[tokio::test]
+    async fn aead_request_header_rejects_extreme_i64_min_and_max_auth_id_timestamps_without_overflow()
+     {
+        let uuid = Uuid::parse_str("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let cmd_key = derive_cmd_key(&uuid);
+        let now = current_unix_secs();
+
+        for extreme_ts in [
+            i64::MIN,
+            i64::MIN + 1,
+            -1_000_000,
+            now - 121,
+            now + 121,
+            i64::MAX,
+        ] {
+            let auth_id = create_auth_id(&cmd_key, extreme_ts).unwrap();
+            let mut cursor = io::Cursor::new(auth_id);
+            let err = read_vmess_aead_request_header(&cmd_key, &mut cursor)
+                .await
+                .expect_err("extreme/skewed AuthID timestamp must fail without overflow");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied,
+                "expected PermissionDenied for timestamp {extreme_ts}, got {err:?}"
+            );
+        }
     }
 }

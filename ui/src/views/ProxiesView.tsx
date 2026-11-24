@@ -22,10 +22,20 @@ import type {
   ProxyNodeConfigPayload,
 } from "../types";
 import {
+  DEFAULT_PROBE_CONCURRENCY,
+  collectUniqueProbeTargets,
+  runWithConcurrency,
+} from "../utils/asyncGuards.mjs";
+import {
   nodeProtocolBadge,
   prettyProtocolLabel,
   protocolBadgeVariant,
 } from "../utils/format";
+import {
+  requiresVlessTcpTransport,
+  resolveTransportOnVlessFlowChange,
+  resolveVlessTransportPayload,
+} from "../utils/vlessTransport.mjs";
 
 interface ProxiesViewProps {
   config: ConfigSnapshot | null;
@@ -199,6 +209,14 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const [proxySkipVerify, setProxySkipVerify] = useState(false);
 
   const groupRefs = useRef<Record<string, HTMLElement | null>>({});
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const groups = useMemo(() => {
     const list = Object.values(proxies).filter(
@@ -272,7 +290,9 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
   const loadActiveNodes = useCallback(async () => {
     try {
       const snap = await clashApi.getActiveNodes();
-      setActiveNodes(snap.nodes);
+      if (mountedRef.current) {
+        setActiveNodes(snap.nodes);
+      }
     } catch {
       // ignore if profile manager unavailable
     }
@@ -433,7 +453,7 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
       setVlessSkipVerify(Boolean(node["skip-cert-verify"]));
       setVlessAlpn((node.alpn ?? []).join(", "));
       const isWs =
-        !ro &&
+        !requiresVlessTcpTransport(Boolean(ro), node.flow) &&
         ((node.network ?? "").toLowerCase() === "ws" || Boolean(node["ws-opts"]));
       setTransportNet(isWs ? "ws" : "tcp");
       setWsPath(node["ws-opts"]?.path ?? "/");
@@ -570,42 +590,82 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
     setTestingMap((prev) => ({ ...prev, [targetName]: true }));
     try {
       await testProxyDelay(targetName, undefined, 4000);
-      await onRefreshProxies();
+      if (mountedRef.current) {
+        await onRefreshProxies();
+      }
     } catch {
-      await onRefreshProxies();
+      if (mountedRef.current) {
+        await onRefreshProxies();
+      }
     } finally {
-      setTestingMap((prev) => ({ ...prev, [targetName]: false }));
+      if (mountedRef.current) {
+        setTestingMap((prev) => ({ ...prev, [targetName]: false }));
+      }
     }
   };
 
-  const handleProbeGroup = async (group: ProxyInfo) => {
-    const members = group.all ?? [];
+  const handleProbeGroup = async (
+    group: ProxyInfo,
+    seen?: Set<string>,
+  ) => {
+    const membersToProbe = collectUniqueProbeTargets(group.all ?? [], seen);
+    const shouldProbeGroup = !seen || !seen.has(group.name);
+    if (shouldProbeGroup) {
+      seen?.add(group.name);
+    }
+    if (membersToProbe.length === 0 && !shouldProbeGroup) {
+      return;
+    }
+
     const flags: Record<string, boolean> = { [group.name]: true };
-    for (const m of members) flags[m] = true;
-    setTestingMap((prev) => ({ ...prev, ...flags }));
+    for (const m of membersToProbe) flags[m] = true;
+    if (mountedRef.current) {
+      setTestingMap((prev) => ({ ...prev, ...flags }));
+    }
 
     try {
-      await Promise.allSettled(
-        members.map((m) => testProxyDelay(m, undefined, 4000)),
+      await runWithConcurrency(
+        membersToProbe,
+        DEFAULT_PROBE_CONCURRENCY,
+        async (member) => {
+          if (!mountedRef.current) return;
+          try {
+            await testProxyDelay(member, undefined, 4000);
+          } finally {
+            if (mountedRef.current) {
+              setTestingMap((prev) => ({ ...prev, [member]: false }));
+            }
+          }
+        },
       );
-      await testProxyDelay(group.name, undefined, 4000).catch(() => undefined);
-      await onRefreshProxies();
+      if (mountedRef.current && shouldProbeGroup) {
+        await testProxyDelay(group.name, undefined, 4000).catch(() => undefined);
+      }
+      if (mountedRef.current) {
+        await onRefreshProxies();
+      }
     } finally {
-      const clear: Record<string, boolean> = { [group.name]: false };
-      for (const m of members) clear[m] = false;
-      setTestingMap((prev) => ({ ...prev, ...clear }));
+      if (mountedRef.current) {
+        const clear: Record<string, boolean> = { [group.name]: false };
+        for (const m of membersToProbe) clear[m] = false;
+        setTestingMap((prev) => ({ ...prev, ...clear }));
+      }
     }
   };
 
   const handleTestAll = async () => {
     if (probingAll) return;
     setProbingAll(true);
+    const seen = new Set<string>();
     try {
       for (const grp of groups) {
-        await handleProbeGroup(grp);
+        if (!mountedRef.current) break;
+        await handleProbeGroup(grp, seen);
       }
     } finally {
-      setProbingAll(false);
+      if (mountedRef.current) {
+        setProbingAll(false);
+      }
     }
   };
 
@@ -811,9 +871,11 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
             : {}),
         };
       }
-      const wsCfg = vlessReality
-        ? { network: "tcp", wsOpts: undefined }
-        : buildWsTransportPayload(origVless?.["ws-opts"]);
+      const wsCfg = resolveVlessTransportPayload({
+        vlessReality,
+        flowTrimmed,
+        buildWsTransport: () => buildWsTransportPayload(origVless?.["ws-opts"]),
+      });
       const fpTrim = vlessFingerprint.trim();
       return {
         type: "vless",
@@ -1972,7 +2034,13 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                         <select
                           className="select"
                           value={vlessFlow}
-                          onChange={(e) => setVlessFlow(e.target.value)}
+                          onChange={(e) => {
+                            const nextFlow = e.target.value;
+                            setVlessFlow(nextFlow);
+                            setTransportNet((prev) =>
+                              resolveTransportOnVlessFlowChange(nextFlow, prev),
+                            );
+                          }}
                         >
                           <option value="">{tr("无 (标准 VLESS)", "None (Standard)")}</option>
                           <option value="xtls-rprx-vision">xtls-rprx-vision</option>
@@ -2422,7 +2490,8 @@ export const ProxiesView: React.FC<ProxiesViewProps> = ({
                     </>
                   )}
 
-                  {((proto === "vless" && !vlessReality && !vlessFlow) ||
+                  {((proto === "vless" &&
+                    !requiresVlessTcpTransport(vlessReality, vlessFlow)) ||
                     proto === "vmess" ||
                     proto === "trojan") && (
                     <>

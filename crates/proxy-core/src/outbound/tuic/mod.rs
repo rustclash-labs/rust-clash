@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
@@ -8,12 +8,12 @@ use std::{
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::{Context, Poll, Wake, Waker, ready},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry as DashEntry};
 use parking_lot::Mutex;
 use rustls::{ServerConfig, pki_types::CertificateDer};
 use tokio::{
@@ -48,6 +48,9 @@ const TUIC_ATYP_IPV4: u8 = 0x01;
 const TUIC_ATYP_IPV6: u8 = 0x02;
 
 const TUIC_NATIVE_UDP_MAX_WIRE: usize = 1150;
+const TUIC_DEFRAG_MAX_SLOTS: usize = 32;
+const TUIC_DEFRAG_MAX_BUFFERED_BYTES: usize = 256 * 1024;
+const TUIC_DEFRAG_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuicUdpRelayMode {
@@ -355,7 +358,16 @@ fn fragment_tuic_udp_packet(
     let mut addr_buf = BytesMut::with_capacity(32);
     encode_tuic_addr(Some(target), &mut addr_buf)?;
     let first_hdr = 10 + addr_buf.len();
-    let max_chunk = max_wire.saturating_sub(first_hdr).max(256);
+    let subsequent_hdr = 10 + 1; // 10B fixed header + 1B TUIC_ATYP_NONE
+    if max_wire <= first_hdr || max_wire <= subsequent_hdr {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "TUIC UDP packet header ({first_hdr} bytes) does not fit in max wire size ({max_wire} bytes)"
+            ),
+        ));
+    }
+    let max_chunk = (max_wire - first_hdr).min(u16::MAX as usize);
 
     if payload.len() <= max_chunk {
         let pkt = TuicUdpPacket {
@@ -368,6 +380,12 @@ fn fragment_tuic_udp_packet(
         };
         let mut out = BytesMut::new();
         pkt.encode(&mut out)?;
+        if out.len() > max_wire {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TUIC UDP fragment exceeds max wire size",
+            ));
+        }
         return Ok(vec![out.freeze()]);
     }
 
@@ -390,55 +408,162 @@ fn fragment_tuic_udp_packet(
         };
         let mut buf = BytesMut::new();
         pkt.encode(&mut buf)?;
+        if buf.len() > max_wire {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TUIC UDP fragment exceeds max wire size",
+            ));
+        }
         out.push(buf.freeze());
     }
     Ok(out)
 }
 
-#[derive(Default)]
-struct TuicDefragger {
+struct TuicDefragEntry {
     pkt_id: u16,
+    frag_total: u8,
     first_addr: Option<TargetAddr>,
     frags: Vec<Option<Vec<u8>>>,
     received: usize,
+    buffered_bytes: usize,
+    last_updated: Instant,
+}
+
+#[derive(Default)]
+struct TuicDefragger {
+    /// Ordered from least-recently updated (front) to most-recently updated (back).
+    entries: VecDeque<TuicDefragEntry>,
+    total_buffered_bytes: usize,
 }
 
 impl TuicDefragger {
+    fn evict_expired(&mut self, now: Instant) {
+        self.entries.retain(|entry| {
+            if now.saturating_duration_since(entry.last_updated) >= TUIC_DEFRAG_TTL {
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn feed(&mut self, pkt: TuicUdpPacket) -> Option<(Vec<u8>, TargetAddr)> {
-        if pkt.frag_total <= 1 {
+        self.feed_at(pkt, Instant::now())
+    }
+
+    fn feed_at(&mut self, pkt: TuicUdpPacket, now: Instant) -> Option<(Vec<u8>, TargetAddr)> {
+        self.evict_expired(now);
+
+        if pkt.frag_total == 0 || pkt.frag_id >= pkt.frag_total {
+            return None;
+        }
+        if pkt.frag_total == 1 {
             let addr = pkt.addr?;
             return Some((pkt.data, addr));
         }
-        if pkt.frag_id >= pkt.frag_total {
+
+        let total = pkt.frag_total as usize;
+        let idx = pkt.frag_id as usize;
+        let add_len = pkt.data.len();
+        if add_len > TUIC_DEFRAG_MAX_BUFFERED_BYTES {
             return None;
         }
-        let total = pkt.frag_total as usize;
-        if pkt.pkt_id != self.pkt_id || self.frags.len() != total {
-            self.pkt_id = pkt.pkt_id;
-            self.first_addr = None;
-            self.frags = vec![None; total];
-            self.received = 0;
-        }
-        if pkt.frag_id == 0 && pkt.addr.is_some() {
-            self.first_addr = pkt.addr;
-        }
-        let idx = pkt.frag_id as usize;
-        if self.frags[idx].is_none() {
-            self.frags[idx] = Some(pkt.data);
-            self.received += 1;
-            if self.received == total {
-                let addr = self.first_addr.take()?;
-                let mut full = Vec::new();
-                for part in self.frags.iter_mut() {
+
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|entry| entry.pkt_id == pkt.pkt_id)
+        {
+            if self.entries[pos].frag_total != pkt.frag_total {
+                // Conflicting fragment count for an active pkt_id: reject without clobbering.
+                return None;
+            }
+            if self.entries[pos].frags[idx].is_some() {
+                // Duplicate fragment: ignore without double-counting buffered bytes.
+                return None;
+            }
+            if self.entries[pos].buffered_bytes.saturating_add(add_len)
+                > TUIC_DEFRAG_MAX_BUFFERED_BYTES
+            {
+                return None;
+            }
+
+            let mut entry = self.entries.remove(pos).expect("validated index");
+            if pkt.frag_id == 0 && pkt.addr.is_some() {
+                entry.first_addr = pkt.addr;
+            }
+            if entry.received + 1 == total {
+                let assembled_len = entry.buffered_bytes + add_len;
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes);
+                let addr = entry.first_addr.take()?;
+                entry.frags[idx] = Some(pkt.data);
+                let mut full = Vec::with_capacity(assembled_len);
+                for part in entry.frags.iter_mut() {
                     if let Some(bytes) = part.take() {
                         full.extend_from_slice(&bytes);
                     }
                 }
-                self.frags.clear();
-                self.received = 0;
                 return Some((full, addr));
             }
+
+            while self.total_buffered_bytes.saturating_add(add_len) > TUIC_DEFRAG_MAX_BUFFERED_BYTES
+            {
+                let Some(evicted) = self.entries.pop_front() else {
+                    break;
+                };
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(evicted.buffered_bytes);
+            }
+            if self.total_buffered_bytes.saturating_add(add_len) > TUIC_DEFRAG_MAX_BUFFERED_BYTES {
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes);
+                return None;
+            }
+
+            entry.frags[idx] = Some(pkt.data);
+            entry.received += 1;
+            entry.buffered_bytes += add_len;
+            entry.last_updated = now;
+            self.total_buffered_bytes += add_len;
+            self.entries.push_back(entry);
+            return None;
         }
+
+        while self.entries.len() >= TUIC_DEFRAG_MAX_SLOTS
+            || self.total_buffered_bytes.saturating_add(add_len) > TUIC_DEFRAG_MAX_BUFFERED_BYTES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.total_buffered_bytes = self
+                .total_buffered_bytes
+                .saturating_sub(evicted.buffered_bytes);
+        }
+        if self.entries.len() >= TUIC_DEFRAG_MAX_SLOTS
+            || self.total_buffered_bytes.saturating_add(add_len) > TUIC_DEFRAG_MAX_BUFFERED_BYTES
+        {
+            return None;
+        }
+
+        let mut frags = vec![None; total];
+        frags[idx] = Some(pkt.data);
+        self.total_buffered_bytes += add_len;
+        self.entries.push_back(TuicDefragEntry {
+            pkt_id: pkt.pkt_id,
+            frag_total: pkt.frag_total,
+            first_addr: if pkt.frag_id == 0 { pkt.addr } else { None },
+            frags,
+            received: 1,
+            buffered_bytes: add_len,
+            last_updated: now,
+        });
         None
     }
 }
@@ -1397,9 +1522,8 @@ impl OutboundHandler for TuicOutbound {
             ));
         }
         let (sess, work) = self.inner.checkout_or_dial_session().await?;
-        let assoc_id = sess.next_assoc_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(128);
-        sess.udp_sessions.insert(assoc_id, tx);
+        let assoc_id = allocate_tuic_assoc_id(&sess.next_assoc_id, &sess.udp_sessions, tx)?;
         if sess.lease.conn.close_reason().is_some() {
             sess.udp_sessions.remove(&assoc_id);
             self.inner.cached_conn.evict_if_same(&sess);
@@ -1418,6 +1542,32 @@ impl OutboundHandler for TuicOutbound {
             _work: Some(work),
         }))
     }
+}
+
+fn allocate_tuic_assoc_id(
+    next_assoc_id: &AtomicU16,
+    udp_sessions: &DashMap<u16, mpsc::Sender<TuicUdpPacket>>,
+    tx: mpsc::Sender<TuicUdpPacket>,
+) -> io::Result<u16> {
+    let start = next_assoc_id.fetch_add(1, Ordering::Relaxed);
+    let mut pending_tx = Some(tx);
+    for offset in 0..=u16::MAX {
+        let candidate = start.wrapping_add(offset);
+        match udp_sessions.entry(candidate) {
+            DashEntry::Vacant(slot) => {
+                slot.insert(pending_tx.take().expect("tx inserted at most once"));
+                if offset > 0 {
+                    next_assoc_id.store(candidate.wrapping_add(1), Ordering::Relaxed);
+                }
+                return Ok(candidate);
+            }
+            DashEntry::Occupied(_) => continue,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "all 65536 TUIC UDP association IDs are simultaneously active",
+    ))
 }
 
 pub struct TuicServerHandle {
@@ -2735,6 +2885,354 @@ mod tests {
                 .poll_write(&mut cx_w, &[])
                 .map(|r| r.unwrap()),
             Poll::Ready(0)
+        );
+    }
+
+    #[test]
+    fn tuic_udp_fragmentation_respects_small_mtu_and_rejects_impossible_wire_size() {
+        let ipv4_target = TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        let payload: Vec<u8> = (0..200).map(|i| ((i * 7 + 3) & 0xff) as u8).collect();
+
+        // Small MTU (< 256) MUST NOT be overridden by `.max(256)`.
+        // IPv4 first_hdr = 10 + 7 = 17, max_wire = 80 -> max_chunk = 63 -> 4 fragments.
+        let max_wire = 80;
+        let frags = fragment_tuic_udp_packet(9, 100, &ipv4_target, &payload, max_wire).unwrap();
+        assert_eq!(frags.len(), 4);
+        for f in &frags {
+            assert!(
+                f.len() <= max_wire,
+                "TUIC fragment size {} exceeded max_wire {}",
+                f.len(),
+                max_wire
+            );
+        }
+
+        // Feed in reverse order (frag 3..=0) to confirm defragger reassembles cleanly even
+        // when frag_id == 0 (carrying target addr) arrives last!
+        let mut defrag = TuicDefragger::default();
+        let mut assembled = None;
+        for f in frags.iter().rev() {
+            let pkt = TuicUdpPacket::decode_slice(f).unwrap().unwrap();
+            assembled = defrag.feed(pkt);
+        }
+        assert_eq!(assembled, Some((payload, ipv4_target.clone())));
+
+        // Reject max_wire <= first_hdr (both IPv4 and long domain).
+        for too_small in [0usize, 10, 16, 17] {
+            let err = fragment_tuic_udp_packet(9, 101, &ipv4_target, b"hi", too_small)
+                .expect_err("max_wire <= first_hdr must fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+        let long_domain = format!("{}.example.com", "a".repeat(120));
+        let domain_target = TargetAddr::new_domain(long_domain, 443).unwrap();
+        let err = fragment_tuic_udp_packet(9, 102, &domain_target, b"hi", 130)
+            .expect_err("long domain exceeding max_wire must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn tuic_defragger_interleaved_reordered_dedup_conflict_lru_ttl_and_byte_cap() {
+        let t0 = Instant::now();
+        let mut defrag = TuicDefragger::default();
+        let addr_a = TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        let addr_b = TargetAddr::new_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+
+        // 1. Invalid frag_total == 0 and frag_id >= frag_total are rejected.
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: 1,
+                        frag_total: 0,
+                        frag_id: 0,
+                        addr: Some(addr_a.clone()),
+                        data: b"bad".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: 1,
+                        frag_total: 2,
+                        frag_id: 2,
+                        addr: None,
+                        data: b"bad".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.total_buffered_bytes, 0);
+
+        // 2. Interleaved & out-of-order reassembly for 2 concurrent pkt_ids with duplicate
+        //    frag_id and conflicting frag_total injected mid-stream.
+        let p1_f1 = TuicUdpPacket {
+            assoc_id: 1,
+            pkt_id: 10,
+            frag_total: 2,
+            frag_id: 1,
+            addr: None,
+            data: b"SECOND".to_vec(),
+        };
+        let p2_f0 = TuicUdpPacket {
+            assoc_id: 1,
+            pkt_id: 11,
+            frag_total: 2,
+            frag_id: 0,
+            addr: Some(addr_b.clone()),
+            data: b"ALPHA-".to_vec(),
+        };
+        assert!(defrag.feed_at(p1_f1.clone(), t0).is_none());
+        assert!(defrag.feed_at(p2_f0, t0).is_none());
+        assert_eq!(defrag.total_buffered_bytes, 12);
+
+        // Duplicate fragment must not double-count bytes or prematurely complete.
+        assert!(defrag.feed_at(p1_f1, t0).is_none());
+        assert_eq!(defrag.total_buffered_bytes, 12);
+
+        // Conflicting frag_total on pkt_id=10 must be rejected without clobbering.
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: 10,
+                        frag_total: 4,
+                        frag_id: 0,
+                        addr: Some(addr_a.clone()),
+                        data: b"CLOBBER".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.total_buffered_bytes, 12);
+
+        // Complete both packets cleanly.
+        let r1 = defrag.feed_at(
+            TuicUdpPacket {
+                assoc_id: 1,
+                pkt_id: 10,
+                frag_total: 2,
+                frag_id: 0,
+                addr: Some(addr_a.clone()),
+                data: b"FIRST-".to_vec(),
+            },
+            t0,
+        );
+        assert_eq!(r1, Some((b"FIRST-SECOND".to_vec(), addr_a.clone())));
+        assert_eq!(defrag.total_buffered_bytes, 6);
+
+        let r2 = defrag.feed_at(
+            TuicUdpPacket {
+                assoc_id: 1,
+                pkt_id: 11,
+                frag_total: 2,
+                frag_id: 1,
+                addr: None,
+                data: b"BETA".to_vec(),
+            },
+            t0,
+        );
+        assert_eq!(r2, Some((b"ALPHA-BETA".to_vec(), addr_b.clone())));
+        assert_eq!(defrag.total_buffered_bytes, 0);
+
+        // 3. Completed packet missing addr on frag_id == 0 drops cleanly with zero byte leak.
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: 99,
+                        frag_total: 2,
+                        frag_id: 0,
+                        addr: None,
+                        data: b"no-addr".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: 99,
+                        frag_total: 2,
+                        frag_id: 1,
+                        addr: None,
+                        data: b"tail".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.total_buffered_bytes, 0);
+        assert!(defrag.entries.is_empty());
+
+        // 4. Slot cap (32) + LRU eviction + TTL expiration + 256 KiB byte cap.
+        for pid in 0..(TUIC_DEFRAG_MAX_SLOTS as u16) {
+            assert!(
+                defrag
+                    .feed_at(
+                        TuicUdpPacket {
+                            assoc_id: 1,
+                            pkt_id: pid,
+                            frag_total: 3,
+                            frag_id: 0,
+                            addr: Some(addr_a.clone()),
+                            data: vec![pid as u8; 8],
+                        },
+                        t0
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(defrag.entries.len(), TUIC_DEFRAG_MAX_SLOTS);
+        // Touch pid=0 so pid=1 becomes LRU.
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: 0,
+                        frag_total: 3,
+                        frag_id: 1,
+                        addr: None,
+                        data: vec![0xBB; 8],
+                    },
+                    t0 + Duration::from_millis(5)
+                )
+                .is_none()
+        );
+        // Insert pid=32 -> evicts pid=1 while preserving pid=0.
+        assert!(
+            defrag
+                .feed_at(
+                    TuicUdpPacket {
+                        assoc_id: 1,
+                        pkt_id: TUIC_DEFRAG_MAX_SLOTS as u16,
+                        frag_total: 2,
+                        frag_id: 0,
+                        addr: Some(addr_a.clone()),
+                        data: vec![0xCC; 8],
+                    },
+                    t0 + Duration::from_millis(10)
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.entries.len(), TUIC_DEFRAG_MAX_SLOTS);
+        assert!(defrag.entries.iter().any(|e| e.pkt_id == 0));
+        assert!(!defrag.entries.iter().any(|e| e.pkt_id == 1));
+
+        // TTL expiry clears all slots and refunds total_buffered_bytes to 0.
+        let t_exp = t0 + TUIC_DEFRAG_TTL + Duration::from_millis(50);
+        assert_eq!(
+            defrag.feed_at(
+                TuicUdpPacket {
+                    assoc_id: 1,
+                    pkt_id: 777,
+                    frag_total: 1,
+                    frag_id: 0,
+                    addr: Some(addr_a.clone()),
+                    data: b"ok".to_vec(),
+                },
+                t_exp
+            ),
+            Some((b"ok".to_vec(), addr_a.clone()))
+        );
+        assert!(defrag.entries.is_empty());
+        assert_eq!(defrag.total_buffered_bytes, 0);
+
+        // Byte cap (256 KiB): 10 x 40 KiB partial packets must stay <= 256 KiB.
+        for i in 0..10u16 {
+            assert!(
+                defrag
+                    .feed_at(
+                        TuicUdpPacket {
+                            assoc_id: 1,
+                            pkt_id: 500 + i,
+                            frag_total: 2,
+                            frag_id: 0,
+                            addr: Some(addr_a.clone()),
+                            data: vec![0x42; 40 * 1024],
+                        },
+                        t_exp
+                    )
+                    .is_none()
+            );
+            assert!(defrag.total_buffered_bytes <= TUIC_DEFRAG_MAX_BUFFERED_BYTES);
+            let sum: usize = defrag.entries.iter().map(|e| e.buffered_bytes).sum();
+            assert_eq!(defrag.total_buffered_bytes, sum);
+        }
+    }
+
+    #[test]
+    fn tuic_assoc_id_allocation_skips_active_collisions_and_returns_addr_in_use_when_exhausted() {
+        let map: DashMap<u16, mpsc::Sender<TuicUdpPacket>> = DashMap::new();
+        let next_id = AtomicU16::new(1);
+
+        // Pre-occupy IDs 1 and 2; allocation MUST skip them without overwriting.
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+        map.insert(1, tx1);
+        map.insert(2, tx2);
+
+        let (tx3, _rx3) = mpsc::channel(4);
+        let got = allocate_tuic_assoc_id(&next_id, &map, tx3).unwrap();
+        assert_eq!(got, 3);
+        // Existing entry 1 must still deliver packets intact.
+        map.get(&1)
+            .unwrap()
+            .try_send(TuicUdpPacket {
+                assoc_id: 1,
+                pkt_id: 1,
+                frag_total: 1,
+                frag_id: 0,
+                addr: None,
+                data: b"alive".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(rx1.try_recv().unwrap().data, b"alive");
+
+        // Wraparound across u16::MAX -> 0 -> skips occupied 0, 1, 2, 3 and claims 4.
+        let (tx_zero, _rx_zero) = mpsc::channel(1);
+        map.insert(0, tx_zero);
+        next_id.store(u16::MAX, Ordering::Relaxed);
+        let (tx_max, _rx_max) = mpsc::channel(1);
+        assert_eq!(
+            allocate_tuic_assoc_id(&next_id, &map, tx_max).unwrap(),
+            u16::MAX
+        );
+        let (tx_wrap, _rx_wrap) = mpsc::channel(1);
+        assert_eq!(allocate_tuic_assoc_id(&next_id, &map, tx_wrap).unwrap(), 4);
+
+        // Exhaust all 65,536 u16 IDs -> MUST return AddrInUse without overwriting any slot.
+        let (shared_tx, _shared_rx) = mpsc::channel(1);
+        for id in 0..=u16::MAX {
+            map.entry(id).or_insert_with(|| shared_tx.clone());
+        }
+        assert_eq!(map.len(), 65_536);
+
+        let (tx_fail, _rx_fail) = mpsc::channel(1);
+        let err = allocate_tuic_assoc_id(&next_id, &map, tx_fail)
+            .expect_err("exhausted TUIC assoc_id space must fail with AddrInUse");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(map.len(), 65_536);
+
+        // Freeing a single distant ID allows allocation to find and claim it cleanly.
+        map.remove(&42_424);
+        let (tx_reclaim, _rx_reclaim) = mpsc::channel(1);
+        assert_eq!(
+            allocate_tuic_assoc_id(&next_id, &map, tx_reclaim).unwrap(),
+            42_424
         );
     }
 }

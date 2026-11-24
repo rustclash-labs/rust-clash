@@ -79,6 +79,15 @@ pub struct LinuxRecoveryRecord {
     pub owned_route_del_args: Vec<Vec<String>>,
 }
 
+impl LinuxRecoveryRecord {
+    pub fn is_empty(&self) -> bool {
+        self.owned_v4_rule_del_args.is_empty()
+            && self.owned_v6_rule_del_args.is_empty()
+            && self.owned_route_del_args.is_empty()
+            && self.device_name.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacOsDnsBackup {
     pub service_name: String,
@@ -483,7 +492,10 @@ where
         && ex.sysproxy.is_some()
     {
         let ex_sp_pid = ex.effective_sysproxy_pid();
-        if ex_sp_pid != caller_pid && is_alive(ex_sp_pid) {
+        if ex_sp_pid != caller_pid {
+            // Preserve foreign process's sysproxy backup unconditionally (both when `ex_sp_pid` is
+            // alive and when a crashed/unrecovered foreign process awaits `recover_stale_network_state`).
+            let _ = is_alive(ex_sp_pid);
             journal.sysproxy = ex.sysproxy.clone();
             Some(ex_sp_pid)
         } else {
@@ -554,19 +566,35 @@ where
     let final_sp_pid = if let Some(ref ex) = existing
         && ex.sysproxy.is_some()
     {
+        // Always preserve existing `sysproxy` entries during TUN teardown — whether owned by
+        // `caller_pid`, a live foreign process, or a dead/unrecovered (`pid = 0`) foreign entry
+        // awaiting `recover_stale_network_state`.
         let ex_sp_pid = ex.effective_sysproxy_pid();
-        if ex_sp_pid == caller_pid || is_pid_alive(ex_sp_pid) {
-            journal.sysproxy = ex.sysproxy.clone();
-            Some(ex_sp_pid)
-        } else {
-            None
-        }
+        journal.sysproxy = ex.sysproxy.clone();
+        Some(ex_sp_pid)
     } else {
         None
     };
 
     journal.normalize_owner_pids(final_tun_pid, final_sp_pid, caller_pid);
     journal.save_atomic(state_dir)
+}
+
+/// Update `network_recovery.json` after Linux TUN teardown (`stop()` or failed `start()`):
+/// retains ONLY genuinely unrecovered policy rules/routes/interface (with `tun_owner_pid = 0`)
+/// and clears the TUN journal entry when teardown succeeded cleanly.
+pub fn finalize_linux_tun_teardown_journal(
+    state_dir: &Path,
+    remaining: Option<LinuxRecoveryRecord>,
+) -> io::Result<()> {
+    finalize_tun_teardown_journal_inner(state_dir, std::process::id(), |j| {
+        if let Some(rem) = remaining.filter(|r| !r.is_empty()) {
+            j.linux_tun = Some(rem);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Update `network_recovery.json` after macOS TUN teardown (`stop()` or failed `start()`):
@@ -658,112 +686,183 @@ pub struct SingleInstanceGuard {
 }
 
 impl SingleInstanceGuard {
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+
     pub fn acquire(state_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(state_dir)?;
         let lock_path = state_dir.join(LOCK_FILENAME);
 
-        #[cfg(not(any(unix, windows)))]
-        {
-            if let Ok(existing_raw) = fs::read_to_string(&lock_path)
-                && let Ok(existing_pid) = existing_raw.trim().parse::<u32>()
-                && existing_pid != std::process::id()
-                && is_pid_alive(existing_pid)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "another rust-clash instance (PID {existing_pid}) is already running (lock: '{}')",
-                        lock_path.display()
-                    ),
-                ));
-            }
-        }
-
-        let mut open_opts = OpenOptions::new();
-        open_opts.create(true).read(true).write(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // FILE_SHARE_READ (0x1) | FILE_SHARE_WRITE (0x2) | FILE_SHARE_DELETE (0x4) = 0x7
-            open_opts.share_mode(0x7);
-        }
-        let mut file = open_opts.open(&lock_path)?;
-
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
-            // SAFETY: `flock` with `LOCK_EX | LOCK_NB` on a valid open `File` fd is safe and non-blocking.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc != 0 {
-                let pid_note = fs::read_to_string(&lock_path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|pid| format!(" (PID {pid})"))
-                    .unwrap_or_default();
-                return Err(io::Error::new(
+            use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+            const MAX_INODE_RETRIES: usize = 8;
+            let mut acquired_file: Option<File> = None;
+
+            for _attempt in 0..MAX_INODE_RETRIES {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_path)?;
+
+                // SAFETY: `flock` with `LOCK_EX | LOCK_NB` on a valid open `File` fd is safe and non-blocking.
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    let pid_note = fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(|pid| format!(" (PID {pid})"))
+                        .unwrap_or_default();
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "another rust-clash instance{pid_note} holds exclusive lock '{}'",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+
+                // Verify that the locked descriptor still refers to the exact `(st_dev, st_ino)`
+                // currently linked at `lock_path` so external deletion/replacement cannot split
+                // two concurrent processes across different inodes.
+                let fd_meta = file.metadata()?;
+                match fs::metadata(&lock_path) {
+                    Ok(path_meta)
+                        if fd_meta.dev() == path_meta.dev() && fd_meta.ino() == path_meta.ino() =>
+                    {
+                        acquired_file = Some(file);
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let mut file = acquired_file.ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!(
-                        "another rust-clash instance{pid_note} holds exclusive lock '{}'",
+                        "unable to stabilize exclusive lock inode for '{}' after {MAX_INODE_RETRIES} attempts",
                         lock_path.display()
                     ),
-                ));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::{
-                Storage::FileSystem::{
-                    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-                },
-                System::IO::OVERLAPPED,
-            };
-            // SAFETY: `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` and a
-            // zeroed `OVERLAPPED` on a valid open `File` handle is non-blocking; the Windows NT kernel
-            // automatically releases the lock when the handle closes or the process terminates.
-            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-            let ok = unsafe {
-                LockFileEx(
-                    file.as_raw_handle() as _,
-                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                    0,
-                    1,
-                    0,
-                    &mut overlapped,
                 )
-            };
-            if ok == 0 {
-                let pid_note = fs::read_to_string(&lock_path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|pid| format!(" (PID {pid})"))
-                    .unwrap_or_default();
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "another rust-clash instance{pid_note} holds exclusive lock '{}'",
-                        lock_path.display()
-                    ),
-                ));
-            }
+            })?;
+
+            file.set_len(0)?;
+            Seek::seek(&mut file, SeekFrom::Start(0))?;
+            writeln!(file, "{}", std::process::id())?;
+            file.sync_all()?;
+
+            Ok(Self {
+                lock_path,
+                _file: file,
+            })
         }
 
-        file.set_len(0)?;
-        Seek::seek(&mut file, SeekFrom::Start(0))?;
-        writeln!(file, "{}", std::process::id())?;
-        file.sync_all()?;
+        #[cfg(not(unix))]
+        {
+            #[cfg(not(windows))]
+            {
+                if let Ok(existing_raw) = fs::read_to_string(&lock_path)
+                    && let Ok(existing_pid) = existing_raw.trim().parse::<u32>()
+                    && existing_pid != std::process::id()
+                    && is_pid_alive(existing_pid)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "another rust-clash instance (PID {existing_pid}) is already running (lock: '{}')",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+            }
 
-        Ok(Self {
-            lock_path,
-            _file: file,
-        })
+            let mut open_opts = OpenOptions::new();
+            open_opts
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_SHARE_READ (0x1) | FILE_SHARE_WRITE (0x2) | FILE_SHARE_DELETE (0x4) = 0x7
+                open_opts.share_mode(0x7);
+            }
+            let mut file = open_opts.open(&lock_path)?;
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::{
+                    Storage::FileSystem::{
+                        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+                    },
+                    System::IO::OVERLAPPED,
+                };
+                // SAFETY: `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` and a
+                // zeroed `OVERLAPPED` on a valid open `File` handle is non-blocking; the Windows NT kernel
+                // automatically releases the lock when the handle closes or the process terminates.
+                let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    LockFileEx(
+                        file.as_raw_handle() as _,
+                        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0,
+                        1,
+                        0,
+                        &mut overlapped,
+                    )
+                };
+                if ok == 0 {
+                    let pid_note = fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(|pid| format!(" (PID {pid})"))
+                        .unwrap_or_default();
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "another rust-clash instance{pid_note} holds exclusive lock '{}'",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+            }
+
+            file.set_len(0)?;
+            Seek::seek(&mut file, SeekFrom::Start(0))?;
+            writeln!(file, "{}", std::process::id())?;
+            file.sync_all()?;
+
+            Ok(Self {
+                lock_path,
+                _file: file,
+            })
+        }
     }
 }
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        // On Unix, `flock(2)` locks the underlying inode rather than the directory path.
+        // Unlinking `lock_path` on drop would allow a racing process on the old unlinked inode
+        // and a new process creating a fresh inode to both succeed in `LOCK_EX` simultaneously.
+        // Dropping `self._file` releases the kernel `flock` atomically while keeping the inode stable.
+        #[cfg(not(unix))]
+        {
+            let _ = fs::remove_file(&self.lock_path);
+        }
     }
 }
 
@@ -822,45 +921,17 @@ where
         Some(journal.pid)
     };
 
+    let mut remaining_linux: Option<LinuxRecoveryRecord> = None;
     let mut remaining_macos: Option<MacOsRecoveryRecord> = None;
     let mut remaining_windows: Option<WindowsRecoveryRecord> = None;
 
     if tun_stale {
         if let Some(linux) = &journal.linux_tun {
-            for args in linux.owned_v4_rule_del_args.iter().rev() {
-                let desc = format!("ip {}", args.join(" "));
-                match run_cmd("ip", args) {
-                    Ok(()) => outcome.actions_executed.push(desc),
-                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-                }
-            }
-            for args in linux.owned_v6_rule_del_args.iter().rev() {
-                let desc = format!("ip {}", args.join(" "));
-                match run_cmd("ip", args) {
-                    Ok(()) => outcome.actions_executed.push(desc),
-                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-                }
-            }
-            for args in linux.owned_route_del_args.iter().rev() {
-                let desc = format!("ip {}", args.join(" "));
-                match run_cmd("ip", args) {
-                    Ok(()) => outcome.actions_executed.push(desc),
-                    Err(e) => outcome.warnings.push(format!("{desc}: {e}")),
-                }
-            }
-            if !linux.device_name.is_empty() {
-                let del_link = vec![
-                    "link".to_string(),
-                    "delete".to_string(),
-                    "dev".to_string(),
-                    linux.device_name.clone(),
-                ];
-                if run_cmd("ip", &del_link).is_ok() {
-                    outcome
-                        .actions_executed
-                        .push(format!("ip link delete dev {}", linux.device_name));
-                }
-            }
+            remaining_linux = crate::platform::tun::linux::rollback_linux_record_with_runner(
+                linux,
+                &mut outcome,
+                run_cmd,
+            );
         }
 
         if let Some(macos) = &journal.macos_tun {
@@ -932,6 +1003,7 @@ where
         }
     }
 
+    let mut sp_recovered = false;
     if sp_stale && let Some(sp) = &journal.sysproxy {
         struct AdapterRunner<'a, F>(&'a mut F);
         impl<F> crate::platform::sysproxy::SysProxyCommandBackend for AdapterRunner<'_, F>
@@ -946,20 +1018,23 @@ where
         let mut adapter = AdapterRunner(run_cmd);
         match crate::platform::sysproxy::restore_sysproxy_record_with_runner_desc(sp, &mut adapter)
         {
-            Ok(desc) => outcome.actions_executed.push(desc),
+            Ok(desc) => {
+                outcome.actions_executed.push(desc);
+                sp_recovered = true;
+                let _ = fs::remove_file(state_dir.join("sysproxy_active.json"));
+            }
             Err(e) => outcome
                 .warnings
                 .push(format!("sysproxy recovery failed: {e}")),
         }
-        let _ = fs::remove_file(state_dir.join("sysproxy_active.json"));
     }
 
     // Preserve any remaining section owned by a still-live process AND any genuinely unrecovered
-    // macOS / Windows TUN rollback items (`pid = 0` so future recovery retries them); if none remain,
-    // `save_atomic` removes `network_recovery.json` cleanly.
+    // Linux / macOS / Windows TUN or sysproxy rollback items (`pid = 0` so future recovery retries
+    // them); if none remain, `save_atomic` removes `network_recovery.json` cleanly.
     let mut survivor = journal;
     let keep_tun_pid = if tun_stale {
-        survivor.linux_tun = None;
+        survivor.linux_tun = remaining_linux.filter(|r| !r.is_empty());
         survivor.macos_tun = remaining_macos.filter(|r| !r.is_empty());
         survivor.windows_tun = remaining_windows.filter(|r| !r.is_empty());
         survivor.has_tun().then_some(0)
@@ -967,8 +1042,12 @@ where
         survivor.has_tun().then_some(tun_pid)
     };
     let keep_sp_pid = if sp_stale {
-        survivor.sysproxy = None;
-        None
+        if sp_recovered {
+            survivor.sysproxy = None;
+            None
+        } else {
+            survivor.sysproxy.is_some().then_some(0)
+        }
     } else {
         survivor.sysproxy.is_some().then_some(sp_pid)
     };
@@ -1610,6 +1689,419 @@ mod tests {
             );
             assert!(target.exists());
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_sysproxy_recovery_failure_retains_backup_with_sentinel_pid_zero_until_retry_succeeds()
+    {
+        for (label, sp_rec, expected_prog) in [
+            (
+                "gnome",
+                SysProxyRecoveryRecord {
+                    platform: "linux".into(),
+                    linux_gnome_mode: Some("none".into()),
+                    ..Default::default()
+                },
+                "gsettings",
+            ),
+            (
+                "kde",
+                SysProxyRecoveryRecord {
+                    platform: "linux".into(),
+                    linux_kde: Some(LinuxKdeProxyBackup {
+                        tool_generation: 6,
+                        proxy_type: Some("0".into()),
+                        http_proxy: Some(String::new()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kwriteconfig6",
+            ),
+            (
+                "macos",
+                SysProxyRecoveryRecord {
+                    platform: "macos".into(),
+                    macos_services: vec![MacOsProxyServiceBackup {
+                        service_name: "Wi-Fi".into(),
+                        web_enabled: false,
+                        web_host: String::new(),
+                        web_port: 0,
+                        secure_web_enabled: false,
+                        secure_web_host: String::new(),
+                        secure_web_port: 0,
+                        socks_enabled: false,
+                        socks_host: String::new(),
+                        socks_port: 0,
+                        bypass_domains: Some(vec![]),
+                    }],
+                    ..Default::default()
+                },
+                "networksetup",
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "rc-sp-fail-retain-{label}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+
+            let mut dead_j = RecoveryJournal::new_for_pid(999_999_992);
+            dead_j.sysproxy = Some(sp_rec.clone());
+            dead_j.save_atomic(&dir).unwrap();
+
+            let meta_path = dir.join("sysproxy_active.json");
+            fs::write(&meta_path, b"[\"127.0.0.1\",7890,[\"localhost\"]]").unwrap();
+
+            // Attempt #1 fails -> journal & `sysproxy_active.json` MUST be preserved with PID 0!
+            let fail_out = recover_stale_network_state_with_runner(&dir, &mut |prog, _args| {
+                if prog == expected_prog {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{prog} failed transiently"),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(fail_out.found_stale_journal, "{label}: stale expected");
+            assert!(
+                !fail_out.warnings.is_empty(),
+                "{label}: warning expected on failed sysproxy recovery"
+            );
+            assert!(
+                meta_path.exists(),
+                "{label}: sysproxy_active.json must NOT be deleted when recovery fails"
+            );
+            let retained = RecoveryJournal::load_from(&dir)
+                .unwrap()
+                .expect("recovery journal must remain on disk after failed sysproxy restore");
+            assert_eq!(retained.sysproxy.as_ref(), Some(&sp_rec));
+            assert_eq!(
+                retained.effective_sysproxy_pid(),
+                0,
+                "{label}: failed sysproxy recovery must use sentinel PID 0"
+            );
+
+            // Attempt #2 succeeds -> both journal and `sysproxy_active.json` are removed cleanly!
+            let ok_out = recover_stale_network_state_with_runner(&dir, &mut |_prog, _args| Ok(()));
+            assert!(ok_out.found_stale_journal);
+            assert!(ok_out.warnings.is_empty(), "{label}: {:?}", ok_out.warnings);
+            assert!(
+                !meta_path.exists(),
+                "{label}: sysproxy_active.json must be deleted after recovery succeeds"
+            );
+            assert!(
+                RecoveryJournal::load_from(&dir).unwrap().is_none(),
+                "{label}: journal must be removed once recovery succeeds"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn stale_linux_tun_eperm_retains_unrecovered_items_with_pid_zero_and_prunes_benign_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "rc-linux-tun-eperm-retain-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let rule_absent = vec![
+            "-4".into(),
+            "rule".into(),
+            "del".into(),
+            "pref".into(),
+            "8990".into(),
+            "to".into(),
+            "1.2.3.4/32".into(),
+            "lookup".into(),
+            "main".into(),
+        ];
+        let rule_eperm_v4 = vec![
+            "-4".into(),
+            "rule".into(),
+            "del".into(),
+            "pref".into(),
+            "9020".into(),
+            "not".into(),
+            "fwmark".into(),
+            "0x1a5".into(),
+            "lookup".into(),
+            "20220".into(),
+        ];
+        let rule_eperm_v6 = vec![
+            "-6".into(),
+            "rule".into(),
+            "del".into(),
+            "pref".into(),
+            "9020".into(),
+            "not".into(),
+            "fwmark".into(),
+            "0x1a5".into(),
+            "lookup".into(),
+            "20220".into(),
+        ];
+        let route_absent = vec![
+            "-4".into(),
+            "route".into(),
+            "del".into(),
+            "default".into(),
+            "dev".into(),
+            "Clash0".into(),
+            "table".into(),
+            "20220".into(),
+        ];
+
+        let mut dead_j = RecoveryJournal::new_for_pid(999_999_994);
+        dead_j.linux_tun = Some(LinuxRecoveryRecord {
+            device_name: "Clash0".into(),
+            route_table_id: 20220,
+            fwmark: 0x1a5,
+            owned_v4_rule_del_args: vec![rule_absent.clone(), rule_eperm_v4.clone()],
+            owned_v6_rule_del_args: vec![rule_eperm_v6.clone()],
+            owned_route_del_args: vec![route_absent.clone()],
+        });
+        dead_j.save_atomic(&dir).unwrap();
+
+        // Non-root recovery: benign-absent items are pruned while EPERM items are retained with PID 0.
+        let non_root_out = recover_stale_network_state_with_runner(&dir, &mut |prog, args| {
+            assert_eq!(prog, "ip");
+            let joined = args.join(" ");
+            if joined.contains("pref 8990") {
+                Err(io::Error::other(
+                    "RTNETLINK answers: No such file or directory",
+                ))
+            } else if joined.contains("Clash0") {
+                Err(io::Error::other("Cannot find device \"Clash0\""))
+            } else {
+                Err(io::Error::other(
+                    "RTNETLINK answers: Operation not permitted",
+                ))
+            }
+        });
+        assert!(non_root_out.found_stale_journal);
+        assert_eq!(non_root_out.warnings.len(), 2);
+
+        let surviving = RecoveryJournal::load_from(&dir)
+            .unwrap()
+            .expect("journal must retain unrecovered EPERM Linux TUN rules");
+        assert_eq!(surviving.effective_tun_pid(), 0);
+        let rem = surviving.linux_tun.expect("remaining linux_tun");
+        assert!(!rem.is_empty());
+        assert!(
+            rem.device_name.is_empty(),
+            "absent device_name must be pruned"
+        );
+        assert!(
+            rem.owned_route_del_args.is_empty(),
+            "absent route must be pruned"
+        );
+        assert_eq!(rem.owned_v4_rule_del_args, vec![rule_eperm_v4.clone()]);
+        assert_eq!(rem.owned_v6_rule_del_args, vec![rule_eperm_v6.clone()]);
+
+        // Elevated retry succeeds and clears the journal completely.
+        let mut retry_cmds = Vec::new();
+        let retry_out = recover_stale_network_state_with_runner(&dir, &mut |prog, args| {
+            retry_cmds.push(format!("{prog} {}", args.join(" ")));
+            Ok(())
+        });
+        assert!(retry_out.found_stale_journal);
+        assert!(retry_out.warnings.is_empty());
+        assert_eq!(retry_cmds.len(), 2);
+        assert!(RecoveryJournal::load_from(&dir).unwrap().is_none());
+
+        // `finalize_linux_tun_teardown_journal` retains unrecovered items with sentinel PID 0,
+        // and removes the journal when passed `None` or an empty `LinuxRecoveryRecord`.
+        let partial_rem = LinuxRecoveryRecord {
+            device_name: String::new(),
+            route_table_id: 20220,
+            fwmark: 0x1a5,
+            owned_v4_rule_del_args: vec![rule_eperm_v4],
+            owned_v6_rule_del_args: Vec::new(),
+            owned_route_del_args: Vec::new(),
+        };
+        finalize_linux_tun_teardown_journal(&dir, Some(partial_rem.clone())).unwrap();
+        let after_partial = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(after_partial.linux_tun.as_ref(), Some(&partial_rem));
+        assert_eq!(after_partial.effective_tun_pid(), 0);
+
+        finalize_linux_tun_teardown_journal(&dir, Some(LinuxRecoveryRecord::default())).unwrap();
+        assert!(RecoveryJournal::load_from(&dir).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_dead_and_sentinel_sysproxy_preserved_across_journal_update_and_tun_teardown() {
+        let dir = std::env::temp_dir().join(format!(
+            "rc-foreign-dead-sp-preserve-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let my_pid = std::process::id();
+        let dead_foreign_pid = 999_999_995u32;
+        let sp_rec = SysProxyRecoveryRecord {
+            platform: "linux".into(),
+            linux_gnome_mode: Some("none".into()),
+            ..Default::default()
+        };
+        let tun_rec = LinuxRecoveryRecord {
+            device_name: "Clash0".into(),
+            route_table_id: 20221,
+            fwmark: 0x1a5,
+            owned_v4_rule_del_args: vec![vec![
+                "-4".into(),
+                "rule".into(),
+                "del".into(),
+                "pref".into(),
+                "9020".into(),
+            ]],
+            owned_v6_rule_del_args: Vec::new(),
+            owned_route_del_args: Vec::new(),
+        };
+
+        // 1. Dead foreign PID leaves behind an unrecovered `sysproxy` backup.
+        let mut initial = RecoveryJournal::new_for_pid(dead_foreign_pid);
+        initial.sysproxy = Some(sp_rec.clone());
+        initial.save_atomic(&dir).unwrap();
+
+        // 2. Current live process writes its own `linux_tun` via `update_journal_for_pid_with_liveness`
+        //    (where `dead_foreign_pid` reports NOT alive). The dead foreign `sysproxy` MUST survive!
+        update_journal_for_pid_with_liveness(
+            &dir,
+            my_pid,
+            |p| p == my_pid,
+            |j| {
+                j.linux_tun = Some(tun_rec.clone());
+            },
+        )
+        .unwrap();
+
+        let after_update = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(after_update.linux_tun.as_ref(), Some(&tun_rec));
+        assert_eq!(after_update.effective_tun_pid(), my_pid);
+        assert_eq!(after_update.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(after_update.effective_sysproxy_pid(), dead_foreign_pid);
+
+        // 3. Current live process cleanly finalizes its Linux TUN teardown via
+        //    `finalize_linux_tun_teardown_journal`: the dead foreign `sysproxy` MUST STILL survive!
+        finalize_linux_tun_teardown_journal(&dir, None).unwrap();
+        let after_teardown = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert!(after_teardown.linux_tun.is_none());
+        assert_eq!(after_teardown.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(after_teardown.effective_sysproxy_pid(), dead_foreign_pid);
+
+        // 4. Same invariant for sentinel PID `0` (previously failed sysproxy recovery):
+        let mut sentinel_j = RecoveryJournal::new_for_pid(0);
+        sentinel_j.sysproxy = Some(sp_rec.clone());
+        sentinel_j.save_atomic(&dir).unwrap();
+
+        update_journal_for_pid_with_liveness(
+            &dir,
+            my_pid,
+            |p| p == my_pid,
+            |j| {
+                j.linux_tun = Some(tun_rec.clone());
+            },
+        )
+        .unwrap();
+        let with_sentinel = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert_eq!(with_sentinel.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(with_sentinel.effective_sysproxy_pid(), 0);
+
+        finalize_linux_tun_teardown_journal(&dir, None).unwrap();
+        let after_sentinel_teardown = RecoveryJournal::load_from(&dir).unwrap().unwrap();
+        assert!(after_sentinel_teardown.linux_tun.is_none());
+        assert_eq!(after_sentinel_teardown.sysproxy.as_ref(), Some(&sp_rec));
+        assert_eq!(after_sentinel_teardown.effective_sysproxy_pid(), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_single_instance_guard_keeps_inode_on_drop_and_enforces_concurrent_exclusion() {
+        use std::{
+            os::unix::fs::MetadataExt,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            },
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("rc-single-instance-inode-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Lockfile inode MUST NOT be unlinked on Drop; reacquisition reuses the exact same inode.
+        let g1 = SingleInstanceGuard::acquire(&dir).expect("acquire #1");
+        let lock_path = g1.lock_path().to_path_buf();
+        let meta1 = fs::metadata(&lock_path).unwrap();
+        let (dev1, ino1) = (meta1.dev(), meta1.ino());
+
+        assert!(
+            SingleInstanceGuard::acquire(&dir).is_err(),
+            "second concurrent acquire must fail while guard #1 is held"
+        );
+
+        drop(g1);
+        assert!(
+            lock_path.exists(),
+            "Unix Drop must NOT unlink lockfile inode"
+        );
+        let meta_after_drop = fs::metadata(&lock_path).unwrap();
+        assert_eq!((meta_after_drop.dev(), meta_after_drop.ino()), (dev1, ino1));
+
+        let g2 = SingleInstanceGuard::acquire(&dir).expect("acquire #2");
+        let meta2 = fs::metadata(&lock_path).unwrap();
+        assert_eq!((meta2.dev(), meta2.ino()), (dev1, ino1));
+        drop(g2);
+
+        // 2. External deletion while unlocked recovers cleanly to a valid inode on next acquire.
+        fs::remove_file(&lock_path).unwrap();
+        let g3 = SingleInstanceGuard::acquire(&dir).expect("acquire after external unlink");
+        assert!(lock_path.exists());
+        drop(g3);
+
+        // 3. Multi-threaded contention: at most ONE thread may hold the guard at any instant.
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let acquired_total = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..6 {
+            let d = dir.clone();
+            let act = Arc::clone(&active);
+            let max = Arc::clone(&max_seen);
+            let tot = Arc::clone(&acquired_total);
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    if let Ok(guard) = SingleInstanceGuard::acquire(&d) {
+                        let cur = act.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        max.fetch_max(cur, AtomicOrdering::SeqCst);
+                        tot.fetch_add(1, AtomicOrdering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        act.fetch_sub(1, AtomicOrdering::SeqCst);
+                        drop(guard);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(acquired_total.load(AtomicOrdering::SeqCst) > 0);
+        assert_eq!(
+            max_seen.load(AtomicOrdering::SeqCst),
+            1,
+            "SingleInstanceGuard must enforce strict mutual exclusion across racing threads"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

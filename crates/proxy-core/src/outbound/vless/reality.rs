@@ -49,6 +49,8 @@ const TLS_HS_CERTIFICATE_VERIFY: u8 = 0x0f;
 const TLS_HS_FINISHED: u8 = 0x14;
 const TLS_HS_KEY_UPDATE: u8 = 0x18;
 
+const MAX_POST_HANDSHAKE_BUF: usize = 64 * 1024;
+
 const CIPHER_TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 const CIPHER_TLS_AES_256_GCM_SHA384: u16 = 0x1302;
 const CIPHER_TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
@@ -677,7 +679,13 @@ fn parse_tls13_certificate_list(body: &[u8]) -> io::Result<Vec<CertificateDer<'s
         ));
     }
     let ctx_len = body[0] as usize;
-    if body.len() < 1 + ctx_len + 3 {
+    let Some(list_hdr_end) = 1usize.checked_add(ctx_len).and_then(|v| v.checked_add(3)) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS 1.3 Certificate context length overflow",
+        ));
+    };
+    if body.len() < list_hdr_end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated TLS 1.3 Certificate context",
@@ -687,29 +695,70 @@ fn parse_tls13_certificate_list(body: &[u8]) -> io::Result<Vec<CertificateDer<'s
     let list_len =
         ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
     pos += 3;
-    if body.len() < pos + list_len {
+    let Some(end) = pos.checked_add(list_len) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS 1.3 Certificate list length overflow",
+        ));
+    };
+    if body.len() < end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated TLS 1.3 Certificate list",
         ));
     }
-    let end = pos + list_len;
     let mut certs = Vec::new();
-    while pos + 3 <= end {
+    while pos < end {
+        let Some(clen_end) = pos.checked_add(3) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate entry offset overflow",
+            ));
+        };
+        if clen_end > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated TLS 1.3 Certificate entry header",
+            ));
+        }
         let clen = ((body[pos] as usize) << 16)
             | ((body[pos + 1] as usize) << 8)
             | (body[pos + 2] as usize);
-        pos += 3;
-        if pos + clen + 2 > end {
+        pos = clen_end;
+        let Some(cert_end) = pos.checked_add(clen) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate entry length overflow",
+            ));
+        };
+        let Some(ext_hdr_end) = cert_end.checked_add(2) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate extensions offset overflow",
+            ));
+        };
+        if ext_hdr_end > end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated TLS 1.3 Certificate entry",
             ));
         }
-        certs.push(CertificateDer::from(body[pos..pos + clen].to_vec()));
-        pos += clen;
+        certs.push(CertificateDer::from(body[pos..cert_end].to_vec()));
+        pos = cert_end;
         let ext_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
-        pos += 2 + ext_len;
+        let Some(next_pos) = ext_hdr_end.checked_add(ext_len) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate extensions length overflow",
+            ));
+        };
+        if next_pos > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated TLS 1.3 Certificate extensions",
+            ));
+        }
+        pos = next_pos;
     }
     if certs.is_empty() {
         return Err(io::Error::new(
@@ -739,19 +788,31 @@ fn read_der_tlv(input: &[u8]) -> io::Result<(u8, &[u8], &[u8])> {
                 "invalid ASN.1 DER length octets",
             ));
         }
-        let mut l = 0usize;
+        let mut l = 0u64;
         for &b in &input[2..2 + num_octets] {
-            l = (l << 8) | (b as usize);
+            l = (l << 8) | u64::from(b);
         }
+        let l = usize::try_from(l).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ASN.1 DER element length exceeds platform limit",
+            )
+        })?;
         (l, 2 + num_octets)
     };
-    if input.len() < hdr_len + len {
+    let Some(end) = hdr_len.checked_add(len) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ASN.1 DER element length overflow",
+        ));
+    };
+    if end > input.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ASN.1 DER element exceeds buffer",
         ));
     }
-    Ok((tag, &input[hdr_len..hdr_len + len], &input[hdr_len + len..]))
+    Ok((tag, &input[hdr_len..end], &input[end..]))
 }
 
 /// Extract `(ed25519_public_key_32B, certificate_signature_bytes)` from a REALITY X.509 leaf DER cert.
@@ -1061,6 +1122,7 @@ pub struct Tls13VisionStream<S> {
     write_keys: RecordTrafficKeys,
     raw_rx_buf: BytesMut,
     dec_rx_buf: BytesMut,
+    post_hs_buf: BytesMut,
     enc_tx_buf: BytesMut,
     tx_fanout: Arc<FanoutWaker>,
     tx_fanout_waker: Waker,
@@ -1089,6 +1151,7 @@ impl<S> Tls13VisionStream<S> {
             write_keys,
             raw_rx_buf,
             dec_rx_buf: BytesMut::with_capacity(16 * 1024),
+            post_hs_buf: BytesMut::new(),
             enc_tx_buf: BytesMut::with_capacity(16 * 1024),
             tx_fanout,
             tx_fanout_waker,
@@ -1743,23 +1806,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13VisionStream<S> {
         res
     }
 
-    fn handle_post_handshake_messages(&mut self, mut hs_bytes: &[u8]) -> io::Result<()> {
-        while hs_bytes.len() >= 4 {
-            let mtype = hs_bytes[0];
-            let mlen = ((hs_bytes[1] as usize) << 16)
-                | ((hs_bytes[2] as usize) << 8)
-                | (hs_bytes[3] as usize);
-            if hs_bytes.len() < 4 + mlen {
+    fn handle_post_handshake_messages(&mut self, hs_bytes: &[u8]) -> io::Result<()> {
+        if self
+            .post_hs_buf
+            .len()
+            .checked_add(hs_bytes.len())
+            .is_none_or(|n| n > MAX_POST_HANDSHAKE_BUF)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 post-handshake buffer exceeds 64 KiB limit",
+            ));
+        }
+        self.post_hs_buf.extend_from_slice(hs_bytes);
+
+        while self.post_hs_buf.len() >= 4 {
+            let mtype = self.post_hs_buf[0];
+            let mlen = ((self.post_hs_buf[1] as usize) << 16)
+                | ((self.post_hs_buf[2] as usize) << 8)
+                | (self.post_hs_buf[3] as usize);
+            let Some(msg_len) = 4usize.checked_add(mlen) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TLS 1.3 post-handshake message length overflow",
+                ));
+            };
+            if msg_len > MAX_POST_HANDSHAKE_BUF {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "TLS 1.3 post-handshake message length {msg_len} exceeds {MAX_POST_HANDSHAKE_BUF} byte limit"
+                    ),
+                ));
+            }
+            if self.post_hs_buf.len() < msg_len {
                 break;
             }
-            let body = &hs_bytes[4..4 + mlen];
-            hs_bytes = &hs_bytes[4 + mlen..];
             match mtype {
                 TLS_HS_NEW_SESSION_TICKET => {
                     // Ignore NewSessionTicket (REALITY / Vision opens fresh ephemeral handshakes)
                 }
                 TLS_HS_KEY_UPDATE => {
-                    let req = body.first().copied().unwrap_or(0);
+                    if mlen != 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid TLS 1.3 KeyUpdate length {mlen}"),
+                        ));
+                    }
+                    let req = self.post_hs_buf[4];
+                    if req > 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid TLS 1.3 KeyUpdate request_update value {req}"),
+                        ));
+                    }
                     self.read_keys.roll_key_update()?;
                     if req == 1 {
                         let ku_resp = [TLS_HS_KEY_UPDATE, 0, 0, 1, 0];
@@ -1773,6 +1873,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13VisionStream<S> {
                 }
                 _ => {}
             }
+            self.post_hs_buf.advance(msg_len);
         }
         Ok(())
     }
@@ -1914,6 +2015,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
                         };
                     match inner_type {
                         TLS_RECORD_APPLICATION_DATA => {
+                            if !self.post_hs_buf.is_empty() {
+                                self.tx_fanout.clear_read();
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "TLS 1.3 application data interleaved with incomplete post-handshake message",
+                                )));
+                            }
                             if plain_len > 0 {
                                 self.any_read_bytes = true;
                                 if pending_tx_err.is_some() {
@@ -1990,7 +2098,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
             let filled = rb.filled();
             if filled.is_empty() {
                 self.tx_fanout.clear_read();
-                if !self.raw_rx_buf.is_empty() {
+                if !self.raw_rx_buf.is_empty() || !self.post_hs_buf.is_empty() {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "truncated TLS 1.3 record on EOF",
@@ -3370,5 +3478,206 @@ mod tests {
             "Tls13VisionStream<BufStream(16)<DuplexStream>>",
         )
         .await;
+    }
+
+    #[test]
+    fn der_tlv_and_tls13_certificate_list_reject_overflow_and_truncated_lengths() {
+        // 1. Valid short-form and multi-octet DER TLV.
+        let (tag, val, rest) = read_der_tlv(&[0x30, 0x03, 0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
+        assert_eq!(tag, 0x30);
+        assert_eq!(val, &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(rest, &[0xdd]);
+
+        let (tag2, val2, rest2) = read_der_tlv(&[0x04, 0x81, 0x02, 0x11, 0x22]).unwrap();
+        assert_eq!(tag2, 0x04);
+        assert_eq!(val2, &[0x11, 0x22]);
+        assert!(rest2.is_empty());
+
+        // 2. Crafted 4-octet u32::MAX / near-u32::MAX lengths must fail cleanly without overflow
+        //    or OOB panic on both 32-bit and 64-bit targets.
+        for bad_der in [
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xfa][..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xf9, 0x00][..],
+            &[0x30, 0x80][..],
+            &[0x30, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01][..],
+            &[0x30, 0x05, 0x01, 0x02][..],
+        ] {
+            let err = read_der_tlv(bad_der).expect_err("crafted DER TLV must return InvalidData");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 3. Valid TLS 1.3 Certificate list with 2 entries and extensions.
+        let mut valid_body = vec![
+            0x00, // request_context len = 0
+            0x00, 0x00, 15, // certificate_list len = 15
+            // Entry 1: 3B cert + 2B ext = 10B total
+            0x00, 0x00, 0x03, 0x30, 0x01, 0x02, 0x00, 0x02, 0xaa, 0xbb,
+            // Entry 2: 0B cert + 0B ext = 5B total
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let certs = parse_tls13_certificate_list(&valid_body).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), &[0x30, 0x01, 0x02]);
+
+        // 4. Crafted `ext_len` exceeding the certificate list boundary must be rejected cleanly.
+        let bad_ext_body = vec![
+            0x00, // request_context len = 0
+            0x00, 0x00, 0x07, // certificate_list len = 7
+            0x00, 0x00, 0x02, 0x30, 0x00, // 2-byte cert
+            0xff, 0xff, // ext_len = 65535 > remaining 0 bytes!
+        ];
+        let err = parse_tls13_certificate_list(&bad_ext_body)
+            .expect_err("oversized CertificateEntry extensions length must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 5. Trailing truncated entry header (< 3 bytes) inside certificate_list must be rejected.
+        valid_body[3] = 17; // list_len = 17
+        valid_body.extend_from_slice(&[0x00, 0x01]);
+        let err = parse_tls13_certificate_list(&valid_body)
+            .expect_err("truncated trailing CertificateEntry header must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_split_post_handshake_key_update_and_interleaving_rules() {
+        // 1. KeyUpdate(request_update = 0) split across 2 TLS 1.3 handshake records (2 B + 3 B)
+        //    followed by AEAD application data encrypted with the rolled key.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            let ku = [TLS_HS_KEY_UPDATE, 0, 0, 1, 0];
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &ku[..2], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &ku[2..], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys.roll_key_update().unwrap();
+            srv.flush().await.unwrap();
+            srv.write_all(b"decrypted-after-split-key-update")
+                .await
+                .unwrap();
+            srv.flush().await.unwrap();
+            srv.shutdown().await.unwrap();
+
+            let mut got = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), cli.read_to_end(&mut got))
+                .await
+                .expect("read_to_end timed out after split KeyUpdate")
+                .expect("split KeyUpdate must roll read keys cleanly");
+            assert_eq!(got, b"decrypted-after-split-key-update");
+        }
+
+        // 2. Coalesced NewSessionTicket + split KeyUpdate(request_update = 1) across 3 records,
+        //    verifying BOTH directions roll keys and exchange post-KeyUpdate traffic cleanly.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            let mut nst_and_ku = vec![TLS_HS_NEW_SESSION_TICKET, 0, 0, 4, 1, 2, 3, 4];
+            let ku1 = [TLS_HS_KEY_UPDATE, 0, 0, 1, 1];
+            nst_and_ku.extend_from_slice(&ku1);
+
+            // Split mid-NST, mid-KU-header, and mid-KU-body.
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &nst_and_ku[..6], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys
+                .seal_record(
+                    TLS_RECORD_HANDSHAKE,
+                    &nst_and_ku[6..10],
+                    &mut srv.enc_tx_buf,
+                )
+                .unwrap();
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &nst_and_ku[10..], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys.roll_key_update().unwrap();
+            srv.flush().await.unwrap();
+            srv.write_all(b"s2c-rolled").await.unwrap();
+            srv.flush().await.unwrap();
+
+            let mut s2c = [0u8; 10];
+            tokio::time::timeout(Duration::from_secs(2), cli.read_exact(&mut s2c))
+                .await
+                .expect("client read after split KeyUpdate(1) timed out")
+                .unwrap();
+            assert_eq!(&s2c, b"s2c-rolled");
+
+            // Client also rolled its write keys and queued KeyUpdate(0); verify server decrypts
+            // both the KeyUpdate(0) ack and subsequent client-to-server application data.
+            cli.write_all(b"c2s-rolled").await.unwrap();
+            cli.flush().await.unwrap();
+            let mut c2s = [0u8; 10];
+            tokio::time::timeout(Duration::from_secs(2), srv.read_exact(&mut c2s))
+                .await
+                .expect("server read after client KeyUpdate ack timed out")
+                .unwrap();
+            assert_eq!(&c2s, b"c2s-rolled");
+        }
+
+        // 3. RFC 8446 §5.1: ApplicationData interleaved while a post-handshake message is
+        //    incomplete MUST be rejected with InvalidData.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            let partial_ku = [TLS_HS_KEY_UPDATE, 0];
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &partial_ku, &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys
+                .seal_record(
+                    TLS_RECORD_APPLICATION_DATA,
+                    b"illegal-interleave",
+                    &mut srv.enc_tx_buf,
+                )
+                .unwrap();
+            srv.flush().await.unwrap();
+
+            let mut buf = [0u8; 32];
+            let err = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect_err("interleaved ApplicationData mid-handshake message must fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 4. Oversized post-handshake message header (> MAX_POST_HANDSHAKE_BUF) must be rejected
+        //    immediately with InvalidData.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            // NewSessionTicket header declaring 64 KiB body -> 4 + 65536 > 65536 cap.
+            let oversized_hdr = [TLS_HS_NEW_SESSION_TICKET, 0x01, 0x00, 0x00];
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &oversized_hdr, &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.flush().await.unwrap();
+
+            let mut buf = [0u8; 32];
+            let err = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect_err("oversized post-handshake message must fail with InvalidData");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 5. Abrupt EOF with an incomplete buffered post-handshake message must return
+        //    UnexpectedEof rather than clean EOF.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            srv.write_keys
+                .seal_record(
+                    TLS_RECORD_HANDSHAKE,
+                    &[TLS_HS_KEY_UPDATE, 0, 0],
+                    &mut srv.enc_tx_buf,
+                )
+                .unwrap();
+            srv.flush().await.unwrap();
+            drop(srv);
+
+            let mut buf = [0u8; 32];
+            let err = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect_err("EOF mid-post-handshake message must return UnexpectedEof");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
     }
 }

@@ -1,7 +1,7 @@
 pub mod h3_auth;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
     str::FromStr,
@@ -9,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicU16, AtomicU32, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use rustls::{ServerConfig, pki_types::CertificateDer};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt},
     sync::{Mutex as AsyncMutex, mpsc, watch},
     task::JoinHandle,
 };
@@ -44,6 +44,9 @@ use crate::{
 const HY2_MAX_TCP_MESSAGE_LEN: usize = 2048;
 const HY2_MAX_TCP_PADDING_LEN: usize = 4096;
 const HY2_MAX_UDP_DATAGRAM_WIRE: usize = 1150;
+const HY2_DEFRAG_MAX_SLOTS: usize = 32;
+const HY2_DEFRAG_MAX_BUFFERED_BYTES: usize = 256 * 1024;
+const HY2_DEFRAG_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Hysteria2OutboundConfig {
@@ -98,21 +101,37 @@ impl Hy2UdpFrame {
         let frag_id = raw[6];
         let frag_count = raw[7];
         let (addr_len_u64, var_used) = decode_quic_varint_slice(&raw[8..])?;
-        let addr_len = addr_len_u64 as usize;
-        if addr_len == 0 || addr_len > HY2_MAX_TCP_MESSAGE_LEN {
+        if addr_len_u64 == 0 || addr_len_u64 > HY2_MAX_TCP_MESSAGE_LEN as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Hysteria2 UDP address length",
             ));
         }
-        let data_start = 8 + var_used + addr_len;
+        let addr_len = usize::try_from(addr_len_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Hysteria2 UDP address length",
+            )
+        })?;
+        let Some(addr_start) = 8usize.checked_add(var_used) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hysteria2 UDP address offset overflow",
+            ));
+        };
+        let Some(data_start) = addr_start.checked_add(addr_len) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hysteria2 UDP address length overflow",
+            ));
+        };
         if raw.len() < data_start {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "truncated Hysteria2 UDP datagram address",
             ));
         }
-        let addr = std::str::from_utf8(&raw[8 + var_used..data_start])
+        let addr = std::str::from_utf8(&raw[addr_start..data_start])
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -141,7 +160,15 @@ fn fragment_hy2_udp_message(
     let mut addr_var = BytesMut::with_capacity(8);
     encode_quic_varint(addr.len() as u64, &mut addr_var)?;
     let hdr_len = 8 + addr_var.len() + addr.len();
-    let max_chunk = max_wire.saturating_sub(hdr_len).max(256);
+    if max_wire <= hdr_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Hysteria2 UDP datagram header ({hdr_len} bytes) does not fit in max wire size ({max_wire} bytes)"
+            ),
+        ));
+    }
+    let max_chunk = max_wire - hdr_len;
 
     if payload.len() <= max_chunk {
         let frame = Hy2UdpFrame {
@@ -181,43 +208,150 @@ fn fragment_hy2_udp_message(
     Ok(out)
 }
 
-#[derive(Default)]
-struct Hy2Defragger {
-    pkt_id: u16,
+struct Hy2DefragEntry {
+    packet_id: u16,
+    frag_count: u8,
     frags: Vec<Option<Vec<u8>>>,
     received: usize,
+    buffered_bytes: usize,
+    addr: String,
+    last_updated: Instant,
+}
+
+#[derive(Default)]
+struct Hy2Defragger {
+    /// Ordered from least-recently updated (front) to most-recently updated (back).
+    entries: VecDeque<Hy2DefragEntry>,
+    total_buffered_bytes: usize,
 }
 
 impl Hy2Defragger {
+    fn evict_expired(&mut self, now: Instant) {
+        self.entries.retain(|entry| {
+            if now.saturating_duration_since(entry.last_updated) >= HY2_DEFRAG_TTL {
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn feed(&mut self, frame: Hy2UdpFrame) -> Option<(Vec<u8>, String)> {
-        if frame.frag_count <= 1 {
-            return Some((frame.data, frame.addr));
-        }
-        if frame.frag_id >= frame.frag_count {
+        self.feed_at(frame, Instant::now())
+    }
+
+    fn feed_at(&mut self, frame: Hy2UdpFrame, now: Instant) -> Option<(Vec<u8>, String)> {
+        self.evict_expired(now);
+
+        if frame.frag_count == 0 || frame.frag_id >= frame.frag_count {
             return None;
         }
-        let total = frame.frag_count as usize;
-        if frame.packet_id != self.pkt_id || self.frags.len() != total {
-            self.pkt_id = frame.packet_id;
-            self.frags = vec![None; total];
-            self.received = 0;
+        if frame.frag_count == 1 {
+            return Some((frame.data, frame.addr));
         }
+
+        let total = frame.frag_count as usize;
         let idx = frame.frag_id as usize;
-        if self.frags[idx].is_none() {
-            self.frags[idx] = Some(frame.data);
-            self.received += 1;
-            if self.received == total {
-                let mut full = Vec::new();
-                for part in self.frags.iter_mut() {
+        let add_len = frame.data.len();
+        if add_len > HY2_DEFRAG_MAX_BUFFERED_BYTES {
+            return None;
+        }
+
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|entry| entry.packet_id == frame.packet_id)
+        {
+            if self.entries[pos].frag_count != frame.frag_count {
+                // Conflicting fragment count for an in-flight packet_id: reject without
+                // clobbering the active reassembly slot.
+                return None;
+            }
+            if self.entries[pos].frags[idx].is_some() {
+                // Duplicate fragment: ignore without double-counting buffered bytes.
+                return None;
+            }
+            if self.entries[pos].buffered_bytes.saturating_add(add_len)
+                > HY2_DEFRAG_MAX_BUFFERED_BYTES
+            {
+                return None;
+            }
+
+            let mut entry = self.entries.remove(pos).expect("validated index");
+            if frame.frag_id == 0 {
+                entry.addr = frame.addr;
+            }
+            if entry.received + 1 == total {
+                let assembled_len = entry.buffered_bytes + add_len;
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes);
+                entry.frags[idx] = Some(frame.data);
+                let mut full = Vec::with_capacity(assembled_len);
+                for part in entry.frags.iter_mut() {
                     if let Some(bytes) = part.take() {
                         full.extend_from_slice(&bytes);
                     }
                 }
-                self.frags.clear();
-                self.received = 0;
-                return Some((full, frame.addr));
+                return Some((full, entry.addr));
             }
+
+            while self.total_buffered_bytes.saturating_add(add_len) > HY2_DEFRAG_MAX_BUFFERED_BYTES
+            {
+                let Some(evicted) = self.entries.pop_front() else {
+                    break;
+                };
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(evicted.buffered_bytes);
+            }
+            if self.total_buffered_bytes.saturating_add(add_len) > HY2_DEFRAG_MAX_BUFFERED_BYTES {
+                self.total_buffered_bytes = self
+                    .total_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes);
+                return None;
+            }
+
+            entry.frags[idx] = Some(frame.data);
+            entry.received += 1;
+            entry.buffered_bytes += add_len;
+            entry.last_updated = now;
+            self.total_buffered_bytes += add_len;
+            self.entries.push_back(entry);
+            return None;
         }
+
+        while self.entries.len() >= HY2_DEFRAG_MAX_SLOTS
+            || self.total_buffered_bytes.saturating_add(add_len) > HY2_DEFRAG_MAX_BUFFERED_BYTES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.total_buffered_bytes = self
+                .total_buffered_bytes
+                .saturating_sub(evicted.buffered_bytes);
+        }
+        if self.entries.len() >= HY2_DEFRAG_MAX_SLOTS
+            || self.total_buffered_bytes.saturating_add(add_len) > HY2_DEFRAG_MAX_BUFFERED_BYTES
+        {
+            return None;
+        }
+
+        let mut frags = vec![None; total];
+        frags[idx] = Some(frame.data);
+        self.total_buffered_bytes += add_len;
+        self.entries.push_back(Hy2DefragEntry {
+            packet_id: frame.packet_id,
+            frag_count: frame.frag_count,
+            frags,
+            received: 1,
+            buffered_bytes: add_len,
+            addr: frame.addr,
+            last_updated: now,
+        });
         None
     }
 }
@@ -494,31 +628,7 @@ impl Hysteria2Inner {
         crate::outbound::with_handshake_timeout("Hysteria2 TCP stream open", async {
             send.write_all(&req).await.map_err(io::Error::from)?;
 
-            let status = recv.read_u8().await?;
-            let msg_len = read_quic_varint(&mut recv).await? as usize;
-            if msg_len > HY2_MAX_TCP_MESSAGE_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Hysteria2 TCP response message exceeds 2048 bytes",
-                ));
-            }
-            let mut msg_bytes = vec![0u8; msg_len];
-            if msg_len > 0 {
-                recv.read_exact(&mut msg_bytes)
-                    .await
-                    .map_err(io::Error::other)?;
-            }
-            let resp_pad_len = read_quic_varint(&mut recv).await? as usize;
-            if resp_pad_len > HY2_MAX_TCP_PADDING_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Hysteria2 TCP response padding exceeds 4096 bytes",
-                ));
-            }
-            if resp_pad_len > 0 {
-                let mut skip = vec![0u8; resp_pad_len];
-                recv.read_exact(&mut skip).await.map_err(io::Error::other)?;
-            }
+            let (status, msg_bytes) = read_hy2_tcp_response(&mut recv).await?;
             if status != 0x00 {
                 let msg = String::from_utf8_lossy(&msg_bytes);
                 return Err(io::Error::new(
@@ -537,6 +647,49 @@ impl Hysteria2Inner {
             Some(Arc::new(work) as Arc<dyn Send + Sync>),
         )))
     }
+}
+
+async fn read_hy2_tcp_response<R: AsyncRead + Unpin + ?Sized>(
+    recv: &mut R,
+) -> io::Result<(u8, Vec<u8>)> {
+    let status = recv.read_u8().await?;
+    let msg_len_u64 = read_quic_varint(recv).await?;
+    if msg_len_u64 > HY2_MAX_TCP_MESSAGE_LEN as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hysteria2 TCP response message exceeds 2048 bytes",
+        ));
+    }
+    let msg_len = usize::try_from(msg_len_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hysteria2 TCP response message exceeds 2048 bytes",
+        )
+    })?;
+    let mut msg_bytes = vec![0u8; msg_len];
+    if msg_len > 0 {
+        recv.read_exact(&mut msg_bytes)
+            .await
+            .map_err(io::Error::other)?;
+    }
+    let resp_pad_len_u64 = read_quic_varint(recv).await?;
+    if resp_pad_len_u64 > HY2_MAX_TCP_PADDING_LEN as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hysteria2 TCP response padding exceeds 4096 bytes",
+        ));
+    }
+    let resp_pad_len = usize::try_from(resp_pad_len_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hysteria2 TCP response padding exceeds 4096 bytes",
+        )
+    })?;
+    if resp_pad_len > 0 {
+        let mut skip = vec![0u8; resp_pad_len];
+        recv.read_exact(&mut skip).await.map_err(io::Error::other)?;
+    }
+    Ok((status, msg_bytes))
 }
 
 /// Parse a Hysteria2 / Mihomo bandwidth string (e.g. `"50"`, `"100 Mbps"`, `"1 gbps"`, `"500 kbps"`)
@@ -1026,24 +1179,36 @@ async fn handle_hy2_server_tcp(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> io::Result<()> {
-    let addr_len = read_quic_varint(&mut recv).await? as usize;
-    if addr_len == 0 || addr_len > HY2_MAX_TCP_MESSAGE_LEN {
+    let addr_len_u64 = read_quic_varint(&mut recv).await?;
+    if addr_len_u64 == 0 || addr_len_u64 > HY2_MAX_TCP_MESSAGE_LEN as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid Hysteria2 TCP address length",
         ));
     }
+    let addr_len = usize::try_from(addr_len_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Hysteria2 TCP address length",
+        )
+    })?;
     let mut addr_buf = vec![0u8; addr_len];
     recv.read_exact(&mut addr_buf)
         .await
         .map_err(io::Error::other)?;
-    let pad_len = read_quic_varint(&mut recv).await? as usize;
-    if pad_len > HY2_MAX_TCP_PADDING_LEN {
+    let pad_len_u64 = read_quic_varint(&mut recv).await?;
+    if pad_len_u64 > HY2_MAX_TCP_PADDING_LEN as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid Hysteria2 TCP padding length",
         ));
     }
+    let pad_len = usize::try_from(pad_len_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Hysteria2 TCP padding length",
+        )
+    })?;
     if pad_len > 0 {
         let mut skip = vec![0u8; pad_len];
         recv.read_exact(&mut skip).await.map_err(io::Error::other)?;
@@ -1197,5 +1362,297 @@ mod tests {
             0,
             "QuicWorkLease must drop to 0 after server-side disconnect and session drop"
         );
+    }
+
+    #[tokio::test]
+    async fn hy2_varint_high_bit_truncation_rejected_in_udp_and_tcp_decoders() {
+        // 1. Hy2UdpFrame::decode must compare u64 varint BEFORE usize conversion so
+        //    `(1u64 << 32) | 5` is rejected with InvalidData (not truncated to 5 on 32-bit).
+        let mut raw_udp = BytesMut::new();
+        raw_udp.put_u32(1); // session_id
+        raw_udp.put_u16(2); // packet_id
+        raw_udp.put_u8(0); // frag_id
+        raw_udp.put_u8(1); // frag_count
+        encode_quic_varint((1u64 << 32) | 5, &mut raw_udp).unwrap();
+        raw_udp.put_slice(b"1.1.1");
+        let err = Hy2UdpFrame::decode(&raw_udp)
+            .expect_err("high-bit u64 UDP addr_len varint must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 2. TCP response msg_len with upper 32 bits set must fail with InvalidData.
+        let mut raw_tcp_msg = BytesMut::new();
+        raw_tcp_msg.put_u8(0x00);
+        encode_quic_varint((1u64 << 32) | 3, &mut raw_tcp_msg).unwrap();
+        raw_tcp_msg.put_slice(b"abc");
+        let mut cur = io::Cursor::new(raw_tcp_msg.as_ref());
+        let err = read_hy2_tcp_response(&mut cur)
+            .await
+            .expect_err("high-bit u64 TCP msg_len varint must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 3. TCP response padding_len with upper 32 bits set must fail with InvalidData.
+        let mut raw_tcp_pad = BytesMut::new();
+        raw_tcp_pad.put_u8(0x00);
+        encode_quic_varint(2, &mut raw_tcp_pad).unwrap();
+        raw_tcp_pad.put_slice(b"ok");
+        encode_quic_varint((1u64 << 32) | 4, &mut raw_tcp_pad).unwrap();
+        raw_tcp_pad.put_slice(b"pads");
+        let mut cur2 = io::Cursor::new(raw_tcp_pad.as_ref());
+        let err = read_hy2_tcp_response(&mut cur2)
+            .await
+            .expect_err("high-bit u64 TCP padding_len varint must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 4. Valid TCP response still decodes cleanly.
+        let mut raw_ok = BytesMut::new();
+        raw_ok.put_u8(0x00);
+        encode_quic_varint(2, &mut raw_ok).unwrap();
+        raw_ok.put_slice(b"ok");
+        encode_quic_varint(3, &mut raw_ok).unwrap();
+        raw_ok.put_slice(b"xyz");
+        let mut cur3 = io::Cursor::new(raw_ok.as_ref());
+        assert_eq!(
+            read_hy2_tcp_response(&mut cur3).await.unwrap(),
+            (0x00, b"ok".to_vec())
+        );
+    }
+
+    #[test]
+    fn hy2_udp_fragmentation_respects_small_mtu_and_rejects_impossible_wire_size() {
+        let addr = "1.2.3.4:443"; // hdr_len = 8 + 1 + 11 = 20
+        let payload: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
+
+        // Small MTU (< 256) MUST NOT be overridden by `.max(256)`.
+        let max_wire = 90;
+        let frags = fragment_hy2_udp_message(7, 42, addr, &payload, max_wire).unwrap();
+        assert_eq!(frags.len(), 3); // max_chunk = 70 -> 70 + 70 + 60
+        let mut defrag = Hy2Defragger::default();
+        let mut out = None;
+        for f in &frags {
+            assert!(
+                f.len() <= max_wire,
+                "fragment wire size {} exceeded max_wire {}",
+                f.len(),
+                max_wire
+            );
+            let decoded = Hy2UdpFrame::decode(f).unwrap();
+            out = defrag.feed(decoded);
+        }
+        assert_eq!(out, Some((payload, addr.to_string())));
+
+        // Wire size <= header length must return InvalidInput.
+        for too_small in [0usize, 10, 19, 20] {
+            let err = fragment_hy2_udp_message(7, 43, addr, b"hi", too_small)
+                .expect_err("max_wire <= hdr_len must fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn hy2_defragger_interleaved_dedup_conflict_lru_ttl_and_byte_cap() {
+        let t0 = Instant::now();
+        let mut defrag = Hy2Defragger::default();
+
+        // 1. Invalid frag_count == 0 and frag_id >= frag_count are rejected.
+        assert!(
+            defrag
+                .feed_at(
+                    Hy2UdpFrame {
+                        session_id: 1,
+                        packet_id: 10,
+                        frag_id: 0,
+                        frag_count: 0,
+                        addr: "1.1.1.1:53".into(),
+                        data: b"bad".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert!(
+            defrag
+                .feed_at(
+                    Hy2UdpFrame {
+                        session_id: 1,
+                        packet_id: 10,
+                        frag_id: 2,
+                        frag_count: 2,
+                        addr: "1.1.1.1:53".into(),
+                        data: b"bad".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.total_buffered_bytes, 0);
+
+        // 2. Interleaved & out-of-order fragments for 2 concurrent packet_ids, with duplicate
+        //    frag_id and conflicting frag_count injected mid-reassembly.
+        let p1_f1 = Hy2UdpFrame {
+            session_id: 1,
+            packet_id: 100,
+            frag_id: 1,
+            frag_count: 2,
+            addr: "8.8.8.8:53".into(),
+            data: b"WORLD".to_vec(),
+        };
+        let p2_f0 = Hy2UdpFrame {
+            session_id: 1,
+            packet_id: 101,
+            frag_id: 0,
+            frag_count: 2,
+            addr: "1.1.1.1:53".into(),
+            data: b"FOO".to_vec(),
+        };
+        assert!(defrag.feed_at(p1_f1.clone(), t0).is_none());
+        assert!(defrag.feed_at(p2_f0, t0).is_none());
+        assert_eq!(defrag.total_buffered_bytes, 8);
+
+        // Duplicate fragment must not double-count buffered bytes or prematurely complete.
+        assert!(defrag.feed_at(p1_f1, t0).is_none());
+        assert_eq!(defrag.total_buffered_bytes, 8);
+
+        // Conflicting frag_count for active packet_id=100 must be rejected without clobbering.
+        assert!(
+            defrag
+                .feed_at(
+                    Hy2UdpFrame {
+                        session_id: 1,
+                        packet_id: 100,
+                        frag_id: 0,
+                        frag_count: 3,
+                        addr: "8.8.8.8:53".into(),
+                        data: b"CONFLICT".to_vec(),
+                    },
+                    t0
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.total_buffered_bytes, 8);
+
+        // Complete both packets in interleaved order.
+        let res1 = defrag.feed_at(
+            Hy2UdpFrame {
+                session_id: 1,
+                packet_id: 100,
+                frag_id: 0,
+                frag_count: 2,
+                addr: "8.8.8.8:53".into(),
+                data: b"HELLO-".to_vec(),
+            },
+            t0,
+        );
+        assert_eq!(res1, Some((b"HELLO-WORLD".to_vec(), "8.8.8.8:53".into())));
+        assert_eq!(defrag.total_buffered_bytes, 3);
+
+        let res2 = defrag.feed_at(
+            Hy2UdpFrame {
+                session_id: 1,
+                packet_id: 101,
+                frag_id: 1,
+                frag_count: 2,
+                addr: "1.1.1.1:53".into(),
+                data: b"BAR".to_vec(),
+            },
+            t0,
+        );
+        assert_eq!(res2, Some((b"FOOBAR".to_vec(), "1.1.1.1:53".into())));
+        assert_eq!(defrag.total_buffered_bytes, 0);
+
+        // 3. Slot cap (32) + LRU eviction: fill 32 slots (ids 0..32), touch id=0 so id=1 becomes
+        //    LRU, then insert id=32 -> id=1 must be evicted while id=0 survives!
+        for pid in 0..(HY2_DEFRAG_MAX_SLOTS as u16) {
+            assert!(
+                defrag
+                    .feed_at(
+                        Hy2UdpFrame {
+                            session_id: 1,
+                            packet_id: pid,
+                            frag_id: 0,
+                            frag_count: 3,
+                            addr: "1.1.1.1:53".into(),
+                            data: vec![pid as u8; 4],
+                        },
+                        t0
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(defrag.entries.len(), HY2_DEFRAG_MAX_SLOTS);
+        // Touch pid=0 with frag_id=1 so pid=0 moves to back (MRU), making pid=1 the LRU.
+        assert!(
+            defrag
+                .feed_at(
+                    Hy2UdpFrame {
+                        session_id: 1,
+                        packet_id: 0,
+                        frag_id: 1,
+                        frag_count: 3,
+                        addr: "1.1.1.1:53".into(),
+                        data: vec![0xEE; 4],
+                    },
+                    t0 + Duration::from_millis(10)
+                )
+                .is_none()
+        );
+        // Insert pid=32 -> evicts pid=1.
+        assert!(
+            defrag
+                .feed_at(
+                    Hy2UdpFrame {
+                        session_id: 1,
+                        packet_id: HY2_DEFRAG_MAX_SLOTS as u16,
+                        frag_id: 0,
+                        frag_count: 2,
+                        addr: "1.1.1.1:53".into(),
+                        data: vec![0xAA; 4],
+                    },
+                    t0 + Duration::from_millis(20)
+                )
+                .is_none()
+        );
+        assert_eq!(defrag.entries.len(), HY2_DEFRAG_MAX_SLOTS);
+        assert!(defrag.entries.iter().any(|e| e.packet_id == 0));
+        assert!(!defrag.entries.iter().any(|e| e.packet_id == 1));
+
+        // 4. TTL expiration (5s) clears all expired slots and refunds total_buffered_bytes to 0.
+        let t_expired = t0 + HY2_DEFRAG_TTL + Duration::from_millis(100);
+        let single = defrag.feed_at(
+            Hy2UdpFrame {
+                session_id: 1,
+                packet_id: 999,
+                frag_id: 0,
+                frag_count: 1,
+                addr: "1.1.1.1:53".into(),
+                data: b"ping".to_vec(),
+            },
+            t_expired,
+        );
+        assert_eq!(single, Some((b"ping".to_vec(), "1.1.1.1:53".into())));
+        assert!(defrag.entries.is_empty());
+        assert_eq!(defrag.total_buffered_bytes, 0);
+
+        // 5. Total buffered bytes cap (256 KiB): feeding 10 x 40 KiB partial packets must evict
+        //    older entries so `total_buffered_bytes <= HY2_DEFRAG_MAX_BUFFERED_BYTES`.
+        for i in 0..10u16 {
+            assert!(
+                defrag
+                    .feed_at(
+                        Hy2UdpFrame {
+                            session_id: 1,
+                            packet_id: 2000 + i,
+                            frag_id: 0,
+                            frag_count: 2,
+                            addr: "1.1.1.1:53".into(),
+                            data: vec![0x55; 40 * 1024],
+                        },
+                        t_expired
+                    )
+                    .is_none()
+            );
+            assert!(defrag.total_buffered_bytes <= HY2_DEFRAG_MAX_BUFFERED_BYTES);
+            let sum: usize = defrag.entries.iter().map(|e| e.buffered_bytes).sum();
+            assert_eq!(defrag.total_buffered_bytes, sum);
+        }
     }
 }

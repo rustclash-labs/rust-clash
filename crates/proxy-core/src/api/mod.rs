@@ -701,19 +701,94 @@ async fn get_tun_status(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResp
     Json(engine.tun_health())
 }
 
-fn detect_primary_lan_ipv4() -> Option<String> {
-    for probe in ["223.5.5.5:53", "198.51.100.1:80"] {
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
-            && sock.connect(probe).is_ok()
-            && let Ok(local) = sock.local_addr()
-        {
-            let ip = local.ip();
-            if !ip.is_unspecified() && !ip.is_loopback() {
-                return Some(ip.to_string());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanIpv4Candidate {
+    Preferred(std::net::Ipv4Addr),
+    LinkLocalFallback(std::net::Ipv4Addr),
+    Rejected,
+}
+
+fn classify_lan_ipv4_candidate(ip: IpAddr, fake_ip_net: ipnet::Ipv4Net) -> LanIpv4Candidate {
+    let IpAddr::V4(v4) = ip else {
+        return LanIpv4Candidate::Rejected;
+    };
+    if v4.is_unspecified()
+        || v4.is_loopback()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || fake_ip_net.contains(&v4)
+    {
+        return LanIpv4Candidate::Rejected;
+    }
+    if v4.is_link_local() {
+        return LanIpv4Candidate::LinkLocalFallback(v4);
+    }
+    LanIpv4Candidate::Preferred(v4)
+}
+
+fn select_lan_ipv4_candidate<I>(candidates: I, fake_ip_net: ipnet::Ipv4Net) -> Option<String>
+where
+    I: IntoIterator<Item = IpAddr>,
+{
+    let mut link_local_fallback: Option<std::net::Ipv4Addr> = None;
+    for ip in candidates {
+        match classify_lan_ipv4_candidate(ip, fake_ip_net) {
+            LanIpv4Candidate::Preferred(v4) => return Some(v4.to_string()),
+            LanIpv4Candidate::LinkLocalFallback(v4) => {
+                link_local_fallback.get_or_insert(v4);
             }
+            LanIpv4Candidate::Rejected => {}
         }
     }
-    None
+    link_local_fallback.map(|ip| ip.to_string())
+}
+
+fn detect_primary_lan_ipv4_with_protector(
+    fake_ip_net: ipnet::Ipv4Net,
+    protector: &dyn crate::platform::socket_protect::SocketProtector,
+) -> Option<String> {
+    const PROBE_TARGETS: [SocketAddr; 2] = [
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(223, 5, 5, 5)), 53),
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1)), 80),
+    ];
+    let mut probed_locals = Vec::with_capacity(PROBE_TARGETS.len());
+    for probe_addr in PROBE_TARGETS {
+        let Ok(sock) = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) else {
+            continue;
+        };
+        if protector.protect_udp(&sock, Some(probe_addr)).is_err() {
+            continue;
+        }
+        let bind_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        if sock.bind(&bind_addr.into()).is_err() {
+            continue;
+        }
+        if sock.connect(&probe_addr.into()).is_err() {
+            continue;
+        }
+        if let Ok(local) = sock.local_addr()
+            && let Some(local_v4) = local.as_socket_ipv4()
+        {
+            let ip = IpAddr::V4(*local_v4.ip());
+            if matches!(
+                classify_lan_ipv4_candidate(ip, fake_ip_net),
+                LanIpv4Candidate::Preferred(_)
+            ) {
+                return Some(local_v4.ip().to_string());
+            }
+            probed_locals.push(ip);
+        }
+    }
+    select_lan_ipv4_candidate(probed_locals, fake_ip_net)
+}
+
+fn detect_primary_lan_ipv4(fake_ip_net: ipnet::Ipv4Net) -> Option<String> {
+    let protector = crate::platform::socket_protect::global_socket_protector();
+    detect_primary_lan_ipv4_with_protector(fake_ip_net, protector.as_ref())
 }
 
 async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
@@ -732,7 +807,7 @@ async fn get_configs(State(engine): State<Arc<ProxyEngine>>) -> impl IntoRespons
     } else {
         None
     };
-    let lan_ip = detect_primary_lan_ipv4();
+    let lan_ip = detect_primary_lan_ipv4(router.dns().fake_ip_net());
     let rss_bytes = read_process_rss_bytes();
     Json(serde_json::json!({
         "port": 0,
@@ -1634,7 +1709,7 @@ async fn explain_rule_api(
 }
 
 async fn flush_dns_cache_api(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
-    engine.router().dns().flush_cache();
+    engine.flush_dns();
     engine
         .hub()
         .push_log("info", "Flushed DNS positive and negative caches");
@@ -2335,6 +2410,70 @@ struct LogsQuery {
     level: Option<String>,
 }
 
+const MAX_LOG_WS_OVERLAP_DEDUP: usize = 256;
+
+fn log_entry_matches_level(entry: &crate::tracker::LogEntry, level_norm: Option<&str>) -> bool {
+    let entry_lvl = entry.level.trim().to_ascii_lowercase();
+    match level_norm {
+        Some("silent" | "off" | "none") => false,
+        Some("error" | "err") => matches!(entry_lvl.as_str(), "error" | "err"),
+        Some("warn" | "warning") => {
+            matches!(entry_lvl.as_str(), "warn" | "warning" | "error" | "err")
+        }
+        Some("info") => !matches!(entry_lvl.as_str(), "debug" | "trace"),
+        _ => true,
+    }
+}
+
+fn snapshot_logs_for_level(
+    hub: &TelemetryHub,
+    level_norm: Option<&str>,
+) -> Vec<crate::tracker::LogEntry> {
+    let base = match level_norm {
+        Some("silent" | "off" | "none") => return Vec::new(),
+        Some("error" | "err" | "warn" | "warning") => hub.important_logs(),
+        _ => hub.recent_logs(),
+    };
+    base.into_iter()
+        .filter(|entry| log_entry_matches_level(entry, level_norm))
+        .collect()
+}
+
+#[derive(Default)]
+struct LogSnapshotDedup {
+    seen: std::collections::VecDeque<(u64, String, String)>,
+    max_ts: u64,
+}
+
+impl LogSnapshotDedup {
+    fn record_sent(&mut self, entry: &crate::tracker::LogEntry) {
+        if entry.timestamp_ms > self.max_ts {
+            self.max_ts = entry.timestamp_ms;
+        }
+        if self.seen.len() >= MAX_LOG_WS_OVERLAP_DEDUP {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((
+            entry.timestamp_ms,
+            entry.level.clone(),
+            entry.payload.clone(),
+        ));
+    }
+
+    fn consume_if_duplicate(&mut self, entry: &crate::tracker::LogEntry) -> bool {
+        if self.seen.is_empty() || entry.timestamp_ms > self.max_ts {
+            return false;
+        }
+        if let Some(pos) = self.seen.iter().position(|(ts, lvl, payload)| {
+            *ts == entry.timestamp_ms && lvl == &entry.level && payload == &entry.payload
+        }) {
+            self.seen.remove(pos);
+            return true;
+        }
+        false
+    }
+}
+
 async fn get_or_ws_logs(
     ws_res: std::result::Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     ws_stop: Option<axum::extract::Extension<WsShutdownWatch>>,
@@ -2342,33 +2481,15 @@ async fn get_or_ws_logs(
     State(engine): State<Arc<ProxyEngine>>,
 ) -> Response {
     let api_stop = ws_stop.and_then(|e| e.0.0);
+    let level_norm = query
+        .level
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
     match ws_res {
-        Ok(ws) => ws.on_upgrade(move |socket| stream_logs_ws(socket, engine, api_stop)),
+        Ok(ws) => ws.on_upgrade(move |socket| stream_logs_ws(socket, engine, api_stop, level_norm)),
         Err(_) => {
-            let level_norm = query
-                .level
-                .as_deref()
-                .map(|s| s.trim().to_ascii_lowercase());
-            let logs = match level_norm.as_deref() {
-                Some("error" | "err") => engine
-                    .hub()
-                    .important_logs()
-                    .into_iter()
-                    .filter(|e| matches!(e.level.to_ascii_lowercase().as_str(), "error" | "err"))
-                    .collect(),
-                Some("warn" | "warning") => engine
-                    .hub()
-                    .important_logs()
-                    .into_iter()
-                    .filter(|e| {
-                        matches!(
-                            e.level.to_ascii_lowercase().as_str(),
-                            "warn" | "warning" | "error" | "err"
-                        )
-                    })
-                    .collect(),
-                _ => engine.hub().recent_logs(),
-            };
+            let logs = snapshot_logs_for_level(engine.hub(), level_norm.as_deref());
             Json(serde_json::json!({ "logs": logs })).into_response()
         }
     }
@@ -2378,19 +2499,25 @@ async fn stream_logs_ws(
     mut socket: WebSocket,
     engine: Arc<ProxyEngine>,
     mut api_stop: Option<watch::Receiver<bool>>,
+    level_norm: Option<String>,
 ) {
     let mut eng_stop = engine.subscribe_shutdown();
-    for entry in engine.hub().recent_logs() {
+    // Subscribe BEFORE snapshotting so no log emitted while reading or sending the initial
+    // backlog can fall into a subscribe gap; `LogSnapshotDedup` suppresses boundary overlap.
+    let mut rx = engine.hub().subscribe_logs();
+    let snapshot = snapshot_logs_for_level(engine.hub(), level_norm.as_deref());
+    let mut dedup = LogSnapshotDedup::default();
+    for entry in snapshot {
         if *eng_stop.borrow() || api_stop.as_ref().is_some_and(|rx| *rx.borrow()) {
             return;
         }
+        dedup.record_sent(&entry);
         if let Ok(text) = serde_json::to_string(&entry)
             && !ws_send_text_bounded(&mut socket, text).await
         {
             return;
         }
     }
-    let mut rx = engine.hub().subscribe_logs();
     loop {
         tokio::select! {
             _ = wait_ws_shutdown(&mut eng_stop, &mut api_stop) => break,
@@ -2402,6 +2529,12 @@ async fn stream_logs_ws(
             item = rx.recv() => {
                 match item {
                     Ok(entry) => {
+                        if !log_entry_matches_level(&entry, level_norm.as_deref()) {
+                            continue;
+                        }
+                        if dedup.consume_if_duplicate(&entry) {
+                            continue;
+                        }
                         if let Ok(text) = serde_json::to_string(&entry)
                             && !ws_send_text_bounded(&mut socket, text).await
                         {
@@ -4913,6 +5046,243 @@ rules:
         let _ = demo_srv.await;
         demo_engine.shutdown();
         let _ = bg_stop_tx.send(true);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn detect_primary_lan_ipv4_protects_udp_and_rejects_fake_ip_and_link_local() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fake_net: ipnet::Ipv4Net = "198.18.0.0/15".parse().unwrap();
+        let custom_fake_net: ipnet::Ipv4Net = "100.64.0.0/16".parse().unwrap();
+
+        // 1. Fake-IP TUN addresses, loopback, unspecified, multicast, broadcast, and IPv6 are rejected.
+        assert_eq!(
+            select_lan_ipv4_candidate(
+                [
+                    "198.18.0.1".parse().unwrap(),
+                    "198.19.255.254".parse().unwrap(),
+                    "127.0.0.1".parse().unwrap(),
+                    "0.0.0.0".parse().unwrap(),
+                    "224.0.0.1".parse().unwrap(),
+                    "255.255.255.255".parse().unwrap(),
+                    "fe80::1".parse().unwrap(),
+                ],
+                fake_net
+            ),
+            None
+        );
+
+        // Custom `fake-ip-range` is also rejected.
+        assert_eq!(
+            select_lan_ipv4_candidate(
+                [
+                    "100.64.0.1".parse().unwrap(),
+                    "192.168.50.12".parse().unwrap(),
+                ],
+                custom_fake_net
+            ),
+            Some("192.168.50.12".to_string())
+        );
+
+        // 2. Link-local `169.254.0.0/16` is bypassed when a normal LAN IPv4 exists,
+        //    and only returned when it is the sole usable fallback.
+        assert_eq!(
+            select_lan_ipv4_candidate(
+                [
+                    "198.18.0.1".parse().unwrap(),
+                    "169.254.42.7".parse().unwrap(),
+                    "10.0.0.23".parse().unwrap(),
+                ],
+                fake_net
+            ),
+            Some("10.0.0.23".to_string())
+        );
+        assert_eq!(
+            select_lan_ipv4_candidate(
+                [
+                    "198.18.0.1".parse().unwrap(),
+                    "169.254.42.7".parse().unwrap(),
+                ],
+                fake_net
+            ),
+            Some("169.254.42.7".to_string())
+        );
+
+        // 3. `detect_primary_lan_ipv4_with_protector` invokes `protect_udp` with `Some(probe_addr)`
+        //    BEFORE `connect()`, and refuses to bypass a failing protector.
+        struct RejectingProtector {
+            udp_calls: AtomicUsize,
+            hints: parking_lot::Mutex<Vec<Option<SocketAddr>>>,
+        }
+        impl crate::platform::socket_protect::SocketProtector for RejectingProtector {
+            fn protect_tcp(
+                &self,
+                _sock: &socket2::Socket,
+                _remote: SocketAddr,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn protect_udp(
+                &self,
+                _sock: &socket2::Socket,
+                remote_hint: Option<SocketAddr>,
+            ) -> std::io::Result<()> {
+                self.udp_calls.fetch_add(1, Ordering::SeqCst);
+                self.hints.lock().push(remote_hint);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    "blocked in test",
+                ))
+            }
+            fn description(&self) -> String {
+                "test-reject".to_string()
+            }
+        }
+
+        let reject_prot = RejectingProtector {
+            udp_calls: AtomicUsize::new(0),
+            hints: parking_lot::Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            detect_primary_lan_ipv4_with_protector(fake_net, &reject_prot),
+            None
+        );
+        assert_eq!(reject_prot.udp_calls.load(Ordering::SeqCst), 2);
+        let hints = reject_prot.hints.lock().clone();
+        assert_eq!(
+            hints,
+            vec![
+                Some("223.5.5.5:53".parse().unwrap()),
+                Some("198.51.100.1:80".parse().unwrap()),
+            ]
+        );
+
+        // With an allowing counting protector, `protect_udp` is called at least once and any
+        // returned IP never lies inside `fake_ip_net`.
+        let counting = crate::platform::socket_protect::CallbackSocketProtector::counting(
+            "test-lan-probe",
+            false,
+        );
+        let detected = detect_primary_lan_ipv4_with_protector(fake_net, &counting);
+        assert!(counting.udp_count() >= 1);
+        if let Some(ip_str) = detected {
+            let v4: std::net::Ipv4Addr = ip_str.parse().unwrap();
+            assert!(!fake_net.contains(&v4));
+            assert!(!v4.is_loopback());
+            assert!(!v4.is_unspecified());
+        }
+    }
+
+    #[test]
+    fn log_level_filter_and_snapshot_overlap_dedup_preserve_order_without_duplicates() {
+        let mk = |ts: u64, level: &str, payload: &str| crate::tracker::LogEntry {
+            timestamp_ms: ts,
+            level: level.to_string(),
+            payload: payload.to_string(),
+        };
+
+        let dbg = mk(10, "debug", "d");
+        let inf = mk(11, "info", "i");
+        let wrn = mk(12, "warn", "w");
+        let err = mk(13, "error", "e");
+
+        assert!(log_entry_matches_level(&err, Some("error")));
+        assert!(!log_entry_matches_level(&wrn, Some("error")));
+        assert!(!log_entry_matches_level(&inf, Some("error")));
+
+        assert!(log_entry_matches_level(&err, Some("warn")));
+        assert!(log_entry_matches_level(&wrn, Some("warn")));
+        assert!(!log_entry_matches_level(&inf, Some("warn")));
+        assert!(!log_entry_matches_level(&dbg, Some("warn")));
+
+        assert!(log_entry_matches_level(&inf, Some("info")));
+        assert!(log_entry_matches_level(&wrn, Some("info")));
+        assert!(!log_entry_matches_level(&dbg, Some("info")));
+
+        assert!(log_entry_matches_level(&dbg, Some("debug")));
+        assert!(log_entry_matches_level(&dbg, None));
+        assert!(!log_entry_matches_level(&err, Some("silent")));
+
+        let mut dedup = LogSnapshotDedup::default();
+        let snap1 = mk(100, "warn", "overlap-1");
+        let snap2 = mk(101, "error", "overlap-2");
+        dedup.record_sent(&snap1);
+        dedup.record_sent(&snap2);
+
+        // Out-of-order overlap entries from broadcast channel are each suppressed exactly once.
+        assert!(dedup.consume_if_duplicate(&snap2));
+        assert!(dedup.consume_if_duplicate(&snap1));
+        // A genuine subsequent repeat after consuming the snapshot occurrence is NOT suppressed.
+        assert!(!dedup.consume_if_duplicate(&snap2));
+        // Entries with newer timestamps pass straight through.
+        assert!(!dedup.consume_if_duplicate(&mk(102, "warn", "live-new")));
+    }
+
+    #[tokio::test]
+    async fn post_dns_flush_bumps_router_epoch_and_removes_persisted_fake_ip_cache() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rc-api-dns-flush-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let cfg = ClashConfig::from_yaml_str(
+            r#"
+mixed-port: 0
+external-controller: "127.0.0.1:0"
+mode: rule
+dns:
+  enable: false
+  enhanced-mode: fake-ip
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        let engine = ProxyEngine::start_with_state_dir(cfg, tmp_dir.clone())
+            .await
+            .unwrap();
+        let cache_file = tmp_dir.join("fake_ip_cache.json");
+        std::fs::write(&cache_file, b"{}").unwrap();
+        assert!(cache_file.exists());
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (api_addr, api_task) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), stop_rx)
+            .await
+            .unwrap();
+
+        let epoch_before = engine.router().epoch();
+        let mut s = TcpStream::connect(api_addr).await.unwrap();
+        let req = format!(
+            "POST /dns/flush HTTP/1.1\r\nHost: {api_addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "unexpected response: {text}"
+        );
+        assert!(text.contains(r#""flushed":true"#));
+
+        let epoch_after = engine.router().epoch();
+        assert!(
+            epoch_after > epoch_before,
+            "POST /dns/flush must bump router epoch (before={epoch_before}, after={epoch_after})"
+        );
+        assert!(
+            !cache_file.exists(),
+            "POST /dns/flush must delete persisted fake_ip_cache.json"
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = api_task.await;
+        engine.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

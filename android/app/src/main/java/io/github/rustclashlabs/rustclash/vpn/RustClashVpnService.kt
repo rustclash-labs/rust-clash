@@ -18,7 +18,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import androidx.annotation.RequiresApi
@@ -72,13 +72,141 @@ internal fun hasGlobalUnicastIpv6Link(linkProperties: LinkProperties?): Boolean 
     return hasIpv6DefaultRoute
 }
 
+/**
+ * Thread-safe lifecycle coordinator for `ConnectivityManager.NetworkCallback` and its dedicated
+ * background `HandlerThread` (`rc-net-cb`).
+ *
+ * Lock discipline: [lock] is a **strict Level 2 leaf lock** that guards only the in-memory
+ * `(activeCallback, activeThread, generation, destroyed)` fields. Thread startup, OS Binder
+ * registration/unregistration, and `quitSafely()` ALWAYS execute strictly outside [lock] so
+ * neither `onDestroy()` (Main Thread) nor `startVpnSessionInternal`/`stopVpnSessionInternal`
+ * (`Dispatchers.IO` under `sessionMutex`) can block on I/O/Binder while holding a lock or invert
+ * the 3-level Service lock hierarchy.
+ */
+internal class NetworkCallbackLifecycle<CB : Any, T : Any> {
+    private val lock = Any()
+    private var activeCallback: CB? = null
+    private var activeThread: T? = null
+    private var generation: Long = 0L
+    private var destroyed: Boolean = false
+
+    val hasActiveRegistration: Boolean
+        get() = synchronized(lock) { activeCallback != null && activeThread != null }
+
+    val isDestroyed: Boolean
+        get() = synchronized(lock) { destroyed }
+
+    fun isGenerationActive(expectedGeneration: Long): Boolean = synchronized(lock) {
+        !destroyed && expectedGeneration != 0L && generation == expectedGeneration
+    }
+
+    fun register(
+        createAndStartThread: () -> T,
+        buildCallback: (registrationGen: Long) -> CB,
+        registerWithOs: (callback: CB, thread: T) -> Boolean,
+        unregisterWithOs: (callback: CB) -> Unit,
+        quitThread: (thread: T) -> Unit,
+    ): Boolean {
+        unregister(
+            markDestroyed = false,
+            unregisterWithOs = unregisterWithOs,
+            quitThread = quitThread,
+        )
+
+        val myGen = synchronized(lock) {
+            if (destroyed) {
+                return false
+            }
+            ++generation
+        }
+
+        val thread = try {
+            createAndStartThread()
+        } catch (t: Throwable) {
+            if (t is SecurityException || t is RuntimeException) {
+                return false
+            }
+            throw t
+        }
+
+        val callback = try {
+            buildCallback(myGen)
+        } catch (t: Throwable) {
+            runCatching { quitThread(thread) }
+            if (t is SecurityException || t is RuntimeException) {
+                return false
+            }
+            throw t
+        }
+
+        val registered = try {
+            registerWithOs(callback, thread)
+        } catch (t: Throwable) {
+            runCatching { quitThread(thread) }
+            if (t is SecurityException || t is RuntimeException) {
+                return false
+            }
+            throw t
+        }
+
+        if (!registered) {
+            runCatching { quitThread(thread) }
+            return false
+        }
+
+        val superseded = synchronized(lock) {
+            if (destroyed || generation != myGen) {
+                true
+            } else {
+                activeCallback = callback
+                activeThread = thread
+                false
+            }
+        }
+
+        if (superseded) {
+            runCatching { unregisterWithOs(callback) }
+            runCatching { quitThread(thread) }
+            return false
+        }
+
+        return true
+    }
+
+    fun unregister(
+        markDestroyed: Boolean = false,
+        unregisterWithOs: (callback: CB) -> Unit,
+        quitThread: (thread: T) -> Unit,
+    ): Boolean {
+        val (cb, thread) = synchronized(lock) {
+            if (markDestroyed) {
+                destroyed = true
+            }
+            generation++
+            val oldCb = activeCallback
+            val oldThread = activeThread
+            activeCallback = null
+            activeThread = null
+            oldCb to oldThread
+        }
+        if (cb != null) {
+            runCatching { unregisterWithOs(cb) }
+        }
+        if (thread != null) {
+            runCatching { quitThread(thread) }
+        }
+        return cb != null || thread != null
+    }
+}
+
 class RustClashVpnService : VpnService() {
     private val sessionMutex = Mutex()
     private val notificationLock = Any()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var telemetryJob: Job? = null
     private var debugSliceJob: Job? = null
-    private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
+    private val networkCallbackLifecycle =
+        NetworkCallbackLifecycle<ConnectivityManager.NetworkCallback, HandlerThread>()
     private var screenStateReceiver: BroadcastReceiver? = null
     private val underlyingNetworkTracker = UnderlyingNetworkTracker()
     private val livePhysicalNetworks = ConcurrentHashMap<Long, Network>()
@@ -149,6 +277,7 @@ class RustClashVpnService : VpnService() {
 
         private const val NOTIFICATION_CHANNEL_ID = "rust_clash_vpn_channel"
         private const val NOTIFICATION_ID = 19818
+        internal const val NETWORK_CALLBACK_THREAD_NAME = "rc-net-cb"
 
         private val nativeLifecycleLock = Any()
         private val statusSnapshotLock = Any()
@@ -614,7 +743,7 @@ class RustClashVpnService : VpnService() {
 
         if (priorToken != 0L) {
             synchronized(nativeLifecycleLock) {
-                if (activeNativeSessionToken.compareAndSet(priorToken, 0L) && NativeBridge.isNativeLoaded) {
+                if (activeNativeSessionToken.compareAndSet(priorToken, 0L) && NativeBridge.isLoadedFast) {
                     runCatching { NativeBridge.nativeStopVpn() }
                 }
             }
@@ -732,7 +861,7 @@ class RustClashVpnService : VpnService() {
                         )
                     } catch (jniErr: Throwable) {
                         activeNativeSessionToken.set(0L)
-                        if (NativeBridge.isNativeLoaded) {
+                        if (NativeBridge.isLoadedFast) {
                             runCatching { NativeBridge.nativeStopVpn() }
                         }
                         throw jniErr
@@ -779,7 +908,7 @@ class RustClashVpnService : VpnService() {
                 activeSessionEpoch = 0L
                 engineRunningNative = false
                 synchronized(nativeLifecycleLock) {
-                    if (tok != 0L && activeNativeSessionToken.compareAndSet(tok, 0L) && NativeBridge.isNativeLoaded) {
+                    if (tok != 0L && activeNativeSessionToken.compareAndSet(tok, 0L) && NativeBridge.isLoadedFast) {
                         runCatching { NativeBridge.nativeStopVpn() }
                     }
                 }
@@ -832,7 +961,7 @@ class RustClashVpnService : VpnService() {
             val errMsg = NodeImportSupport.redactSecretsForUi(t.message ?: t.javaClass.simpleName)
             DebugLogManager.onVpnSessionError(errMsg)
             synchronized(nativeLifecycleLock) {
-                if (tok != 0L && activeNativeSessionToken.compareAndSet(tok, 0L) && NativeBridge.isNativeLoaded) {
+                if (tok != 0L && activeNativeSessionToken.compareAndSet(tok, 0L) && NativeBridge.isLoadedFast) {
                     runCatching { NativeBridge.nativeStopVpn() }
                 }
             }
@@ -871,8 +1000,10 @@ class RustClashVpnService : VpnService() {
                     Intent.ACTION_SCREEN_OFF -> {
                         isScreenInteractive = false
                         DebugLogManager.onScreenInteractiveChanged(false)
-                        if (NativeBridge.isNativeLoaded) {
-                            runCatching { NativeBridge.nativeSetLowPowerMode(true) }
+                        if (NativeBridge.isLoadedFast) {
+                            serviceScope.launch {
+                                runCatching { NativeBridge.nativeSetLowPowerMode(!isScreenInteractive) }
+                            }
                         }
                         telemetryJob?.cancel()
                         telemetryJob = null
@@ -882,8 +1013,10 @@ class RustClashVpnService : VpnService() {
                     Intent.ACTION_SCREEN_ON -> {
                         isScreenInteractive = true
                         DebugLogManager.onScreenInteractiveChanged(true)
-                        if (NativeBridge.isNativeLoaded) {
-                            runCatching { NativeBridge.nativeSetLowPowerMode(false) }
+                        if (NativeBridge.isLoadedFast) {
+                            serviceScope.launch {
+                                runCatching { NativeBridge.nativeSetLowPowerMode(!isScreenInteractive) }
+                            }
                         }
                         if (!lifecycleCoordinator.isDestroyed &&
                             !lifecycleCoordinator.isRevokedForCurrentSession &&
@@ -943,79 +1076,99 @@ class RustClashVpnService : VpnService() {
     }
 
     private fun registerNetworkHandoffObserver() {
-        unregisterNetworkHandoffObserver()
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull() ?: return
-                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
-                applyCapabilitiesTransition(network, caps, lp, eventType = "NET_AVAILABLE")
-            }
-
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
-                applyCapabilitiesTransition(network, caps, lp, eventType = "NET_CAPS")
-            }
-
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
-                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                    return
-                }
-                if (caps != null) {
-                    livePhysicalNetworks[network.networkHandle] = network
-                }
-                val hasIpv6 = hasGlobalUnicastIpv6Link(linkProperties)
-                val decision = underlyingNetworkTracker.onLinkPropertiesIpv6Changed(
-                    networkHandle = network.networkHandle,
-                    hasIpv6 = hasIpv6,
-                )
-                if (decision.notifyNative) {
-                    val transport = when {
-                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "WIFI"
-                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "CELLULAR"
-                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "ETHERNET"
-                        else -> if (decision.isWifi) "WIFI" else "CELLULAR"
-                    }
-                    DebugLogManager.onNetworkLinkIpv6Changed(
-                        context = this@RustClashVpnService,
-                        networkHandle = network.networkHandle,
-                        transportLabel = transport,
-                        hasIpv6 = hasIpv6,
-                        handoffTriggered = decision.triggerSessionRecovery,
-                    )
-                }
-                applyNetworkDecision(networkForHandle = network, decision = decision)
-            }
-
-            override fun onLost(network: Network) {
-                livePhysicalNetworks.remove(network.networkHandle)
-                val decision = underlyingNetworkTracker.onUnderlyingLost(network.networkHandle)
-                DebugLogManager.onNetworkLostObserved(
-                    networkHandle = network.networkHandle,
-                    lostActiveUnderlying = decision.triggerSessionRecovery,
-                    fallbackHandle = decision.effectiveHandle,
-                )
-                applyNetworkDecision(networkForHandle = null, decision = decision)
-            }
+        val cm = getSystemService(ConnectivityManager::class.java)
+        if (cm == null) {
+            unregisterNetworkHandoffObserver()
+            return
         }
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
-        val mainHandler = Handler(Looper.getMainLooper())
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                cm.registerBestMatchingNetworkCallback(request, cb, mainHandler)
-            } else {
-                cm.registerNetworkCallback(request, cb, mainHandler)
-            }
-            connectivityCallback = cb
-        } catch (_: SecurityException) {
-            // Best-effort if OS restricts callback registration
-        } catch (_: RuntimeException) {
-            // Guard against ConnectivityService callback limit / Binder edge cases
-        }
+        networkCallbackLifecycle.register(
+            createAndStartThread = {
+                HandlerThread(NETWORK_CALLBACK_THREAD_NAME).apply { start() }
+            },
+            buildCallback = { registrationGen ->
+                object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull() ?: return
+                        val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        applyCapabilitiesTransition(network, caps, lp, eventType = "NET_AVAILABLE")
+                    }
+
+                    override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        applyCapabilitiesTransition(network, caps, lp, eventType = "NET_CAPS")
+                    }
+
+                    override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                            return
+                        }
+                        if (caps != null) {
+                            livePhysicalNetworks[network.networkHandle] = network
+                        }
+                        val hasIpv6 = hasGlobalUnicastIpv6Link(linkProperties)
+                        val decision = underlyingNetworkTracker.onLinkPropertiesIpv6Changed(
+                            networkHandle = network.networkHandle,
+                            hasIpv6 = hasIpv6,
+                        )
+                        if (decision.notifyNative) {
+                            val transport = when {
+                                caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "WIFI"
+                                caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "CELLULAR"
+                                caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "ETHERNET"
+                                else -> if (decision.isWifi) "WIFI" else "CELLULAR"
+                            }
+                            DebugLogManager.onNetworkLinkIpv6Changed(
+                                context = this@RustClashVpnService,
+                                networkHandle = network.networkHandle,
+                                transportLabel = transport,
+                                hasIpv6 = hasIpv6,
+                                handoffTriggered = decision.triggerSessionRecovery,
+                            )
+                        }
+                        applyNetworkDecision(networkForHandle = network, decision = decision)
+                    }
+
+                    override fun onLost(network: Network) {
+                        if (!networkCallbackLifecycle.isGenerationActive(registrationGen)) return
+                        livePhysicalNetworks.remove(network.networkHandle)
+                        val decision = underlyingNetworkTracker.onUnderlyingLost(network.networkHandle)
+                        DebugLogManager.onNetworkLostObserved(
+                            networkHandle = network.networkHandle,
+                            lostActiveUnderlying = decision.triggerSessionRecovery,
+                            fallbackHandle = decision.effectiveHandle,
+                        )
+                        applyNetworkDecision(networkForHandle = null, decision = decision)
+                    }
+                }
+            },
+            registerWithOs = { cb, thread ->
+                val looper = thread.looper ?: return@register false
+                val callbackHandler = Handler(looper)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    cm.registerBestMatchingNetworkCallback(request, cb, callbackHandler)
+                } else {
+                    cm.registerNetworkCallback(request, cb, callbackHandler)
+                }
+                true
+            },
+            unregisterWithOs = { cb ->
+                cm.unregisterNetworkCallback(cb)
+            },
+            quitThread = { thread ->
+                thread.quitSafely()
+            },
+        )
     }
 
     private fun applyCapabilitiesTransition(
@@ -1077,7 +1230,7 @@ class RustClashVpnService : VpnService() {
                 }
             }
         }
-        if ((decision.notifyNative || decision.syncInitialBaselineToNative) && NativeBridge.isNativeLoaded) {
+        if ((decision.notifyNative || decision.syncInitialBaselineToNative) && NativeBridge.isLoadedFast) {
             runCatching {
                 NativeBridge.nativeNotifyNetworkChangedWithCaps(
                     decision.effectiveHandle,
@@ -1100,15 +1253,18 @@ class RustClashVpnService : VpnService() {
         }
     }
 
-    private fun unregisterNetworkHandoffObserver() {
-        val cb = connectivityCallback ?: return
-        connectivityCallback = null
+    private fun unregisterNetworkHandoffObserver(markDestroyed: Boolean = false) {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        networkCallbackLifecycle.unregister(
+            markDestroyed = markDestroyed,
+            unregisterWithOs = { cb ->
+                cm?.unregisterNetworkCallback(cb)
+            },
+            quitThread = { thread ->
+                thread.quitSafely()
+            },
+        )
         livePhysicalNetworks.clear()
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        try {
-            cm.unregisterNetworkCallback(cb)
-        } catch (_: Exception) {
-        }
     }
 
     private fun isSessionRunningOrReconnecting(): Boolean {
@@ -1303,7 +1459,7 @@ class RustClashVpnService : VpnService() {
         telemetryJob = null
         debugSliceJob?.cancel()
         debugSliceJob = null
-        unregisterNetworkHandoffObserver()
+        unregisterNetworkHandoffObserver(markDestroyed = true)
         unregisterScreenStateObserver()
         underlyingNetworkTracker.reset()
         livePhysicalNetworks.clear()
@@ -1329,7 +1485,7 @@ class RustClashVpnService : VpnService() {
                     trigger = if (isRevoked) "revoked" else "service-destroy",
                 )
                 synchronized(nativeLifecycleLock) {
-                    if (activeNativeSessionToken.compareAndSet(tokenToStop, 0L) && NativeBridge.isNativeLoaded) {
+                    if (activeNativeSessionToken.compareAndSet(tokenToStop, 0L) && NativeBridge.isLoadedFast) {
                         runCatching { NativeBridge.nativeStopVpn() }
                     }
                 }
@@ -1382,7 +1538,7 @@ class RustClashVpnService : VpnService() {
                 trigger = if (revokedBySystem) "revoked" else "disconnect",
             )
             synchronized(nativeLifecycleLock) {
-                if (activeNativeSessionToken.compareAndSet(tokenToStop, 0L) && NativeBridge.isNativeLoaded) {
+                if (activeNativeSessionToken.compareAndSet(tokenToStop, 0L) && NativeBridge.isLoadedFast) {
                     runCatching { NativeBridge.nativeStopVpn() }
                 }
             }

@@ -256,16 +256,22 @@ fn encode_qpack_int(mut val: usize, prefix_bits: u8, first_mask: u8, out: &mut B
 }
 
 fn decode_qpack_int(data: &[u8], prefix_bits: u8) -> io::Result<(usize, usize)> {
+    if prefix_bits == 0 || prefix_bits > 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid QPACK integer prefix width",
+        ));
+    }
     let Some(&first) = data.first() else {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "empty QPACK integer",
         ));
     };
-    let max_prefix = (1usize << prefix_bits) - 1;
-    let mut val = (first as usize) & max_prefix;
+    let max_prefix = (1u64 << prefix_bits) - 1;
+    let mut val = u64::from(first) & max_prefix;
     if val < max_prefix {
-        return Ok((val, 1));
+        return Ok((val as usize, 1));
     }
     let mut shift = 0u32;
     let mut idx = 1usize;
@@ -277,17 +283,37 @@ fn decode_qpack_int(data: &[u8], prefix_bits: u8) -> io::Result<(usize, usize)> 
             ));
         };
         idx += 1;
-        if shift > 28 {
+        let chunk = u64::from(b & 0x7f);
+        let Some(shifted) = chunk.checked_shl(shift) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "QPACK integer overflow",
+            ));
+        };
+        if (shifted >> shift) != chunk {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "QPACK integer overflow",
             ));
         }
-        val = val.saturating_add(((b & 0x7f) as usize) << shift);
-        if (b & 0x80) == 0 {
-            return Ok((val, idx));
+        val = val
+            .checked_add(shifted)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow"))?;
+        if val > u64::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "QPACK integer overflow",
+            ));
         }
-        shift += 7;
+        if (b & 0x80) == 0 {
+            let out = usize::try_from(val).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
+            })?;
+            return Ok((out, idx));
+        }
+        shift = shift
+            .checked_add(7)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow"))?;
     }
 }
 
@@ -305,13 +331,19 @@ fn decode_qpack_str(data: &[u8], prefix_bits: u8) -> io::Result<(String, usize)>
     };
     let huffman = (first & (1u8 << prefix_bits)) != 0;
     let (str_len, used) = decode_qpack_int(data, prefix_bits)?;
-    if data.len() < used + str_len {
+    let Some(end) = used.checked_add(str_len) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "QPACK string length overflow",
+        ));
+    };
+    if data.len() < end {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "truncated QPACK string literal",
         ));
     }
-    let raw = &data[used..used + str_len];
+    let raw = &data[used..end];
     let bytes = if huffman {
         huffman_decode(raw)?
     } else {
@@ -323,7 +355,7 @@ fn decode_qpack_str(data: &[u8], prefix_bits: u8) -> io::Result<(String, usize)>
             "invalid UTF-8 in QPACK header string",
         )
     })?;
-    Ok((text, used + str_len))
+    Ok((text, end))
 }
 
 fn encode_qpack_literal_header(name_lower: &str, value: &str, out: &mut BytesMut) {
@@ -673,5 +705,47 @@ mod tests {
             parse_bandwidth_bytes_per_sec(Some("1 gbps")).unwrap(),
             125_000_000
         );
+    }
+
+    #[test]
+    fn qpack_int_and_str_reject_overflow_and_32bit_shift_truncation() {
+        // Exact u32::MAX (127 + 0xffff_ff80) decodes cleanly.
+        let exact_u32_max = [0x7fu8, 0x80, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(
+            decode_qpack_int(&exact_u32_max, 7).unwrap(),
+            (u32::MAX as usize, 6)
+        );
+
+        // Encodings exceeding u32::MAX — including shift == 28 bit-loss cases that silently
+        // truncated or saturated on 32-bit targets — must fail with InvalidData.
+        for bad in [
+            // 127 + (0x10 << 28) == 2^32 + 127 (previously truncated to 127 on 32-bit!)
+            &[0x7fu8, 0x80, 0x80, 0x80, 0x80, 0x10][..],
+            // 127 + (127 + 127<<7 + 127<<14 + 127<<21 + 15<<28) == u32::MAX + 127 (previously saturated!)
+            &[0x7fu8, 0xff, 0xff, 0xff, 0xff, 0x0f][..],
+            // 127 + (0x7f << 28)
+            &[0x7fu8, 0x80, 0x80, 0x80, 0x80, 0x7f][..],
+            // Overlong continuation chain exceeding 64-bit shift width.
+            &[
+                0x7fu8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+            ][..],
+        ] {
+            let err =
+                decode_qpack_int(bad, 7).expect_err("overflowing QPACK integer must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // `decode_qpack_str` must reject overflowing integer lengths with InvalidData and
+        // reject u32::MAX string lengths cleanly without wrapping `used + str_len`.
+        let err_overflow = decode_qpack_str(&[0x7fu8, 0xff, 0xff, 0xff, 0xff, 0x0f], 7)
+            .expect_err("overflowing QPACK string length must fail");
+        assert_eq!(err_overflow.kind(), io::ErrorKind::InvalidData);
+
+        let err_trunc = decode_qpack_str(&exact_u32_max, 7)
+            .expect_err("huge QPACK string length with short buffer must fail cleanly");
+        assert!(matches!(
+            err_trunc.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+        ));
     }
 }

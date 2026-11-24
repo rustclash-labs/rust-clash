@@ -3847,45 +3847,262 @@ where
     read_bounded_stream(&mut tls_stream).await
 }
 
-fn http11_response_is_complete(raw: &[u8]) -> bool {
-    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(head_str) = std::str::from_utf8(&raw[..hdr_end]) else {
-        return false;
-    };
-    let body_raw = &raw[hdr_end + 4..];
-    let mut is_chunked = false;
-    let mut content_length: Option<usize> = None;
-    for line in head_str.split("\r\n").skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if key.eq_ignore_ascii_case("transfer-encoding")
-                && val
-                    .split(',')
-                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
-            {
-                is_chunked = true;
-            } else if key.eq_ignore_ascii_case("content-length")
-                && let Ok(len) = val.parse::<usize>()
-            {
-                content_length = Some(len);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramingProgress {
+    NeedMore,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkedCursorState {
+    ReadSizeLine,
+    SkipData(usize),
+    ExpectCrlf,
+    ReadTrailers,
+    Done,
+}
+
+/// Incremental O(N) HTTP/1.1 response framing state machine for [`read_bounded_stream`].
+///
+/// Parses response headers exactly once when `\r\n\r\n` first arrives and then tracks
+/// `Content-Length` or `Transfer-Encoding: chunked` framing via a monotonic cursor so each
+/// received byte is inspected at most once with O(1) extra memory.
+#[derive(Debug, Clone)]
+enum Http11StreamFramingState {
+    ReadingHeaders {
+        scan_pos: usize,
+    },
+    FixedLength {
+        body_start: usize,
+        content_length: usize,
+    },
+    Chunked {
+        cursor: usize,
+        scan_pos: usize,
+        decoded_bytes: usize,
+        state: ChunkedCursorState,
+    },
+    CloseDelimited,
+}
+
+impl Http11StreamFramingState {
+    fn new() -> Self {
+        Self::ReadingHeaders { scan_pos: 0 }
+    }
+
+    fn headers_complete(&self) -> bool {
+        !matches!(self, Self::ReadingHeaders { .. })
+    }
+
+    fn advance(&mut self, buf: &[u8]) -> Result<FramingProgress> {
+        loop {
+            match self {
+                Self::ReadingHeaders { scan_pos } => {
+                    let search_start = *scan_pos;
+                    let Some(rel) = buf[search_start..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                    else {
+                        *scan_pos = buf.len().saturating_sub(3);
+                        return Ok(FramingProgress::NeedMore);
+                    };
+                    let hdr_end = search_start + rel;
+                    let body_start = hdr_end + 4;
+                    let head_str = std::str::from_utf8(&buf[..hdr_end]).map_err(|_| {
+                        ProxyError::Config("non-ASCII HTTP headers in subscription response".into())
+                    })?;
+
+                    let mut has_transfer_encoding = false;
+                    let mut is_chunked = false;
+                    let mut content_length: Option<usize> = None;
+                    for line in head_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            let key = k.trim();
+                            let val = v.trim();
+                            if key.eq_ignore_ascii_case("transfer-encoding") {
+                                has_transfer_encoding = true;
+                                if val
+                                    .split(',')
+                                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+                                {
+                                    is_chunked = true;
+                                } else {
+                                    return Err(ProxyError::Config(format!(
+                                        "unsupported Transfer-Encoding '{val}' in subscription response"
+                                    )));
+                                }
+                            } else if key.eq_ignore_ascii_case("content-length") {
+                                if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                                    return Err(ProxyError::Config(format!(
+                                        "invalid Content-Length header '{val}' in subscription response"
+                                    )));
+                                }
+                                let parsed_len = val.parse::<usize>().map_err(|_| {
+                                    ProxyError::Config(format!(
+                                        "invalid Content-Length header '{val}' in subscription response"
+                                    ))
+                                })?;
+                                if parsed_len > MAX_SUBSCRIPTION_BYTES {
+                                    return Err(ProxyError::Config(
+                                        "subscription Content-Length exceeds 8 MiB safety limit"
+                                            .into(),
+                                    ));
+                                }
+                                if let Some(prev_len) = content_length
+                                    && prev_len != parsed_len
+                                {
+                                    return Err(ProxyError::Config(
+                                        "conflicting duplicate Content-Length headers in subscription response"
+                                            .into(),
+                                    ));
+                                }
+                                content_length = Some(parsed_len);
+                            }
+                        }
+                    }
+
+                    if has_transfer_encoding && content_length.is_some() {
+                        return Err(ProxyError::Config(
+                            "conflicting Transfer-Encoding and Content-Length headers in subscription response"
+                                .into(),
+                        ));
+                    }
+
+                    if is_chunked {
+                        *self = Self::Chunked {
+                            cursor: body_start,
+                            scan_pos: body_start,
+                            decoded_bytes: 0,
+                            state: ChunkedCursorState::ReadSizeLine,
+                        };
+                    } else if let Some(content_length) = content_length {
+                        *self = Self::FixedLength {
+                            body_start,
+                            content_length,
+                        };
+                    } else {
+                        *self = Self::CloseDelimited;
+                        return Ok(FramingProgress::NeedMore);
+                    }
+                }
+                Self::FixedLength {
+                    body_start,
+                    content_length,
+                } => {
+                    return if buf.len().saturating_sub(*body_start) >= *content_length {
+                        Ok(FramingProgress::Complete)
+                    } else {
+                        Ok(FramingProgress::NeedMore)
+                    };
+                }
+                Self::Chunked {
+                    cursor,
+                    scan_pos,
+                    decoded_bytes,
+                    state,
+                } => match *state {
+                    ChunkedCursorState::ReadSizeLine => {
+                        let search_start = (*scan_pos).max(*cursor);
+                        let Some(rel) = buf[search_start..].windows(2).position(|w| w == b"\r\n")
+                        else {
+                            *scan_pos = buf.len().saturating_sub(1).max(*cursor);
+                            return Ok(FramingProgress::NeedMore);
+                        };
+                        let line_end = search_start + rel;
+                        let len_str = std::str::from_utf8(&buf[*cursor..line_end])
+                            .map_err(|_| {
+                                ProxyError::Config("invalid HTTP chunk size header".into())
+                            })?
+                            .split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if len_str.is_empty() || !len_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            return Err(ProxyError::Config(
+                                "invalid chunked transfer hex length".into(),
+                            ));
+                        }
+                        let chunk_len = usize::from_str_radix(len_str, 16).map_err(|_| {
+                            ProxyError::Config("invalid chunked transfer hex length".into())
+                        })?;
+                        *cursor = line_end + 2;
+                        *scan_pos = *cursor;
+                        if chunk_len == 0 {
+                            *state = ChunkedCursorState::ReadTrailers;
+                        } else {
+                            let next_decoded = decoded_bytes
+                                .checked_add(chunk_len)
+                                .filter(|&n| n <= MAX_SUBSCRIPTION_BYTES)
+                                .ok_or_else(|| {
+                                    ProxyError::Config(format!(
+                                        "chunked HTTP body exceeds maximum allowed size ({MAX_SUBSCRIPTION_BYTES} bytes)"
+                                    ))
+                                })?;
+                            *decoded_bytes = next_decoded;
+                            *state = ChunkedCursorState::SkipData(chunk_len);
+                        }
+                    }
+                    ChunkedCursorState::SkipData(rem) => {
+                        let avail = buf.len().saturating_sub(*cursor);
+                        if avail < rem {
+                            *cursor += avail;
+                            *scan_pos = *cursor;
+                            *state = ChunkedCursorState::SkipData(rem - avail);
+                            return Ok(FramingProgress::NeedMore);
+                        }
+                        *cursor += rem;
+                        *scan_pos = *cursor;
+                        *state = ChunkedCursorState::ExpectCrlf;
+                    }
+                    ChunkedCursorState::ExpectCrlf => {
+                        let avail = buf.len().saturating_sub(*cursor);
+                        if avail < 2 {
+                            if avail == 1 && buf[*cursor] != b'\r' {
+                                return Err(ProxyError::Config(
+                                    "invalid HTTP chunk delimiter".into(),
+                                ));
+                            }
+                            return Ok(FramingProgress::NeedMore);
+                        }
+                        if &buf[*cursor..*cursor + 2] != b"\r\n" {
+                            return Err(ProxyError::Config("invalid HTTP chunk delimiter".into()));
+                        }
+                        *cursor += 2;
+                        *scan_pos = *cursor;
+                        *state = ChunkedCursorState::ReadSizeLine;
+                    }
+                    ChunkedCursorState::ReadTrailers => {
+                        let search_start = (*scan_pos).max(*cursor);
+                        let Some(rel) = buf[search_start..].windows(2).position(|w| w == b"\r\n")
+                        else {
+                            *scan_pos = buf.len().saturating_sub(1).max(*cursor);
+                            return Ok(FramingProgress::NeedMore);
+                        };
+                        let line_end = search_start + rel;
+                        let is_empty_line = line_end == *cursor;
+                        *cursor = line_end + 2;
+                        *scan_pos = *cursor;
+                        if is_empty_line {
+                            *state = ChunkedCursorState::Done;
+                            return Ok(FramingProgress::Complete);
+                        }
+                    }
+                    ChunkedCursorState::Done => {
+                        return Ok(FramingProgress::Complete);
+                    }
+                },
+                Self::CloseDelimited => {
+                    return Ok(FramingProgress::NeedMore);
+                }
             }
         }
-    }
-    if is_chunked {
-        decode_chunked_body(body_raw).is_ok()
-    } else if let Some(expected_len) = content_length {
-        body_raw.len() >= expected_len
-    } else {
-        false
     }
 }
 
 async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(8192);
     let mut chunk = [0u8; 16384];
+    let mut framing = Http11StreamFramingState::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -3901,8 +4118,7 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
             Ok(n) => n,
             Err(io_err)
                 if io_err.kind() == std::io::ErrorKind::UnexpectedEof
-                    && !out.is_empty()
-                    && out.windows(4).any(|w| w == b"\r\n\r\n") =>
+                    && framing.headers_complete() =>
             {
                 break;
             }
@@ -3917,7 +4133,7 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
             ));
         }
         out.extend_from_slice(&chunk[..n]);
-        if http11_response_is_complete(&out) {
+        if framing.advance(&out)? == FramingProgress::Complete {
             break;
         }
     }
@@ -5695,5 +5911,91 @@ rules:
         }
 
         srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn incremental_http11_chunked_framing_handles_byte_splits_trailers_rejections_and_large_bodies()
+     {
+        use tokio::io::AsyncWriteExt;
+
+        // 1. Feed chunked response with chunk extension + multi-line trailers 1 byte at a time.
+        let sample = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0;last=yes\r\nX-Trailer-One: a\r\nX-Trailer-Two: b\r\n\r\n";
+        let mut st = Http11StreamFramingState::new();
+        let mut acc = Vec::new();
+        for (idx, &b) in sample.iter().enumerate() {
+            acc.push(b);
+            let prog = st.advance(&acc).unwrap();
+            if idx + 1 < sample.len() {
+                assert_eq!(
+                    prog,
+                    FramingProgress::NeedMore,
+                    "premature completion at byte {idx}"
+                );
+            } else {
+                assert_eq!(prog, FramingProgress::Complete);
+            }
+        }
+        let (code, _, body) = parse_http11_response(&acc).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(body, b"hello world");
+
+        // 2. Malformed chunk size, bad chunk delimiter, oversized chunk size, and conflicting TE+CL fail fast.
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffff\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"[..],
+        ] {
+            let mut bad_st = Http11StreamFramingState::new();
+            assert!(
+                bad_st.advance(bad).is_err(),
+                "malformed/oversized framing must be rejected: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
+        // 3. Large streaming chunked body (3 MiB across 3,072 x 1 KiB chunks) on a keep-alive
+        //    duplex stream completes rapidly in O(N) time without waiting for EOF.
+        let (mut client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let chunk_count = 3072usize;
+        let chunk_payload = vec![b'A'; 1024];
+        let payload_copy = chunk_payload.clone();
+        let writer_task = tokio::spawn(async move {
+            server_io
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let hdr = format!("{:x}\r\n", payload_copy.len());
+            for _ in 0..chunk_count {
+                server_io.write_all(hdr.as_bytes()).await.unwrap();
+                server_io.write_all(&payload_copy).await.unwrap();
+                server_io.write_all(b"\r\n").await.unwrap();
+            }
+            server_io
+                .write_all(b"0\r\nX-Checksum: ok\r\n\r\n")
+                .await
+                .unwrap();
+            server_io.flush().await.unwrap();
+            // Keep connection open so completion depends purely on incremental framing detection.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let raw = tokio::time::timeout(Duration::from_secs(5), read_bounded_stream(&mut client_io))
+            .await
+            .expect("3 MiB chunked keep-alive stream must complete promptly in O(N)")
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "incremental chunked framing took unexpectedly long: {:?}",
+            started.elapsed()
+        );
+        let (status, _, decoded) = parse_http11_response(&raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(decoded.len(), chunk_count * chunk_payload.len());
+        writer_task.abort();
     }
 }

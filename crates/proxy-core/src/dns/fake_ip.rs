@@ -308,18 +308,20 @@ impl PoolInner {
             self.domain_to_ip.remove(&normalized);
         }
 
-        let total_span = (self.end_host - self.start_host + 1) as usize;
+        let total_span = (self.end_host - self.start_host) as usize + 1;
         let mut chosen = None;
-        for _ in 0..total_span.min(8) {
-            let candidate = Ipv4Addr::from(self.cursor);
-            self.cursor = if self.cursor >= self.end_host {
-                self.start_host
-            } else {
-                self.cursor + 1
-            };
-            if !self.ip_to_domain.contains(&candidate) {
-                chosen = Some(candidate);
-                break;
+        if self.ip_to_domain.len() < total_span {
+            for _ in 0..total_span {
+                let candidate = Ipv4Addr::from(self.cursor);
+                self.cursor = if self.cursor >= self.end_host {
+                    self.start_host
+                } else {
+                    self.cursor + 1
+                };
+                if !self.ip_to_domain.contains(&candidate) {
+                    chosen = Some(candidate);
+                    break;
+                }
             }
         }
 
@@ -3404,8 +3406,23 @@ impl FakeIpDnsEngine {
                         let sock_clone = Arc::clone(&sock);
                         tokio::spawn(async move {
                             let _permit = permit;
+                            let max_udp = crate::dns::wire::extract_edns0_udp_payload_size(&req);
                             if let Ok(resp) = engine.handle_dns_packet(&req).await {
-                                let _ = sock_clone.send_to(&resp, peer).await;
+                                let wire_out = if resp.len() > max_udp {
+                                    if let Ok(qp) = crate::dns::wire::DnsQueryPacket::parse(&req) {
+                                        crate::dns::wire::build_truncated_dns_header(&req, &qp)
+                                    } else if resp.len() >= 12 {
+                                        let mut hdr = resp[..12].to_vec();
+                                        hdr[2] |= 0x82; // QR=1, TC=1
+                                        hdr[4..12].fill(0);
+                                        hdr
+                                    } else {
+                                        resp
+                                    }
+                                } else {
+                                    resp
+                                };
+                                let _ = sock_clone.send_to(&wire_out, peer).await;
                             }
                         });
                     }
@@ -5879,5 +5896,182 @@ dns:
         assert_eq!(r2_res, vec![cached_ip_2]);
 
         srv_task.abort();
+    }
+
+    #[test]
+    fn fake_ip_pool_wraparound_with_long_occupied_run_avoids_premature_lru_eviction() {
+        // 198.18.0.0/26 -> host span .2..=.61 (60 usable Fake-IPs), LRU cap 64 (> 60).
+        let net: Ipv4Net = "198.18.0.0/26".parse().unwrap();
+        let mut pool = PoolInner::new(net, 64);
+        let total_span = (pool.end_host - pool.start_host) as usize + 1;
+        assert_eq!(total_span, 60);
+
+        // Occupy 12 consecutive slots (.2..=.13, strictly > 8).
+        let mut initial_mappings = Vec::new();
+        for i in 0..12 {
+            let domain = format!("cluster-{i}.example.com");
+            let (ip, newly_inserted) = pool.get_or_assign(&domain);
+            assert!(newly_inserted);
+            initial_mappings.push((domain, ip));
+        }
+        // Insert a preserved entry at `end_host` (.61) so `pool.cursor` wraps right back to `.2`,
+        // directly in front of the 12-IP contiguous occupied cluster.
+        let last_host = Ipv4Addr::from(pool.end_host);
+        assert!(pool.insert_preserved(last_host, "tail-entry.example.com", net));
+        assert_eq!(pool.cursor, pool.start_host);
+
+        // Next allocation MUST scan past all 12 occupied slots to `.14` without evicting `.2`!
+        let (wrapped_ip, newly_inserted) = pool.get_or_assign("after-wrap.example.com");
+        assert!(newly_inserted);
+        assert_eq!(wrapped_ip, Ipv4Addr::from(pool.start_host + 12));
+        for (domain, ip) in &initial_mappings {
+            assert_eq!(
+                pool.lookup_ip(domain),
+                Some(*ip),
+                "occupied domain {domain} must NOT be prematurely evicted while free slots exist"
+            );
+            assert_eq!(pool.lookup_domain(*ip).as_deref(), Some(domain.as_str()));
+        }
+        assert_eq!(pool.lookup_ip("tail-entry.example.com"), Some(last_host));
+        assert_eq!(pool.ip_to_domain.len(), 14);
+
+        // Fill all remaining 46 free slots up to exact full occupancy (60/60) with zero evictions.
+        for i in 0..(total_span - 14) {
+            let (ip, newly_inserted) = pool.get_or_assign(&format!("fill-{i}.example.com"));
+            assert!(newly_inserted);
+            assert!(net.contains(&ip));
+        }
+        assert_eq!(pool.ip_to_domain.len(), total_span);
+        assert_eq!(pool.domain_to_ip.len(), total_span);
+
+        // Only once the subnet is genuinely full (60/60) should LRU eviction kick in.
+        let (evicted_reused_ip, newly_inserted) = pool.get_or_assign("overflow-61.example.com");
+        assert!(newly_inserted);
+        assert_eq!(pool.ip_to_domain.len(), total_span);
+        assert_eq!(pool.domain_to_ip.len(), total_span);
+        assert_eq!(
+            pool.lookup_domain(evicted_reused_ip).as_deref(),
+            Some("overflow-61.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_dns_server_truncates_oversized_replies_by_rfc1035_and_edns0_limit() {
+        // Mock upstream returns ~700-byte TXT answer for `med.txt.example` and ~1400-byte TXT
+        // answer for `big.txt.example`.
+        let upstream_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_sock.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, peer)) = upstream_sock.recv_from(&mut buf).await {
+                let req = &buf[..n];
+                let Ok(qp) = DnsQueryPacket::parse(req) else {
+                    continue;
+                };
+                let count = if qp.question.name == "big.txt.example" {
+                    7
+                } else {
+                    4
+                };
+                let txt_chunk = "x".repeat(200);
+                let answers: Vec<DnsAnswerData> = (0..count)
+                    .map(|_| DnsAnswerData::Txt(txt_chunk.clone()))
+                    .collect();
+                let resp = qp.build_response(req, 0, 60, &answers);
+                let _ = upstream_sock.send_to(&resp, peer).await;
+            }
+        });
+
+        let cfg = DnsConfig {
+            nameserver: vec![upstream_addr.to_string()],
+            fallback: vec![],
+            default_nameserver: vec![],
+            ..DnsConfig::default()
+        };
+        let engine = Arc::new(FakeIpDnsEngine::new(&cfg).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (dns_addr, dns_task) = Arc::clone(&engine)
+            .spawn_udp_server("127.0.0.1:0", shutdown_rx)
+            .await
+            .unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut rx = vec![0u8; 4096];
+
+        let append_edns0_opt = |base: Vec<u8>, udp_size: u16| -> Vec<u8> {
+            let mut pkt = BytesMut::from(base.as_slice());
+            pkt[10] = 0;
+            pkt[11] = 1; // ARCOUNT = 1
+            pkt.put_u8(0); // root owner
+            pkt.put_u16(crate::dns::wire::QTYPE_OPT);
+            pkt.put_u16(udp_size);
+            pkt.put_u32(0);
+            pkt.put_u16(0);
+            pkt.to_vec()
+        };
+
+        // Case 1: Plain query (no EDNS0 OPT -> 512B limit) for ~880B TXT response -> MUST return TC=1!
+        let q_plain = build_dns_query(0x1001, "med.txt.example", QTYPE_TXT);
+        client.send_to(&q_plain, dns_addr).await.unwrap();
+        let (n1, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        let meta1 = crate::dns::wire::extract_dns_response_meta(&rx[..n1]).unwrap();
+        assert!(
+            meta1.truncated,
+            "plain UDP query without EDNS0 must set TC=1 when reply > 512B (got {n1}B)"
+        );
+        assert!(n1 <= 512);
+        assert_eq!(meta1.ancount, 0);
+
+        // Case 2: EDNS0 OPT advertising 1000B for ~880B TXT response -> fits within 1000B <= 1232B,
+        // MUST return full untruncated response (TC=0)!
+        let q_edns_1000 =
+            append_edns0_opt(build_dns_query(0x1002, "med.txt.example", QTYPE_TXT), 1000);
+        client.send_to(&q_edns_1000, dns_addr).await.unwrap();
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        let meta2 = crate::dns::wire::extract_dns_response_meta(&rx[..n2]).unwrap();
+        assert!(
+            !meta2.truncated,
+            "EDNS0 1000B query must NOT truncate an ~880B reply (got {n2}B)"
+        );
+        assert!(n2 > 512 && n2 <= 1000);
+        assert_eq!(meta2.ancount, 4);
+
+        // Case 3: EDNS0 OPT advertising 600B for ~880B TXT response -> exceeds 600B, MUST return TC=1!
+        let q_edns_600 =
+            append_edns0_opt(build_dns_query(0x1003, "med.txt.example", QTYPE_TXT), 600);
+        client.send_to(&q_edns_600, dns_addr).await.unwrap();
+        let (n3, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        let meta3 = crate::dns::wire::extract_dns_response_meta(&rx[..n3]).unwrap();
+        assert!(
+            meta3.truncated,
+            "EDNS0 600B query must set TC=1 for ~880B reply (got {n3}B)"
+        );
+
+        // Case 4: EDNS0 OPT advertising 4096B (clamped to 1232B) for ~1500B TXT response -> MUST return TC=1!
+        let q_edns_4096 =
+            append_edns0_opt(build_dns_query(0x1004, "big.txt.example", QTYPE_TXT), 4096);
+        client.send_to(&q_edns_4096, dns_addr).await.unwrap();
+        let (n4, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        let meta4 = crate::dns::wire::extract_dns_response_meta(&rx[..n4]).unwrap();
+        assert!(
+            meta4.truncated,
+            "EDNS0 4096B query clamped to 1232B must set TC=1 for ~1500B reply (got {n4}B)"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), dns_task).await;
+        upstream_task.abort();
     }
 }

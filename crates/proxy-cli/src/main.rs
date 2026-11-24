@@ -361,9 +361,7 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let (api_addr, api_task) =
                 spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx).await?;
-            if let Err(err) = engine.publish_controller_discovery(state_dir.clone(), api_addr) {
-                tracing::warn!("Failed writing runtime controller discovery file: {err}");
-            }
+            maybe_publish_controller_discovery(&engine, &state_dir, api_addr, demo);
             let api_base_url = format_api_base_url(api_addr);
 
             let active_secret = engine.config_snapshot().secret;
@@ -673,16 +671,15 @@ async fn main() -> Result<()> {
             timeout_ms,
             json,
         } => {
-            let loaded = mcp::load_cli_or_profile_config(config.as_ref());
-            let fallback_cfg = loaded.as_ref().ok().map(|(c, _)| c);
+            let loaded_cfg = resolve_probe_config(config.as_ref())?;
             let ctrl_clients = mcp::resolve_controller_clients(
                 controller.as_deref(),
                 secret.as_deref(),
-                fallback_cfg,
+                loaded_cfg.as_ref(),
             );
             let explicit_controller_or_secret = controller.is_some() || secret.is_some();
             let clamped_timeout = timeout_ms.clamp(300, 20_000);
-            let cfg_for_fallback = loaded.map(|(c, _)| c).unwrap_or_default();
+            let cfg_for_fallback = loaded_cfg.unwrap_or_default();
 
             let target_proxy = match proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(p) => p.to_string(),
@@ -1200,6 +1197,54 @@ async fn try_live_probe_json(
     }
 }
 
+/// Returns whether `rust-clash run` should publish `rust-clash.controller.json`.
+///
+/// `--demo` intentionally skips `SingleInstanceGuard` so users can run a local sandbox alongside
+/// a live daemon; therefore it must never overwrite or clean up the live daemon's controller
+/// discovery metadata.
+fn should_publish_controller_discovery(demo: bool) -> bool {
+    !demo
+}
+
+fn maybe_publish_controller_discovery(
+    engine: &ProxyEngine,
+    state_dir: &std::path::Path,
+    api_addr: std::net::SocketAddr,
+    demo: bool,
+) {
+    if should_publish_controller_discovery(demo)
+        && let Err(err) = engine.publish_controller_discovery(state_dir.to_path_buf(), api_addr)
+    {
+        tracing::warn!("Failed writing runtime controller discovery file: {err}");
+    }
+}
+
+/// Resolves the loaded configuration for `rust-clash probe`.
+///
+/// - When `--config <path>` is explicitly supplied, any load/parse/validation error fails closed
+///   instead of silently falling back to `ClashConfig::default()` / `"DIRECT"`.
+/// - When `--config` is omitted, a missing or unavailable default profile resolves to `Ok(None)`
+///   so `probe` can still query a live controller or fall back to standalone defaults.
+fn resolve_probe_loaded_config(
+    config: Option<&PathBuf>,
+    loaded: Result<(ClashConfig, String)>,
+) -> Result<Option<ClashConfig>> {
+    match (config, loaded) {
+        (_, Ok((cfg, _))) => Ok(Some(cfg)),
+        (Some(path), Err(err)) => Err(err).with_context(|| {
+            format!(
+                "failed to load explicit --config '{}' for probe",
+                path.display()
+            )
+        }),
+        (None, Err(_)) => Ok(None),
+    }
+}
+
+fn resolve_probe_config(config: Option<&PathBuf>) -> Result<Option<ClashConfig>> {
+    resolve_probe_loaded_config(config, mcp::load_cli_or_profile_config(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,5 +1340,153 @@ mod tests {
         assert!(fallback.is_none());
 
         let _ = server_jh.await;
+    }
+
+    fn unique_cli_test_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rc-cli-{label}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp cli test dir");
+        dir
+    }
+
+    #[test]
+    fn probe_config_fails_closed_on_explicit_config_error_and_allows_missing_implicit_profile() {
+        let temp_dir = unique_cli_test_dir("probe-config");
+
+        // 1. Explicit --config pointing to a missing file MUST fail closed (never fall back to DIRECT).
+        let missing_path = temp_dir.join("does-not-exist.yaml");
+        let missing_err = resolve_probe_config(Some(&missing_path))
+            .expect_err("explicit missing --config must fail closed");
+        let missing_chain = format!("{missing_err:#}");
+        assert!(
+            missing_chain.contains("does-not-exist.yaml"),
+            "error chain must include explicit config path, got: {missing_chain}"
+        );
+
+        // 2. Explicit --config containing invalid YAML MUST fail closed.
+        let corrupt_path = temp_dir.join("corrupt.yaml");
+        std::fs::write(&corrupt_path, "proxies: [unterminated_yaml: {{{\n")
+            .expect("write corrupt yaml");
+        let corrupt_err = resolve_probe_config(Some(&corrupt_path))
+            .expect_err("explicit invalid --config YAML must fail closed");
+        let corrupt_chain = format!("{corrupt_err:#}");
+        assert!(
+            corrupt_chain.contains("corrupt.yaml"),
+            "error chain must include invalid config path, got: {corrupt_chain}"
+        );
+
+        // 3. Explicit --config with valid YAML loads and preserves configured groups/proxies.
+        let valid_path = temp_dir.join("valid.yaml");
+        std::fs::write(
+            &valid_path,
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\nproxies:\n  - name: TEST-NODE\n    type: ss\n    server: 198.51.100.10\n    port: 8388\n    cipher: aes-256-gcm\n    password: test-password\nproxy-groups:\n  - name: TEST-GROUP\n    type: select\n    proxies:\n      - TEST-NODE\n      - DIRECT\nrules:\n  - MATCH,TEST-GROUP\n",
+        )
+        .expect("write valid yaml");
+        let loaded_valid = resolve_probe_config(Some(&valid_path))
+            .expect("valid explicit --config must succeed")
+            .expect("valid explicit --config must return Some(ClashConfig)");
+        assert_eq!(loaded_valid.proxy_groups.len(), 1);
+        assert_eq!(loaded_valid.proxy_groups[0].name, "TEST-GROUP");
+        assert_eq!(loaded_valid.proxies.len(), 1);
+        assert_eq!(loaded_valid.proxies[0].name(), "TEST-NODE");
+
+        // 4. Explicit --config error passed to resolve_probe_loaded_config fails closed, whereas
+        //    implicit config == None tolerates missing default profile and resolves to Ok(None).
+        assert!(
+            resolve_probe_loaded_config(Some(&missing_path), Err(anyhow::anyhow!("boom"))).is_err(),
+            "explicit config error must never be swallowed"
+        );
+        let implicit_fallback =
+            resolve_probe_loaded_config(None, Err(anyhow::anyhow!("missing default profile")))
+                .expect("implicit config == None should tolerate unavailable default profile");
+        assert!(
+            implicit_fallback.is_none(),
+            "implicit missing config should resolve to None for default fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn run_demo_preserves_existing_controller_discovery_while_non_demo_publishes_it() {
+        use proxy_core::platform::recovery::{
+            ControllerRuntimeEndpoint, read_controller_discovery, write_controller_discovery,
+        };
+
+        assert!(!should_publish_controller_discovery(true));
+        assert!(should_publish_controller_discovery(false));
+
+        let temp_dir = unique_cli_test_dir("demo-discovery");
+        let existing_live = ControllerRuntimeEndpoint {
+            pid: std::process::id(),
+            addr: "127.0.0.1:19090".to_string(),
+            secret: Some("live-daemon-secret".to_string()),
+        };
+        write_controller_discovery(&temp_dir, &existing_live)
+            .expect("seed pre-existing live daemon controller discovery");
+
+        // Start a real demo engine and invoke the exact discovery helper used by `Commands::Run`.
+        let demo_engine = ProxyEngine::start_demo(
+            Some(0),
+            Some("127.0.0.1:0".to_string()),
+            Some("127.0.0.1:0".to_string()),
+        )
+        .await
+        .expect("start demo engine");
+        let demo_api_addr: std::net::SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        maybe_publish_controller_discovery(&demo_engine, &temp_dir, demo_api_addr, true);
+
+        assert_eq!(
+            read_controller_discovery(&temp_dir),
+            Some(existing_live.clone()),
+            "run --demo must NOT overwrite pre-existing rust-clash.controller.json"
+        );
+
+        // Neither reload sync nor demo shutdown may overwrite or delete the live daemon's file.
+        demo_engine.sync_controller_discovery();
+        demo_engine.shutdown_async().await;
+        assert_eq!(
+            read_controller_discovery(&temp_dir),
+            Some(existing_live),
+            "demo sync/shutdown must leave pre-existing rust-clash.controller.json untouched"
+        );
+
+        // Non-demo mode MUST publish its own controller discovery endpoint and clean it up on shutdown.
+        let live_cfg = ClashConfig::from_yaml_str(
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\nsecret: non-demo-secret\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("parse non-demo config");
+        let live_engine = ProxyEngine::start_with_state_dir(live_cfg, temp_dir.clone())
+            .await
+            .expect("start non-demo engine");
+        let live_api_addr: std::net::SocketAddr = "127.0.0.1:19091".parse().unwrap();
+        maybe_publish_controller_discovery(&live_engine, &temp_dir, live_api_addr, false);
+
+        assert_eq!(
+            read_controller_discovery(&temp_dir),
+            Some(ControllerRuntimeEndpoint {
+                pid: std::process::id(),
+                addr: "127.0.0.1:19091".to_string(),
+                secret: Some("non-demo-secret".to_string()),
+            }),
+            "non-demo run must publish rust-clash.controller.json"
+        );
+
+        live_engine.shutdown_async().await;
+        assert!(
+            read_controller_discovery(&temp_dir).is_none(),
+            "non-demo engine shutdown must clean up its own rust-clash.controller.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
