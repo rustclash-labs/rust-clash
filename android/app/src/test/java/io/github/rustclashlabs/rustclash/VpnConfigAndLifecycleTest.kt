@@ -1,5 +1,10 @@
 package io.github.rustclashlabs.rustclash
 
+import android.content.ContextWrapper
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import io.github.rustclashlabs.rustclash.security.AndroidKeystoreVault
+import io.github.rustclashlabs.rustclash.ui.RustClashViewModel
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
 import io.github.rustclashlabs.rustclash.ui.model.DiagnosticsFilter
 import io.github.rustclashlabs.rustclash.ui.model.ExitIpUi
@@ -15,6 +20,7 @@ import io.github.rustclashlabs.rustclash.vpn.UnderlyingNetworkTracker
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
 import io.github.rustclashlabs.rustclash.vpn.VpnRoutePlan
 import io.github.rustclashlabs.rustclash.vpn.VpnRoutePlanner
+import io.github.rustclashlabs.rustclash.vpn.VpnServiceLifecycleCoordinator
 import io.github.rustclashlabs.rustclash.vpn.VpnSessionConfig
 import io.github.rustclashlabs.rustclash.vpn.VpnStateTracker
 import io.github.rustclashlabs.rustclash.vpn.isGlobalUnicastIpv6Address
@@ -22,9 +28,26 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetAddress
+import java.security.Key
+import java.security.KeyStore
+import java.security.KeyStoreSpi
+import java.security.cert.Certificate
+import java.util.Collections
+import java.util.Date
+import java.util.Enumeration
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.spec.SecretKeySpec
 
 class VpnConfigAndLifecycleTest {
 
@@ -1748,27 +1771,44 @@ class VpnConfigAndLifecycleTest {
 
     @Test
     fun freshStatusSnapshotReuseWindowPreventsDuplicateForegroundJniPolling() {
-        RustClashVpnService.clearFreshStatusSnapshot()
-        assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
-        assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 10_000L, lastUpdatedMs = 0L))
+        try {
+            RustClashVpnService.clearFreshStatusSnapshot()
+            assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+            assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 10_000L, lastUpdatedMs = 0L))
 
-        val sample = "{\"running\":true,\"downRate\":12345,\"upRate\":678}"
-        RustClashVpnService.publishFreshStatusSnapshot(sample, nowMs = 50_000L)
-        assertEquals(sample, RustClashVpnService.latestStatusJson)
-        assertEquals(50_000L, RustClashVpnService.latestStatusUpdatedAtMs)
+            val token = 101L
+            RustClashVpnService.activeNativeSessionToken.set(token)
+            RustClashVpnService.stateTracker.onRunning()
 
-        // Fresh within 2.5s window -> reuse without duplicate JNI call
-        assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 50_000L, lastUpdatedMs = 50_000L))
-        assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 51_200L, lastUpdatedMs = 50_000L))
-        assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 52_500L, lastUpdatedMs = 50_000L))
+            val sample = "{\"running\":true,\"downRate\":12345,\"upRate\":678}"
+            assertTrue(
+                RustClashVpnService.publishFreshStatusSnapshot(
+                    rawJson = sample,
+                    expectedToken = token,
+                    nowMs = 50_000L,
+                ),
+            )
+            assertEquals(sample, RustClashVpnService.latestStatusJson)
+            assertEquals(50_000L, RustClashVpnService.latestStatusUpdatedAtMs)
 
-        // Expired past 2.5s or backward clock skew -> poll fresh from JNI
-        assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 52_501L, lastUpdatedMs = 50_000L))
-        assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 49_999L, lastUpdatedMs = 50_000L))
+            // Fresh within 2.5s window -> reuse without duplicate JNI call
+            assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 50_000L, lastUpdatedMs = 50_000L))
+            assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 51_200L, lastUpdatedMs = 50_000L))
+            assertTrue(RustClashVpnService.shouldReuseFreshStatus(nowMs = 52_500L, lastUpdatedMs = 50_000L))
 
-        RustClashVpnService.clearFreshStatusSnapshot()
-        assertEquals("{\"running\":false}", RustClashVpnService.latestStatusJson)
-        assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+            // Expired past 2.5s or backward clock skew -> poll fresh from JNI
+            assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 52_501L, lastUpdatedMs = 50_000L))
+            assertFalse(RustClashVpnService.shouldReuseFreshStatus(nowMs = 49_999L, lastUpdatedMs = 50_000L))
+
+            RustClashVpnService.clearFreshStatusSnapshot()
+            assertEquals("{\"running\":false}", RustClashVpnService.latestStatusJson)
+            assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+        } finally {
+            RustClashVpnService.activeNativeSessionToken.set(0L)
+            RustClashVpnService.stateTracker.clearError()
+            RustClashVpnService.stateTracker.onStopped()
+            RustClashVpnService.clearFreshStatusSnapshot()
+        }
     }
 
     @Test
@@ -1853,5 +1893,1181 @@ class VpnConfigAndLifecycleTest {
         val directManual = ExitIpUi(verified = true, ip = "198.51.100.9", country = "Japan", countryCode = "JP", ipType = "ISP / Broadband")
         assertEquals("运营商 / 宽带 IP", directManual.ipTypeDisplayZh)
         assertEquals("🇯🇵 日本 · 198.51.100.9", directManual.compactPillText)
+    }
+
+    @Test
+    fun vpnServiceLifecycleCoordinatorRecoversAfterOnRevokeOnReusedServiceInstance() {
+        val coord = VpnServiceLifecycleCoordinator()
+
+        // 1. First session starts cleanly
+        val startEpoch1 = coord.onStartRequested(startCommandId = 1)
+        assertTrue(startEpoch1 > 0L)
+        assertEquals(1, coord.lastDeliveredCommandId)
+        assertFalse(coord.isDestroyed)
+        assertFalse(coord.isRevokedForCurrentSession)
+        assertFalse(coord.isStartSupersededOrCancelled(startEpoch1, startCommandId = 1))
+
+        // 2. Android invokes onRevoke() -> cancels session 1 & captures commandId=1; duplicate onRevoke() is deduplicated
+        val revoke1 = coord.onRevokeRequested()
+        assertNotNull(revoke1)
+        assertTrue(revoke1!!.epoch > startEpoch1)
+        assertEquals(1, revoke1.capturedCommandId)
+        assertTrue(coord.isRevokedForCurrentSession)
+        assertTrue(coord.isStartSupersededOrCancelled(startEpoch1, startCommandId = 1))
+        assertTrue(coord.shouldFinalizeFailedOrAbortedStart(startEpoch1, startCommandId = 1))
+        assertNull("Duplicate onRevoke() in the same session must be deduplicated", coord.onRevokeRequested())
+        assertFalse(coord.isStopSupersededByNewerStart(revoke1.epoch))
+
+        // 3. Reused Service instance receives new ACTION_START_VPN before onDestroy() -> MUST NOT stay poisoned!
+        val startEpoch2 = coord.onStartRequested(startCommandId = 2)
+        assertTrue(startEpoch2 > revoke1.epoch)
+        assertEquals(2, coord.lastDeliveredCommandId)
+        assertFalse(coord.isRevokedForCurrentSession)
+        assertFalse(coord.isStartSupersededOrCancelled(startEpoch2, startCommandId = 2))
+        assertTrue(
+            "Stale revoke teardown must recognize it was superseded by newer ACTION_START_VPN",
+            coord.isStopSupersededByNewerStart(revoke1.epoch),
+        )
+        assertTrue(coord.hasPendingNewerStart(startEpoch1))
+        assertFalse(
+            "Aborted start #1 must NOT clobber newer start #2's foreground notification",
+            coord.shouldFinalizeFailedOrAbortedStart(startEpoch1, startCommandId = 1),
+        )
+
+        // 4. Subsequent onRevoke() on the NEW session #2 must NOT be dropped by session #1's revoke!
+        val revoke2 = coord.onRevokeRequested()
+        assertNotNull(revoke2)
+        assertTrue(revoke2!!.epoch > startEpoch2)
+        assertEquals(2, revoke2.capturedCommandId)
+        assertTrue(coord.isRevokedForCurrentSession)
+        assertTrue(coord.isStartSupersededOrCancelled(startEpoch2, startCommandId = 2))
+
+        // 5. onDestroy() permanently blocks any further start or revoke on the destroyed instance
+        val destroyEpoch = coord.onDestroy()
+        assertTrue(destroyEpoch > revoke2.epoch)
+        assertTrue(coord.isDestroyed)
+        assertEquals(0L, coord.onStartRequested(startCommandId = 3))
+        assertNull(coord.onRevokeRequested())
+        assertTrue(coord.isStartSupersededOrCancelled(startEpoch2, startCommandId = 2))
+        assertFalse(coord.hasPendingNewerStart(startEpoch1))
+    }
+
+    @Test
+    fun onRevokeRequestedCapturesDeliveredCommandIdAndAvoidsUnconditionalStopSelfRace() {
+        // 1. Pure BIND_VPN_SERVICE startup (no onStartCommand delivered): capturedCommandId == 0
+        //    must still clear foreground notification & state WITHOUT invoking unconditional stopSelf(),
+        //    even if onStartCommand(startId = 1) races in right after notificationLock release.
+        val bindOnlyCoord = VpnServiceLifecycleCoordinator()
+        val bindOnlyTracker = VpnStateTracker()
+        val bindOnlyLock = Any()
+        assertEquals(0, bindOnlyCoord.lastDeliveredCommandId)
+        val bindRevoke = bindOnlyCoord.onRevokeRequested()
+        assertNotNull(bindRevoke)
+        assertEquals(0, bindRevoke!!.capturedCommandId)
+        bindOnlyTracker.onSystemRevoked()
+
+        var bindSessionCleared = false
+        var bindForegroundCleared = false
+        var bindTileSynced = false
+        var stopSelfWithResultCalls = 0
+        val bindFinalized = RustClashVpnService.finalizeStopSession(
+            notificationLock = bindOnlyLock,
+            coordinator = bindOnlyCoord,
+            stateTracker = bindOnlyTracker,
+            expectedEpoch = bindRevoke.epoch,
+            supersededAtEntry = false,
+            stopStartId = bindRevoke.capturedCommandId.takeIf { it > 0 },
+            isCurrentOrIdleGlobalSession = { true },
+            onClearSessionState = { bindSessionCleared = true },
+            stopForegroundAndClearNotification = { bindForegroundCleared = true },
+            requestTileSync = {
+                bindTileSynced = true
+                // Simulate onStartCommand(startId = 1) arriving immediately after notificationLock
+                // release while finalizeStopSession is about to complete outside the lock.
+                val start1Reg = RustClashVpnService.registerStartAndPromoteForeground(
+                    notificationLock = bindOnlyLock,
+                    coordinator = bindOnlyCoord,
+                    stateTracker = bindOnlyTracker,
+                    startCommandId = 1,
+                    promoteForeground = { true },
+                    fgsRestrictedErrorMessage = "fgs restricted",
+                )
+                assertTrue(start1Reg.startEpoch > bindRevoke.epoch)
+                assertTrue(start1Reg.promoted)
+            },
+            stopSelfWithResult = {
+                stopSelfWithResultCalls++
+                true
+            },
+        )
+        assertTrue(bindFinalized)
+        assertTrue(bindSessionCleared)
+        assertTrue(bindForegroundCleared)
+        assertTrue(bindTileSynced)
+        assertEquals(
+            "Pure BIND_VPN_SERVICE revoke (capturedCommandId == 0) must NEVER call stopSelf/stopSelfResult",
+            0,
+            stopSelfWithResultCalls,
+        )
+        assertEquals(VpnLifecycleState.STARTING, bindOnlyTracker.state)
+
+        // 2. Normal start(1) -> onRevoke() captures commandId=1; concurrent start(2) supersedes stop finalization
+        val coord = VpnServiceLifecycleCoordinator()
+        val tracker = VpnStateTracker()
+        val lock = Any()
+        val start1 = coord.onStartRequested(startCommandId = 1)
+        assertTrue(start1 > 0L)
+        tracker.onStartRequested()
+        tracker.onRunning()
+
+        val revoke1 = coord.onRevokeRequested()
+        assertNotNull(revoke1)
+        assertEquals(1, revoke1!!.capturedCommandId)
+        tracker.onSystemRevoked()
+
+        // Concurrent onStartCommand(ACTION_START_VPN, startId = 2) arrives before stop finalization
+        val start2Reg = RustClashVpnService.registerStartAndPromoteForeground(
+            notificationLock = lock,
+            coordinator = coord,
+            stateTracker = tracker,
+            startCommandId = 2,
+            promoteForeground = { true },
+            fgsRestrictedErrorMessage = "fgs restricted",
+        )
+        assertTrue(start2Reg.startEpoch > revoke1.epoch)
+        assertTrue(start2Reg.promoted)
+        assertTrue(coord.isStopSupersededByNewerStart(revoke1.epoch))
+        assertEquals(VpnLifecycleState.STARTING, tracker.state)
+
+        var foregroundCleared = false
+        var stopResultArg: Int? = null
+        val supersededFinalized = RustClashVpnService.finalizeStopSession(
+            notificationLock = lock,
+            coordinator = coord,
+            stateTracker = tracker,
+            expectedEpoch = revoke1.epoch,
+            supersededAtEntry = false,
+            stopStartId = revoke1.capturedCommandId.takeIf { it > 0 },
+            isCurrentOrIdleGlobalSession = { true },
+            onClearSessionState = {},
+            stopForegroundAndClearNotification = { foregroundCleared = true },
+            requestTileSync = {},
+            stopSelfWithResult = { cmdId ->
+                stopResultArg = cmdId
+                true
+            },
+        )
+        assertFalse("Superseded revoke finalizer must skip teardown", supersededFinalized)
+        assertFalse(foregroundCleared)
+        assertNull(stopResultArg)
+        assertEquals(VpnLifecycleState.STARTING, tracker.state)
+
+        // 3. Even if IO finalizer enters notificationLock BEFORE Main registers start(2), AMS already
+        //    delivered startId=2 -> stopSelfResult(1) returns false and preserves Session 2 (NEVER stopSelf()).
+        val coordPre = VpnServiceLifecycleCoordinator()
+        val trackerPre = VpnStateTracker()
+        val lockPre = Any()
+        coordPre.onStartRequested(startCommandId = 1)
+        trackerPre.onStartRequested()
+        trackerPre.onRunning()
+        val revokePre = coordPre.onRevokeRequested()!!
+        assertEquals(1, revokePre.capturedCommandId)
+        trackerPre.onSystemRevoked()
+
+        val amsLatestDeliveredStartId = 2 // AMS has already dispatched startId = 2 to Main thread
+        var amsServiceDestroyed = false
+        var preStopResultCmdId: Int? = null
+        val preFinalized = RustClashVpnService.finalizeStopSession(
+            notificationLock = lockPre,
+            coordinator = coordPre,
+            stateTracker = trackerPre,
+            expectedEpoch = revokePre.epoch,
+            supersededAtEntry = false,
+            stopStartId = revokePre.capturedCommandId.takeIf { it > 0 },
+            isCurrentOrIdleGlobalSession = { true },
+            onClearSessionState = {},
+            stopForegroundAndClearNotification = {},
+            requestTileSync = {},
+            stopSelfWithResult = { cmdId ->
+                preStopResultCmdId = cmdId
+                if (cmdId == amsLatestDeliveredStartId) {
+                    amsServiceDestroyed = true
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+        assertTrue(preFinalized)
+        assertEquals(1, preStopResultCmdId)
+        assertFalse("AMS must reject stopSelfResult(1) because startId=2 was already delivered", amsServiceDestroyed)
+
+        // 4. recordDeliveredCommandId and onStopRequested monotonically track latest command ID
+        val monoCoord = VpnServiceLifecycleCoordinator()
+        monoCoord.onStartRequested(1)
+        monoCoord.onStopRequested(2)
+        monoCoord.recordDeliveredCommandId(5)
+        monoCoord.recordDeliveredCommandId(3)
+        monoCoord.recordDeliveredCommandId(0)
+        monoCoord.recordDeliveredCommandId(-1)
+        assertEquals(5, monoCoord.lastDeliveredCommandId)
+        assertEquals(5, monoCoord.onRevokeRequested()!!.capturedCommandId)
+    }
+
+    @Test
+    fun concurrentStartRegistrationAndStopOrAbortFinalizationPreserveSession2UnderContention() {
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            // Phase 1: Main-thread registerStartAndPromoteForeground(startId=2) racing against
+            // IO-thread finalizeStopSession(revokeEpoch, capturedCommandId=1) under shared notificationLock
+            repeat(250) { round ->
+                val notificationLock = Any()
+                val coord = VpnServiceLifecycleCoordinator()
+                val tracker = VpnStateTracker()
+
+                val start1 = coord.onStartRequested(startCommandId = 1)
+                assertTrue(start1 > 0L)
+                tracker.onStartRequested()
+                tracker.onRunning()
+
+                val revoke1 = synchronized(notificationLock) {
+                    val res = coord.onRevokeRequested()!!
+                    tracker.onSystemRevoked()
+                    res
+                }
+                assertEquals(1, revoke1.capturedCommandId)
+
+                // AMS delivers startId=2 to Main thread while IO teardown is about to finalize revoke1
+                val amsLatestStartId = 2
+                val amsServiceDestroyed = AtomicBoolean(false)
+                val foregroundActive = AtomicBoolean(true)
+                val nonPositiveStopCalls = AtomicInteger(0)
+                val barrier = CyclicBarrier(2)
+
+                val mainFuture = executor.submit<RustClashVpnService.StartRegistrationResult> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    RustClashVpnService.registerStartAndPromoteForeground(
+                        notificationLock = notificationLock,
+                        coordinator = coord,
+                        stateTracker = tracker,
+                        startCommandId = 2,
+                        promoteForeground = {
+                            foregroundActive.set(true)
+                            true
+                        },
+                        fgsRestrictedErrorMessage = "fgs restricted",
+                    )
+                }
+
+                val ioFuture = executor.submit<Boolean> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    RustClashVpnService.finalizeStopSession(
+                        notificationLock = notificationLock,
+                        coordinator = coord,
+                        stateTracker = tracker,
+                        expectedEpoch = revoke1.epoch,
+                        supersededAtEntry = false,
+                        stopStartId = revoke1.capturedCommandId.takeIf { it > 0 },
+                        isCurrentOrIdleGlobalSession = { true },
+                        onClearSessionState = {},
+                        stopForegroundAndClearNotification = {
+                            foregroundActive.set(false)
+                        },
+                        requestTileSync = {},
+                        stopSelfWithResult = { cmdId ->
+                            if (cmdId <= 0) {
+                                nonPositiveStopCalls.incrementAndGet()
+                                amsServiceDestroyed.set(true)
+                                true
+                            } else if (cmdId == amsLatestStartId) {
+                                amsServiceDestroyed.set(true)
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                    )
+                }
+
+                val start2Reg = mainFuture.get(5, TimeUnit.SECONDS)
+                ioFuture.get(5, TimeUnit.SECONDS)
+
+                assertTrue("Round $round: Session 2 must register cleanly", start2Reg.startEpoch > revoke1.epoch)
+                assertTrue("Round $round: Session 2 must promote foreground", start2Reg.promoted)
+                assertEquals(
+                    "Round $round: Session 2 STARTING state must NEVER be clobbered to DISCONNECTED/REVOKED",
+                    VpnLifecycleState.STARTING,
+                    tracker.state,
+                )
+                assertTrue(
+                    "Round $round: Session 2 must NEVER lose its foreground notification",
+                    foregroundActive.get(),
+                )
+                assertFalse(
+                    "Round $round: AMS must NEVER destroy reused Service for Session 2",
+                    amsServiceDestroyed.get(),
+                )
+                assertEquals(
+                    "Round $round: stopSelfResult must NEVER be called with non-positive startId",
+                    0,
+                    nonPositiveStopCalls.get(),
+                )
+                assertFalse(coord.isRevokedForCurrentSession)
+                assertFalse(coord.isStartSupersededOrCancelled(start2Reg.startEpoch, startCommandId = 2))
+            }
+
+            // Phase 2: Main-thread registerStartAndPromoteForeground(startId=2) racing against
+            // IO-thread finalizeAbortedStartInternal(start1Epoch, startCommandId=1)
+            repeat(250) { round ->
+                val notificationLock = Any()
+                val coord = VpnServiceLifecycleCoordinator()
+                val tracker = VpnStateTracker()
+
+                val start1 = coord.onStartRequested(startCommandId = 1)
+                tracker.onStartRequested()
+                synchronized(notificationLock) {
+                    coord.onRevokeRequested()!!
+                    tracker.onSystemRevoked()
+                }
+
+                val amsLatestStartId = 2
+                val amsServiceDestroyed = AtomicBoolean(false)
+                val foregroundActive = AtomicBoolean(true)
+                val barrier = CyclicBarrier(2)
+
+                val mainFuture = executor.submit<RustClashVpnService.StartRegistrationResult> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    RustClashVpnService.registerStartAndPromoteForeground(
+                        notificationLock = notificationLock,
+                        coordinator = coord,
+                        stateTracker = tracker,
+                        startCommandId = 2,
+                        promoteForeground = {
+                            foregroundActive.set(true)
+                            true
+                        },
+                        fgsRestrictedErrorMessage = "fgs restricted",
+                    )
+                }
+
+                val ioFuture = executor.submit<Boolean> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    RustClashVpnService.finalizeAbortedStartInternal(
+                        notificationLock = notificationLock,
+                        coordinator = coord,
+                        stateTracker = tracker,
+                        startEpoch = start1,
+                        startCommandId = 1,
+                        isCurrentOrIdleGlobalSession = { true },
+                        onClearSessionState = {},
+                        stopForegroundAndClearNotification = {
+                            foregroundActive.set(false)
+                        },
+                        requestTileSync = {},
+                        stopSelfWithResult = { cmdId ->
+                            if (cmdId == amsLatestStartId) {
+                                amsServiceDestroyed.set(true)
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                    )
+                }
+
+                val start2Reg = mainFuture.get(5, TimeUnit.SECONDS)
+                ioFuture.get(5, TimeUnit.SECONDS)
+
+                assertTrue("Abort round $round: Session 2 must register cleanly", start2Reg.startEpoch > start1)
+                assertTrue("Abort round $round: Session 2 must promote foreground", start2Reg.promoted)
+                assertEquals(
+                    "Abort round $round: Session 2 STARTING state must NEVER be clobbered",
+                    VpnLifecycleState.STARTING,
+                    tracker.state,
+                )
+                assertTrue(
+                    "Abort round $round: Session 2 must NEVER lose its foreground notification",
+                    foregroundActive.get(),
+                )
+                assertFalse(
+                    "Abort round $round: AMS must NEVER destroy reused Service for Session 2",
+                    amsServiceDestroyed.get(),
+                )
+            }
+
+            // Phase 3: FGS promotion rollback, non-positive startCommandId guard, & post-onDestroy rejection
+            val rollbackCoord = VpnServiceLifecycleCoordinator()
+            val rollbackTracker = VpnStateTracker()
+            val rollbackLock = Any()
+            val failedProm = RustClashVpnService.registerStartAndPromoteForeground(
+                notificationLock = rollbackLock,
+                coordinator = rollbackCoord,
+                stateTracker = rollbackTracker,
+                startCommandId = 1,
+                promoteForeground = { false },
+                fgsRestrictedErrorMessage = "FGS blocked",
+            )
+            assertTrue(failedProm.startEpoch > 0L)
+            assertFalse(failedProm.promoted)
+            assertEquals(VpnLifecycleState.ERROR, rollbackTracker.state)
+            assertEquals("FGS blocked", rollbackTracker.lastError)
+            assertTrue(rollbackCoord.isStartSupersededOrCancelled(failedProm.startEpoch, startCommandId = 1))
+            assertFalse(rollbackCoord.hasPendingNewerStart(0L))
+
+            // finalizeAbortedStartInternal with startCommandId <= 0 must never invoke stopSelfResult
+            val zeroCmdCoord = VpnServiceLifecycleCoordinator()
+            val zeroCmdTracker = VpnStateTracker()
+            val zeroCmdEpoch = zeroCmdCoord.onStartRequested(startCommandId = 0)
+            zeroCmdCoord.onRevokeRequested()
+            var zeroCmdStopCalls = 0
+            assertTrue(
+                RustClashVpnService.finalizeAbortedStartInternal(
+                    notificationLock = Any(),
+                    coordinator = zeroCmdCoord,
+                    stateTracker = zeroCmdTracker,
+                    startEpoch = zeroCmdEpoch,
+                    startCommandId = 0,
+                    isCurrentOrIdleGlobalSession = { true },
+                    onClearSessionState = {},
+                    stopForegroundAndClearNotification = {},
+                    requestTileSync = {},
+                    stopSelfWithResult = {
+                        zeroCmdStopCalls++
+                        true
+                    },
+                ),
+            )
+            assertEquals(0, zeroCmdStopCalls)
+
+            rollbackCoord.onDestroy()
+            var promoteCalledAfterDestroy = false
+            val afterDestroy = RustClashVpnService.registerStartAndPromoteForeground(
+                notificationLock = rollbackLock,
+                coordinator = rollbackCoord,
+                stateTracker = rollbackTracker,
+                startCommandId = 2,
+                promoteForeground = {
+                    promoteCalledAfterDestroy = true
+                    true
+                },
+                fgsRestrictedErrorMessage = "FGS blocked",
+            )
+            assertEquals(0L, afterDestroy.startEpoch)
+            assertFalse(afterDestroy.promoted)
+            assertFalse(promoteCalledAfterDestroy)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun pureBindOnlyRevokeNeverInvokesStopSelfAndPreservesRacingStart1() {
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            repeat(200) { round ->
+                val notificationLock = Any()
+                val coord = VpnServiceLifecycleCoordinator()
+                val tracker = VpnStateTracker()
+
+                // Pure BIND_VPN_SERVICE instance: no onStartCommand delivered -> capturedCommandId == 0
+                val bindRevoke = synchronized(notificationLock) {
+                    val res = coord.onRevokeRequested()!!
+                    tracker.onSystemRevoked()
+                    res
+                }
+                assertEquals(0, bindRevoke.capturedCommandId)
+
+                val foregroundActive = AtomicBoolean(false)
+                val stopSelfCalls = AtomicInteger(0)
+                val barrier = CyclicBarrier(2)
+
+                val mainFuture = executor.submit<RustClashVpnService.StartRegistrationResult> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    RustClashVpnService.registerStartAndPromoteForeground(
+                        notificationLock = notificationLock,
+                        coordinator = coord,
+                        stateTracker = tracker,
+                        startCommandId = 1,
+                        promoteForeground = {
+                            foregroundActive.set(true)
+                            true
+                        },
+                        fgsRestrictedErrorMessage = "fgs restricted",
+                    )
+                }
+
+                val ioFuture = executor.submit<Boolean> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    RustClashVpnService.finalizeStopSession(
+                        notificationLock = notificationLock,
+                        coordinator = coord,
+                        stateTracker = tracker,
+                        expectedEpoch = bindRevoke.epoch,
+                        supersededAtEntry = false,
+                        stopStartId = bindRevoke.capturedCommandId.takeIf { it > 0 },
+                        isCurrentOrIdleGlobalSession = { true },
+                        onClearSessionState = {},
+                        stopForegroundAndClearNotification = {
+                            foregroundActive.set(false)
+                        },
+                        requestTileSync = {},
+                        stopSelfWithResult = {
+                            stopSelfCalls.incrementAndGet()
+                            true
+                        },
+                    )
+                }
+
+                val start1Reg = mainFuture.get(5, TimeUnit.SECONDS)
+                ioFuture.get(5, TimeUnit.SECONDS)
+
+                assertTrue("Round $round: start(1) must succeed", start1Reg.startEpoch > bindRevoke.epoch)
+                assertTrue("Round $round: start(1) must promote foreground", start1Reg.promoted)
+                assertEquals(
+                    "Round $round: pure-bind revoke must NEVER invoke stopSelf/stopSelfResult",
+                    0,
+                    stopSelfCalls.get(),
+                )
+                assertEquals(
+                    "Round $round: racing start(1) STARTING state must be preserved",
+                    VpnLifecycleState.STARTING,
+                    tracker.state,
+                )
+                assertTrue(
+                    "Round $round: racing start(1) foreground notification must remain active",
+                    foregroundActive.get(),
+                )
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun abortedNewerStartDoesNotSupersedeStopNotificationCleanupAndPreservesErrorState() {
+        // 1. Interleaving F (Subcase A1 & A2): Start(1) -> Stop(2) -> Start(3, promoteForeground=false)
+        //    Start(3) aborts before launch via onStartAbortedBeforeLaunch(3) and sets state=ERROR.
+        //    Stop(2) must NOT treat aborted Start(3) as a superseding start; it MUST clear the
+        //    foreground notification & session state (zero zombie notification) while preserving ERROR.
+        for (stopEnteredAfterAbortedStart3 in listOf(false, true)) {
+            val lock = Any()
+            val coord = VpnServiceLifecycleCoordinator()
+            val tracker = VpnStateTracker()
+            var foregroundActive = false
+
+            val start1Reg = RustClashVpnService.registerStartAndPromoteForeground(
+                notificationLock = lock,
+                coordinator = coord,
+                stateTracker = tracker,
+                startCommandId = 1,
+                promoteForeground = {
+                    foregroundActive = true
+                    true
+                },
+                fgsRestrictedErrorMessage = "FGS blocked",
+            )
+            assertTrue(start1Reg.promoted)
+            assertTrue(foregroundActive)
+            tracker.onRunning()
+
+            val stop2Epoch = synchronized(lock) {
+                val epoch = coord.onStopRequested(stopCommandId = 2)
+                tracker.onStopRequested()
+                epoch
+            }
+            assertEquals(VpnLifecycleState.STOPPING, tracker.state)
+
+            val start3Reg = RustClashVpnService.registerStartAndPromoteForeground(
+                notificationLock = lock,
+                coordinator = coord,
+                stateTracker = tracker,
+                startCommandId = 3,
+                promoteForeground = { false },
+                fgsRestrictedErrorMessage = "FGS blocked",
+            )
+            assertTrue(start3Reg.startEpoch > stop2Epoch)
+            assertFalse(start3Reg.promoted)
+            assertEquals(VpnLifecycleState.ERROR, tracker.state)
+            assertEquals("FGS blocked", tracker.lastError)
+
+            assertFalse(
+                "Aborted Start(3) must NOT supersede Stop(2)",
+                coord.isStopSupersededByNewerStart(stop2Epoch),
+            )
+            assertFalse(coord.hasPendingNewerStart(stop2Epoch))
+
+            if (stopEnteredAfterAbortedStart3) {
+                // Subcase A2: stopVpnSessionInternal enters notificationLock AFTER Start(3) failed
+                synchronized(lock) {
+                    val superseded = coord.isStopSupersededByNewerStart(stop2Epoch)
+                    assertFalse(superseded)
+                    tracker.onStopRequested()
+                }
+                assertEquals(
+                    "onStopRequested() must preserve ERROR set by Start(3)'s FGS failure",
+                    VpnLifecycleState.ERROR,
+                    tracker.state,
+                )
+            }
+
+            var sessionStateCleared = false
+            var tileSynced = false
+            var stopResultCmdId: Int? = null
+            val finalized = RustClashVpnService.finalizeStopSession(
+                notificationLock = lock,
+                coordinator = coord,
+                stateTracker = tracker,
+                expectedEpoch = stop2Epoch,
+                supersededAtEntry = false,
+                stopStartId = 2,
+                isCurrentOrIdleGlobalSession = { true },
+                onClearSessionState = { sessionStateCleared = true },
+                stopForegroundAndClearNotification = { foregroundActive = false },
+                requestTileSync = { tileSynced = true },
+                stopSelfWithResult = { cmdId ->
+                    stopResultCmdId = cmdId
+                    false // AMS already delivered startId = 3
+                },
+            )
+            assertTrue("Stop(2) must finalize cleanup after aborted Start(3)", finalized)
+            assertFalse("Zombie foreground notification MUST be cleared", foregroundActive)
+            assertTrue("Session state (activeOutboundLabel/snapshot) MUST be cleared", sessionStateCleared)
+            assertTrue("Tile sync MUST be requested", tileSynced)
+            assertEquals(2, stopResultCmdId)
+            assertEquals(
+                "ERROR state from Start(3)'s failed FGS promotion must be preserved",
+                VpnLifecycleState.ERROR,
+                tracker.state,
+            )
+            assertEquals("FGS blocked", tracker.lastError)
+        }
+
+        // 2. Start(1) -> onRevoke() -> Start(2, promoteForeground=false) -> revoke teardown clears notification
+        //    and preserves Start(2)'s FGS ERROR rather than overwriting with REVOKED or leaving zombie notification.
+        val revLock = Any()
+        val revCoord = VpnServiceLifecycleCoordinator()
+        val revTracker = VpnStateTracker()
+        var revForegroundActive = false
+
+        RustClashVpnService.registerStartAndPromoteForeground(
+            notificationLock = revLock,
+            coordinator = revCoord,
+            stateTracker = revTracker,
+            startCommandId = 1,
+            promoteForeground = {
+                revForegroundActive = true
+                true
+            },
+            fgsRestrictedErrorMessage = "FGS blocked",
+        )
+        revTracker.onRunning()
+
+        val revoke1 = synchronized(revLock) {
+            val res = revCoord.onRevokeRequested()!!
+            revTracker.onSystemRevoked()
+            res
+        }
+        val failedStart2 = RustClashVpnService.registerStartAndPromoteForeground(
+            notificationLock = revLock,
+            coordinator = revCoord,
+            stateTracker = revTracker,
+            startCommandId = 2,
+            promoteForeground = { false },
+            fgsRestrictedErrorMessage = "FGS blocked",
+        )
+        assertFalse(failedStart2.promoted)
+        assertFalse(revCoord.isRevokedForCurrentSession)
+        assertFalse(revCoord.isStopSupersededByNewerStart(revoke1.epoch))
+
+        val revFinalized = RustClashVpnService.finalizeStopSession(
+            notificationLock = revLock,
+            coordinator = revCoord,
+            stateTracker = revTracker,
+            expectedEpoch = revoke1.epoch,
+            supersededAtEntry = false,
+            stopStartId = revoke1.capturedCommandId.takeIf { it > 0 },
+            isCurrentOrIdleGlobalSession = { true },
+            onClearSessionState = {},
+            stopForegroundAndClearNotification = { revForegroundActive = false },
+            requestTileSync = {},
+            stopSelfWithResult = { false },
+        )
+        assertTrue(revFinalized)
+        assertFalse("Foreground notification must be cleared after revoke + aborted Start(2)", revForegroundActive)
+        assertEquals(VpnLifecycleState.ERROR, revTracker.state)
+        assertEquals("FGS blocked", revTracker.lastError)
+
+        // 3. VpnStateTracker ERROR preservation & explicit recovery via clearError() / onStartRequested()
+        val stateTracker = VpnStateTracker()
+        stateTracker.onError("boom")
+        stateTracker.onStopRequested()
+        assertEquals(VpnLifecycleState.ERROR, stateTracker.state)
+        stateTracker.onStopped()
+        assertEquals(VpnLifecycleState.ERROR, stateTracker.state)
+        assertEquals("boom", stateTracker.lastError)
+        stateTracker.clearError()
+        assertEquals(VpnLifecycleState.DISCONNECTED, stateTracker.state)
+        assertNull(stateTracker.lastError)
+    }
+
+    @Test
+    fun vpnServiceLifecycleCoordinatorHandlesStopAndAbortedLaunchWithoutClobberingNewerStart() {
+        val coord = VpnServiceLifecycleCoordinator()
+
+        val start1 = coord.onStartRequested(startCommandId = 1)
+        val stop2 = coord.onStopRequested(stopCommandId = 2)
+        assertTrue(stop2 > start1)
+        assertTrue(coord.isStartSupersededOrCancelled(start1, startCommandId = 1))
+        assertTrue(coord.shouldFinalizeFailedOrAbortedStart(start1, startCommandId = 1))
+        assertFalse(coord.isStopSupersededByNewerStart(stop2))
+
+        // Newer start arrives after stop -> stop is superseded, new start proceeds
+        val start3 = coord.onStartRequested(startCommandId = 3)
+        assertTrue(start3 > stop2)
+        assertTrue(coord.isStopSupersededByNewerStart(stop2))
+        assertFalse(coord.isStartSupersededOrCancelled(start3, startCommandId = 3))
+
+        // If promoteForeground fails on start3, onStartAbortedBeforeLaunch invalidates start3 cleanly
+        // so stop2 is no longer superseded and can clear the foreground notification.
+        coord.onStartAbortedBeforeLaunch(start3)
+        assertTrue(coord.isStartSupersededOrCancelled(start3, startCommandId = 3))
+        assertFalse(coord.hasPendingNewerStart(start1))
+        assertFalse(coord.hasPendingNewerStart(stop2))
+        assertFalse(coord.isStopSupersededByNewerStart(stop2))
+
+        // Subsequent foreground start recovers cleanly and supersedes stop2 again
+        val start4 = coord.onStartRequested(startCommandId = 4)
+        assertTrue(start4 > start3)
+        assertFalse(coord.isStartSupersededOrCancelled(start4, startCommandId = 4))
+        assertTrue(coord.isStopSupersededByNewerStart(stop2))
+    }
+
+    @Test
+    fun tokenGatedStatusSnapshotAndNotificationGuardBlockPostStopZombieUpdates() {
+        try {
+            RustClashVpnService.activeNativeSessionToken.set(0L)
+            RustClashVpnService.stateTracker.clearError()
+            RustClashVpnService.stateTracker.onStopped()
+            RustClashVpnService.clearFreshStatusSnapshot()
+
+            val runningJson = "{\"running\":true,\"downRate\":8192,\"upRate\":2048}"
+
+            // 1. Disconnected / zero token must reject snapshot writes
+            assertFalse(RustClashVpnService.publishFreshStatusSnapshot(runningJson, expectedToken = 0L, nowMs = 1_000L))
+            assertFalse(RustClashVpnService.publishFreshStatusSnapshot(runningJson, expectedToken = 77L, nowMs = 1_000L))
+            assertEquals("{\"running\":false}", RustClashVpnService.latestStatusJson)
+            assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+
+            // 2. Active RUNNING session accepts matching token only
+            RustClashVpnService.activeNativeSessionToken.set(77L)
+            RustClashVpnService.stateTracker.onRunning()
+            assertFalse(RustClashVpnService.publishFreshStatusSnapshot(runningJson, expectedToken = 76L, nowMs = 2_000L))
+            assertTrue(RustClashVpnService.publishFreshStatusSnapshot(runningJson, expectedToken = 77L, nowMs = 2_000L))
+            assertEquals(runningJson, RustClashVpnService.latestStatusJson)
+            assertEquals(2_000L, RustClashVpnService.latestStatusUpdatedAtMs)
+
+            // 3. After stop clears token and snapshot, late in-flight JNI writes with old token 77L are dropped
+            RustClashVpnService.activeNativeSessionToken.set(0L)
+            RustClashVpnService.stateTracker.onStopped()
+            RustClashVpnService.clearFreshStatusSnapshot()
+            assertFalse(RustClashVpnService.publishFreshStatusSnapshot(runningJson, expectedToken = 77L, nowMs = 3_000L))
+            assertEquals("{\"running\":false}", RustClashVpnService.latestStatusJson)
+            assertEquals(0L, RustClashVpnService.latestStatusUpdatedAtMs)
+
+            // 4. Notification guard rejects stopped, cancelled, destroyed, or token-mismatched ticks
+            assertTrue(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = true,
+                    serviceDestroyed = false,
+                    instanceToken = 88L,
+                    activeGlobalToken = 88L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.RUNNING,
+                ),
+            )
+            assertTrue(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = true,
+                    serviceDestroyed = false,
+                    instanceToken = 88L,
+                    activeGlobalToken = 88L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.RECONNECTING,
+                ),
+            )
+            assertFalse(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = false,
+                    serviceDestroyed = false,
+                    instanceToken = 88L,
+                    activeGlobalToken = 88L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.RUNNING,
+                ),
+            )
+            assertFalse(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = true,
+                    serviceDestroyed = true,
+                    instanceToken = 88L,
+                    activeGlobalToken = 88L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.RUNNING,
+                ),
+            )
+            assertFalse(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = true,
+                    serviceDestroyed = false,
+                    instanceToken = 0L,
+                    activeGlobalToken = 88L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.RUNNING,
+                ),
+            )
+            assertFalse(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = true,
+                    serviceDestroyed = false,
+                    instanceToken = 88L,
+                    activeGlobalToken = 89L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.RUNNING,
+                ),
+            )
+            assertFalse(
+                RustClashVpnService.canPostSessionNotification(
+                    coroutineActive = true,
+                    serviceDestroyed = false,
+                    instanceToken = 88L,
+                    activeGlobalToken = 88L,
+                    expectedToken = 88L,
+                    lifecycleState = VpnLifecycleState.STOPPING,
+                ),
+            )
+
+            // 5. ViewModel post-IO reconciliation forces {"running":false} if VPN stopped or token rotated mid-IO
+            assertEquals(
+                runningJson,
+                RustClashViewModel.resolveEffectivePolledStatusJson(
+                    postIoState = VpnLifecycleState.RUNNING,
+                    capturedToken = 88L,
+                    postIoToken = 88L,
+                    polledRawJson = runningJson,
+                ),
+            )
+            assertEquals(
+                "{\"running\":false}",
+                RustClashViewModel.resolveEffectivePolledStatusJson(
+                    postIoState = VpnLifecycleState.DISCONNECTED,
+                    capturedToken = 88L,
+                    postIoToken = 0L,
+                    polledRawJson = runningJson,
+                ),
+            )
+            assertEquals(
+                "{\"running\":false}",
+                RustClashViewModel.resolveEffectivePolledStatusJson(
+                    postIoState = VpnLifecycleState.REVOKED,
+                    capturedToken = 88L,
+                    postIoToken = 0L,
+                    polledRawJson = runningJson,
+                ),
+            )
+            assertEquals(
+                "{\"running\":false}",
+                RustClashViewModel.resolveEffectivePolledStatusJson(
+                    postIoState = VpnLifecycleState.RUNNING,
+                    capturedToken = 88L,
+                    postIoToken = 89L,
+                    polledRawJson = runningJson,
+                ),
+            )
+        } finally {
+            RustClashVpnService.activeNativeSessionToken.set(0L)
+            RustClashVpnService.stateTracker.clearError()
+            RustClashVpnService.stateTracker.onStopped()
+            RustClashVpnService.clearFreshStatusSnapshot()
+        }
+    }
+
+    @Test
+    fun safeServiceStartAndStopHelpersCatchBackgroundRestrictionsAndReconcileStaleState() {
+        try {
+            RustClashVpnService.activeNativeSessionToken.set(0L)
+            RustClashVpnService.stateTracker.clearError()
+            RustClashVpnService.stateTracker.onStopped()
+
+            // 1. runSafeServiceCall catches IllegalStateException & SecurityException (FGS/background limits)
+            assertTrue(RustClashVpnService.runSafeServiceCall { /* ok */ })
+            assertFalse(
+                RustClashVpnService.runSafeServiceCall {
+                    throw IllegalStateException("Background start not allowed")
+                },
+            )
+            assertFalse(
+                RustClashVpnService.runSafeServiceCall {
+                    throw SecurityException("Missing FGS permission")
+                },
+            )
+            try {
+                RustClashVpnService.runSafeServiceCall {
+                    throw IllegalArgumentException("Unrelated programmer error")
+                }
+                fail("Unrelated IllegalArgumentException should not be swallowed")
+            } catch (_: IllegalArgumentException) {
+                // expected
+            }
+
+            // 2. safeRequestStopVpnInternal: direct startService succeeds without touching fallback
+            var fallbackInvoked = false
+            assertTrue(
+                RustClashVpnService.safeRequestStopVpnInternal(
+                    startStopIntent = { /* ok */ },
+                    stopServiceFallback = {
+                        fallbackInvoked = true
+                        true
+                    },
+                ),
+            )
+            assertFalse(fallbackInvoked)
+
+            // 3. Background startService throws -> falls back to stopService() when service is running
+            assertTrue(
+                RustClashVpnService.safeRequestStopVpnInternal(
+                    startStopIntent = { throw IllegalStateException("BackgroundServiceStartNotAllowed") },
+                    stopServiceFallback = {
+                        fallbackInvoked = true
+                        true
+                    },
+                ),
+            )
+            assertTrue(fallbackInvoked)
+
+            // 4. Background startService throws AND service is no longer running -> reconciles stale STARTING to DISCONNECTED
+            RustClashVpnService.stateTracker.onStartRequested()
+            assertEquals(VpnLifecycleState.STARTING, RustClashVpnService.stateTracker.state)
+            assertFalse(
+                RustClashVpnService.safeRequestStopVpnInternal(
+                    startStopIntent = { throw IllegalStateException("BackgroundServiceStartNotAllowed") },
+                    stopServiceFallback = { false },
+                ),
+            )
+            assertEquals(VpnLifecycleState.DISCONNECTED, RustClashVpnService.stateTracker.state)
+        } finally {
+            RustClashVpnService.activeNativeSessionToken.set(0L)
+            RustClashVpnService.stateTracker.clearError()
+            RustClashVpnService.stateTracker.onStopped()
+        }
+    }
+
+    @Test
+    fun perAppAllowlistFailsClosedWhenEmptySelfOnlyOrAllPackagesUninstalled() {
+        val selfPkg = "io.github.rustclashlabs.rustclash"
+
+        // 1. Empty allowlist populates blockingError
+        val emptyAllowPlan = PerAppVpnPolicy.buildPlan(
+            mode = PerAppMode.ALLOWLIST,
+            selectedPackages = emptySet(),
+            selfPackageName = selfPkg,
+            isLockdownEnabled = false,
+        )
+        assertNotNull(emptyAllowPlan.blockingError)
+        assertTrue(emptyAllowPlan.allowedPackages.isEmpty())
+
+        // 2. Self-only allowlist (stripped to empty) ALSO populates blockingError
+        val selfOnlyAllowPlan = PerAppVpnPolicy.buildPlan(
+            mode = PerAppMode.ALLOWLIST,
+            selectedPackages = setOf(selfPkg, "   "),
+            selfPackageName = selfPkg,
+            isLockdownEnabled = true,
+        )
+        assertNotNull(selfOnlyAllowPlan.blockingError)
+        assertTrue(selfOnlyAllowPlan.allowedPackages.isEmpty())
+        assertTrue(selfOnlyAllowPlan.lockdownConflictWarning!!.contains("Lockdown"))
+
+        // 3. Valid allowlist, ALL_APPS, and BLOCKLIST have null blockingError
+        val validAllowPlan = PerAppVpnPolicy.buildPlan(
+            mode = PerAppMode.ALLOWLIST,
+            selectedPackages = setOf("org.mozilla.firefox", "com.missing.app"),
+            selfPackageName = selfPkg,
+            isLockdownEnabled = false,
+        )
+        assertNull(validAllowPlan.blockingError)
+        assertNull(
+            PerAppVpnPolicy.buildPlan(PerAppMode.ALL_APPS, emptySet(), selfPkg, false).blockingError,
+        )
+        assertNull(
+            PerAppVpnPolicy.buildPlan(PerAppMode.BLOCKLIST, emptySet(), selfPkg, false).blockingError,
+        )
+
+        // 4. applyPackagesFailClosed throws IllegalStateException (NOT IllegalArgumentException) when empty
+        try {
+            PerAppVpnPolicy.applyPackagesFailClosed(
+                plan = emptyAllowPlan,
+                addAllowed = { fail("Must not call addAllowed for blocked empty allowlist") },
+                addDisallowed = { fail("Must not call addDisallowed for allowlist") },
+            )
+            fail("Expected IllegalStateException for empty allowlist")
+        } catch (e: IllegalStateException) {
+            assertFalse(e is IllegalArgumentException)
+        }
+
+        // 5. applyPackagesFailClosed fails closed with IllegalStateException when ALL allowlisted apps are uninstalled
+        try {
+            PerAppVpnPolicy.applyPackagesFailClosed(
+                plan = validAllowPlan,
+                addAllowed = { pkg -> throw PackageManager.NameNotFoundException(pkg) },
+                addDisallowed = { fail("Must not call addDisallowed for allowlist") },
+            )
+            fail("Expected IllegalStateException when 0 allowlisted packages resolve")
+        } catch (e: IllegalStateException) {
+            assertFalse(e is IllegalArgumentException)
+        }
+
+        // 6. Partial uninstall leaves remaining installed app active and succeeds
+        val applied = mutableListOf<String>()
+        val count = PerAppVpnPolicy.applyPackagesFailClosed(
+            plan = validAllowPlan,
+            addAllowed = { pkg ->
+                if (pkg == "com.missing.app") {
+                    throw PackageManager.NameNotFoundException(pkg)
+                }
+                applied.add(pkg)
+            },
+            addDisallowed = { fail("Must not call addDisallowed for allowlist") },
+        )
+        assertEquals(1, count)
+        assertEquals(listOf("org.mozilla.firefox"), applied)
+
+        // 7. validateAppliedAllowlistCount rejects 0 for ALLOWLIST only
+        PerAppVpnPolicy.validateAppliedAllowlistCount(PerAppMode.ALL_APPS, 0)
+        PerAppVpnPolicy.validateAppliedAllowlistCount(PerAppMode.BLOCKLIST, 0)
+        try {
+            PerAppVpnPolicy.validateAppliedAllowlistCount(PerAppMode.ALLOWLIST, 0)
+            fail("Expected IllegalStateException for ALLOWLIST with 0 applied packages")
+        } catch (_: IllegalStateException) {
+            // expected
+        }
+    }
+
+    @Test
+    fun androidKeystoreVaultDecryptIsReadOnlyRefusesAliasOverwriteAndRemovesKeyWithoutKeystore() {
+        // 1. Pure-JVM unwrapMasterKey safely returns null (no Keystore available, never throws)
+        assertNull(AndroidKeystoreVault.unwrapMasterKey(ByteArray(8)))
+        assertNull(AndroidKeystoreVault.unwrapMasterKey(ByteArray(44)))
+
+        // 2. Fake KeyStore exercising missing alias, existing SecretKeyEntry, and transient unavailable alias
+        val secretKey = SecretKeySpec(ByteArray(32) { it.toByte() }, "AES")
+        val entries = mutableMapOf<String, KeyStore.Entry?>()
+        val fakeSpi = object : KeyStoreSpi() {
+            override fun engineGetKey(alias: String?, password: CharArray?): Key? =
+                (entries[alias] as? KeyStore.SecretKeyEntry)?.secretKey
+
+            override fun engineGetCertificateChain(alias: String?): Array<Certificate>? = null
+            override fun engineGetCertificate(alias: String?): Certificate? = null
+            override fun engineGetCreationDate(alias: String?): Date? = null
+            override fun engineSetKeyEntry(alias: String?, key: Key?, password: CharArray?, chain: Array<out Certificate>?) {}
+            override fun engineSetKeyEntry(alias: String?, key: ByteArray?, chain: Array<out Certificate>?) {}
+            override fun engineSetCertificateEntry(alias: String?, cert: Certificate?) {}
+            override fun engineDeleteEntry(alias: String?) {
+                entries.remove(alias)
+            }
+
+            override fun engineAliases(): Enumeration<String> = Collections.enumeration(entries.keys)
+            override fun engineContainsAlias(alias: String?): Boolean = alias != null && entries.containsKey(alias)
+            override fun engineSize(): Int = entries.size
+            override fun engineIsKeyEntry(alias: String?): Boolean = entries[alias] is KeyStore.SecretKeyEntry
+            override fun engineIsCertificateEntry(alias: String?): Boolean = false
+            override fun engineGetCertificateAlias(cert: Certificate?): String? = null
+            override fun engineStore(stream: OutputStream?, password: CharArray?) {}
+            override fun engineLoad(stream: InputStream?, password: CharArray?) {}
+            override fun engineGetEntry(alias: String?, protParam: KeyStore.ProtectionParameter?): KeyStore.Entry? =
+                entries[alias]
+        }
+        val fakeKeyStore = object : KeyStore(fakeSpi, null, "FakeKeyStore") {}.apply { load(null) }
+
+        // Read-only lookup on missing alias returns null
+        assertNull(AndroidKeystoreVault.resolveExistingSecretKey(fakeKeyStore, "missing_alias"))
+
+        // resolveOrCreateSecretKey generates ONLY when alias is absent, and reuses existing SecretKeyEntry
+        var generatedCount = 0
+        val created = AndroidKeystoreVault.resolveOrCreateSecretKey(fakeKeyStore, "vault_key") {
+            generatedCount++
+            entries["vault_key"] = KeyStore.SecretKeyEntry(secretKey)
+            secretKey
+        }
+        assertSame(secretKey, created)
+        assertEquals(1, generatedCount)
+
+        val reused = AndroidKeystoreVault.resolveOrCreateSecretKey(fakeKeyStore, "vault_key") {
+            generatedCount++
+            SecretKeySpec(ByteArray(32) { 9 }, "AES")
+        }
+        assertSame(secretKey, reused)
+        assertEquals(1, generatedCount)
+        assertSame(secretKey, AndroidKeystoreVault.resolveExistingSecretKey(fakeKeyStore, "vault_key"))
+
+        // Critical P1 #30 regression: alias exists in KeyStore, yet getEntry returns null (e.g., locked TEE / non-SecretKeyEntry).
+        // Read-only lookup MUST return null, and resolveOrCreateSecretKey MUST throw instead of overwriting!
+        entries["existing_but_unreadable"] = null
+        assertNull(AndroidKeystoreVault.resolveExistingSecretKey(fakeKeyStore, "existing_but_unreadable"))
+        try {
+            AndroidKeystoreVault.resolveOrCreateSecretKey(fakeKeyStore, "existing_but_unreadable") {
+                generatedCount++
+                SecretKeySpec(ByteArray(32) { 7 }, "AES")
+            }
+            fail("Must throw IllegalStateException instead of overwriting an existing unreadable alias")
+        } catch (_: IllegalStateException) {
+            // expected
+        }
+        assertEquals("Generator must NEVER be called for an existing alias", 1, generatedCount)
+
+        // 3. removeEncryptedKey removes SharedPreferences key cleanly without touching Keystore or Cipher
+        val backingStore = mutableMapOf<String, Any?>(
+            RustClashVpnService.VAULT_KEY_ACTIVE_YAML to "iv_b64:ciphertext_b64",
+            "other_key" to "keep_me",
+        )
+        val fakePrefs = object : SharedPreferences {
+            override fun getAll(): MutableMap<String, *> = backingStore.toMutableMap()
+            override fun getString(key: String?, defValue: String?): String? =
+                (backingStore[key] as? String) ?: defValue
+            override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+            override fun getInt(key: String?, defValue: Int): Int = defValue
+            override fun getLong(key: String?, defValue: Long): Long = defValue
+            override fun getFloat(key: String?, defValue: Float): Float = defValue
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+            override fun contains(key: String?): Boolean = backingStore.containsKey(key)
+            override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+                private val removals = mutableSetOf<String>()
+                override fun putString(key: String?, value: String?): SharedPreferences.Editor = this
+                override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor = this
+                override fun putInt(key: String?, value: Int): SharedPreferences.Editor = this
+                override fun putLong(key: String?, value: Long): SharedPreferences.Editor = this
+                override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = this
+                override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = this
+                override fun remove(key: String?): SharedPreferences.Editor {
+                    if (key != null) removals.add(key)
+                    return this
+                }
+                override fun clear(): SharedPreferences.Editor = this
+                override fun commit(): Boolean {
+                    removals.forEach { backingStore.remove(it) }
+                    return true
+                }
+                override fun apply() {
+                    removals.forEach { backingStore.remove(it) }
+                }
+            }
+        }
+        val fakeContext = object : ContextWrapper(null) {
+            override fun getSharedPreferences(name: String?, mode: Int): SharedPreferences = fakePrefs
+        }
+
+        AndroidKeystoreVault.removeEncryptedKey(fakeContext, RustClashVpnService.VAULT_KEY_ACTIVE_YAML)
+        assertFalse(backingStore.containsKey(RustClashVpnService.VAULT_KEY_ACTIVE_YAML))
+        assertEquals("keep_me", backingStore["other_key"])
     }
 }

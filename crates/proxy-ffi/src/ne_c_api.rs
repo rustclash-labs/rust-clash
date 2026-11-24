@@ -243,8 +243,9 @@ unsafe fn start_ne_engine_internal(
 
         // Inside `NEPacketTunnelProvider`, Apple owns the system interface (`NEPacketTunnelFlow`)
         // and passes raw L3 packets over FFI, so `smoltcp` runs in virtual channel mode (`auto_route = false`),
-        // and internal listeners must use ephemeral loopback ports (`127.0.0.1:0`) so the System Extension
-        // never exposes LAN ports or collides with the host desktop app's `mixed-port` (`7890`).
+        // `NEDNSSettings` forwards all DNS queries to the virtual TUN VIP (`198.19.255.254:53`) requiring
+        // `dns_hijack = true`, and internal listeners must use ephemeral loopback ports (`127.0.0.1:0`) so the
+        // System Extension never exposes LAN ports or collides with the host desktop app's `mixed-port` (`7890`).
         cfg.allow_lan = false;
         cfg.bind_address = "127.0.0.1".to_string();
         cfg.lan_allowed_ips.clear();
@@ -268,6 +269,7 @@ unsafe fn start_ne_engine_internal(
         }
         cfg.tun.enable = true;
         cfg.tun.auto_route = false;
+        cfg.tun.dns_hijack = true;
         cfg.tun.mtu = usize::from(mtu.max(1280));
         if let Some(enable_ipv6) = enable_ipv6_override {
             cfg.tun.ipv6 = enable_ipv6;
@@ -680,5 +682,80 @@ mod tests {
 
         rc_ne_stop_engine(handle);
         assert!(!rc_ne_set_low_power_mode(handle, true));
+    }
+
+    #[test]
+    fn ne_start_engine_enforces_tun_dns_hijack_when_yaml_disables_it() {
+        let cases = [
+            (
+                "dns-hijack: false",
+                "mixed-port: 0\nexternal-controller: \"\"\nmode: rule\ntun:\n  dns-hijack: false\nrules:\n  - MATCH,DIRECT\n",
+            ),
+            (
+                "dns-hijack: []",
+                "mixed-port: 0\nexternal-controller: \"\"\nmode: rule\ntun:\n  dns-hijack: []\nrules:\n  - MATCH,DIRECT\n",
+            ),
+        ];
+
+        for (label, raw_yaml) in cases {
+            let parsed = ClashConfig::from_yaml_str(raw_yaml).expect("parse test yaml");
+            assert!(
+                !parsed.tun.dns_hijack,
+                "precondition: raw YAML ({label}) must deserialize tun.dns_hijack=false"
+            );
+
+            let yaml = CString::new(raw_yaml).unwrap();
+
+            // 1. Verify `rc_ne_start_engine` enforces `tun.dns_hijack = true`.
+            let mut err_ptr: *mut c_char = ptr::null_mut();
+            // SAFETY: `yaml` is valid NUL-terminated UTF-8 and `err_ptr` is a valid out-pointer.
+            let h1 = unsafe { rc_ne_start_engine(yaml.as_ptr(), 1500, &raw mut err_ptr) };
+            if !err_ptr.is_null() {
+                // SAFETY: allocated by `rc_ne_start_engine`.
+                unsafe { rc_ne_free_string(err_ptr) };
+            }
+            assert!(
+                !h1.is_null(),
+                "rc_ne_start_engine should start cleanly for {label}"
+            );
+            {
+                let ctx = lookup_context(h1).expect("v1 handle active");
+                assert!(
+                    ctx.engine.config_snapshot().tun.dns_hijack,
+                    "rc_ne_start_engine must enforce cfg.tun.dns_hijack=true ({label})"
+                );
+                assert!(
+                    ctx.engine.router().tun_dns_hijack(),
+                    "rc_ne_start_engine must enforce router.tun_dns_hijack()=true ({label})"
+                );
+            }
+            rc_ne_stop_engine(h1);
+
+            // 2. Verify `rc_ne_start_engine_v2` enforces `tun.dns_hijack = true`.
+            let mut err_ptr_v2: *mut c_char = ptr::null_mut();
+            // SAFETY: `yaml` is valid NUL-terminated UTF-8 and `err_ptr_v2` is a valid out-pointer.
+            let h2 =
+                unsafe { rc_ne_start_engine_v2(yaml.as_ptr(), 1500, true, &raw mut err_ptr_v2) };
+            if !err_ptr_v2.is_null() {
+                // SAFETY: allocated by `rc_ne_start_engine_v2`.
+                unsafe { rc_ne_free_string(err_ptr_v2) };
+            }
+            assert!(
+                !h2.is_null(),
+                "rc_ne_start_engine_v2 should start cleanly for {label}"
+            );
+            {
+                let ctx = lookup_context(h2).expect("v2 handle active");
+                assert!(
+                    ctx.engine.config_snapshot().tun.dns_hijack,
+                    "rc_ne_start_engine_v2 must enforce cfg.tun.dns_hijack=true ({label})"
+                );
+                assert!(
+                    ctx.engine.router().tun_dns_hijack(),
+                    "rc_ne_start_engine_v2 must enforce router.tun_dns_hijack()=true ({label})"
+                );
+            }
+            rc_ne_stop_engine(h2);
+        }
     }
 }

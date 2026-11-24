@@ -43,6 +43,7 @@ const RELAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 const RELAUNCH_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const IPC_SOCKET_TIMEOUT: Duration = Duration::from_millis(600);
 const IPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+const API_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -322,7 +323,9 @@ impl DesktopWakeupServer {
     }
 
     pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
+        if self.stop_flag.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let _ = fs::remove_file(&self.ipc_path);
         if let Some(worker) = self.worker.take() {
             let _ = TcpStream::connect_timeout(&self.local_addr, Duration::from_millis(50));
@@ -545,6 +548,23 @@ pub fn write_startup_crash_log(state_dir: &Path, message: &str) -> PathBuf {
     log_path
 }
 
+struct ShutdownDoneGuard {
+    watch_tx: watch::Sender<bool>,
+    sync_done: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Drop for ShutdownDoneGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.sync_done;
+        {
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+            cvar.notify_all();
+        }
+        let _ = self.watch_tx.send_replace(true);
+    }
+}
+
 #[derive(Clone)]
 pub struct DesktopAppState {
     pub engine: Arc<ProxyEngine>,
@@ -553,8 +573,11 @@ pub struct DesktopAppState {
     prefs: Arc<RwLock<DesktopPrefs>>,
     instance_guard: Arc<Mutex<Option<SingleInstanceGuard>>>,
     wakeup_server: Arc<Mutex<Option<DesktopWakeupServer>>>,
-    ipc_path: Option<PathBuf>,
     relaunch_in_progress: Arc<AtomicBool>,
+    shutdown_started: Arc<AtomicBool>,
+    shutdown_done: watch::Sender<bool>,
+    shutdown_done_sync: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    api_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _shutdown_tx: watch::Sender<bool>,
 }
 
@@ -674,7 +697,6 @@ impl DesktopAppState {
         let prefs = DesktopPrefs::load_from(&state_dir);
 
         let wakeup_srv = DesktopWakeupServer::bind_in_state_dir(&state_dir).ok();
-        let ipc_path = wakeup_srv.as_ref().map(|s| s.ipc_path().to_path_buf());
 
         let mut startup_warnings: Vec<String> = Vec::new();
         let profile_mgr = match ProfileManager::open_or_init(&state_dir) {
@@ -799,8 +821,11 @@ impl DesktopAppState {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_done, _) = watch::channel(false);
+        let shutdown_done_sync =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let preferred_ctrl = engine.config_snapshot().external_controller;
-        let (api_addr, _task) =
+        let (api_addr, api_task) =
             match spawn_api_server(&preferred_ctrl, Arc::clone(&engine), shutdown_rx.clone()).await
             {
                 Ok(bound) => bound,
@@ -817,8 +842,11 @@ impl DesktopAppState {
             prefs: Arc::new(RwLock::new(prefs)),
             instance_guard: Arc::new(Mutex::new(Some(instance_guard))),
             wakeup_server: Arc::new(Mutex::new(wakeup_srv)),
-            ipc_path,
             relaunch_in_progress: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
+            shutdown_done,
+            shutdown_done_sync,
+            api_task: Arc::new(Mutex::new(Some(api_task))),
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -849,7 +877,6 @@ impl DesktopAppState {
         } else {
             None
         };
-        let ipc_path = wakeup_srv.as_ref().map(|s| s.ipc_path().to_path_buf());
 
         let engine =
             match ProxyEngine::start_demo(Some(7890), Some("127.0.0.1:9090".into()), None).await {
@@ -897,7 +924,10 @@ impl DesktopAppState {
             }
         }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (api_addr, _task) = match spawn_api_server(
+        let (shutdown_done, _) = watch::channel(false);
+        let shutdown_done_sync =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (api_addr, api_task) = match spawn_api_server(
             "127.0.0.1:9090",
             Arc::clone(&engine),
             shutdown_rx.clone(),
@@ -917,8 +947,11 @@ impl DesktopAppState {
             prefs: Arc::new(RwLock::new(prefs)),
             instance_guard: Arc::new(Mutex::new(instance_guard)),
             wakeup_server: Arc::new(Mutex::new(wakeup_srv)),
-            ipc_path,
             relaunch_in_progress: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
+            shutdown_done,
+            shutdown_done_sync,
+            api_task: Arc::new(Mutex::new(Some(api_task))),
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -976,24 +1009,141 @@ impl DesktopAppState {
         }
     }
 
-    /// Idempotently shuts down the wakeup IPC listener, embedded control API server, `ProxyEngine`,
-    /// OS TUN routes, OS System Proxy, and deterministically releases `SingleInstanceGuard` + `.ipc`
-    /// BEFORE any `app_handle.exit(0)` (`std::process::exit`) call.
-    pub fn shutdown(&self) {
-        if let Some(ipc_path) = &self.ipc_path {
-            let _ = fs::remove_file(ipc_path);
+    fn disable_sysproxy_if_enabled(&self) {
+        if query_sysproxy_status(&self.state_dir).enabled {
+            let _ = disable_system_proxy(&self.state_dir);
         }
-        if let Some(mut srv) = self.wakeup_server.lock().take() {
+        let engine_state_dir = self.engine.state_dir();
+        if engine_state_dir != self.state_dir && query_sysproxy_status(&engine_state_dir).enabled {
+            let _ = disable_system_proxy(&engine_state_dir);
+        }
+    }
+
+    fn shutdown_done_guard(&self) -> ShutdownDoneGuard {
+        ShutdownDoneGuard {
+            watch_tx: self.shutdown_done.clone(),
+            sync_done: Arc::clone(&self.shutdown_done_sync),
+        }
+    }
+
+    fn wait_for_shutdown_done_sync(&self, timeout: Duration) {
+        let (lock, cvar) = &*self.shutdown_done_sync;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard {
+            return;
+        }
+        let _ = cvar.wait_timeout_while(guard, timeout, |done| !*done);
+    }
+
+    /// Idempotently and asynchronously shuts down the wakeup IPC listener, embedded control API
+    /// server, OS System Proxy, and `ProxyEngine` (awaiting complete closure of `tun`, `dns`, and
+    /// `mixed` sockets), releasing `SingleInstanceGuard` **LAST** so a relaunched elevated instance
+    /// never hits `AddrInUse` or loses its newly created `.ipc` file.
+    ///
+    /// Concurrent callers wait for the active shutdown to complete before returning so exit paths
+    /// that immediately invoke `app.exit(0)` (e.g. `SIGTERM` or elevated relaunch) never terminate
+    /// the process mid-teardown.
+    pub async fn shutdown_async(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            let mut rx = self.shutdown_done.subscribe();
+            let _ = tokio::time::timeout(
+                API_SHUTDOWN_TIMEOUT + Duration::from_secs(6),
+                rx.wait_for(|&done| done),
+            )
+            .await;
+            return;
+        }
+        let _done_guard = self.shutdown_done_guard();
+        let wakeup_srv = self.wakeup_server.lock().take();
+        if let Some(mut srv) = wakeup_srv {
             srv.stop();
         }
         let _ = self._shutdown_tx.send(true);
-        let state_dir = self.engine.state_dir();
-        if query_sysproxy_status(&state_dir).enabled {
-            let _ = disable_system_proxy(&state_dir);
+        let api_task = self.api_task.lock().take();
+        if let Some(mut handle) = api_task
+            && tokio::time::timeout(API_SHUTDOWN_TIMEOUT, &mut handle)
+                .await
+                .is_err()
+        {
+            handle.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
         }
-        self.engine.shutdown();
-        let _ = self.instance_guard.lock().take();
+        self.disable_sysproxy_if_enabled();
+        self.engine.shutdown_async().await;
+        let guard = self.instance_guard.lock().take();
+        drop(guard);
+        drop(_done_guard);
     }
+
+    /// Idempotently shuts down the wakeup IPC listener, embedded control API server, `ProxyEngine`,
+    /// OS TUN routes, OS System Proxy, and deterministically releases `SingleInstanceGuard` + `.ipc`
+    /// BEFORE any `app_handle.exit(0)` (`std::process::exit`) call.
+    ///
+    /// Safe to invoke from synchronous callbacks (`RunEvent::Exit`, `WindowEvent::CloseRequested`,
+    /// tray `quit`) both inside and outside a Tokio runtime: if another caller is actively running
+    /// `shutdown_async()` or `shutdown()`, this waits for teardown completion before returning on
+    /// non-Tokio OS threads and `MultiThread` Tokio runtimes (skipping the blocking wait only on
+    /// `CurrentThread` runtimes to prevent single-thread deadlock); repeated calls after completion
+    /// return immediately as strict no-ops.
+    pub fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            let wait_timeout = API_SHUTDOWN_TIMEOUT + Duration::from_secs(6);
+            match tokio::runtime::Handle::try_current() {
+                Err(_) => self.wait_for_shutdown_done_sync(wait_timeout),
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    tokio::task::block_in_place(|| self.wait_for_shutdown_done_sync(wait_timeout));
+                }
+                Ok(_) => {}
+            }
+            return;
+        }
+        let _done_guard = self.shutdown_done_guard();
+        let wakeup_srv = self.wakeup_server.lock().take();
+        if let Some(mut srv) = wakeup_srv {
+            srv.stop();
+        }
+        let _ = self._shutdown_tx.send(true);
+        if let Some(handle) = self.api_task.lock().take() {
+            handle.abort();
+        }
+        self.disable_sysproxy_if_enabled();
+        self.engine.shutdown();
+        let guard = self.instance_guard.lock().take();
+        drop(guard);
+        drop(_done_guard);
+    }
+}
+
+/// Validates `url` against SSRF rules (whitelisting only the active Demo Sandbox benchmark origin
+/// when Demo mode is enabled) and probes latency for outbound `name`.
+pub async fn probe_proxy_delay_for_engine(
+    engine: &ProxyEngine,
+    name: &str,
+    url: Option<&str>,
+) -> Result<u64, String> {
+    let demo = engine.demo_info();
+    let default_url = if demo.enabled && !demo.http_benchmark_origin.trim().is_empty() {
+        format!(
+            "{}/generate_204",
+            demo.http_benchmark_origin.trim().trim_end_matches('/')
+        )
+    } else {
+        "http://www.gstatic.com/generate_204".to_string()
+    };
+    let target_url = url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_url.as_str());
+    let allowed = proxy_core::api::demo_allowed_private_addrs(engine);
+    proxy_core::probe::validate_probe_url(target_url, false, &allowed)
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    engine
+        .router()
+        .test_delay_with_policy(name, target_url, Duration::from_secs(5), false, &allowed)
+        .await
+        .map_err(|e| redact_sensitive_text(&e.to_string()))
 }
 
 /// Result returned to the desktop UI when requesting an automatic UAC elevated relaunch for TUN.
@@ -1516,7 +1666,7 @@ pub fn run_desktop_app_with_options(
         println!("  Mixed Inbound : {}", status.mixed_listen);
         println!("  Web Console   : {}", status.api_base_url);
         rt.block_on(wait_for_shutdown_signal());
-        state.shutdown();
+        rt.block_on(state.shutdown_async());
         Ok(())
     }
 }
@@ -1635,7 +1785,7 @@ pub async fn run_elevated_tun_helper(config_path: &std::path::Path) -> anyhow::R
     }
     let ctrl_listen = engine.config_snapshot().external_controller;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (api_addr, _api_task) =
+    let (api_addr, mut api_task) =
         match spawn_api_server(&ctrl_listen, Arc::clone(&engine), shutdown_rx.clone()).await {
             Ok(bound) => bound,
             Err(_) => spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx).await?,
@@ -1654,11 +1804,17 @@ pub async fn run_elevated_tun_helper(config_path: &std::path::Path) -> anyhow::R
     wait_for_shutdown_signal().await;
     tracing::info!("Shutting down RustClash elevated TUN helper...");
     let _ = shutdown_tx.send(true);
+    if tokio::time::timeout(API_SHUTDOWN_TIMEOUT, &mut api_task)
+        .await
+        .is_err()
+    {
+        api_task.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(500), api_task).await;
+    }
     if query_sysproxy_status(&state_dir).enabled {
         let _ = disable_system_proxy(&state_dir);
     }
-    engine.shutdown();
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    engine.shutdown_async().await;
     drop(instance_guard);
     Ok(())
 }
@@ -1729,13 +1885,7 @@ mod desktop_ipc {
         name: String,
         url: Option<String>,
     ) -> Result<u64, String> {
-        let target_url = url.unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string());
-        state
-            .engine
-            .router()
-            .test_delay(&name, &target_url, Duration::from_secs(5))
-            .await
-            .map_err(|e| redact_sensitive_text(&e.to_string()))
+        crate::probe_proxy_delay_for_engine(&state.engine, &name, url.as_deref()).await
     }
 
     #[tauri::command]
@@ -1800,7 +1950,7 @@ mod desktop_ipc {
             let exit_app = app.clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(120)).await;
-                exit_state.shutdown();
+                exit_state.shutdown_async().await;
                 exit_app.exit(0);
             });
         }
@@ -1929,7 +2079,7 @@ mod desktop_ipc {
                                     Ok((outcome, should_exit)) => {
                                         if should_exit {
                                             tokio::time::sleep(Duration::from_millis(120)).await;
-                                            tray_state.shutdown();
+                                            tray_state.shutdown_async().await;
                                             handle_clone.exit(0);
                                             return;
                                         } else if outcome.status == "cancelled"
@@ -2020,7 +2170,7 @@ mod desktop_ipc {
                                     tracing::info!(
                                         "Received SIGTERM in Desktop GUI; tearing down TUN, DNS, and OS System Proxy before exit"
                                     );
-                                    sigterm_state.shutdown();
+                                    sigterm_state.shutdown_async().await;
                                     sigterm_handle.exit(0);
                                 }
                             }
@@ -2585,5 +2735,662 @@ mod tests {
         assert!(!is_linux_pkexec_cancelled(Some(127)));
         assert!(!is_linux_pkexec_cancelled(Some(0)));
         assert!(!is_linux_pkexec_cancelled(None));
+    }
+
+    fn assert_send_sync_clone_static<T: Send + Sync + Clone + 'static>() {}
+
+    fn assert_future_send<F: std::future::Future + Send>(f: F) -> F {
+        f
+    }
+
+    #[tokio::test]
+    async fn double_shutdown_does_not_delete_new_instances_ipc_file() {
+        assert_send_sync_clone_static::<DesktopAppState>();
+
+        let temp_dir = unique_temp_dir("double-shutdown-ipc");
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&temp_dir)
+            .expect("init profile manager");
+        fs::write(
+            mgr.active_profile_path(),
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("write profile");
+        drop(mgr);
+
+        let state = DesktopAppState::bootstrap_in_state_dir(temp_dir.clone())
+            .await
+            .expect("bootstrap desktop state");
+        let ipc_path = temp_dir.join(DESKTOP_IPC_FILENAME);
+        assert!(ipc_path.exists(), "initial .ipc file must exist");
+        assert!(try_signal_running_instance(&temp_dir));
+
+        // First shutdown cleans up our own .ipc and releases SingleInstanceGuard.
+        state.shutdown();
+        assert!(
+            !ipc_path.exists(),
+            "first shutdown() must remove the old instance's .ipc file"
+        );
+        assert!(
+            !temp_dir.join("rust-clash.instance.lock").exists(),
+            "first shutdown() must release SingleInstanceGuard"
+        );
+
+        // Simulate a newly launched elevated replacement instance acquiring the lock and
+        // binding its own wakeup IPC server before the old process's RunEvent::Exit fires.
+        let new_guard =
+            SingleInstanceGuard::acquire(&temp_dir).expect("new instance acquires lock");
+        let mut new_wakeup =
+            DesktopWakeupServer::bind_in_state_dir(&temp_dir).expect("new instance binds .ipc");
+        let new_ipc_contents = fs::read_to_string(&ipc_path).expect("read new .ipc contents");
+
+        // Second sync shutdown (e.g., RunEvent::Exit) and a subsequent shutdown_async()
+        // MUST be strict no-ops, return immediately without hanging, and MUST NOT delete or
+        // alter the new instance's .ipc file.
+        state.shutdown();
+        let post_shutdown_start = std::time::Instant::now();
+        assert_future_send(state.shutdown_async()).await;
+        assert!(
+            post_shutdown_start.elapsed() < std::time::Duration::from_secs(1),
+            "repeat shutdown_async() after completed shutdown() must return immediately"
+        );
+
+        assert!(
+            ipc_path.exists(),
+            "second shutdown() must NOT delete a new instance's .ipc file"
+        );
+        assert_eq!(
+            fs::read_to_string(&ipc_path).expect("read preserved .ipc"),
+            new_ipc_contents,
+            "new instance's .ipc payload must remain untouched"
+        );
+        assert!(
+            try_signal_running_instance(&temp_dir),
+            "new instance's wakeup IPC server must remain reachable"
+        );
+        assert_eq!(new_wakeup.wakeup_count(), 1);
+
+        new_wakeup.stop();
+        drop(new_guard);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_async_releases_mixed_and_api_ports_before_dropping_instance_guard() {
+        use super::acquire_instance_for_relaunch;
+        use std::{net::TcpListener, time::Duration};
+
+        let temp_dir = unique_temp_dir("shutdown-async-ports");
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&temp_dir)
+            .expect("init profile manager");
+        fs::write(
+            mgr.active_profile_path(),
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("write profile");
+        drop(mgr);
+
+        let state = DesktopAppState::bootstrap_in_state_dir(temp_dir.clone())
+            .await
+            .expect("bootstrap desktop state");
+        let mixed_addr = state.engine.mixed_addr();
+        let api_addr = state.api_addr;
+
+        // Verify both ports and SingleInstanceGuard are actively held prior to shutdown_async().
+        assert!(
+            TcpListener::bind(mixed_addr).is_err(),
+            "mixed_addr {mixed_addr} must be bound before shutdown_async"
+        );
+        assert!(
+            TcpListener::bind(api_addr).is_err(),
+            "api_addr {api_addr} must be bound before shutdown_async"
+        );
+        assert!(
+            SingleInstanceGuard::acquire(&temp_dir).is_err(),
+            "SingleInstanceGuard must be held before shutdown_async"
+        );
+
+        // Spawn a concurrent handoff waiter simulating the elevated relaunch process:
+        // the instant `SingleInstanceGuard` becomes acquirable, BOTH `mixed_addr` and `api_addr`
+        // must ALREADY be closed and immediately re-bindable with zero sleep!
+        let handoff_dir = temp_dir.clone();
+        let handoff_thread = std::thread::spawn(move || {
+            let new_guard = acquire_instance_for_relaunch(&handoff_dir, Duration::from_secs(5))
+                .expect("handoff process must acquire SingleInstanceGuard after shutdown_async");
+            let rebound_mixed = TcpListener::bind(mixed_addr).unwrap_or_else(|err| {
+                panic!(
+                    "mixed port {mixed_addr} was still busy when SingleInstanceGuard dropped: {err}"
+                )
+            });
+            let rebound_api = TcpListener::bind(api_addr).unwrap_or_else(|err| {
+                panic!("api port {api_addr} was still busy when SingleInstanceGuard dropped: {err}")
+            });
+            drop(rebound_mixed);
+            drop(rebound_api);
+            let new_wakeup = DesktopWakeupServer::bind_in_state_dir(&handoff_dir)
+                .expect("handoff process binds fresh wakeup ipc");
+            (new_guard, new_wakeup)
+        });
+
+        assert_future_send(state.shutdown_async()).await;
+
+        let (new_guard, mut new_wakeup) = handoff_thread.join().expect("join handoff thread");
+
+        // Re-verify immediate re-binding on the exact mixed and api addresses succeeds cleanly.
+        let direct_mixed = TcpListener::bind(mixed_addr)
+            .expect("immediate TcpListener::bind on mixed_addr must succeed after shutdown_async");
+        let direct_api = TcpListener::bind(api_addr)
+            .expect("immediate TcpListener::bind on api_addr must succeed after shutdown_async");
+        drop(direct_mixed);
+        drop(direct_api);
+
+        // A second shutdown_async() (and sync shutdown()) must be a strict idempotent no-op
+        // that returns immediately and leaves the handoff instance's `.ipc` and lock intact.
+        let ipc_path = temp_dir.join(DESKTOP_IPC_FILENAME);
+        let ipc_before = fs::read_to_string(&ipc_path).expect("handoff .ipc exists");
+        let repeat_start = std::time::Instant::now();
+        state.shutdown_async().await;
+        assert!(
+            repeat_start.elapsed() < Duration::from_secs(1),
+            "repeat shutdown_async() after completed shutdown_async() must return immediately"
+        );
+        state.shutdown();
+        assert_eq!(
+            fs::read_to_string(&ipc_path).expect("handoff .ipc still exists after 2nd shutdown"),
+            ipc_before
+        );
+        assert!(try_signal_running_instance(&temp_dir));
+
+        new_wakeup.stop();
+        drop(new_guard);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_shutdown_async_waits_for_active_shutdown_completion() {
+        use std::{
+            net::TcpListener,
+            time::{Duration, Instant},
+        };
+        use tokio::io::AsyncWriteExt;
+
+        assert_send_sync_clone_static::<DesktopAppState>();
+
+        let temp_dir = unique_temp_dir("concurrent-shutdown-async");
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&temp_dir)
+            .expect("init profile manager");
+        fs::write(
+            mgr.active_profile_path(),
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("write profile");
+        drop(mgr);
+
+        let state = DesktopAppState::bootstrap_in_state_dir(temp_dir.clone())
+            .await
+            .expect("bootstrap desktop state");
+        let mixed_addr = state.engine.mixed_addr();
+        let api_addr = state.api_addr;
+        let secret = state
+            .status()
+            .api_secret
+            .clone()
+            .expect("bootstrap populates api secret");
+
+        // Hold an incomplete `PUT /configs` request open on `api_addr` so Caller #1's graceful
+        // API server shutdown must wait up to `API_SHUTDOWN_TIMEOUT` before aborting and tearing
+        // down `engine` + `SingleInstanceGuard`.
+        let mut slow_client = tokio::net::TcpStream::connect(api_addr)
+            .await
+            .expect("connect to control api");
+        let partial_req = format!(
+            "PUT /configs HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n{{\"payload\":"
+        );
+        slow_client
+            .write_all(partial_req.as_bytes())
+            .await
+            .expect("send incomplete PUT /configs");
+        slow_client.flush().await.expect("flush partial request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state1 = state.clone();
+        let caller1 = tokio::spawn(async move {
+            let started = Instant::now();
+            assert_future_send(state1.shutdown_async()).await;
+            started.elapsed()
+        });
+
+        // Wait 150ms so Caller #1 is actively blocked inside `api_task` graceful shutdown.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            SingleInstanceGuard::acquire(&temp_dir).is_err(),
+            "SingleInstanceGuard must still be held while Caller #1 is mid-teardown"
+        );
+
+        let state2 = state.clone();
+        let caller2_start = Instant::now();
+        assert_future_send(state2.shutdown_async()).await;
+        let caller2_elapsed = caller2_start.elapsed();
+
+        assert!(
+            caller2_elapsed >= Duration::from_secs(2),
+            "Caller #2 returned prematurely in {caller2_elapsed:?} before Caller #1 finished shutdown"
+        );
+
+        // The instant Caller #2 returns, teardown MUST already be complete: SingleInstanceGuard
+        // is released, `.ipc` is removed, and both `mixed_addr` and `api_addr` bind immediately
+        // with zero AddrInUse.
+        let rebound_guard = SingleInstanceGuard::acquire(&temp_dir)
+            .expect("SingleInstanceGuard must already be released when Caller #2 returns");
+        assert!(
+            !temp_dir.join(DESKTOP_IPC_FILENAME).exists(),
+            "desktop .ipc must already be removed when Caller #2 returns"
+        );
+        let rebound_mixed = TcpListener::bind(mixed_addr).unwrap_or_else(|err| {
+            panic!("mixed_addr {mixed_addr} was still bound when Caller #2 returned: {err}")
+        });
+        let rebound_api = TcpListener::bind(api_addr).unwrap_or_else(|err| {
+            panic!("api_addr {api_addr} was still bound when Caller #2 returned: {err}")
+        });
+        drop(rebound_mixed);
+        drop(rebound_api);
+        drop(rebound_guard);
+
+        let caller1_elapsed = caller1.await.expect("join Caller #1");
+        assert!(
+            caller1_elapsed >= super::API_SHUTDOWN_TIMEOUT - Duration::from_millis(100),
+            "expected Caller #1 to wait for API_SHUTDOWN_TIMEOUT, elapsed={caller1_elapsed:?}"
+        );
+
+        // A third shutdown_async() after teardown has completed must return immediately.
+        let repeat_start = Instant::now();
+        assert_future_send(state.shutdown_async()).await;
+        assert!(
+            repeat_start.elapsed() < Duration::from_secs(1),
+            "post-completion shutdown_async() must return immediately"
+        );
+
+        drop(slow_client);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_waits_for_active_shutdown_async_completion() {
+        use std::{
+            net::TcpListener,
+            time::{Duration, Instant},
+        };
+        use tokio::io::AsyncWriteExt;
+
+        assert_send_sync_clone_static::<DesktopAppState>();
+
+        let temp_dir = unique_temp_dir("sync-waits-for-async-shutdown");
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&temp_dir)
+            .expect("init profile manager");
+        fs::write(
+            mgr.active_profile_path(),
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("write profile");
+        drop(mgr);
+
+        let state = DesktopAppState::bootstrap_in_state_dir(temp_dir.clone())
+            .await
+            .expect("bootstrap desktop state");
+        let mixed_addr = state.engine.mixed_addr();
+        let api_addr = state.api_addr;
+        let secret = state
+            .status()
+            .api_secret
+            .clone()
+            .expect("bootstrap populates api secret");
+
+        // Hold an incomplete `PUT /configs` request open on `api_addr` so Task #1's graceful
+        // API server shutdown waits for `API_SHUTDOWN_TIMEOUT` before aborting and tearing down
+        // `engine` + `SingleInstanceGuard`.
+        let mut slow_client = tokio::net::TcpStream::connect(api_addr)
+            .await
+            .expect("connect to control api");
+        let partial_req = format!(
+            "PUT /configs HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n{{\"payload\":"
+        );
+        slow_client
+            .write_all(partial_req.as_bytes())
+            .await
+            .expect("send incomplete PUT /configs");
+        slow_client.flush().await.expect("flush partial request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state1 = state.clone();
+        let caller1 = tokio::spawn(async move {
+            let started = Instant::now();
+            assert_future_send(state1.shutdown_async()).await;
+            started.elapsed()
+        });
+
+        // Wait 150ms so Task #1 is actively blocked inside `api_task` graceful shutdown.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            SingleInstanceGuard::acquire(&temp_dir).is_err(),
+            "SingleInstanceGuard must still be held while Task #1 is mid-teardown"
+        );
+
+        // Spawn a non-Tokio OS thread (matching Tauri's main GUI thread for tray `"quit"` /
+        // `CloseRequested`) calling synchronous `state.shutdown()`. The INSTANT it returns,
+        // teardown MUST already be complete.
+        let os_state = state.clone();
+        let os_dir = temp_dir.clone();
+        let os_thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            os_state.shutdown();
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed >= Duration::from_secs(2),
+                "OS thread sync shutdown() returned prematurely in {elapsed:?} before shutdown_async() finished"
+            );
+            let rebound_guard = SingleInstanceGuard::acquire(&os_dir).expect(
+                "SingleInstanceGuard must already be released the instant sync shutdown() returns",
+            );
+            assert!(
+                !os_dir.join(DESKTOP_IPC_FILENAME).exists(),
+                "desktop .ipc must already be removed the instant sync shutdown() returns"
+            );
+            let rebound_mixed = TcpListener::bind(mixed_addr).unwrap_or_else(|err| {
+                panic!(
+                    "mixed_addr {mixed_addr} was still bound the instant sync shutdown() returned: {err}"
+                )
+            });
+            let rebound_api = TcpListener::bind(api_addr).unwrap_or_else(|err| {
+                panic!(
+                    "api_addr {api_addr} was still bound the instant sync shutdown() returned: {err}"
+                )
+            });
+            drop(rebound_mixed);
+            drop(rebound_api);
+            drop(rebound_guard);
+            elapsed
+        });
+
+        // Also verify a MultiThread Tokio worker calling sync `shutdown()` blocks via
+        // `block_in_place` until teardown finishes without starving Task #1.
+        let mt_state = state.clone();
+        let mt_caller = tokio::spawn(async move {
+            let started = Instant::now();
+            mt_state.shutdown();
+            started.elapsed()
+        });
+
+        let os_elapsed = tokio::task::spawn_blocking(move || os_thread.join())
+            .await
+            .expect("join spawn_blocking")
+            .expect("OS thread sync shutdown panicked");
+        assert!(
+            os_elapsed >= Duration::from_secs(2),
+            "OS thread sync shutdown() elapsed too short: {os_elapsed:?}"
+        );
+
+        let mt_elapsed = mt_caller.await.expect("join MultiThread sync caller");
+        assert!(
+            mt_elapsed >= Duration::from_secs(2),
+            "MultiThread Tokio sync shutdown() returned prematurely in {mt_elapsed:?}"
+        );
+
+        let caller1_elapsed = caller1.await.expect("join Task #1");
+        assert!(
+            caller1_elapsed >= super::API_SHUTDOWN_TIMEOUT - Duration::from_millis(100),
+            "expected Task #1 to wait for API_SHUTDOWN_TIMEOUT, elapsed={caller1_elapsed:?}"
+        );
+
+        // Post-completion sync `shutdown()` on both a non-Tokio OS thread AND inside Tokio MUST
+        // observe `done == true` and complete in `< 50ms`.
+        let post_os_state = state.clone();
+        let post_os_elapsed = tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                post_os_state.shutdown();
+                started.elapsed()
+            })
+            .join()
+            .expect("post-completion OS thread panicked")
+        })
+        .await
+        .expect("join post-completion OS check");
+        assert!(
+            post_os_elapsed < Duration::from_millis(50),
+            "post-completion OS thread shutdown() took {post_os_elapsed:?} (expected < 50ms)"
+        );
+
+        let post_tokio_state = state.clone();
+        let post_tokio_worker_elapsed = tokio::spawn(async move {
+            let started = Instant::now();
+            post_tokio_state.shutdown();
+            started.elapsed()
+        })
+        .await
+        .expect("join post-completion Tokio worker check");
+        assert!(
+            post_tokio_worker_elapsed < Duration::from_millis(50),
+            "post-completion Tokio worker shutdown() took {post_tokio_worker_elapsed:?} (expected < 50ms)"
+        );
+
+        let post_direct_start = Instant::now();
+        state.shutdown();
+        let post_direct_elapsed = post_direct_start.elapsed();
+        assert!(
+            post_direct_elapsed < Duration::from_millis(50),
+            "post-completion Tokio direct shutdown() took {post_direct_elapsed:?} (expected < 50ms)"
+        );
+
+        drop(slow_client);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_shutdown_on_current_thread_runtime_returns_immediately_without_deadlock() {
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = unique_temp_dir("current-thread-sync-shutdown");
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&temp_dir)
+            .expect("init profile manager");
+        fs::write(
+            mgr.active_profile_path(),
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("write profile");
+        drop(mgr);
+
+        let state = DesktopAppState::bootstrap_in_state_dir(temp_dir.clone())
+            .await
+            .expect("bootstrap desktop state");
+        let api_addr = state.api_addr;
+        let secret = state
+            .status()
+            .api_secret
+            .clone()
+            .expect("bootstrap populates api secret");
+
+        // Keep `api_task` open so `shutdown_async()` stays in-progress while we invoke sync
+        // `shutdown()` on the same `CurrentThread` runtime.
+        let mut slow_client = tokio::net::TcpStream::connect(api_addr)
+            .await
+            .expect("connect to control api");
+        let partial_req = format!(
+            "PUT /configs HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: 1024\r\n\r\n{{\"payload\":"
+        );
+        slow_client
+            .write_all(partial_req.as_bytes())
+            .await
+            .expect("send incomplete PUT /configs");
+        slow_client.flush().await.expect("flush partial request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state1 = state.clone();
+        let caller1 = tokio::spawn(async move {
+            assert_future_send(state1.shutdown_async()).await;
+        });
+
+        // Yield so `caller1` sets `shutdown_started = true` and suspends waiting on `api_task`.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            SingleInstanceGuard::acquire(&temp_dir).is_err(),
+            "SingleInstanceGuard must still be held while CurrentThread shutdown_async() is active"
+        );
+
+        // Calling synchronous `state.shutdown()` on a `CurrentThread` runtime while
+        // `shutdown_started` is already `true` MUST return immediately without blocking or
+        // panicking so `caller1` on the single worker thread is never deadlocked.
+        let started = Instant::now();
+        state.shutdown();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "CurrentThread sync shutdown() blocked for {elapsed:?} (must return immediately without deadlock)"
+        );
+
+        // `caller1` must still complete cleanly once we yield back to the CurrentThread executor.
+        caller1.await.expect("join CurrentThread shutdown_async");
+
+        let reacquired = SingleInstanceGuard::acquire(&temp_dir).expect(
+            "SingleInstanceGuard must be released after CurrentThread shutdown_async finishes",
+        );
+        assert!(!temp_dir.join(DESKTOP_IPC_FILENAME).exists());
+        drop(reacquired);
+
+        // Subsequent post-completion sync `shutdown()` on both CurrentThread and an OS thread
+        // returns immediately.
+        let post_ct_start = Instant::now();
+        state.shutdown();
+        assert!(
+            post_ct_start.elapsed() < Duration::from_millis(50),
+            "post-completion CurrentThread shutdown() must return immediately"
+        );
+
+        let post_os_state = state.clone();
+        let post_os_elapsed = std::thread::spawn(move || {
+            let started = Instant::now();
+            post_os_state.shutdown();
+            started.elapsed()
+        })
+        .join()
+        .expect("join post-completion OS thread");
+        assert!(
+            post_os_elapsed < Duration::from_millis(50),
+            "post-completion OS thread shutdown() took {post_os_elapsed:?} (expected < 50ms)"
+        );
+
+        drop(slow_client);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn probe_proxy_delay_for_engine_blocks_ssrf_and_invalid_urls() {
+        use super::probe_proxy_delay_for_engine;
+
+        let temp_dir = unique_temp_dir("probe-delay-ssrf");
+        let cfg = ClashConfig::from_yaml_str(
+            "mixed-port: 0\nexternal-controller: 127.0.0.1:0\ndns:\n  enable: true\n  listen: 127.0.0.1:0\ntun:\n  enable: false\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .expect("parse minimal config");
+        let engine = proxy_core::engine::ProxyEngine::start_with_state_dir(cfg, temp_dir.clone())
+            .await
+            .expect("start non-demo engine");
+
+        let blocked_urls = [
+            "http://127.0.0.1:80/",
+            "http://localhost:80/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/",
+            "http://[fd00:ec2::254]/",
+            "http://[::127.0.0.1]/",
+            "http://[::ffff:0:127.0.0.1]/",
+            "http://0.1.2.3/",
+            "ftp://example.com/",
+            "http://user:pass@example.com/",
+        ];
+        for url in blocked_urls {
+            let err = match assert_future_send(probe_proxy_delay_for_engine(
+                &engine,
+                "DIRECT",
+                Some(url),
+            ))
+            .await
+            {
+                Ok(ms) => panic!("probe_proxy_delay_for_engine must reject {url}, got Ok({ms}ms)"),
+                Err(err) => err,
+            };
+            let low = err.to_ascii_lowercase();
+            assert!(
+                low.contains("ssrf")
+                    || low.contains("restricted")
+                    || low.contains("blocked")
+                    || low.contains("scheme")
+                    || low.contains("userinfo"),
+                "expected SSRF/validation error for {url}, got: {err}"
+            );
+            if url.contains("user:pass") {
+                assert!(
+                    !err.contains("user:pass"),
+                    "error message must not echo URL credentials: {err}"
+                );
+            }
+        }
+
+        // Verify Demo Sandbox mode still allows its own whitelisted benchmark origin by default,
+        // while still blocking arbitrary loopback/metadata targets and its own local DNS listener!
+        engine
+            .set_demo_sandbox(true)
+            .await
+            .expect("enable hermetic demo sandbox");
+
+        let default_delay = probe_proxy_delay_for_engine(&engine, "DIRECT", None)
+            .await
+            .expect("demo default delay probe must succeed against whitelisted benchmark origin");
+        assert!(
+            default_delay < 5_000,
+            "unexpected demo delay: {default_delay}ms"
+        );
+
+        let blank_delay = probe_proxy_delay_for_engine(&engine, "DIRECT", Some("   "))
+            .await
+            .expect("empty/whitespace URL must fall back to demo default URL");
+        assert!(
+            blank_delay < 5_000,
+            "unexpected demo delay: {blank_delay}ms"
+        );
+
+        assert!(
+            probe_proxy_delay_for_engine(&engine, "DIRECT", Some("http://127.0.0.1:80/"))
+                .await
+                .is_err(),
+            "non-whitelisted localhost port must still be rejected in Demo mode"
+        );
+        assert!(
+            probe_proxy_delay_for_engine(
+                &engine,
+                "DIRECT",
+                Some("http://169.254.169.254/latest/meta-data/"),
+            )
+            .await
+            .is_err(),
+            "IMDS metadata IP must still be rejected in Demo mode"
+        );
+        let dns_addr = engine
+            .dns_addr()
+            .expect("demo engine must expose an active local DNS listener");
+        let dns_url = format!("http://127.0.0.1:{}/", dns_addr.port());
+        let dns_err = probe_proxy_delay_for_engine(&engine, "DIRECT", Some(&dns_url))
+            .await
+            .expect_err("Demo mode must NOT whitelist engine.dns_addr() for HTTP delay probing");
+        let dns_low = dns_err.to_ascii_lowercase();
+        assert!(
+            dns_low.contains("ssrf")
+                || dns_low.contains("restricted")
+                || dns_low.contains("blocked"),
+            "expected SSRF rejection for Demo DNS listener {dns_url}, got: {dns_err}"
+        );
+
+        engine.shutdown_async().await;
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

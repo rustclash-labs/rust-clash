@@ -7,7 +7,6 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.PowerManager
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
@@ -342,44 +341,76 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private suspend fun pollLiveStatusAndDiagnostics(includeDiagnostics: Boolean) {
-        val state = RustClashVpnService.stateTracker.state
-        val err = RustClashVpnService.stateTracker.lastError
-        val warn = RustClashVpnService.lockdownWarning
+    companion object {
+        internal fun resolveEffectivePolledStatusJson(
+            postIoState: VpnLifecycleState,
+            capturedToken: Long,
+            postIoToken: Long,
+            polledRawJson: String?,
+        ): String {
+            if (postIoState != VpnLifecycleState.RUNNING) {
+                return "{\"running\":false}"
+            }
+            if (capturedToken == 0L || postIoToken != capturedToken || polledRawJson.isNullOrBlank()) {
+                return "{\"running\":false}"
+            }
+            return polledRawJson
+        }
+    }
 
-        val result = withContext(Dispatchers.IO) {
+    private suspend fun pollLiveStatusAndDiagnostics(includeDiagnostics: Boolean) {
+        val preIoState = RustClashVpnService.stateTracker.state
+        val sessionToken = RustClashVpnService.activeNativeSessionToken.get()
+
+        val ioResult = withContext(Dispatchers.IO) {
             if (!NativeBridge.ensureLoaded()) {
                 return@withContext null
             }
-            val statusJson = if (state == VpnLifecycleState.RUNNING) {
+            val polledRawJson = if (preIoState == VpnLifecycleState.RUNNING && sessionToken != 0L) {
                 NativeBridge.nativeGetStatusJson().also { fresh ->
-                    RustClashVpnService.publishFreshStatusSnapshot(fresh)
+                    RustClashVpnService.publishFreshStatusSnapshot(fresh, expectedToken = sessionToken)
                 }
             } else {
-                RustClashVpnService.latestStatusJson
+                null
             }
-            val parsedStatus = UiJsonParsers.parseLiveTelemetry(statusJson)
-            val parsedDiag = if (includeDiagnostics && parsedStatus.running) {
+            val preliminaryRunning = polledRawJson != null &&
+                UiJsonParsers.parseLiveTelemetry(polledRawJson).running
+            val parsedDiag = if (includeDiagnostics && preliminaryRunning) {
                 UiJsonParsers.parseDiagnosticsResponse(NativeBridge.nativeGetDiagnosticsJson(150))
-            } else if (!parsedStatus.running) {
-                _uiState.value.diagnostics.takeIf { it.isEmpty() } ?: emptyList()
             } else {
-                _uiState.value.diagnostics
+                null
             }
-            parsedStatus to parsedDiag
+            polledRawJson to parsedDiag
         }
-        if (result == null) {
+
+        val postIoState = RustClashVpnService.stateTracker.state
+        val postIoToken = RustClashVpnService.activeNativeSessionToken.get()
+        val err = RustClashVpnService.stateTracker.lastError
+        val warn = RustClashVpnService.lockdownWarning
+        if (ioResult == null) {
             _uiState.update {
                 it.copy(
                     nativeLoaded = false,
-                    vpnState = state,
+                    vpnState = postIoState,
                     lastError = err,
                     lockdownWarning = warn,
                 )
             }
             return
         }
-        val (telemetry, diagnostics) = result
+        val (polledRawJson, fetchedDiag) = ioResult
+        val effectiveStatusJson = resolveEffectivePolledStatusJson(
+            postIoState = postIoState,
+            capturedToken = sessionToken,
+            postIoToken = postIoToken,
+            polledRawJson = polledRawJson,
+        )
+        val telemetry = UiJsonParsers.parseLiveTelemetry(effectiveStatusJson)
+        val diagnostics = when {
+            !telemetry.running -> _uiState.value.diagnostics.takeIf { it.isEmpty() } ?: emptyList()
+            fetchedDiag != null -> fetchedDiag
+            else -> _uiState.value.diagnostics
+        }
 
         val prevTelemetry = _uiState.value.telemetry
         val transitioned = previousVpnRunning != telemetry.running
@@ -403,7 +434,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 emptyList()
             }
             prev.copy(
-                vpnState = state,
+                vpnState = postIoState,
                 lastError = err?.let(NodeImportSupport::redactSecretsForUi),
                 lockdownWarning = warn,
                 telemetry = telemetry,
@@ -1264,33 +1295,43 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         if (_uiState.value.vpnState != VpnLifecycleState.RUNNING) return false
         val prepared = runCatching { VpnService.prepare(appContext) == null }.getOrDefault(false)
         if (!prepared) return false
-        return runCatching {
-            val restartIntent = Intent(appContext, RustClashVpnService::class.java).apply {
-                action = RustClashVpnService.ACTION_START_VPN
-                putExtra(RustClashVpnService.EXTRA_DEMO_MODE, _uiState.value.demoMode)
-            }
-            ContextCompat.startForegroundService(appContext, restartIntent)
-            true
-        }.getOrDefault(false)
+        val restartIntent = Intent(appContext, RustClashVpnService::class.java).apply {
+            action = RustClashVpnService.ACTION_START_VPN
+            putExtra(RustClashVpnService.EXTRA_DEMO_MODE, _uiState.value.demoMode)
+        }
+        return RustClashVpnService.safeStartVpnForegroundService(appContext, restartIntent)
     }
 
     fun savePerAppPolicy(mode: PerAppMode, selectedPackages: Set<String>) {
-        prefs.edit()
-            .putString(RustClashVpnService.KEY_PER_APP_MODE, mode.name)
-            .putStringSet(RustClashVpnService.KEY_SELECTED_PACKAGES, selectedPackages)
-            .apply()
         val plan = io.github.rustclashlabs.rustclash.vpn.PerAppVpnPolicy.buildPlan(
             mode = mode,
             selectedPackages = selectedPackages,
             selfPackageName = appContext.packageName,
             isLockdownEnabled = RustClashVpnService.lockdownWarning?.contains("Lockdown") == true,
         )
+        if (plan.blockingError != null) {
+            val warningToKeep = plan.lockdownConflictWarning ?: plan.blockingError
+            RustClashVpnService.updateLockdownWarning(warningToKeep)
+            _uiState.update {
+                it.copy(
+                    lockdownWarning = warningToKeep,
+                    settingsSheetNotice = plan.blockingError,
+                )
+            }
+            emitMessage(plan.blockingError)
+            return
+        }
+        prefs.edit()
+            .putString(RustClashVpnService.KEY_PER_APP_MODE, mode.name)
+            .putStringSet(RustClashVpnService.KEY_SELECTED_PACKAGES, selectedPackages)
+            .apply()
         RustClashVpnService.updateLockdownWarning(plan.lockdownConflictWarning)
         _uiState.update {
             it.copy(
                 perAppMode = mode,
                 selectedPackages = selectedPackages,
                 lockdownWarning = plan.lockdownConflictWarning,
+                settingsSheetNotice = plan.lockdownConflictWarning,
             )
         }
         val restarted = requestLiveVpnTunnelRestartIfPermitted()

@@ -21,6 +21,9 @@ use crate::{
     },
 };
 
+/// Hard upper bound (16 MiB) for on-disk rule-provider files to prevent OOM / device reads.
+pub const MAX_RULESET_FILE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct PayloadYaml {
     #[serde(default)]
@@ -170,7 +173,7 @@ impl RuleSetMatcher {
             "ipcidr" => {
                 let mut v4_raw = Vec::new();
                 let mut v6_raw = Vec::new();
-                for raw in entries {
+                for (idx, raw) in entries.iter().enumerate() {
                     let s = raw.trim().trim_matches('\'').trim_matches('"');
                     if s.is_empty() || s.starts_with('#') || s.starts_with("//") {
                         continue;
@@ -179,9 +182,10 @@ impl RuleSetMatcher {
                     let net: IpNet = token
                         .parse::<IpNet>()
                         .or_else(|e| token.parse::<IpAddr>().map(IpNet::from).map_err(|_| e))
-                        .map_err(|e| {
+                        .map_err(|_| {
                             ProxyError::Config(format!(
-                                "rule-provider '{name}' invalid ipcidr entry '{s}': {e}"
+                                "rule-provider '{name}' invalid ipcidr entry at item #{}",
+                                idx + 1
                             ))
                         })?;
                     match net {
@@ -376,16 +380,16 @@ pub fn default_http_provider_cache_path(state_dir: &Path, name: &str, format: &s
         .join(format!("{sanitized}.{ext}"))
 }
 
-fn normalize_relative_http_provider_subpath(name: &str, raw_path: &str) -> Result<PathBuf> {
+fn normalize_relative_provider_subpath(kind: &str, name: &str, raw_path: &str) -> Result<PathBuf> {
     if raw_path.chars().any(|c| c.is_control()) {
         return Err(ProxyError::Config(format!(
-            "http rule-provider '{name}' path contains control or null bytes"
+            "{kind} rule-provider '{name}' path contains control or null bytes"
         )));
     }
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err(ProxyError::Config(format!(
-            "http rule-provider '{name}' path is whitespace-only"
+            "{kind} rule-provider '{name}' path is whitespace-only"
         )));
     }
     let p = Path::new(trimmed);
@@ -399,7 +403,7 @@ fn normalize_relative_http_provider_subpath(name: &str, raw_path: &str) -> Resul
         || raw_path.split(['/', '\\']).any(|seg| seg == "..")
     {
         return Err(ProxyError::Config(format!(
-            "http rule-provider '{name}' path '{raw_path}' must be a confined relative path"
+            "{kind} rule-provider '{name}' path '{raw_path}' must be a confined relative path"
         )));
     }
 
@@ -410,7 +414,7 @@ fn normalize_relative_http_provider_subpath(name: &str, raw_path: &str) -> Resul
             std::path::Component::Normal(seg) => {
                 let seg_str = seg.to_str().ok_or_else(|| {
                     ProxyError::Config(format!(
-                        "http rule-provider '{name}' path contains non-UTF-8 segment"
+                        "{kind} rule-provider '{name}' path contains non-UTF-8 segment"
                     ))
                 })?;
                 if seg_str.is_empty()
@@ -420,7 +424,7 @@ fn normalize_relative_http_provider_subpath(name: &str, raw_path: &str) -> Resul
                     || seg_str.chars().any(|c| c.is_control())
                 {
                     return Err(ProxyError::Config(format!(
-                        "http rule-provider '{name}' path contains invalid segment '{seg_str}'"
+                        "{kind} rule-provider '{name}' path contains invalid segment '{seg_str}'"
                     )));
                 }
                 clean.push(seg_str);
@@ -429,17 +433,21 @@ fn normalize_relative_http_provider_subpath(name: &str, raw_path: &str) -> Resul
             | std::path::Component::RootDir
             | std::path::Component::Prefix(_) => {
                 return Err(ProxyError::Config(format!(
-                    "http rule-provider '{name}' path '{raw_path}' escapes ruleset directory"
+                    "{kind} rule-provider '{name}' path '{raw_path}' escapes ruleset directory"
                 )));
             }
         }
     }
     if clean.as_os_str().is_empty() {
         return Err(ProxyError::Config(format!(
-            "http rule-provider '{name}' path '{raw_path}' has no normal path component"
+            "{kind} rule-provider '{name}' path '{raw_path}' has no normal path component"
         )));
     }
     Ok(clean)
+}
+
+fn normalize_relative_http_provider_subpath(name: &str, raw_path: &str) -> Result<PathBuf> {
+    normalize_relative_provider_subpath("http", name, raw_path)
 }
 
 fn canonicalize_with_missing_tail(path: &Path) -> std::io::Result<PathBuf> {
@@ -559,6 +567,64 @@ pub fn resolve_confined_http_provider_path(
     Ok(candidate)
 }
 
+/// Resolves a `file` rule-provider path strictly inside `state_dir`, requiring an active
+/// `state_dir`, rejecting absolute paths, drive prefixes, `..` traversal, control characters,
+/// symlink components, and canonical escapes outside `state_dir`.
+pub fn resolve_confined_file_provider_path(
+    state_dir: Option<&Path>,
+    name: &str,
+    raw_path: &str,
+) -> Result<PathBuf> {
+    let state_dir = state_dir.ok_or_else(|| {
+        ProxyError::Config(format!(
+            "file rule-provider '{name}' requires an active state_dir confinement root"
+        ))
+    })?;
+    let clean = normalize_relative_provider_subpath("file", name, raw_path)?;
+    let canon_state_dir = std::fs::canonicalize(state_dir).map_err(|e| {
+        ProxyError::Config(format!(
+            "failed resolving state_dir for file rule-provider '{name}': {e}"
+        ))
+    })?;
+
+    let mut cur = state_dir.to_path_buf();
+    for comp in clean.components() {
+        cur.push(comp.as_os_str());
+        let meta = std::fs::symlink_metadata(&cur).map_err(|e| {
+            ProxyError::Config(format!(
+                "failed inspecting file rule-provider '{name}' path: {e}"
+            ))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(ProxyError::Config(format!(
+                "refusing symlink component in file rule-provider '{name}' path"
+            )));
+        }
+        let canon_cur = std::fs::canonicalize(&cur).map_err(|e| {
+            ProxyError::Config(format!(
+                "failed canonicalizing file rule-provider '{name}' path: {e}"
+            ))
+        })?;
+        if !canon_cur.starts_with(&canon_state_dir) {
+            return Err(ProxyError::Config(format!(
+                "file rule-provider '{name}' path escapes state_dir"
+            )));
+        }
+    }
+
+    let canon_final = std::fs::canonicalize(&cur).map_err(|e| {
+        ProxyError::Config(format!(
+            "failed canonicalizing file rule-provider '{name}' path: {e}"
+        ))
+    })?;
+    if !canon_final.starts_with(&canon_state_dir) {
+        return Err(ProxyError::Config(format!(
+            "file rule-provider '{name}' path escapes state_dir"
+        )));
+    }
+    Ok(canon_final)
+}
+
 fn load_provider_entries(
     name: &str,
     cfg: &RuleProviderConfig,
@@ -571,17 +637,8 @@ fn load_provider_entries(
             let path_str = cfg.path.as_deref().ok_or_else(|| {
                 ProxyError::Config(format!("file rule-provider '{name}' requires 'path'"))
             })?;
-            if path_str.chars().any(|c| c.is_control())
-                || Path::new(path_str)
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                || path_str.split(['/', '\\']).any(|seg| seg == "..")
-            {
-                return Err(ProxyError::Config(format!(
-                    "file rule-provider '{name}' path contains forbidden traversal or control bytes"
-                )));
-            }
-            read_provider_file(name, Path::new(path_str), &cfg.format)
+            let confined = resolve_confined_file_provider_path(state_dir, name, path_str)?;
+            read_provider_file(name, &confined, &cfg.format)
         }
         "http" => {
             if let Some(ref raw_path) = cfg.path
@@ -637,8 +694,10 @@ fn parse_provider_raw_str(name: &str, raw: &str, format: &str) -> Result<Vec<Str
             .map(ToString::to_string)
             .collect())
     } else {
-        let mut val = crate::config::parse_yaml_value_with_merges(cleaned).map_err(|e| {
-            ProxyError::Config(format!("failed parsing YAML rule-provider '{name}': {e}"))
+        let mut val = crate::config::parse_yaml_value_with_merges(cleaned).map_err(|_| {
+            ProxyError::Config(format!(
+                "failed parsing YAML syntax for rule-provider '{name}'"
+            ))
         })?;
         if let serde_json::Value::Object(ref mut m) = val
             && let Some(p) = m.get_mut("payload")
@@ -646,18 +705,79 @@ fn parse_provider_raw_str(name: &str, raw: &str, format: &str) -> Result<Vec<Str
         {
             seq.retain(|v| !v.is_null());
         }
-        let parsed: PayloadYaml = serde_json::from_value(val).map_err(|e| {
-            ProxyError::Config(format!("failed parsing YAML rule-provider '{name}': {e}"))
+        let parsed: PayloadYaml = serde_json::from_value(val).map_err(|_| {
+            ProxyError::Config(format!(
+                "failed validating YAML payload schema for rule-provider '{name}'"
+            ))
         })?;
         Ok(parsed.payload)
     }
 }
 
 fn read_provider_file(name: &str, path: &Path, format: &str) -> Result<Vec<String>> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
+    use std::io::Read;
+
+    let pre_meta = std::fs::symlink_metadata(path).map_err(|e| {
         ProxyError::Config(format!(
-            "failed reading rule-provider '{name}' file '{}': {e}",
-            path.display()
+            "failed inspecting rule-provider '{name}' file: {e}"
+        ))
+    })?;
+    if pre_meta.file_type().is_symlink() {
+        return Err(ProxyError::Config(format!(
+            "refusing symlink rule-provider '{name}' file"
+        )));
+    }
+    if !pre_meta.file_type().is_file() {
+        return Err(ProxyError::Config(format!(
+            "refusing non-regular rule-provider '{name}' file"
+        )));
+    }
+    if pre_meta.len() > MAX_RULESET_FILE_BYTES as u64 {
+        return Err(ProxyError::Config(format!(
+            "rule-provider '{name}' file exceeds {MAX_RULESET_FILE_BYTES} byte safety limit"
+        )));
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path).map_err(|e| {
+        ProxyError::Config(format!("failed opening rule-provider '{name}' file: {e}"))
+    })?;
+    let fd_meta = file.metadata().map_err(|e| {
+        ProxyError::Config(format!(
+            "failed inspecting opened rule-provider '{name}' file: {e}"
+        ))
+    })?;
+    if !fd_meta.file_type().is_file() {
+        return Err(ProxyError::Config(format!(
+            "refusing non-regular rule-provider '{name}' file"
+        )));
+    }
+    if fd_meta.len() > MAX_RULESET_FILE_BYTES as u64 {
+        return Err(ProxyError::Config(format!(
+            "rule-provider '{name}' file exceeds {MAX_RULESET_FILE_BYTES} byte safety limit"
+        )));
+    }
+
+    let mut buf = Vec::new();
+    file.take((MAX_RULESET_FILE_BYTES as u64) + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            ProxyError::Config(format!("failed reading rule-provider '{name}' file: {e}"))
+        })?;
+    if buf.len() > MAX_RULESET_FILE_BYTES {
+        return Err(ProxyError::Config(format!(
+            "rule-provider '{name}' file exceeds {MAX_RULESET_FILE_BYTES} byte safety limit"
+        )));
+    }
+    let raw = String::from_utf8(buf).map_err(|_| {
+        ProxyError::Config(format!(
+            "rule-provider '{name}' file is not valid UTF-8 text"
         ))
     })?;
     parse_provider_raw_str(name, &raw, format)
@@ -943,5 +1063,206 @@ mod tests {
         assert!(check_dom("sub.example.com"));
         assert!(check_dom("img.cdn.example.org"));
         assert!(!check_dom("other.example.net"));
+    }
+
+    #[test]
+    fn file_provider_enforces_state_dir_confinement_symlinks_size_cap_and_no_content_echo() {
+        let tmp = std::env::temp_dir().join(format!("rc-file-ruleset-{}", uuid::Uuid::new_v4()));
+        let state_dir = tmp.join("state");
+        let outside_dir = tmp.join("outside");
+        std::fs::create_dir_all(state_dir.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let valid_file = state_dir.join("sub/corp.yaml");
+        std::fs::write(&valid_file, "payload:\n  - '+.corp.example'\n").unwrap();
+
+        let outside_secret = outside_dir.join("secret.txt");
+        std::fs::write(&outside_secret, "TOP_SECRET_OUTSIDE_TOKEN_999\n").unwrap();
+
+        // 1. Requires state_dir.is_some()
+        assert!(resolve_confined_file_provider_path(None, "corp", "sub/corp.yaml").is_err());
+
+        // 2. Rejects absolute, drive-prefix, traversal, NUL/control bytes
+        for bad in [
+            "/etc/passwd",
+            "../outside/secret.txt",
+            "sub/../../outside/secret.txt",
+            r"C:\Windows\win.ini",
+            r"\\server\share\x.yaml",
+            "bad\0name.yaml",
+            ".",
+        ] {
+            assert!(
+                resolve_confined_file_provider_path(Some(&state_dir), "corp", bad).is_err(),
+                "file provider path {bad:?} must be rejected"
+            );
+        }
+
+        // 3. Valid confined relative file loads cleanly
+        let ok_cfg = RuleProviderConfig {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            path: Some("sub/corp.yaml".into()),
+            url: None,
+            interval: 86400,
+            payload: vec![],
+        };
+        let matcher =
+            RuleSetMatcher::from_provider_with_state_dir("corp", &ok_cfg, None, Some(&state_dir))
+                .expect("confined relative file rule-provider must load");
+        assert!(matcher.matches(
+            None,
+            None,
+            SocketTransport::Tcp,
+            &TargetAddr::new_domain("app.corp.example", 443).unwrap(),
+            &[],
+            false
+        ));
+
+        // 4. Directory (non-regular file) MUST be rejected
+        let dir_cfg = RuleProviderConfig {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: "text".into(),
+            path: Some("sub".into()),
+            url: None,
+            interval: 86400,
+            payload: vec![],
+        };
+        assert!(
+            RuleSetMatcher::from_provider_with_state_dir("dir", &dir_cfg, None, Some(&state_dir))
+                .is_err()
+        );
+
+        // 5. Symlink file AND symlink directory escaping state_dir MUST be rejected
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside_secret, state_dir.join("leak.yaml")).unwrap();
+            assert!(
+                resolve_confined_file_provider_path(Some(&state_dir), "leak", "leak.yaml").is_err()
+            );
+            std::os::unix::fs::symlink(&outside_dir, state_dir.join("escape_dir")).unwrap();
+            assert!(
+                resolve_confined_file_provider_path(
+                    Some(&state_dir),
+                    "leak",
+                    "escape_dir/secret.txt"
+                )
+                .is_err()
+            );
+        }
+
+        // 6. Oversized (> 16 MiB) file MUST be rejected cleanly without OOM
+        let big_file = state_dir.join("huge.txt");
+        {
+            let f = std::fs::File::create(&big_file).unwrap();
+            f.set_len((MAX_RULESET_FILE_BYTES as u64) + 64).unwrap();
+        }
+        let big_cfg = RuleProviderConfig {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: "text".into(),
+            path: Some("huge.txt".into()),
+            url: None,
+            interval: 86400,
+            payload: vec![],
+        };
+        let big_err =
+            RuleSetMatcher::from_provider_with_state_dir("huge", &big_cfg, None, Some(&state_dir))
+                .err()
+                .expect("oversized file rule-provider must be rejected")
+                .to_string();
+        assert!(
+            big_err.contains("safety limit"),
+            "expected size limit error, got: {big_err}"
+        );
+
+        // 7. Invalid ipcidr & YAML errors MUST NEVER echo raw file line contents!
+        let sentinel = "ROOT_X_0_0_SECRET_PASSWD_CANARY_42";
+        let bad_ipcidr_file = state_dir.join("bad_ipcidr.txt");
+        std::fs::write(&bad_ipcidr_file, format!("10.0.0.0/8\n{sentinel}\n")).unwrap();
+        let bad_ipcidr_cfg = RuleProviderConfig {
+            provider_type: "file".into(),
+            behavior: "ipcidr".into(),
+            format: "text".into(),
+            path: Some("bad_ipcidr.txt".into()),
+            url: None,
+            interval: 86400,
+            payload: vec![],
+        };
+        let ipcidr_err = RuleSetMatcher::from_provider_with_state_dir(
+            "bad-cidr",
+            &bad_ipcidr_cfg,
+            None,
+            Some(&state_dir),
+        )
+        .err()
+        .expect("invalid ipcidr entry must error")
+        .to_string();
+        assert!(
+            !ipcidr_err.contains(sentinel),
+            "ipcidr error must NEVER echo raw file content: {ipcidr_err}"
+        );
+        assert!(
+            ipcidr_err.contains("item #2"),
+            "ipcidr error should report item index: {ipcidr_err}"
+        );
+
+        let bad_yaml_file = state_dir.join("bad_yaml.yaml");
+        std::fs::write(&bad_yaml_file, format!("payload: \"{sentinel}\"\n")).unwrap();
+        let bad_yaml_cfg = RuleProviderConfig {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            path: Some("bad_yaml.yaml".into()),
+            url: None,
+            interval: 86400,
+            payload: vec![],
+        };
+        let yaml_err = RuleSetMatcher::from_provider_with_state_dir(
+            "bad-yaml",
+            &bad_yaml_cfg,
+            None,
+            Some(&state_dir),
+        )
+        .err()
+        .expect("bad YAML payload schema must error")
+        .to_string();
+        assert!(
+            !yaml_err.contains(sentinel),
+            "YAML schema error must NEVER echo raw file content: {yaml_err}"
+        );
+
+        let bad_syntax_file = state_dir.join("bad_syntax.yaml");
+        std::fs::write(
+            &bad_syntax_file,
+            format!("payload: [unterminated, {sentinel}\n"),
+        )
+        .unwrap();
+        let bad_syntax_cfg = RuleProviderConfig {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            path: Some("bad_syntax.yaml".into()),
+            url: None,
+            interval: 86400,
+            payload: vec![],
+        };
+        let syntax_err = RuleSetMatcher::from_provider_with_state_dir(
+            "bad-syntax",
+            &bad_syntax_cfg,
+            None,
+            Some(&state_dir),
+        )
+        .err()
+        .expect("bad YAML syntax must error")
+        .to_string();
+        assert!(
+            !syntax_err.contains(sentinel),
+            "YAML syntax error must NEVER echo raw file content: {syntax_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1027,14 +1027,49 @@ async fn get_proxy_delay(
             "http://www.gstatic.com/generate_204".to_string()
         }
     };
-    let probe_url = q.url.as_deref().unwrap_or(&default_url);
+    let probe_url = q
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&default_url);
+    let allowed_private = demo_allowed_private_addrs(&engine);
+    if let Err(err) = crate::probe::validate_probe_url(probe_url, false, &allowed_private) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&err.to_string())
+            })),
+        )
+            .into_response();
+    }
     let timeout = Duration::from_millis(q.timeout.clamp(200, 15_000));
 
-    match engine.router().test_delay(&name, probe_url, timeout).await {
+    match engine
+        .router()
+        .test_delay_with_policy(&name, probe_url, timeout, false, &allowed_private)
+        .await
+    {
         Ok(delay) => (StatusCode::OK, Json(serde_json::json!({ "delay": delay }))).into_response(),
+        Err(ProxyError::Config(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&msg)
+            })),
+        )
+            .into_response(),
+        Err(ProxyError::Routing(msg)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&msg)
+            })),
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::GATEWAY_TIMEOUT,
-            Json(serde_json::json!({ "message": err.to_string() })),
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&err.to_string())
+            })),
         )
             .into_response(),
     }
@@ -1045,6 +1080,31 @@ async fn get_group_delay(
     Path(name): Path<String>,
     Query(q): Query<DelayQuery>,
 ) -> Response {
+    let default_url = {
+        let d = engine.demo_info();
+        if d.enabled && !d.http_benchmark_origin.is_empty() {
+            format!("{}/generate_204", d.http_benchmark_origin)
+        } else {
+            "http://www.gstatic.com/generate_204".to_string()
+        }
+    };
+    let probe_url = q
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&default_url);
+    let allowed_private = demo_allowed_private_addrs(&engine);
+    if let Err(err) = crate::probe::validate_probe_url(probe_url, false, &allowed_private) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "message": crate::config::uri::redact_sensitive_text(&err.to_string())
+            })),
+        )
+            .into_response();
+    }
+
     let router = engine.router();
     let Some(members) = router
         .proxies_snapshot()
@@ -1058,18 +1118,33 @@ async fn get_group_delay(
             .into_response();
     };
 
-    let default_url = {
-        let d = engine.demo_info();
-        if d.enabled && !d.http_benchmark_origin.is_empty() {
-            format!("{}/generate_204", d.http_benchmark_origin)
-        } else {
-            "http://www.gstatic.com/generate_204".to_string()
-        }
-    };
-    let probe_url = q.url.as_deref().unwrap_or(&default_url);
     let timeout = Duration::from_millis(q.timeout.clamp(200, 15_000));
 
-    let _ = router.test_delay(&name, probe_url, timeout).await;
+    match router
+        .test_delay_with_policy(&name, probe_url, timeout, false, &allowed_private)
+        .await
+    {
+        Ok(_) => {}
+        Err(ProxyError::Config(msg)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "message": crate::config::uri::redact_sensitive_text(&msg)
+                })),
+            )
+                .into_response();
+        }
+        Err(ProxyError::Routing(msg)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "message": crate::config::uri::redact_sensitive_text(&msg)
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {}
+    }
 
     let mut alive_delays = serde_json::Map::with_capacity(members.len());
     for member in members {
@@ -3786,7 +3861,9 @@ async fn post_diagnostics_audit_api(
 static PROBE_API_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
-fn demo_allowed_private_addrs(engine: &ProxyEngine) -> Vec<SocketAddr> {
+/// Returns the exact loopback `(ip, port)` endpoints permitted for HTTP/HTTPS probe URLs
+/// in built-in `--demo` sandbox mode (`demo.http_benchmark_origin` ONLY — never `engine.dns_addr()`).
+pub fn demo_allowed_private_addrs(engine: &ProxyEngine) -> Vec<SocketAddr> {
     let demo = engine.demo_info();
     if !demo.enabled {
         return Vec::new();
@@ -3805,6 +3882,17 @@ fn demo_allowed_private_addrs(engine: &ProxyEngine) -> Vec<SocketAddr> {
             allowed.push(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)));
         }
     }
+    allowed
+}
+
+/// Returns the exact loopback `(ip, port)` endpoint permitted strictly for UDP DNS probes
+/// in built-in `--demo` sandbox mode (`engine.dns_addr()` ONLY).
+pub fn demo_allowed_udp_private_addrs(engine: &ProxyEngine) -> Vec<SocketAddr> {
+    let demo = engine.demo_info();
+    if !demo.enabled {
+        return Vec::new();
+    }
+    let mut allowed = Vec::new();
     if let Some(dns_addr) = engine.dns_addr() {
         allowed.push(SocketAddr::new(
             canonical_ip(dns_addr.ip()),
@@ -3864,12 +3952,13 @@ async fn post_proxy_waterfall_probe_api(
         .or(fallback_demo_udp.as_deref());
 
     let allowed_private = demo_allowed_private_addrs(&engine);
+    let allowed_private_udp = demo_allowed_udp_private_addrs(&engine);
     let router = engine.router();
     let cfg = engine.config_snapshot();
     let extra_ca = engine.extra_ca_der();
     let timeout = Duration::from_millis(req.timeout.clamp(200, 15_000));
 
-    match crate::probe::probe_target_waterfall(
+    match crate::probe::probe_target_waterfall_with_udp_allowlist(
         &router,
         &cfg,
         &name,
@@ -3882,6 +3971,7 @@ async fn post_proxy_waterfall_probe_api(
             allow_private_targets: false,
             allowed_private_addrs: &allowed_private,
         },
+        &allowed_private_udp,
     )
     .await
     {
@@ -3945,12 +4035,13 @@ async fn post_proxy_endpoint_matrix_api(
         .or(fallback_demo_udp.as_deref());
 
     let allowed_private = demo_allowed_private_addrs(&engine);
+    let allowed_private_udp = demo_allowed_udp_private_addrs(&engine);
     let router = engine.router();
     let cfg = engine.config_snapshot();
     let extra_ca = engine.extra_ca_der();
     let timeout = Duration::from_millis(req.timeout.clamp(200, 15_000));
 
-    match crate::probe::probe_endpoint_matrix(
+    match crate::probe::probe_endpoint_matrix_with_udp_allowlist(
         &router,
         &cfg,
         &name,
@@ -3963,6 +4054,7 @@ async fn post_proxy_endpoint_matrix_api(
             allow_private_targets: false,
             allowed_private_addrs: &allowed_private,
         },
+        &allowed_private_udp,
     )
     .await
     {
@@ -4025,12 +4117,13 @@ async fn post_diagnostics_site_check_api(
     };
 
     let allowed_private = demo_allowed_private_addrs(&engine);
+    let allowed_private_udp = demo_allowed_udp_private_addrs(&engine);
     let router = engine.router();
     let cfg = engine.config_snapshot();
     let extra_ca = engine.extra_ca_der();
     let timeout = Duration::from_millis(req.timeout.clamp(300, 15_000));
 
-    match crate::probe::diagnose_site(
+    match crate::probe::diagnose_site_with_udp_allowlist(
         &router,
         &cfg,
         &req.target,
@@ -4043,6 +4136,7 @@ async fn post_diagnostics_site_check_api(
             allow_private_targets: false,
             allowed_private_addrs: &allowed_private,
         },
+        &allowed_private_udp,
     )
     .await
     {
@@ -4334,11 +4428,15 @@ rules:
         assert!(!engine.config_snapshot().dns.ipv6);
         assert!(!engine.config_snapshot().tun.ipv6);
 
-        // 3. GET /group/PROXY/delay against a local mock HTTP server returns member delay map
+        // 3. Non-demo HTTP GET /group/PROXY/delay against loopback MUST be blocked with 400 (SSRF),
+        //    while internal hermetic `router.test_delay` still probes the local mock server cleanly.
         let bench_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bench_addr = bench_listener.local_addr().unwrap();
+        let bench_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bench_hits_bg = Arc::clone(&bench_hits);
         tokio::spawn(async move {
-            if let Ok((mut s, _)) = bench_listener.accept().await {
+            while let Ok((mut s, _)) = bench_listener.accept().await {
+                bench_hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut b = [0u8; 512];
                 let _ = s.read(&mut b).await;
                 let _ = s
@@ -4359,10 +4457,25 @@ rules:
             .unwrap();
         let mut grp_raw = Vec::new();
         grp_conn.read_to_end(&mut grp_raw).await.unwrap();
-        assert!(String::from_utf8_lossy(&grp_raw).starts_with("HTTP/1.1 200"));
-        let grp_body = extract_http_response_body_str(&grp_raw).unwrap();
-        let grp_json: serde_json::Value = serde_json::from_str(&grp_body).unwrap();
-        assert!(grp_json["DIRECT"].as_u64().is_some());
+        assert!(
+            String::from_utf8_lossy(&grp_raw).starts_with("HTTP/1.1 400"),
+            "non-demo loopback /group/PROXY/delay must return 400 SSRF error: {}",
+            String::from_utf8_lossy(&grp_raw)
+        );
+        assert_eq!(
+            bench_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "blocked SSRF delay probe must never dial loopback target"
+        );
+
+        let local_url = format!("http://127.0.0.1:{}/generate_204", bench_addr.port());
+        let internal_ms = engine
+            .router()
+            .test_delay("PROXY", &local_url, Duration::from_secs(2))
+            .await
+            .expect("hermetic internal router.test_delay must still work");
+        assert!(internal_ms >= 1);
+        assert!(engine.router().effective_member_delay("DIRECT").is_some());
 
         let _ = stop_tx.send(true);
         let _ = server_handle.await;
@@ -4477,6 +4590,329 @@ rules:
         let _ = stop_tx.send(true);
         let _ = server_handle.await;
         engine.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn delay_endpoints_enforce_ssrf_dns_rebinding_and_demo_whitelist() {
+        use std::{
+            net::Ipv4Addr,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::UdpSocket;
+
+        use crate::dns::wire::{DnsAnswerData, DnsQueryPacket, QTYPE_A};
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-api-delay-ssrf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Canary TCP listener that MUST NEVER be dialed by blocked delay probes
+        let canary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let canary_addr = canary.local_addr().unwrap();
+        let canary_hits = Arc::new(AtomicUsize::new(0));
+        let canary_hits_bg = Arc::clone(&canary_hits);
+        let (bg_stop_tx, mut bg_stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = bg_stop_rx.changed() => break,
+                    acc = canary.accept() => {
+                        let Ok((mut s, _)) = acc else { continue };
+                        canary_hits_bg.fetch_add(1, Ordering::SeqCst);
+                        let _ = s
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                }
+            }
+        });
+
+        // Mock upstream DNS resolving attacker domains to loopback & IMDS
+        let mock_ns = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mock_ns_addr = mock_ns.local_addr().unwrap();
+        let ns_bg = Arc::clone(&mock_ns);
+        let mut ns_stop = bg_stop_tx.subscribe();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    _ = ns_stop.changed() => break,
+                    res = ns_bg.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = res else { continue };
+                        let Ok(pkt) = DnsQueryPacket::parse(&buf[..n]) else { continue };
+                        let q = pkt.question.name.to_ascii_lowercase();
+                        let resp = match (q.as_str(), pkt.question.qtype) {
+                            ("rebind-loopback.attacker.test", QTYPE_A) => pkt.build_response(
+                                &buf[..n],
+                                0,
+                                60,
+                                &[DnsAnswerData::A(Ipv4Addr::LOCALHOST)],
+                            ),
+                            ("rebind-imds.attacker.test", QTYPE_A) => pkt.build_response(
+                                &buf[..n],
+                                0,
+                                60,
+                                &[DnsAnswerData::A(Ipv4Addr::new(169, 254, 169, 254))],
+                            ),
+                            _ => pkt.build_response(&buf[..n], 0, 60, &[]),
+                        };
+                        let _ = ns_bg.send_to(&resp, peer).await;
+                    }
+                }
+            }
+        });
+
+        let yaml = format!(
+            "mixed-port: 0\nexternal-controller: \"\"\nmode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:0\n  nameserver:\n    - \"{mock_ns_addr}\"\n  direct-nameserver:\n    - \"{mock_ns_addr}\"\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [DIRECT]\nrules:\n  - MATCH,PROXY\n"
+        );
+        let cfg = ClashConfig::from_yaml_str(&yaml).unwrap();
+        let engine = ProxyEngine::start_with_state_dir(cfg, tmp_dir.clone())
+            .await
+            .unwrap();
+        // Pre-seed healthy delay on DIRECT and verify SSRF rejections NEVER poison it!
+        engine.router().delays().record("DIRECT", 19);
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (bound, server_handle) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), stop_rx)
+            .await
+            .unwrap();
+
+        async fn send_get(addr: SocketAddr, path: &str) -> (u16, String) {
+            let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            conn.write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut raw = Vec::new();
+            conn.read_to_end(&mut raw).await.unwrap();
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let status = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            let body = extract_http_response_body_str(&raw).unwrap_or_default();
+            (status, body)
+        }
+
+        let ssrf_urls = [
+            format!("http://127.0.0.1:{}/generate_204", canary_addr.port()),
+            format!("http://localhost:{}/generate_204", canary_addr.port()),
+            "http://0.1.2.3/generate_204".to_string(),
+            "http://[::127.0.0.1]/generate_204".to_string(),
+            "http://[::ffff:0:127.0.0.1]/generate_204".to_string(),
+            "http://[fec0::1]/generate_204".to_string(),
+            "http://[100::1]/generate_204".to_string(),
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            "http://10.0.0.1/admin".to_string(),
+            "http://[fd00:ec2::254]/latest/meta-data/".to_string(),
+            "ftp://example.com/file".to_string(),
+            "http://alice:supersecret99@example.com/generate_204".to_string(),
+            format!(
+                "http://rebind-loopback.attacker.test:{}/generate_204",
+                canary_addr.port()
+            ),
+            "http://rebind-imds.attacker.test/latest/meta-data/".to_string(),
+        ];
+
+        for raw_target in &ssrf_urls {
+            let encoded =
+                url::form_urlencoded::byte_serialize(raw_target.as_bytes()).collect::<String>();
+            for endpoint in [
+                format!("/proxies/DIRECT/delay?url={encoded}&timeout=2000"),
+                format!("/group/PROXY/delay?url={encoded}&timeout=2000"),
+            ] {
+                let (code, body) = send_get(bound, &endpoint).await;
+                assert_eq!(
+                    code, 400,
+                    "expected 400 Bad Request for SSRF target {raw_target} on {endpoint}, got {code}: {body}"
+                );
+                assert!(
+                    !body.contains("supersecret99"),
+                    "error response must redact userinfo secrets: {body}"
+                );
+            }
+        }
+        assert_eq!(
+            canary_hits.load(Ordering::SeqCst),
+            0,
+            "blocked SSRF probes must never connect to canary socket"
+        );
+        assert_eq!(
+            engine.router().delays().latest_delay("DIRECT"),
+            Some(19),
+            "SSRF 400 rejection must not poison recorded healthy delay"
+        );
+
+        // Unknown proxy with valid public URL returns 404 Not Found
+        let (nf_code, _) = send_get(
+            bound,
+            "/proxies/NO_SUCH_PROXY/delay?url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=1000",
+        )
+        .await;
+        assert_eq!(nf_code, 404);
+
+        let _ = stop_tx.send(true);
+        let _ = server_handle.await;
+        engine.shutdown();
+
+        // Demo mode: whitelisted benchmark origin succeeds (200), while disallowed localhost canary port is blocked (400)!
+        let demo_engine = ProxyEngine::start_demo(
+            Some(0),
+            Some("127.0.0.1:0".into()),
+            Some("127.0.0.1:0".into()),
+        )
+        .await
+        .unwrap();
+        let (demo_stop_tx, demo_stop_rx) = tokio::sync::watch::channel(false);
+        let (demo_bound, demo_srv) =
+            spawn_api_server("127.0.0.1:0", Arc::clone(&demo_engine), demo_stop_rx)
+                .await
+                .unwrap();
+
+        async fn send_post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+            let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            conn.write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut raw = Vec::new();
+            conn.read_to_end(&mut raw).await.unwrap();
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let status = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            let resp_body = extract_http_response_body_str(&raw).unwrap_or_default();
+            (status, resp_body)
+        }
+
+        let demo_dns_addr = demo_engine.dns_addr().expect("demo engine has DNS port");
+        let demo_http_allow = demo_allowed_private_addrs(&demo_engine);
+        let demo_udp_allow = demo_allowed_udp_private_addrs(&demo_engine);
+        assert!(
+            !demo_http_allow.contains(&demo_dns_addr),
+            "demo_allowed_private_addrs must NEVER include engine.dns_addr()"
+        );
+        assert!(
+            demo_udp_allow.contains(&demo_dns_addr),
+            "demo_allowed_udp_private_addrs must include engine.dns_addr()"
+        );
+
+        let demo_origin = demo_engine.demo_info().http_benchmark_origin;
+        let allowed_url = format!("{demo_origin}/generate_204");
+        let allowed_enc =
+            url::form_urlencoded::byte_serialize(allowed_url.as_bytes()).collect::<String>();
+        let (ok_code, ok_body) = send_get(
+            demo_bound,
+            &format!("/proxies/DIRECT/delay?url={allowed_enc}&timeout=3000"),
+        )
+        .await;
+        assert_eq!(
+            ok_code, 200,
+            "Demo whitelisted benchmark origin must return 200: {ok_body}"
+        );
+
+        // Demo mode MUST reject HTTP probes targeting `engine.dns_addr()` across `/delay`, `/group/.../delay`,
+        // `/probe`, and `/diagnostics/site-check` (`400 Bad Request`).
+        let demo_group = demo_engine
+            .config_snapshot()
+            .proxy_groups
+            .first()
+            .expect("demo config has a proxy group")
+            .name
+            .clone();
+        let demo_group_enc =
+            url::form_urlencoded::byte_serialize(demo_group.as_bytes()).collect::<String>();
+        for dns_http_url in [
+            format!("http://127.0.0.1:{}/", demo_dns_addr.port()),
+            format!("http://localhost:{}/", demo_dns_addr.port()),
+        ] {
+            let dns_enc =
+                url::form_urlencoded::byte_serialize(dns_http_url.as_bytes()).collect::<String>();
+            for ep in [
+                format!("/proxies/DIRECT/delay?url={dns_enc}&timeout=1000"),
+                format!("/group/{demo_group_enc}/delay?url={dns_enc}&timeout=1000"),
+            ] {
+                let (code, body) = send_get(demo_bound, &ep).await;
+                assert_eq!(
+                    code, 400,
+                    "Demo HTTP delay must block engine.dns_addr() ({dns_http_url}) on {ep}, got {code}: {body}"
+                );
+            }
+            let probe_body = serde_json::json!({
+                "url": dns_http_url,
+                "check_udp": false,
+                "timeout": 1000
+            })
+            .to_string();
+            let (probe_code, probe_resp) =
+                send_post_json(demo_bound, "/proxies/DIRECT/probe", &probe_body).await;
+            assert_eq!(
+                probe_code, 400,
+                "Demo POST /proxies/DIRECT/probe must block engine.dns_addr() ({dns_http_url}), got {probe_code}: {probe_resp}"
+            );
+            let site_body = serde_json::json!({
+                "target": dns_http_url,
+                "check_udp": false,
+                "timeout": 1000
+            })
+            .to_string();
+            let (site_code, site_resp) =
+                send_post_json(demo_bound, "/diagnostics/site-check", &site_body).await;
+            assert_eq!(
+                site_code, 400,
+                "Demo POST /diagnostics/site-check must block engine.dns_addr() ({dns_http_url}), got {site_code}: {site_resp}"
+            );
+        }
+
+        // Demo waterfall probe against whitelisted `demo.http_benchmark_origin` with `check_udp: true`
+        // MUST STILL succeed on BOTH HTTP AND Demo UDP DNS probing!
+        let ok_probe_body = serde_json::json!({
+            "url": allowed_url,
+            "check_udp": true,
+            "timeout": 3000
+        })
+        .to_string();
+        let (ok_probe_code, ok_probe_resp) =
+            send_post_json(demo_bound, "/proxies/DIRECT/probe", &ok_probe_body).await;
+        assert_eq!(
+            ok_probe_code, 200,
+            "Demo waterfall probe with HTTP origin + UDP DNS must return 200: {ok_probe_resp}"
+        );
+        let ok_probe_json: serde_json::Value = serde_json::from_str(&ok_probe_resp).unwrap();
+        assert_eq!(ok_probe_json["verdict"], "reachable");
+        assert_eq!(ok_probe_json["udp_probe"]["status"], "verified");
+
+        let disallowed_demo_url = format!("http://127.0.0.1:{}/generate_204", canary_addr.port());
+        let disallowed_enc = url::form_urlencoded::byte_serialize(disallowed_demo_url.as_bytes())
+            .collect::<String>();
+        let (bad_demo_code, bad_demo_body) = send_get(
+            demo_bound,
+            &format!("/proxies/DIRECT/delay?url={disallowed_enc}&timeout=2000"),
+        )
+        .await;
+        assert_eq!(
+            bad_demo_code, 400,
+            "Demo mode must still reject non-whitelisted localhost ports with 400: {bad_demo_body}"
+        );
+        assert_eq!(canary_hits.load(Ordering::SeqCst), 0);
+
+        let _ = demo_stop_tx.send(true);
+        let _ = demo_srv.await;
+        demo_engine.shutdown();
+        let _ = bg_stop_tx.send(true);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

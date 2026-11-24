@@ -37,6 +37,14 @@ import type {
   VlessKeypairResponse,
   WaterfallProbeReport,
 } from "./types";
+import {
+  normalizeControllerBaseUrl,
+  readScopedSessionSecret,
+  resolveEffectiveSecret,
+  serializeScopedSessionSecret,
+} from "./utils/controllerSecret.mjs";
+
+export { resolveEffectiveSecret };
 
 export interface ControllerSettings {
   baseUrl: string;
@@ -74,24 +82,31 @@ const SESSION_SECRET_KEY = "rust_clash_session_secret_v1";
 let discoveredDesktopBaseUrl: string | null = null;
 let discoveredDesktopSecret: string | null = null;
 let capturedBootSecret: string | null = null;
+let capturedBootSecretBase = "";
 let desktopDiscoveryPromise: Promise<string> | null = null;
 
-function readSessionSecret(): string {
+function readSessionSecret(targetBaseUrl = ""): string {
+  const target = normalizeControllerBaseUrl(targetBaseUrl);
   try {
-    const val = sessionStorage.getItem(SESSION_SECRET_KEY)?.trim();
-    if (val) return val;
+    const raw = sessionStorage.getItem(SESSION_SECRET_KEY);
+    if (raw !== null) {
+      return readScopedSessionSecret(raw, target);
+    }
   } catch {
     // ignore sessionStorage restrictions
   }
-  return capturedBootSecret || "";
+  return capturedBootSecretBase === target ? capturedBootSecret || "" : "";
 }
 
-function writeSessionSecret(secret: string): void {
-  const clean = secret.trim();
-  capturedBootSecret = clean || null;
+function writeSessionSecret(secret: string, baseUrl = ""): void {
+  const cleanSecret = secret.trim();
+  const cleanBase = normalizeControllerBaseUrl(baseUrl);
+  capturedBootSecret = cleanSecret || null;
+  capturedBootSecretBase = cleanSecret ? cleanBase : "";
   try {
-    if (clean) {
-      sessionStorage.setItem(SESSION_SECRET_KEY, clean);
+    const serialized = serializeScopedSessionSecret(cleanSecret, cleanBase);
+    if (serialized) {
+      sessionStorage.setItem(SESSION_SECRET_KEY, serialized);
     } else {
       sessionStorage.removeItem(SESSION_SECRET_KEY);
     }
@@ -109,13 +124,13 @@ function migrateAndScrubLegacyLocalStorage(): string {
       Record<string, unknown>;
     const cleanBaseUrl =
       typeof parsed.baseUrl === "string"
-        ? parsed.baseUrl.replace(/\/+$/, "")
+        ? normalizeControllerBaseUrl(parsed.baseUrl)
         : "";
     if ("secret" in parsed) {
       const legacySecret =
         typeof parsed.secret === "string" ? parsed.secret.trim() : "";
-      if (legacySecret && !readSessionSecret()) {
-        writeSessionSecret(legacySecret);
+      if (legacySecret && !readSessionSecret(cleanBaseUrl)) {
+        writeSessionSecret(legacySecret, cleanBaseUrl);
       }
       localStorage.setItem(
         STORAGE_KEY,
@@ -130,7 +145,7 @@ function migrateAndScrubLegacyLocalStorage(): string {
 
 function captureSecretFromUrlOnBoot(): void {
   if (typeof window === "undefined") return;
-  migrateAndScrubLegacyLocalStorage();
+  const savedBaseUrl = migrateAndScrubLegacyLocalStorage();
   try {
     const params = new URLSearchParams(window.location.search);
     const hasQueryToken = params.has("secret") || params.has("token");
@@ -179,11 +194,13 @@ function captureSecretFromUrlOnBoot(): void {
     }
 
     if (urlSecret) {
-      writeSessionSecret(urlSecret);
+      // URL query/hash boot tokens belong strictly to the local origin ("").
+      writeSessionSecret(urlSecret, "");
     } else {
-      const existingSession = readSessionSecret();
+      const existingSession = readSessionSecret(savedBaseUrl);
       if (existingSession) {
         capturedBootSecret = existingSession;
+        capturedBootSecretBase = savedBaseUrl;
       }
     }
   } catch {
@@ -337,11 +354,13 @@ export async function readClipboardText(): Promise<string | null> {
 }
 
 async function resolveRuntimeBaseUrl(configuredBase: string): Promise<string> {
-  if (configuredBase) return configuredBase;
+  const cleanConfiguredBase = normalizeControllerBaseUrl(configuredBase);
+  if (cleanConfiguredBase) return cleanConfiguredBase;
   if (typeof window === "undefined") return "";
   const w = window as HostWindow;
-  if (w.__RUST_CLASH_API_BASE__) {
-    return w.__RUST_CLASH_API_BASE__.replace(/\/+$/, "");
+  const injectedBase = normalizeControllerBaseUrl(w.__RUST_CLASH_API_BASE__);
+  if (injectedBase) {
+    return injectedBase;
   }
   if (discoveredDesktopBaseUrl !== null) {
     return discoveredDesktopBaseUrl;
@@ -356,10 +375,13 @@ async function resolveRuntimeBaseUrl(configuredBase: string): Promise<string> {
               api_secret?: string | null;
             }>("get_desktop_status");
             if (status?.api_secret) {
-              discoveredDesktopSecret = status.api_secret;
+              discoveredDesktopSecret = status.api_secret.trim() || null;
             }
-            if (status?.api_base_url) {
-              discoveredDesktopBaseUrl = status.api_base_url.replace(/\/+$/, "");
+            const normalizedDesktopBase = normalizeControllerBaseUrl(
+              status?.api_base_url,
+            );
+            if (normalizedDesktopBase) {
+              discoveredDesktopBaseUrl = normalizedDesktopBase;
               return discoveredDesktopBaseUrl;
             }
           }
@@ -384,13 +406,13 @@ export function loadControllerSettings(): ControllerSettings {
   const baseUrl = migrateAndScrubLegacyLocalStorage();
   return {
     baseUrl,
-    secret: readSessionSecret(),
+    secret: readSessionSecret(baseUrl),
   };
 }
 
 export function saveControllerSettings(settings: ControllerSettings): void {
-  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, "");
-  writeSessionSecret(settings.secret);
+  const cleanBaseUrl = normalizeControllerBaseUrl(settings.baseUrl);
+  writeSessionSecret(settings.secret, cleanBaseUrl);
   try {
     localStorage.setItem(
       STORAGE_KEY,
@@ -404,23 +426,25 @@ export function saveControllerSettings(settings: ControllerSettings): void {
 }
 
 function effectiveSecret(settings: ControllerSettings): string {
-  return (
-    settings.secret ||
-    readSessionSecret() ||
-    discoveredDesktopSecret ||
-    ""
+  return resolveEffectiveSecret(
+    settings,
+    readSessionSecret(settings.baseUrl),
+    discoveredDesktopSecret ?? "",
   );
 }
 
 export async function probeControllerSettings(
   settings: ControllerSettings,
 ): Promise<VersionInfo> {
-  const cleanBase = settings.baseUrl.replace(/\/+$/, "");
+  const cleanBase = normalizeControllerBaseUrl(settings.baseUrl);
   const base = await resolveRuntimeBaseUrl(cleanBase);
   const url = `${base}/version`;
   const headers = new Headers();
-  const secret =
-    settings.secret.trim() || (!cleanBase ? discoveredDesktopSecret || "" : "");
+  const secret = resolveEffectiveSecret(
+    settings,
+    "",
+    discoveredDesktopSecret ?? "",
+  );
   if (secret) {
     headers.set("Authorization", `Bearer ${secret}`);
   }
@@ -479,7 +503,8 @@ async function apiFetch<T>(
   init?: RequestInit,
   settings: ControllerSettings = loadControllerSettings(),
 ): Promise<T> {
-  const base = await resolveRuntimeBaseUrl(settings.baseUrl);
+  const cleanBase = normalizeControllerBaseUrl(settings.baseUrl);
+  const base = await resolveRuntimeBaseUrl(cleanBase);
   const url = `${base}${path}`;
   const headers = new Headers(init?.headers);
   const secret = effectiveSecret(settings);
@@ -945,10 +970,13 @@ export function buildWsUrl(path: string): string {
   const w = (typeof window !== "undefined" ? window : {}) as HostWindow;
   const fallbackOrigin = isTauriWebview()
     ? discoveredDesktopBaseUrl ||
-      w.__RUST_CLASH_API_BASE__ ||
+      normalizeControllerBaseUrl(w.__RUST_CLASH_API_BASE__) ||
       "http://127.0.0.1:9090"
-    : window.location.origin;
-  const base = settings.baseUrl || fallbackOrigin;
+    : typeof window !== "undefined"
+      ? window.location.origin
+      : "";
+  const cleanBase = normalizeControllerBaseUrl(settings.baseUrl);
+  const base = cleanBase || normalizeControllerBaseUrl(fallbackOrigin);
   const wsBase = base.replace(/^http/i, "ws");
   const sep = path.includes("?") ? "&" : "?";
   const secret = effectiveSecret(settings);

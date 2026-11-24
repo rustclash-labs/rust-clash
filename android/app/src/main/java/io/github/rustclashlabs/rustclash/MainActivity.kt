@@ -513,7 +513,7 @@ class MainActivity : AppCompatActivity() {
             val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
                 action = RustClashVpnService.ACTION_STOP_VPN
             }
-            startService(stopIntent)
+            RustClashVpnService.safeRequestStopVpn(this, stopIntent)
             viewModel.syncServiceStateImmediate()
             return
         }
@@ -555,7 +555,12 @@ class MainActivity : AppCompatActivity() {
             action = RustClashVpnService.ACTION_START_VPN
             putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)
         }
-        ContextCompat.startForegroundService(this, startIntent)
+        if (!RustClashVpnService.safeStartVpnForegroundService(this, startIntent)) {
+            val errMsg = "系统限制了 VPN 前台服务启动，请保持应用在前台后重试连接"
+            RustClashVpnService.stateTracker.onError(errMsg)
+            viewModel.syncServiceStateImmediate()
+            viewModel.emitUiMessage(errMsg)
+        }
     }
 
     private fun readSystemClipboardText(): String? {

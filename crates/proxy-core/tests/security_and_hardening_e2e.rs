@@ -1368,3 +1368,478 @@ rules:
     engine.shutdown();
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[tokio::test]
+async fn ssrf_delay_endpoints_geodata_subscription_and_file_ruleset_confinement_e2e() {
+    use proxy_core::{
+        profile::fetch_subscription_http_with_proxy,
+        router::{
+            geodata::fetch_http_bytes_protected_with_proxy,
+            ruleset::resolve_confined_file_provider_path,
+        },
+    };
+
+    let state_dir =
+        std::env::temp_dir().join(format!("rc-sec-m2-ssrf-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // 1. Canary loopback HTTP server that MUST NEVER receive any SSRF probe
+    let canary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let canary_addr = canary.local_addr().unwrap();
+    let canary_hits = Arc::new(AtomicUsize::new(0));
+    let canary_hits_bg = Arc::clone(&canary_hits);
+    let (bg_stop_tx, mut bg_stop_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = bg_stop_rx.changed() => break,
+                acc = canary.accept() => {
+                    let Ok((mut s, _)) = acc else { continue };
+                    canary_hits_bg.fetch_add(1, Ordering::SeqCst);
+                    let _ = s
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+        }
+    });
+
+    // Mock upstream DNS resolving attacker domain -> 127.0.0.1 and 169.254.169.254
+    let mock_ns = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mock_ns_addr = mock_ns.local_addr().unwrap();
+    let ns_bg = Arc::clone(&mock_ns);
+    let mut ns_stop = bg_stop_tx.subscribe();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            tokio::select! {
+                _ = ns_stop.changed() => break,
+                res = ns_bg.recv_from(&mut buf) => {
+                    let Ok((n, peer)) = res else { continue };
+                    let Ok(pkt) = DnsQueryPacket::parse(&buf[..n]) else { continue };
+                    let q = pkt.question.name.to_ascii_lowercase();
+                    let resp = match (q.as_str(), pkt.question.qtype) {
+                        ("rebind-direct.e2e.test", QTYPE_A) => pkt.build_response(
+                            &buf[..n],
+                            0,
+                            60,
+                            &[DnsAnswerData::A(Ipv4Addr::LOCALHOST)],
+                        ),
+                        ("rebind-meta.e2e.test", QTYPE_A) => pkt.build_response(
+                            &buf[..n],
+                            0,
+                            60,
+                            &[DnsAnswerData::A(Ipv4Addr::new(169, 254, 169, 254))],
+                        ),
+                        _ => pkt.build_response(&buf[..n], 0, 60, &[]),
+                    };
+                    let _ = ns_bg.send_to(&resp, peer).await;
+                }
+            }
+        }
+    });
+
+    // 2. Non-demo engine: `/proxies/DIRECT/delay` & `/group/PROXY/delay` MUST return 400 on SSRF/rebinding
+    let base_yaml = format!(
+        r#"
+mixed-port: 0
+external-controller: 127.0.0.1:0
+mode: rule
+dns:
+  enable: true
+  listen: 127.0.0.1:0
+  nameserver:
+    - "{mock_ns_addr}"
+  direct-nameserver:
+    - "{mock_ns_addr}"
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,PROXY
+"#
+    );
+    let cfg = ClashConfig::from_yaml_str(&base_yaml).unwrap();
+    let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+        .await
+        .unwrap();
+    let (api_stop_tx, api_stop_rx) = watch::channel(false);
+    let (api_addr, _api_task) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), api_stop_rx)
+        .await
+        .unwrap();
+    let host_hdr = api_addr.to_string();
+
+    for raw_target in [
+        format!("http://127.0.0.1:{}/generate_204", canary_addr.port()),
+        format!("http://localhost:{}/generate_204", canary_addr.port()),
+        "http://0.1.2.3/generate_204".to_string(),
+        "http://[::127.0.0.1]/generate_204".to_string(),
+        "http://[::ffff:0:127.0.0.1]/generate_204".to_string(),
+        "http://[fec0::1]/generate_204".to_string(),
+        "http://[100::1]/generate_204".to_string(),
+        "http://169.254.169.254/latest/meta-data/".to_string(),
+        "http://10.0.0.1/".to_string(),
+        "http://[fd00:ec2::254]/".to_string(),
+        "ftp://example.com/file".to_string(),
+        "http://u:p@example.com/generate_204".to_string(),
+        format!(
+            "http://rebind-direct.e2e.test:{}/generate_204",
+            canary_addr.port()
+        ),
+        "http://rebind-meta.e2e.test/latest/meta-data/".to_string(),
+    ] {
+        let enc: String = raw_target
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        for path in [
+            format!("/proxies/DIRECT/delay?url={enc}&timeout=2000"),
+            format!("/group/PROXY/delay?url={enc}&timeout=2000"),
+        ] {
+            let (code, _, body) =
+                raw_http_with_headers(api_addr, "GET", &path, &host_hdr, &[], None).await;
+            assert_eq!(
+                code, 400,
+                "SSRF delay target {raw_target} on {path} must return 400, got {code}: {body}"
+            );
+        }
+    }
+    assert_eq!(canary_hits.load(Ordering::SeqCst), 0);
+
+    // 3. `PUT /configs` MUST reject `file` rule-provider pointing to `/etc/passwd` AND must NEVER
+    //    echo contents of confined malformed files in error responses!
+    let etc_passwd_yaml = r#"
+mode: rule
+rule-providers:
+  leak:
+    type: file
+    behavior: ipcidr
+    format: text
+    path: /etc/passwd
+rules:
+  - RULE-SET,leak,DIRECT
+  - MATCH,DIRECT
+"#;
+    let put_etc = serde_json::json!({ "payload": etc_passwd_yaml }).to_string();
+    let (etc_code, _, etc_body) =
+        raw_http_with_headers(api_addr, "PUT", "/configs", &host_hdr, &[], Some(&put_etc)).await;
+    assert_eq!(
+        etc_code, 400,
+        "PUT /configs with /etc/passwd file rule-provider must fail with 400: {etc_body}"
+    );
+    assert!(!etc_body.contains("root:x:0:0"));
+
+    // Write a confined file inside state_dir with a secret sentinel line and verify `PUT /configs`
+    // error for invalid `ipcidr` NEVER echoes the sentinel line!
+    let sentinel = "SECRET_CANARY_LINE_DO_NOT_ECHO_777";
+    std::fs::write(state_dir.join("bad_cidrs.txt"), format!("{sentinel}\n")).unwrap();
+    let echo_test_yaml = r#"
+mode: rule
+rule-providers:
+  bad-cidrs:
+    type: file
+    behavior: ipcidr
+    format: text
+    path: bad_cidrs.txt
+rules:
+  - RULE-SET,bad-cidrs,DIRECT
+  - MATCH,DIRECT
+"#;
+    let put_echo = serde_json::json!({ "payload": echo_test_yaml }).to_string();
+    let (echo_code, _, echo_body) =
+        raw_http_with_headers(api_addr, "PUT", "/configs", &host_hdr, &[], Some(&put_echo)).await;
+    assert_eq!(echo_code, 400);
+    assert!(
+        !echo_body.contains(sentinel),
+        "PUT /configs rule-provider error must never echo raw file content: {echo_body}"
+    );
+    assert!(resolve_confined_file_provider_path(Some(&state_dir), "leak", "/etc/passwd").is_err());
+
+    // Relative backslash rule-provider path MUST be rejected by ClashConfig::from_yaml_str too.
+    let backslash_provider_yaml = r#"
+mode: rule
+rule-providers:
+  bs:
+    type: file
+    behavior: domain
+    path: "sub\\backslash.yaml"
+rules:
+  - MATCH,DIRECT
+"#;
+    assert!(
+        ClashConfig::from_yaml_str(backslash_provider_yaml).is_err(),
+        "relative backslash rule-provider path must be rejected during config validation"
+    );
+
+    let _ = api_stop_tx.send(true);
+    engine.shutdown();
+
+    // 4. Demo mode: allowed benchmark port + UDP DNS succeed, while engine.dns_addr() over HTTP
+    //    and disallowed localhost canary port return 400!
+    let demo_engine = ProxyEngine::start_demo(
+        Some(0),
+        Some("127.0.0.1:0".into()),
+        Some("127.0.0.1:0".into()),
+    )
+    .await
+    .unwrap();
+    let (demo_stop_tx, demo_stop_rx) = watch::channel(false);
+    let (demo_api_addr, _demo_api_task) =
+        spawn_api_server("127.0.0.1:0", Arc::clone(&demo_engine), demo_stop_rx)
+            .await
+            .unwrap();
+    let demo_host = demo_api_addr.to_string();
+    let demo_origin = demo_engine.demo_info().http_benchmark_origin;
+    let demo_dns_addr = demo_engine.dns_addr().expect("demo engine has DNS port");
+    let ok_demo_path = format!(
+        "/proxies/DIRECT/delay?url={}%2Fgenerate_204&timeout=3000",
+        demo_origin.replace(':', "%3A").replace('/', "%2F")
+    );
+    let (ok_demo_code, _, ok_demo_body) =
+        raw_http_with_headers(demo_api_addr, "GET", &ok_demo_path, &demo_host, &[], None).await;
+    assert_eq!(
+        ok_demo_code, 200,
+        "Demo benchmark port must succeed: {ok_demo_body}"
+    );
+
+    // Demo HTTP delay, group delay, waterfall probe, matrix probe, and site-check MUST reject `engine.dns_addr()`!
+    let demo_group = demo_engine
+        .config_snapshot()
+        .proxy_groups
+        .first()
+        .expect("demo config has proxy group")
+        .name
+        .clone();
+    let demo_group_enc: String = demo_group
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    for dns_http_url in [
+        format!("http://127.0.0.1:{}/", demo_dns_addr.port()),
+        format!("http://localhost:{}/", demo_dns_addr.port()),
+    ] {
+        let dns_enc: String = dns_http_url
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        for delay_path in [
+            format!("/proxies/DIRECT/delay?url={dns_enc}&timeout=1000"),
+            format!("/group/{demo_group_enc}/delay?url={dns_enc}&timeout=1000"),
+        ] {
+            let (code, _, body) =
+                raw_http_with_headers(demo_api_addr, "GET", &delay_path, &demo_host, &[], None)
+                    .await;
+            assert_eq!(
+                code, 400,
+                "Demo delay must reject engine.dns_addr() ({dns_http_url}) on {delay_path}, got {code}: {body}"
+            );
+        }
+
+        let probe_payload = serde_json::json!({
+            "url": dns_http_url,
+            "check_udp": false,
+            "timeout": 1000
+        })
+        .to_string();
+        let (probe_code, _, probe_body) = raw_http_with_headers(
+            demo_api_addr,
+            "POST",
+            "/proxies/DIRECT/probe",
+            &demo_host,
+            &[],
+            Some(&probe_payload),
+        )
+        .await;
+        assert_eq!(
+            probe_code, 400,
+            "Demo /probe must reject engine.dns_addr() ({dns_http_url}), got {probe_code}: {probe_body}"
+        );
+
+        let matrix_payload = serde_json::json!({
+            "targets": [{
+                "id": "evil-dns",
+                "label": "DNS TCP",
+                "category": "test",
+                "url": dns_http_url
+            }],
+            "timeout": 1000
+        })
+        .to_string();
+        let (matrix_code, _, matrix_body) = raw_http_with_headers(
+            demo_api_addr,
+            "POST",
+            "/proxies/DIRECT/matrix",
+            &demo_host,
+            &[],
+            Some(&matrix_payload),
+        )
+        .await;
+        assert_eq!(
+            matrix_code, 400,
+            "Demo /matrix must reject engine.dns_addr() ({dns_http_url}), got {matrix_code}: {matrix_body}"
+        );
+
+        let site_payload = serde_json::json!({
+            "target": dns_http_url,
+            "check_udp": false,
+            "timeout": 1000
+        })
+        .to_string();
+        let (site_code, _, site_body) = raw_http_with_headers(
+            demo_api_addr,
+            "POST",
+            "/diagnostics/site-check",
+            &demo_host,
+            &[],
+            Some(&site_payload),
+        )
+        .await;
+        assert_eq!(
+            site_code, 400,
+            "Demo /diagnostics/site-check must reject engine.dns_addr() ({dns_http_url}), got {site_code}: {site_body}"
+        );
+    }
+
+    // Demo `/probe` and `/matrix` against `demo.http_benchmark_origin` MUST STILL pass BOTH HTTP and Demo UDP DNS!
+    let ok_demo_probe_payload = serde_json::json!({
+        "url": format!("{demo_origin}/generate_204"),
+        "check_udp": true,
+        "timeout": 3000
+    })
+    .to_string();
+    let (ok_probe_code, _, ok_probe_body) = raw_http_with_headers(
+        demo_api_addr,
+        "POST",
+        "/proxies/DIRECT/probe",
+        &demo_host,
+        &[],
+        Some(&ok_demo_probe_payload),
+    )
+    .await;
+    assert_eq!(
+        ok_probe_code, 200,
+        "Demo /probe against benchmark origin + UDP DNS must return 200: {ok_probe_body}"
+    );
+    let ok_probe_json: serde_json::Value = serde_json::from_str(&ok_probe_body).unwrap();
+    assert_eq!(ok_probe_json["verdict"], "reachable");
+    assert_eq!(ok_probe_json["udp_probe"]["status"], "verified");
+
+    let ok_demo_matrix_payload = serde_json::json!({
+        "targets": [{
+            "id": "demo-origin",
+            "label": "Demo Benchmark",
+            "category": "sandbox",
+            "url": format!("{demo_origin}/generate_204")
+        }],
+        "timeout": 3000
+    })
+    .to_string();
+    let (ok_matrix_code, _, ok_matrix_body) = raw_http_with_headers(
+        demo_api_addr,
+        "POST",
+        "/proxies/DIRECT/matrix",
+        &demo_host,
+        &[],
+        Some(&ok_demo_matrix_payload),
+    )
+    .await;
+    assert_eq!(
+        ok_matrix_code, 200,
+        "Demo /matrix against benchmark origin + UDP DNS must return 200: {ok_matrix_body}"
+    );
+    let ok_matrix_json: serde_json::Value = serde_json::from_str(&ok_matrix_body).unwrap();
+    assert_eq!(ok_matrix_json["reachable_count"], 1);
+    assert_eq!(ok_matrix_json["udp_probe"]["status"], "verified");
+
+    let bad_demo_path = format!(
+        "/proxies/DIRECT/delay?url=http%3A%2F%2F127.0.0.1%3A{}%2Fgenerate_204&timeout=2000",
+        canary_addr.port()
+    );
+    let (bad_demo_code, _, bad_demo_body) =
+        raw_http_with_headers(demo_api_addr, "GET", &bad_demo_path, &demo_host, &[], None).await;
+    assert_eq!(
+        bad_demo_code, 400,
+        "Demo mode must block non-whitelisted localhost port: {bad_demo_body}"
+    );
+    assert_eq!(canary_hits.load(Ordering::SeqCst), 0);
+
+    let _ = demo_stop_tx.send(true);
+    demo_engine.shutdown();
+
+    // 5. GeoData & Subscription fetchers NEVER invoke fallback_proxy or dial traps when blocked by SSRF or userinfo!
+    struct CountingProxy(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl proxy_core::outbound::OutboundHandler for CountingProxy {
+        fn name(&self) -> &str {
+            "CountingE2EProxy"
+        }
+        fn protocol(&self) -> &'static str {
+            "socks5"
+        }
+        async fn connect_tcp(
+            &self,
+            _target: &TargetAddr,
+        ) -> io::Result<proxy_core::outbound::BoxedStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+        }
+    }
+    let proxy_hits = Arc::new(AtomicUsize::new(0));
+    let counting_ob: DynOutbound = Arc::new(CountingProxy(Arc::clone(&proxy_hits)));
+    let loopback_userinfo = format!("http://user:pass@127.0.0.1:{}/", canary_addr.port());
+    for bad_remote in [
+        loopback_userinfo.as_str(),
+        "https://user:pass@example.com/data",
+        "https://0.1.2.3/data",
+        "https://[::127.0.0.1]/data",
+        "https://[::ffff:0:127.0.0.1]/data",
+        "https://[fec0::1]/data",
+        "https://[100::1]/data",
+        "https://10.0.0.1/data",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://[fd00:ec2::254]/latest/meta-data/",
+        "https://metadata.google.internal/computeMetadata/v1/",
+    ] {
+        assert!(
+            fetch_http_bytes_protected_with_proxy(bad_remote, &[], Some(&counting_ob))
+                .await
+                .is_err(),
+            "GeoData must reject {bad_remote}"
+        );
+        assert!(
+            fetch_subscription_http_with_proxy(bad_remote, &[], Some(&counting_ob))
+                .await
+                .is_err(),
+            "Subscription must reject {bad_remote}"
+        );
+    }
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        0,
+        "SSRF/userinfo-blocked GeoData and subscription URLs must NEVER fall back through proxy"
+    );
+    assert_eq!(
+        canary_hits.load(Ordering::SeqCst),
+        0,
+        "userinfo loopback URL must NEVER reach canary server"
+    );
+
+    let _ = bg_stop_tx.send(true);
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

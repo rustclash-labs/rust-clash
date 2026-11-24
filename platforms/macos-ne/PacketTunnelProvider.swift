@@ -7,11 +7,13 @@ import os.log
 /// `NEPacketTunnelFlow` L3 packets directly into `rust-clash` (`libproxy_ffi.a`).
 ///
 /// Concurrency & Power Efficiency Architecture:
-/// 1. Zero Use-After-Free (UAF): `stateLock` synchronizes `engineHandle` and `running` across
-///    `startTunnel`, `stopTunnel`, `packetFlow.readPackets`, `egressQueue`, `wake()`, and
+/// 1. Zero Use-After-Free (UAF) & Balanced `DispatchGroup`: `stateLock` synchronizes
+///    `engineHandle`, `stopRequested`, `sessionGeneration`, and `egressGroup.enter()` atomically
+///    across `startTunnel`, `stopTunnel`, `packetFlow.readPackets`, `egressQueue`, `wake()`, and
 ///    `handleAppMessage`, backed by Rust's `Arc`-counted opaque handle registry (`NE_ENGINES`).
-///    `stopTunnel` unblocks the egress worker via `rc_ne_stop_engine` and waits on `egressGroup`
-///    before invoking `completionHandler()`.
+///    `stopTunnel` bumps `sessionGeneration`, unblocks the egress worker via `rc_ne_stop_engine`,
+///    and waits on `egressGroup` (always balanced by a strong local `group.leave()`) before
+///    invoking `completionHandler()`.
 /// 2. `0 Hz` Idle CPU Wakeups: Replaces periodic `DispatchSourceTimer` polling with event-driven
 ///    blocking `rc_ne_wait_outbound_packet(handle, ..., -1)` + 64-packet non-blocking batch drain.
 ///
@@ -25,6 +27,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let stateLock = NSLock()
     private var engineHandle: OpaquePointer?
     private var stopRequested = false
+    private var sessionGeneration: UInt64 = 0
     private let egressGroup = DispatchGroup()
     private let egressQueue = DispatchQueue(
         label: "io.github.rustclashlabs.rustclash.ne.egress",
@@ -38,18 +41,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return engineHandle
     }
 
+    private func activeHandle(for generation: UInt64) -> OpaquePointer? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !stopRequested, sessionGeneration == generation else { return nil }
+        return engineHandle
+    }
+
+    private func isSessionCancelled(generation: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopRequested || sessionGeneration != generation
+    }
+
     override func startTunnel(
         options: [String: NSObject]?,
         completionHandler: @escaping (Error?) -> Void
     ) {
         stateLock.lock()
+        sessionGeneration &+= 1
+        let myGeneration = sessionGeneration
         stopRequested = false
-        if let stale = engineHandle {
-            engineHandle = nil
-            stateLock.unlock()
+        let staleHandle = engineHandle
+        engineHandle = nil
+        stateLock.unlock()
+
+        if let stale = staleHandle {
             rc_ne_stop_engine(stale)
-        } else {
-            stateLock.unlock()
         }
 
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
@@ -117,6 +135,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
+            // Abort early before starting the Rust engine if `stopTunnel` or a newer `startTunnel`
+            // already superseded this session while `setTunnelNetworkSettings` was in flight.
+            if self.isSessionCancelled(generation: myGeneration) {
+                let cancelledErr = NSError(
+                    domain: "io.github.rustclashlabs.rustclash.ne",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Tunnel stopped while starting"]
+                )
+                completionHandler(cancelledErr)
+                return
+            }
+
             var errPtr: UnsafeMutablePointer<CChar>?
             let handle = yamlConfig.withCString { cYaml in
                 rc_ne_start_engine_v2(cYaml, UInt16(clamping: mtu), enableIpv6, &errPtr)
@@ -139,9 +169,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            // Check whether `stopTunnel` raced while `setTunnelNetworkSettings` / `rc_ne_start_engine_v2` ran
+            // Check whether `stopTunnel` or a newer `startTunnel` raced while `rc_ne_start_engine_v2` ran.
+            // Call `egressGroup.enter()` atomically under `stateLock` together with `engineHandle = validHandle`
+            // so `stopTunnel` can never observe a live handle before `egressGroup` tracks the egress worker.
             self.stateLock.lock()
-            if self.stopRequested {
+            if self.stopRequested || self.sessionGeneration != myGeneration {
                 self.stateLock.unlock()
                 rc_ne_stop_engine(validHandle)
                 let cancelledErr = NSError(
@@ -153,10 +185,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.engineHandle = validHandle
+            self.egressGroup.enter()
+            let group = self.egressGroup
             self.stateLock.unlock()
 
-            self.startInboundPump(expectedHandle: validHandle)
-            self.startOutboundPump(handle: validHandle)
+            self.startInboundPump(generation: myGeneration)
+            self.startOutboundPump(handle: validHandle, generation: myGeneration, group: group)
             os_log(
                 .info,
                 log: self.log,
@@ -174,6 +208,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     ) {
         stateLock.lock()
         stopRequested = true
+        sessionGeneration &+= 1
         let handleToStop = engineHandle
         engineHandle = nil
         stateLock.unlock()
@@ -217,11 +252,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func startInboundPump(expectedHandle: OpaquePointer) {
+    private func startInboundPump(generation: UInt64) {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self = self,
-                  let current = self.activeHandle(),
-                  current == expectedHandle
+                  let current = self.activeHandle(for: generation)
             else {
                 return
             }
@@ -232,21 +266,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                 }
             }
-            if self.activeHandle() == expectedHandle {
-                self.startInboundPump(expectedHandle: expectedHandle)
+            if self.activeHandle(for: generation) == current {
+                self.startInboundPump(generation: generation)
             }
         }
     }
 
-    private func startOutboundPump(handle: OpaquePointer) {
-        egressGroup.enter()
+    private func startOutboundPump(handle: OpaquePointer, generation: UInt64, group: DispatchGroup) {
+        // `egressGroup.enter()` was already invoked atomically under `stateLock` by `startTunnel`.
         egressQueue.async { [weak self] in
-            defer { self?.egressGroup.leave() }
+            // Always balance `enter()` via the strong local `group` reference (never `self?.egressGroup.leave()`),
+            // preventing unbalanced `DispatchGroup` `EXC_BAD_INSTRUCTION` traps or hanging `stopTunnel`.
+            defer { group.leave() }
             // 65,600-byte scratch buffer safely accommodates max-length IPv6 frames
             // (40-byte fixed IPv6 header + 65,535-byte payload = 65,575 bytes).
             var scratch = [UInt8](repeating: 0, count: 65600)
 
             while true {
+                guard self?.activeHandle(for: generation) == handle else {
+                    break
+                }
                 // Event-driven wait (`timeout_ms = -1`): blocks on Rust Condvar with 0 Hz idle wakeups!
                 let firstLen = scratch.withUnsafeMutableBufferPointer { buf -> Int in
                     rc_ne_wait_outbound_packet(handle, buf.baseAddress, buf.count, -1)
@@ -271,7 +310,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     continue
                 }
 
-                guard let self = self, self.activeHandle() == handle else {
+                guard let self = self, self.activeHandle(for: generation) == handle else {
                     break
                 }
 

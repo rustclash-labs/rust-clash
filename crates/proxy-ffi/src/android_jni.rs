@@ -94,8 +94,44 @@ fn ensure_tracing_initialized() {
     });
 }
 
+/// Reference-counted owner for the active Android Tokio runtime.
+///
+/// Holding `Arc<ManagedRuntime>` across every JNI `block_on(...)` call prevents
+/// `stop_android_vpn_core()` from tearing down the Tokio timer/I/O driver while a
+/// concurrent JNI thread is blocked inside a future, while still guaranteeing bounded
+/// `300ms` runtime shutdown once the last holder drops.
+///
+/// CRITICAL INVARIANT: Never move an `Arc<ManagedRuntime>` into a `handle.spawn(...)`
+/// task — dropping a Tokio `Runtime` on one of its own worker threads panics.
+struct ManagedRuntime(Option<tokio::runtime::Runtime>);
+
+impl ManagedRuntime {
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self(Some(rt))
+    }
+
+    fn handle(&self) -> &tokio::runtime::Handle {
+        self.0.as_ref().expect("ManagedRuntime dropped").handle()
+    }
+
+    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        self.0
+            .as_ref()
+            .expect("ManagedRuntime dropped")
+            .block_on(fut)
+    }
+}
+
+impl Drop for ManagedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_timeout(Duration::from_millis(300));
+        }
+    }
+}
+
 struct AndroidVpnRuntime {
-    runtime: tokio::runtime::Runtime,
+    runtime: Arc<ManagedRuntime>,
     engine: Arc<ProxyEngine>,
     #[cfg(unix)]
     fd_bridge: Option<UnixPacketFdBridge>,
@@ -615,7 +651,10 @@ fn shutdown_runtime_outside_lock(#[allow(unused_mut)] mut prev: AndroidVpnRuntim
     prev.engine.shutdown();
     clear_global_socket_protector();
     proxy_core::platform::socket_protect::set_os_underlying_ipv6_available(None);
-    prev.runtime.shutdown_timeout(Duration::from_millis(300));
+    // Drop `prev` (releasing the global `Arc<ManagedRuntime>` ref): shuts down
+    // immediately in <=300ms when no JNI `block_on` is in flight, or cleanly
+    // after the last in-flight JNI `block_on` exits.
+    drop(prev);
 }
 
 fn hash_canonical_json(val: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
@@ -839,11 +878,11 @@ fn primary_selector_group_name(cfg: &ClashConfig) -> String {
         .unwrap_or_else(|| "PROXY".to_string())
 }
 
-fn live_handle_and_engine() -> Option<(tokio::runtime::Handle, Arc<ProxyEngine>)> {
+fn live_runtime_and_engine() -> Option<(Arc<ManagedRuntime>, Arc<ProxyEngine>)> {
     let guard = ANDROID_RUNTIME.lock();
     guard
         .as_ref()
-        .map(|rt| (rt.runtime.handle().clone(), Arc::clone(&rt.engine)))
+        .map(|rt| (Arc::clone(&rt.runtime), Arc::clone(&rt.engine)))
 }
 
 /// Pure-Rust core implementation of `nativeStartVpn` (backwards-compatible wrapper without explicit `state_dir`).
@@ -988,6 +1027,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             enforce_android_local_only_config(&mut cfg);
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
+            cfg.tun.dns_hijack = true;
             cfg.tun.ipv6 = enable_ipv6;
             cfg.dns.ipv6 = enable_ipv6;
             cfg.secret = Some(ephemeral_secret.clone());
@@ -1034,6 +1074,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             cfg.dns.listen = "127.0.0.1:0".to_string();
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
+            cfg.tun.dns_hijack = true;
             cfg.tun.ipv6 = enable_ipv6;
             cfg.dns.ipv6 = enable_ipv6;
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
@@ -1069,6 +1110,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
             enforce_android_local_only_config(&mut cfg);
             cfg.tun.enable = true;
             cfg.tun.auto_route = false;
+            cfg.tun.dns_hijack = true;
             cfg.tun.ipv6 = enable_ipv6;
             cfg.dns.ipv6 = enable_ipv6;
             if cfg.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
@@ -1146,7 +1188,7 @@ fn start_android_vpn_with_state_dir_and_jvm(
     let probe_engine = Arc::clone(&engine);
 
     let candidate = AndroidVpnRuntime {
-        runtime: rt,
+        runtime: Arc::new(ManagedRuntime::new(rt)),
         engine,
         #[cfg(unix)]
         fd_bridge,
@@ -1412,7 +1454,7 @@ fn build_android_mutation_json(
 /// active profile, and effective outbound.
 pub fn android_node_manager_snapshot_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -1538,7 +1580,7 @@ pub fn android_import_unified_core(
     auto_select: bool,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -1551,7 +1593,7 @@ pub fn android_import_unified_core(
             .is_some_and(|p| p.proxy_count == 0);
         let prev_ids: std::collections::HashSet<String> =
             prev_snap.profiles.into_iter().map(|p| p.id).collect();
-        let mut report = handle
+        let mut report = runtime
             .block_on(engine.import_unified_live(raw_input, None, deduplicate, auto_select))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let after_snap = mgr.snapshot();
@@ -1570,7 +1612,7 @@ pub fn android_import_unified_core(
                 .persist_active_yaml(&report.config, None, None)
                 .map_err(|e| redact_sensitive_text(&e.to_string()))?;
             if !engine.demo_info().enabled {
-                handle
+                runtime
                     .block_on(
                         engine.activate_profile_config_with_selections(
                             report.config.clone(),
@@ -1591,7 +1633,7 @@ pub fn android_import_unified_core(
             enforce_android_local_only_config(&mut prev_cfg);
             let prev_sel = mgr.active_selected_groups();
             if !engine.demo_info().enabled {
-                let _ = handle.block_on(
+                let _ = runtime.block_on(
                     engine.activate_profile_config_with_selections(prev_cfg, Some(&prev_sel)),
                 );
             }
@@ -1679,7 +1721,7 @@ pub fn android_select_proxy_persisted_core(
     proxy_name: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let _ = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -1710,11 +1752,11 @@ pub fn android_upsert_node_core(
     let node: ProxyNodeConfig = serde_json::from_str(node_json)
         .map_err(|e| redact_sensitive_text(&format!("invalid node JSON: {e}")))?;
 
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let report = handle
+        let report = runtime
             .block_on(engine.upsert_node_live(original_name, node, auto_select))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let eff = engine.router().effective_primary_outbound();
@@ -1736,11 +1778,11 @@ pub fn android_delete_node_core(
     target_name: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let report = handle
+        let report = runtime
             .block_on(engine.delete_node_live(target_name))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let eff = engine.router().effective_primary_outbound();
@@ -1759,11 +1801,11 @@ pub fn android_delete_node_core(
 /// Offline + Live deduplication of saved proxy nodes.
 pub fn android_deduplicate_nodes_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        let report = handle
+        let report = runtime
             .block_on(engine.deduplicate_nodes_live())
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let eff = engine.router().effective_primary_outbound();
@@ -2092,7 +2134,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
             "rule" => RunMode::Rule,
             _ => return false,
         };
-        if let Some((_, engine)) = live_handle_and_engine() {
+        if let Some((_, engine)) = live_runtime_and_engine() {
             engine.set_mode(mode);
             true
         } else {
@@ -2117,11 +2159,42 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
         ) else {
             return false;
         };
-        let Some((_, engine)) = live_handle_and_engine() else {
+        let Some((_, engine)) = live_runtime_and_engine() else {
             return false;
         };
         engine.select_group_and_persist(&grp, &prx).is_ok()
     })
+}
+
+/// Pure-Rust core implementation of `nativeReloadConfig`, preserving Android virtual TUN
+/// invariants (`tun.enable = true`, `tun.auto_route = false`, `tun.dns_hijack = true`, `dns.ipv6`).
+pub fn android_reload_config_core(yaml: &str) -> Result<serde_json::Value, String> {
+    let (runtime, engine) =
+        live_runtime_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
+    let prev = engine.config_snapshot();
+    let mut parsed = ClashConfig::from_yaml_str_unchecked(yaml)
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    parsed.restore_redacted_from(&prev);
+    enforce_android_local_only_config(&mut parsed);
+    parsed.dns.ipv6 = prev.dns.ipv6;
+    parsed.tun = prev.tun;
+    parsed.tun.enable = true;
+    parsed.tun.auto_route = false;
+    parsed.tun.dns_hijack = true;
+    if parsed.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
+        parsed.secret = prev
+            .secret
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some(generate_ephemeral_api_secret()));
+    }
+    let merged = parsed
+        .to_yaml_string()
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    runtime
+        .block_on(engine.reload_yaml(&merged))
+        .map_err(|e| redact_sensitive_text(&e.to_string()))?;
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 #[unsafe(no_mangle)]
@@ -2134,31 +2207,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 ) -> jstring {
     jni_json_guarded(env, |env| {
         let yaml = jstring_to_rust(env, &yaml_config)?;
-        let (handle, engine) =
-            live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
-        let prev = engine.config_snapshot();
-        let mut parsed = ClashConfig::from_yaml_str_unchecked(&yaml)
-            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        parsed.restore_redacted_from(&prev);
-        enforce_android_local_only_config(&mut parsed);
-        parsed.dns.ipv6 = prev.dns.ipv6;
-        parsed.tun = prev.tun;
-        parsed.tun.enable = true;
-        parsed.tun.auto_route = false;
-        if parsed.secret.as_ref().is_none_or(|s| s.trim().is_empty()) {
-            parsed.secret = prev
-                .secret
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| Some(generate_ephemeral_api_secret()));
-        }
-        let merged = parsed
-            .to_yaml_string()
-            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        handle
-            .block_on(engine.reload_yaml(&merged))
-            .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        Ok(serde_json::json!({ "ok": true }))
+        android_reload_config_core(&yaml)
     })
 }
 
@@ -2172,9 +2221,9 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 ) -> jstring {
     jni_json_guarded(env, |env| {
         let raw = jstring_to_rust(env, &uris_payload)?;
-        let (handle, engine) =
-            live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
-        let nodes = handle
+        let (runtime, engine) =
+            live_runtime_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
+        let nodes = runtime
             .block_on(engine.import_uris_live(&raw))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         Ok(serde_json::json!({ "ok": true, "imported": nodes.len() }))
@@ -2203,7 +2252,7 @@ pub fn android_flush_dns_core() -> bool {
         removed_persisted = true;
     }
     proxy_core::dns::upstream::clear_dns_upstream_pools();
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         engine.flush_dns();
         true
     } else {
@@ -2232,11 +2281,11 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
         let target_raw = jstring_to_rust(env, &target_jstr)?;
         let net_raw = jstring_to_rust(env, &network_jstr)?;
         let _ = net_raw;
-        let (handle, engine) =
-            live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
+        let (runtime, engine) =
+            live_runtime_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
         let target = parse_explain_target(&target_raw)?;
         let router = engine.router();
-        let decision = handle.block_on(router.route_async(None, &target));
+        let decision = runtime.block_on(router.route_async(None, &target));
         Ok(serde_json::json!({
             "ok": true,
             "input": target_raw,
@@ -2260,7 +2309,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 /// routine `active`/`closed` traffic churn never evicts real connection failures from Android's UI.
 pub fn android_get_diagnostics_core(limit: usize) -> serde_json::Value {
     let capped = limit.clamp(1, 500);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mut entries = engine.hub().diagnostics_snapshot(capped);
         let failed = engine.hub().failed_diagnostics_snapshot(capped.min(100));
         if !failed.is_empty() {
@@ -2288,7 +2337,7 @@ pub fn android_get_diagnostics_core(limit: usize) -> serde_json::Value {
 }
 
 pub fn android_clear_diagnostics_core() -> bool {
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         engine.hub().clear_diagnostics();
         true
     } else {
@@ -2299,7 +2348,7 @@ pub fn android_clear_diagnostics_core() -> bool {
 /// Offline + Live routing preset snapshot (`smart-cn`, `global`, `direct`, `custom`).
 pub fn android_get_routing_snapshot_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2334,7 +2383,7 @@ pub fn android_set_routing_preset_core(
     let choice = RoutingPresetChoice::parse_str(preset_str)
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
 
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         if engine.demo_info().enabled {
             match choice {
                 RoutingPresetChoice::Global => engine.set_mode(RunMode::Global),
@@ -2357,7 +2406,7 @@ pub fn android_set_routing_preset_core(
         } else {
             enforce_android_local_only_config(&mut cfg);
         }
-        handle
+        runtime
             .block_on(
                 engine.activate_profile_config_with_selections(cfg, Some(&snap.selected_groups)),
             )
@@ -2400,7 +2449,7 @@ pub fn android_save_custom_rules_core(
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
     let rules = parse_custom_rules_input(rules_payload);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2413,7 +2462,7 @@ pub fn android_save_custom_rules_core(
         } else {
             enforce_android_local_only_config(&mut cfg);
         }
-        handle
+        runtime
             .block_on(
                 engine.activate_profile_config_with_selections(cfg, Some(&snap.selected_groups)),
             )
@@ -2439,7 +2488,7 @@ pub fn android_save_custom_rules_core(
 /// Query GeoSite / GeoIP database status (persisted cache vs built-in baseline, entry counts, expiration).
 pub fn android_geodata_status_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let st = engine.geodata_status();
         return Ok(serde_json::json!({
             "ok": true,
@@ -2456,8 +2505,8 @@ pub fn android_geodata_status_core(state_dir: &Path) -> Result<serde_json::Value
 /// Trigger an immediate GeoSite / GeoIP rule database update across mirrors (preserving existing data on failure).
 pub fn android_update_geodata_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
-        let st = handle
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
+        let st = runtime
             .block_on(engine.update_geodata())
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         return Ok(serde_json::json!({
@@ -2488,9 +2537,9 @@ pub fn android_explain_rule_with_state_dir_core(
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
     let target = parse_explain_target(target_raw)?;
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let router = engine.router();
-        let decision = handle.block_on(router.route_async(None, &target));
+        let decision = runtime.block_on(router.route_async(None, &target));
         return Ok(serde_json::json!({
             "ok": true,
             "vpnRunning": true,
@@ -2576,7 +2625,7 @@ pub fn android_test_latency_core(
         .map(ToOwned::to_owned);
     let timeout = Duration::from_millis(timeout_ms.clamp(300, 12_000));
 
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let default_url = {
             let d = engine.demo_info();
             if d.enabled && !d.http_benchmark_origin.is_empty() {
@@ -2593,7 +2642,7 @@ pub fn android_test_latency_core(
         let cfg = engine.config_snapshot();
         let node_names: Vec<String> = cfg.proxies.iter().map(|p| p.name().to_string()).collect();
         let router = engine.router();
-        let tested = handle.block_on(run_router_latency_probe(
+        let tested = runtime.block_on(run_router_latency_probe(
             Arc::clone(&router),
             node_names,
             clean_target,
@@ -2642,7 +2691,7 @@ pub fn android_test_latency_core(
 /// Offline + Live snapshot of all saved profiles in `ProfileManager`.
 pub fn android_profiles_snapshot_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2674,7 +2723,7 @@ pub fn android_activate_profile_core(
     profile_id: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2688,7 +2737,7 @@ pub fn android_activate_profile_core(
             enforce_android_local_only_config(&mut cfg);
         }
         let sel = mgr.active_selected_groups();
-        handle
+        runtime
             .block_on(engine.activate_profile_config_with_selections(cfg, Some(&sel)))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         return android_profiles_snapshot_core(state_dir);
@@ -2714,7 +2763,7 @@ pub fn android_delete_profile_core(
     profile_id: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2738,12 +2787,12 @@ pub fn android_refresh_profile_core(
     profile_id: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         let prev_cfg = mgr.load_profile_config_by_id(profile_id);
-        let (meta, mut cfg, is_active) = handle
+        let (meta, mut cfg, is_active) = runtime
             .block_on(mgr.refresh_subscription(profile_id))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         if needs_local_only_sanitization(&cfg) {
@@ -2759,7 +2808,7 @@ pub fn android_refresh_profile_core(
             .map(|prev| proxy_core::audit::diff_configs(prev, &cfg));
         let audit = proxy_core::audit::audit_config(&cfg);
         if is_active && !engine.demo_info().enabled {
-            handle
+            runtime
                 .block_on(
                     engine
                         .activate_profile_config_with_selections(cfg, Some(&meta.selected_groups)),
@@ -2815,7 +2864,7 @@ pub fn android_refresh_profile_core(
 /// Retrieve the active profile's redacted YAML + rules list offline or live.
 pub fn android_get_active_yaml_core(state_dir: &Path) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2862,7 +2911,7 @@ pub fn android_save_active_yaml_core(
     yaml_text: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -2885,7 +2934,7 @@ pub fn android_save_active_yaml_core(
         let sel = mgr
             .persist_active_yaml(&parsed, raw_override, None)
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
-        handle
+        runtime
             .block_on(engine.activate_profile_config_with_selections(parsed, Some(&sel)))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         return android_node_manager_snapshot_core(state_dir);
@@ -2920,9 +2969,9 @@ pub fn android_save_active_yaml_core(
 
 /// Toggle the built-in self-contained Multi-Protocol Demo Sandbox while VPN is running.
 pub fn android_set_demo_sandbox_core(enable: bool) -> Result<serde_json::Value, String> {
-    let (handle, engine) =
-        live_handle_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
-    handle
+    let (runtime, engine) =
+        live_runtime_and_engine().ok_or_else(|| "VPN engine is not running".to_string())?;
+    runtime
         .block_on(engine.set_demo_sandbox(enable))
         .map_err(|e| redact_sensitive_text(&e.to_string()))?;
     Ok(serde_json::json!({
@@ -3177,11 +3226,11 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 
 /// Toggle low-power / screen-off Doze battery saver mode on the live Android `ProxyEngine`.
 pub fn android_set_low_power_mode_core(enabled: bool) -> bool {
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         engine.set_low_power_mode(enabled);
         if !enabled {
             maybe_spawn_active_leaf_delay_probe(
-                &handle,
+                runtime.handle(),
                 &engine,
                 Some(STALE_ACTIVE_DELAY_MAX_AGE_MS),
             );
@@ -3226,7 +3275,7 @@ pub fn android_update_profile_settings_core(
         name,
         auto_update_interval_secs,
     };
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         let mgr = engine
             .ensure_profile_manager()
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
@@ -3298,7 +3347,7 @@ pub extern "system" fn Java_io_github_rustclashlabs_rustclash_vpn_NativeBridge_n
 /// Enable or disable Android debug diagnostic mode offline or live.
 pub fn android_set_debug_logging_core(enabled: bool) -> bool {
     let prev = ANDROID_DEBUG_LOGGING.swap(enabled, Ordering::AcqRel);
-    if let Some((_, engine)) = live_handle_and_engine() {
+    if let Some((_, engine)) = live_runtime_and_engine() {
         engine.hub().set_debug_mode(enabled);
         if prev != enabled {
             engine.hub().push_log(
@@ -4051,29 +4100,10 @@ pub fn android_diagnose_site_core(
     target_raw: &str,
 ) -> Result<serde_json::Value, String> {
     record_state_dir(state_dir);
-    if let Some((handle, engine)) = live_handle_and_engine() {
+    if let Some((runtime, engine)) = live_runtime_and_engine() {
         let demo = engine.demo_info();
-        let mut allowed_private = Vec::new();
-        if demo.enabled {
-            if let Some(authority) = demo
-                .http_benchmark_origin
-                .trim()
-                .strip_prefix("http://")
-                .or_else(|| demo.http_benchmark_origin.trim().strip_prefix("https://"))
-                .and_then(|rest| rest.split('/').next())
-            {
-                if let Ok(sock_addr) = authority.parse::<std::net::SocketAddr>() {
-                    allowed_private.push(sock_addr);
-                } else if let Some(port_str) = authority.strip_prefix("localhost:")
-                    && let Ok(port) = port_str.parse::<u16>()
-                {
-                    allowed_private.push(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
-                }
-            }
-            if let Some(dns_addr) = engine.dns_addr() {
-                allowed_private.push(dns_addr);
-            }
-        }
+        let allowed_private = proxy_core::api::demo_allowed_private_addrs(&engine);
+        let allowed_private_udp = proxy_core::api::demo_allowed_udp_private_addrs(&engine);
         let fallback_demo_udp = if demo.enabled {
             engine.dns_addr().map(|a| a.to_string())
         } else {
@@ -4088,8 +4118,8 @@ pub fn android_diagnose_site_core(
             tun_enabled: engine.is_tun_active() || engine.is_virtual_tun_active(),
             platform_hint: "android".to_string(),
         };
-        let report = handle
-            .block_on(proxy_core::probe::diagnose_site(
+        let report = runtime
+            .block_on(proxy_core::probe::diagnose_site_with_udp_allowlist(
                 &router,
                 &cfg,
                 target_raw,
@@ -4102,6 +4132,7 @@ pub fn android_diagnose_site_core(
                     allow_private_targets: false,
                     allowed_private_addrs: &allowed_private,
                 },
+                &allowed_private_udp,
             ))
             .map_err(|e| redact_sensitive_text(&e.to_string()))?;
         sync_delays_from_router(&router);
@@ -4177,12 +4208,12 @@ pub fn android_probe_exit_ip_core(
     record_state_dir(state_dir);
 
     enum ProbeRunner {
-        Live(tokio::runtime::Handle),
+        Live(Arc<ManagedRuntime>),
         Offline(Arc<tokio::runtime::Runtime>),
     }
 
     let (router, mode_str, vpn_running, demo_enabled, extra_ca, runner) =
-        if let Some((handle, engine)) = live_handle_and_engine() {
+        if let Some((runtime, engine)) = live_runtime_and_engine() {
             let router = engine.router();
             let mode_str = router.mode().as_str().to_string();
             let demo_enabled = engine.demo_info().enabled;
@@ -4193,7 +4224,7 @@ pub fn android_probe_exit_ip_core(
                 true,
                 demo_enabled,
                 extra_ca,
-                ProbeRunner::Live(handle),
+                ProbeRunner::Live(runtime),
             )
         } else {
             let mgr = ProfileManager::open_or_init(state_dir)
@@ -4318,7 +4349,7 @@ pub fn android_probe_exit_ip_core(
         .flatten()
     };
     let probe_res = match runner {
-        ProbeRunner::Live(handle) => handle.block_on(probe_fut),
+        ProbeRunner::Live(runtime) => runtime.block_on(probe_fut),
         ProbeRunner::Offline(runtime) => runtime.block_on(probe_fut),
     };
 
@@ -4627,7 +4658,7 @@ mod tests {
         .expect("start_android_vpn_with_options ipv6=true");
         assert_eq!(res_v6["ok"], true);
 
-        let (_, engine_v6) = live_handle_and_engine().expect("live engine v6");
+        let (_, engine_v6) = live_runtime_and_engine().expect("live engine v6");
         let cfg_v6 = engine_v6.config_snapshot();
         assert!(cfg_v6.tun.ipv6);
         assert!(cfg_v6.dns.ipv6);
@@ -4654,7 +4685,7 @@ mod tests {
         )
         .expect("start_android_vpn_with_options raw ipv6=true");
         assert_eq!(res_raw["ok"], true);
-        let (_, engine_raw) = live_handle_and_engine().expect("live raw engine");
+        let (_, engine_raw) = live_runtime_and_engine().expect("live raw engine");
         let cfg_raw = engine_raw.config_snapshot();
         assert!(cfg_raw.tun.ipv6);
         assert!(cfg_raw.dns.ipv6);
@@ -4674,7 +4705,7 @@ mod tests {
         .expect("start_android_vpn_with_options");
         assert_eq!(res["ok"], true);
 
-        let (_, engine) = live_handle_and_engine().expect("live engine running");
+        let (_, engine) = live_runtime_and_engine().expect("live engine running");
         let cfg = engine.config_snapshot();
         assert!(!cfg.tun.ipv6);
         assert!(!cfg.dns.ipv6);
@@ -4713,7 +4744,7 @@ mod tests {
         .expect("start_android_vpn_with_options");
         assert_eq!(res["ok"], true);
 
-        let (_, engine) = live_handle_and_engine().expect("live engine running");
+        let (_, engine) = live_runtime_and_engine().expect("live engine running");
         let mgr = engine.ensure_profile_manager().expect("profile manager");
         let yaml_path = mgr.active_profile_path();
         assert!(yaml_path.exists());
@@ -4878,7 +4909,7 @@ mod tests {
             .expect("active runtime on baseline");
         assert!(!base_rep.dns_cache_flushed);
 
-        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let (_, engine) = live_runtime_and_engine().expect("live engine");
         let target = proxy_core::addr::TargetAddr::new_domain("ipv4.example.com", 443).unwrap();
         let active_conn = engine.hub().register_connection(
             "TUN(smoltcp)",
@@ -5267,7 +5298,7 @@ mod tests {
         assert_eq!(st["hasIpv6"], true);
 
         // 4. Verify `sync_delays_from_router` preserves positive cached delay when a probe times out (`0`)
-        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let (_, engine) = live_runtime_and_engine().expect("live engine");
         engine.router().delays().record("DIRECT", 42);
         sync_delays_from_router(&engine.router());
         assert_eq!(OFFLINE_DELAY_CACHE.lock().get("DIRECT").copied(), Some(42));
@@ -5331,7 +5362,7 @@ mod tests {
         .expect("start_android_vpn_with_options with enable_ipv6=true");
         assert_eq!(res["ok"], true);
 
-        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let (_, engine) = live_runtime_and_engine().expect("live engine");
         assert!(engine.config_snapshot().tun.ipv6);
         assert!(engine.config_snapshot().dns.ipv6);
 
@@ -5498,7 +5529,7 @@ rules:
         assert_eq!(second["totalNodes"], 2);
 
         // 3. Importing a Clash YAML with auto_select=false does NOT bump live router epoch or switch away.
-        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let (_, engine) = live_runtime_and_engine().expect("live engine");
         let epoch_before = engine.router().epoch();
         let yaml = r#"
 proxies:
@@ -5554,7 +5585,7 @@ rules:
         .expect("start_android_vpn_with_options");
         assert_eq!(res["ok"], true);
 
-        let (_, engine) = live_handle_and_engine().expect("live engine");
+        let (_, engine) = live_runtime_and_engine().expect("live engine");
         let hub = engine.hub();
 
         // Record an early failed connection
@@ -5608,5 +5639,299 @@ rules:
         drop(engine);
         assert!(stop_android_vpn_core());
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn android_vpn_start_and_reload_enforce_tun_dns_hijack_true() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rustclash-jni-dns-hijack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp state dir");
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-dns-hijack", false));
+
+        let cases = [
+            (
+                "dns-hijack: false",
+                "mixed-port: 0\nexternal-controller: \"\"\nmode: rule\ntun:\n  dns-hijack: false\nrules:\n  - MATCH,DIRECT\n",
+            ),
+            (
+                "dns-hijack: []",
+                "mixed-port: 0\nexternal-controller: \"\"\nmode: rule\ntun:\n  dns-hijack: []\nrules:\n  - MATCH,DIRECT\n",
+            ),
+        ];
+
+        for (label, raw_yaml) in cases {
+            let parsed = ClashConfig::from_yaml_str(raw_yaml).expect("parse raw yaml");
+            assert!(
+                !parsed.tun.dns_hijack,
+                "precondition: raw YAML ({label}) must deserialize tun.dns_hijack=false"
+            );
+
+            // 1. Inline YAML start (`state_dir = None`)
+            let inline_res = start_android_vpn_with_options(
+                #[cfg(unix)]
+                None,
+                None,
+                raw_yaml,
+                false,
+                true,
+                Arc::clone(&protector),
+            )
+            .expect("inline YAML start");
+            assert_eq!(inline_res["ok"], true);
+            {
+                let (_, engine) = live_runtime_and_engine().expect("live inline engine");
+                assert!(
+                    engine.config_snapshot().tun.dns_hijack,
+                    "inline YAML start must force cfg.tun.dns_hijack=true ({label})"
+                );
+                assert!(
+                    engine.router().tun_dns_hijack(),
+                    "inline YAML start must force router.tun_dns_hijack()=true ({label})"
+                );
+            }
+
+            // 2. Live reload (`android_reload_config_core` / `nativeReloadConfig`)
+            let reload_res = android_reload_config_core(raw_yaml).expect("live reload");
+            assert_eq!(reload_res["ok"], true);
+            {
+                let (_, engine) = live_runtime_and_engine().expect("live reloaded engine");
+                assert!(
+                    engine.config_snapshot().tun.dns_hijack,
+                    "live reload must force cfg.tun.dns_hijack=true ({label})"
+                );
+                assert!(
+                    engine.router().tun_dns_hijack(),
+                    "live reload must force router.tun_dns_hijack()=true ({label})"
+                );
+            }
+            assert!(stop_android_vpn_core());
+
+            // 3. `state_dir` profile start with persisted YAML containing `dns-hijack: false` / `[]`
+            let case_dir = tmp_dir.join(if label.contains("false") {
+                "case-false"
+            } else {
+                "case-empty"
+            });
+            std::fs::create_dir_all(&case_dir).expect("create case dir");
+            {
+                let mgr = ProfileManager::open_or_init(&case_dir).expect("init profile manager");
+                mgr.persist_active_yaml(&parsed, Some(raw_yaml), None)
+                    .expect("persist dns-hijack-disabled active yaml");
+                let (disk_cfg, _) = mgr.load_active_config().expect("reload persisted yaml");
+                assert!(
+                    !disk_cfg.tun.dns_hijack,
+                    "persisted profile YAML ({label}) should still have dns_hijack=false on disk"
+                );
+            }
+            let state_res = start_android_vpn_with_options(
+                #[cfg(unix)]
+                None,
+                Some(&case_dir),
+                "",
+                false,
+                true,
+                Arc::clone(&protector),
+            )
+            .expect("state_dir profile start");
+            assert_eq!(state_res["ok"], true);
+            {
+                let (_, engine) = live_runtime_and_engine().expect("live state_dir engine");
+                assert!(
+                    engine.config_snapshot().tun.dns_hijack,
+                    "state_dir start must force cfg.tun.dns_hijack=true ({label})"
+                );
+                assert!(
+                    engine.router().tun_dns_hijack(),
+                    "state_dir start must force router.tun_dns_hijack()=true ({label})"
+                );
+            }
+            assert!(stop_android_vpn_core());
+        }
+
+        // 4. Demo mode start also enforces `tun.dns_hijack = true`
+        let demo_res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            Some(&tmp_dir),
+            "",
+            true,
+            true,
+            protector,
+        )
+        .expect("demo mode start");
+        assert_eq!(demo_res["ok"], true);
+        {
+            let (_, engine) = live_runtime_and_engine().expect("live demo engine");
+            assert!(
+                engine.config_snapshot().tun.dns_hijack,
+                "demo start must force cfg.tun.dns_hijack=true"
+            );
+            assert!(
+                engine.router().tun_dns_hijack(),
+                "demo start must force router.tun_dns_hijack()=true"
+            );
+        }
+        assert!(stop_android_vpn_core());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn stop_android_vpn_core_does_not_panic_inflight_block_on_timer() {
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let protector = Arc::new(CallbackSocketProtector::counting("unit-rt-race", false));
+
+        let res = start_android_vpn_with_options(
+            #[cfg(unix)]
+            None,
+            None,
+            "",
+            false,
+            false,
+            protector,
+        )
+        .expect("start_android_vpn_with_options");
+        assert_eq!(res["ok"], true);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = std::thread::spawn(move || -> (usize, Duration) {
+            let (runtime, _engine) =
+                live_runtime_and_engine().expect("worker acquired live runtime");
+            let started = Instant::now();
+            let val = runtime.block_on(async move {
+                entered_tx.send(()).expect("signal block_on entry");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                42usize
+            });
+            (val, started.elapsed())
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker entered runtime.block_on");
+        std::thread::sleep(Duration::from_millis(30));
+
+        assert!(
+            stop_android_vpn_core(),
+            "stop_android_vpn_core must succeed while JNI block_on is in flight"
+        );
+        assert!(
+            live_runtime_and_engine().is_none(),
+            "global ANDROID_RUNTIME must be cleared immediately on stop"
+        );
+
+        let (val, elapsed) = worker
+            .join()
+            .expect("in-flight runtime.block_on thread must complete cleanly with zero panic");
+        assert_eq!(val, 42);
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "sleep future should finish cleanly without premature timer driver shutdown (elapsed={elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn android_diagnose_site_demo_separates_http_and_udp_ssrf_allowlists() {
+        struct DemoVpnCleanupGuard {
+            state_dir: PathBuf,
+            stopped: bool,
+        }
+
+        impl Drop for DemoVpnCleanupGuard {
+            fn drop(&mut self) {
+                if !self.stopped {
+                    let _ = stop_android_vpn_core();
+                }
+                let _ = std::fs::remove_dir_all(&self.state_dir);
+            }
+        }
+
+        let _test_guard = UNIT_TEST_LOCK.lock();
+        let _ = stop_android_vpn_core();
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustclash-jni-demo-site-ssrf-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create temp state dir");
+        let mut cleanup = DemoVpnCleanupGuard {
+            state_dir: state_dir.clone(),
+            stopped: false,
+        };
+
+        let protector = Arc::new(CallbackSocketProtector::counting(
+            "unit-demo-site-ssrf",
+            false,
+        ));
+        let started = start_android_vpn_with_state_dir(
+            #[cfg(unix)]
+            None,
+            Some(&state_dir),
+            "",
+            true,
+            protector,
+        )
+        .expect("start live Android Demo VPN");
+        assert_eq!(started["ok"], true);
+
+        let dns_listen = started["dnsListen"]
+            .as_str()
+            .expect("demo VPN must report dnsListen")
+            .to_string();
+        let dns_addr: std::net::SocketAddr = dns_listen
+            .parse()
+            .expect("dnsListen must be a valid SocketAddr");
+        let dns_port = dns_addr.port();
+
+        let http_benchmark_origin = {
+            let (_, engine) = live_runtime_and_engine().expect("live demo engine");
+            let demo = engine.demo_info();
+            assert!(demo.enabled, "demo sandbox must be active");
+            assert!(
+                !demo.http_benchmark_origin.is_empty(),
+                "demo http_benchmark_origin must be populated"
+            );
+            demo.http_benchmark_origin
+        };
+
+        // HTTP site probes targeting the local Demo DNS listener MUST be blocked by SSRF
+        // across IPv4 literal, localhost hostname, and IPv4-mapped IPv6 encodings.
+        for blocked_target in [
+            format!("http://{dns_listen}/"),
+            format!("http://localhost:{dns_port}/"),
+            format!("http://[::ffff:127.0.0.1]:{dns_port}/"),
+        ] {
+            let err = android_diagnose_site_core(&state_dir, &blocked_target).expect_err(&format!(
+                "HTTP site diagnose targeting Demo dns_listen ({blocked_target}) must be rejected"
+            ));
+            assert!(
+                err.contains("blocked by SSRF protection"),
+                "expected SSRF rejection for {blocked_target}, got: {err}"
+            );
+        }
+
+        // Positive control: diagnosing the Demo HTTP benchmark origin must succeed AND still
+        // verify UDP DNS against the Demo DNS listener via the separated UDP allowlist.
+        let ok_target = format!("{http_benchmark_origin}/generate_204");
+        let diag = android_diagnose_site_core(&state_dir, &ok_target)
+            .expect("Demo HTTP benchmark origin diagnosis must succeed");
+        assert_eq!(diag["ok"], true);
+        assert_eq!(diag["vpnRunning"], true);
+        assert_eq!(
+            diag["diagnosis"]["waterfall"]["verdict"], "reachable",
+            "Demo benchmark origin must be reachable: {diag}"
+        );
+        assert_eq!(
+            diag["diagnosis"]["waterfall"]["http_status"], 204,
+            "Demo benchmark origin must return HTTP 204: {diag}"
+        );
+        assert_eq!(
+            diag["diagnosis"]["waterfall"]["udp_probe"]["status"], "verified",
+            "Demo UDP DNS probe must remain verified via separated UDP allowlist: {diag}"
+        );
+
+        assert!(stop_android_vpn_core());
+        cleanup.stopped = true;
     }
 }

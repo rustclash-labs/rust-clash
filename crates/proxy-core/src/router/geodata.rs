@@ -791,8 +791,81 @@ pub async fn resolve_host_bypassing_fake_ip(host: &str, port: u16) -> Result<Vec
     )))
 }
 
-async fn connect_protected_http_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
-    let addrs = resolve_host_bypassing_fake_ip(host, port).await?;
+enum DirectFetchError {
+    SsrfBlocked(ProxyError),
+    Transport(ProxyError),
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let clean = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if clean.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    clean
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+fn validate_geodata_host(host: &str, allow_loopback: bool) -> Result<()> {
+    let clean = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if clean.is_empty() {
+        return Err(ProxyError::Config("GeoData URL missing host".into()));
+    }
+    if let Ok(ip) = clean.parse::<IpAddr>() {
+        if allow_loopback && ip.to_canonical().is_loopback() {
+            return Ok(());
+        }
+        if crate::probe::is_restricted_probe_ip(ip) {
+            return Err(ProxyError::Config(format!(
+                "refusing GeoData connection to restricted address '{clean}' (blocked by SSRF protection)"
+            )));
+        }
+        return Ok(());
+    }
+    if allow_loopback && is_loopback_host(clean) {
+        return Ok(());
+    }
+    if crate::probe::is_restricted_probe_hostname(clean) {
+        return Err(ProxyError::Config(format!(
+            "refusing GeoData connection to restricted internal hostname '{clean}' (blocked by SSRF protection)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_geodata_resolved_ip(ip: IpAddr, allow_loopback: bool) -> Result<()> {
+    if allow_loopback && ip.to_canonical().is_loopback() {
+        return Ok(());
+    }
+    if crate::probe::is_restricted_probe_ip(ip) {
+        return Err(ProxyError::Config(format!(
+            "refusing GeoData connection to restricted resolved IP {ip} (blocked by SSRF protection)"
+        )));
+    }
+    Ok(())
+}
+
+async fn connect_protected_http_tcp_with_addrs(
+    host: &str,
+    port: u16,
+    addrs: Vec<SocketAddr>,
+    allow_loopback: bool,
+) -> std::result::Result<tokio::net::TcpStream, DirectFetchError> {
+    if addrs.is_empty() {
+        return Err(DirectFetchError::Transport(ProxyError::Dns(format!(
+            "unable to resolve real IP for host '{host}'"
+        ))));
+    }
+    for target in &addrs {
+        if let Err(err) = validate_geodata_resolved_ip(target.ip(), allow_loopback) {
+            return Err(DirectFetchError::SsrfBlocked(err));
+        }
+    }
+
     let mut last_err = None;
     for target in addrs {
         let domain = if target.is_ipv6() {
@@ -827,16 +900,9 @@ async fn connect_protected_http_tcp(host: &str, port: u16) -> Result<tokio::net:
             }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| ProxyError::Config(format!("failed connecting to '{host}:{port}'"))))
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let clean = host.trim_start_matches('[').trim_end_matches(']');
-    clean.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    Err(DirectFetchError::Transport(last_err.unwrap_or_else(|| {
+        ProxyError::Config(format!("failed connecting to '{host}:{port}'"))
+    })))
 }
 
 /// Download an HTTPS (or loopback HTTP for tests) GeoData resource over a `SocketProtector`-protected socket.
@@ -855,19 +921,42 @@ pub async fn fetch_http_bytes_protected_with_proxy(
     extra_ca_der: &[CertificateDer<'static>],
     fallback_proxy: Option<&DynOutbound>,
 ) -> Result<Vec<u8>> {
+    fetch_http_bytes_protected_inner(raw_url, extra_ca_der, fallback_proxy, |h, p| async move {
+        resolve_host_bypassing_fake_ip(&h, p).await
+    })
+    .await
+}
+
+async fn fetch_http_bytes_protected_inner<F, Fut>(
+    raw_url: &str,
+    extra_ca_der: &[CertificateDer<'static>],
+    fallback_proxy: Option<&DynOutbound>,
+    mut resolver: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<SocketAddr>>>,
+{
     let mut current = Url::parse(raw_url.trim())
         .map_err(|e| ProxyError::Config(format!("invalid GeoData URL: {e}")))?;
+    let mut allow_loopback = current.host_str().is_some_and(is_loopback_host);
 
     for _hop in 0..=3 {
+        if !current.username().is_empty() || current.password().is_some() {
+            return Err(ProxyError::Config(
+                "GeoData URL must not contain userinfo credentials".into(),
+            ));
+        }
         let scheme = current.scheme().to_ascii_lowercase();
         let host = current
             .host_str()
             .ok_or_else(|| ProxyError::Config("GeoData URL missing host".into()))?
             .to_string();
+        allow_loopback = allow_loopback && is_loopback_host(&host);
 
         let is_https = match scheme.as_str() {
             "https" => true,
-            "http" if is_loopback_host(&host) => false,
+            "http" if allow_loopback && is_loopback_host(&host) => false,
             "http" => {
                 return Err(ProxyError::Config(
                     "cleartext http:// GeoData URLs are rejected for security; use https://".into(),
@@ -879,6 +968,8 @@ pub async fn fetch_http_bytes_protected_with_proxy(
                 )));
             }
         };
+
+        validate_geodata_host(&host, allow_loopback)?;
 
         let port = current
             .port_or_known_default()
@@ -903,23 +994,39 @@ pub async fn fetch_http_bytes_protected_with_proxy(
             env!("CARGO_PKG_VERSION")
         );
 
-        let direct_attempt: Result<Vec<u8>> = async {
-            let tcp = connect_protected_http_tcp(&host, port).await?;
-            if is_https {
-                exchange_https_over_stream(tcp, &host, &req_bytes, extra_ca_der).await
-            } else {
-                let mut tcp = tcp;
-                tcp.write_all(req_bytes.as_bytes())
-                    .await
-                    .map_err(ProxyError::Io)?;
-                read_bounded_bytes(&mut tcp).await
+        let resolved_direct = resolver(host.clone(), port)
+            .await
+            .map_err(DirectFetchError::Transport);
+        let direct_attempt: std::result::Result<Vec<u8>, DirectFetchError> = match resolved_direct {
+            Ok(addrs) => {
+                let tcp =
+                    connect_protected_http_tcp_with_addrs(&host, port, addrs, allow_loopback).await;
+                match tcp {
+                    Ok(tcp) => {
+                        if is_https {
+                            exchange_https_over_stream(tcp, &host, &req_bytes, extra_ca_der)
+                                .await
+                                .map_err(DirectFetchError::Transport)
+                        } else {
+                            let mut tcp = tcp;
+                            match tcp.write_all(req_bytes.as_bytes()).await {
+                                Ok(()) => read_bounded_bytes(&mut tcp)
+                                    .await
+                                    .map_err(DirectFetchError::Transport),
+                                Err(e) => Err(DirectFetchError::Transport(ProxyError::Io(e))),
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
             }
-        }
-        .await;
+            Err(err) => Err(err),
+        };
 
         let raw_resp = match direct_attempt {
             Ok(bytes) => bytes,
-            Err(direct_err) => {
+            Err(DirectFetchError::SsrfBlocked(err)) => return Err(err),
+            Err(DirectFetchError::Transport(direct_err)) => {
                 if is_https
                     && !is_loopback_host(&host)
                     && let Some(proxy_ob) = fallback_proxy
@@ -961,7 +1068,7 @@ pub async fn fetch_http_bytes_protected_with_proxy(
         };
 
         let (status, headers, body) = parse_http_response(&raw_resp)?;
-        if matches!(status, 301 | 302 | 307 | 308) {
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let loc = headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("location"))
@@ -972,11 +1079,39 @@ pub async fn fetch_http_bytes_protected_with_proxy(
             let next_url = current
                 .join(loc)
                 .map_err(|e| ProxyError::Config(format!("invalid redirect Location: {e}")))?;
-            if is_https && next_url.scheme().eq_ignore_ascii_case("http") {
+            if !next_url.username().is_empty() || next_url.password().is_some() {
+                return Err(ProxyError::Config(
+                    "GeoData redirect URL must not contain userinfo credentials".into(),
+                ));
+            }
+            let next_scheme = next_url.scheme().to_ascii_lowercase();
+            if is_https && next_scheme == "http" {
                 return Err(ProxyError::Config(
                     "refusing HTTPS-to-HTTP downgrade redirect on GeoData URL".into(),
                 ));
             }
+            if !matches!(next_scheme.as_str(), "https" | "http") {
+                return Err(ProxyError::Config(format!(
+                    "unsupported GeoData redirect URL scheme '{next_scheme}'"
+                )));
+            }
+            let next_host = next_url
+                .host_str()
+                .ok_or_else(|| ProxyError::Config("GeoData redirect URL missing host".into()))?;
+            if !allow_loopback && is_loopback_host(next_host) {
+                return Err(ProxyError::Config(
+                    "refusing remote GeoData redirect to local loopback host".into(),
+                ));
+            }
+            let next_allow_loopback = allow_loopback && is_loopback_host(next_host);
+            if next_scheme == "http" && !(next_allow_loopback && is_loopback_host(next_host)) {
+                return Err(ProxyError::Config(
+                    "cleartext http:// GeoData redirects are rejected for security; use https://"
+                        .into(),
+                ));
+            }
+            validate_geodata_host(next_host, next_allow_loopback)?;
+            allow_loopback = next_allow_loopback;
             current = next_url;
             continue;
         }
@@ -1227,5 +1362,184 @@ mod tests {
             non_cn_builtin,
             "api.blocked-sub.example.cn"
         ));
+    }
+
+    #[tokio::test]
+    async fn geodata_ssrf_blocks_private_ula_metadata_userinfo_redirects_and_never_uses_fallback_proxy()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::ffff:127.0.0.1"));
+        assert!(is_loopback_host("[::ffff:127.0.0.1]"));
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("169.254.169.254"));
+
+        struct CountingFallbackProxy {
+            hits: Arc<AtomicUsize>,
+            forward_to: Option<SocketAddr>,
+        }
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for CountingFallbackProxy {
+            fn name(&self) -> &str {
+                "CountingGeoFallback"
+            }
+            fn protocol(&self) -> &'static str {
+                "socks5"
+            }
+            async fn connect_tcp(
+                &self,
+                _target: &TargetAddr,
+            ) -> std::io::Result<crate::outbound::BoxedStream> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                if let Some(addr) = self.forward_to {
+                    let s = tokio::net::TcpStream::connect(addr).await?;
+                    Ok(Box::new(s))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "mock proxy refused",
+                    ))
+                }
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counting_proxy: DynOutbound = Arc::new(CountingFallbackProxy {
+            hits: Arc::clone(&hits),
+            forward_to: None,
+        });
+
+        // 1. Direct literal restricted IPs, internal hostnames, userinfo, and non-HTTP schemes MUST fail
+        //    WITHOUT ever invoking fallback_proxy!
+        for blocked_url in [
+            "https://10.0.0.1/Country.mmdb",
+            "https://172.16.0.1/Country.mmdb",
+            "https://192.168.1.1/Country.mmdb",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[fd00:ec2::254]/latest/meta-data/",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://internal-service.local/Country.mmdb",
+            "https://user:pass@example.com/Country.mmdb",
+            "ftp://example.com/Country.mmdb",
+        ] {
+            let err =
+                fetch_http_bytes_protected_with_proxy(blocked_url, &[], Some(&counting_proxy))
+                    .await
+                    .expect_err("GeoData SSRF/bad URL must be blocked");
+            assert!(
+                matches!(err, ProxyError::Config(_)),
+                "expected Config error for {blocked_url}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "fallback_proxy must NEVER be invoked on SSRF-blocked GeoData URLs"
+        );
+
+        // 2. Post-DNS resolution to restricted IPs (DNS rebinding) returns SsrfBlocked and MUST NOT
+        //    invoke fallback_proxy!
+        for rebound_ip in [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "fd00:ec2::254",
+        ] {
+            let ip: IpAddr = rebound_ip.parse().unwrap();
+            let err = fetch_http_bytes_protected_inner(
+                "https://rebind-geo.example.com/Country.mmdb",
+                &[],
+                Some(&counting_proxy),
+                move |_h, port| async move { Ok(vec![SocketAddr::new(ip, port)]) },
+            )
+            .await
+            .expect_err("DNS-rebound GeoData IP must be blocked");
+            assert!(
+                matches!(err, ProxyError::Config(_)),
+                "expected Config error for rebinding to {rebound_ip}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "fallback_proxy must NEVER be invoked when DNS resolution triggers SsrfBlocked"
+        );
+
+        // 3. Remote HTTPS server behind fallback_proxy redirecting to loopback / IPv4-mapped loopback /
+        //    IMDS / internal hostname MUST be blocked before following the redirect!
+        let (tls_cfg, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &["redirect-geo.invalid".into()],
+            &[],
+        )
+        .unwrap();
+        let acceptor = TlsAcceptor::from(tls_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let redirect_locations = Arc::new(parking_lot::Mutex::new(
+            std::collections::VecDeque::from(vec![
+                "https://127.0.0.1:9090/configs".to_string(),
+                "https://[::ffff:127.0.0.1]:9090/configs".to_string(),
+                "https://169.254.169.254/latest/meta-data/".to_string(),
+                "https://[fd00:ec2::254]/latest/meta-data/".to_string(),
+                "https://metadata.google.internal/computeMetadata/v1/".to_string(),
+            ]),
+        ));
+        let locs_bg = Arc::clone(&redirect_locations);
+        let srv_task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                let loc = locs_bg
+                    .lock()
+                    .pop_front()
+                    .unwrap_or_else(|| "https://127.0.0.1:9090/".into());
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acc.accept(tcp).await {
+                        let mut buf = [0u8; 1024];
+                        let _ = tls.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = tls.write_all(resp.as_bytes()).await;
+                        let _ = tls.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        for i in 1..=5usize {
+            let redir_hits = Arc::new(AtomicUsize::new(0));
+            let redir_proxy: DynOutbound = Arc::new(CountingFallbackProxy {
+                hits: Arc::clone(&redir_hits),
+                forward_to: Some(srv_addr),
+            });
+            let err = fetch_http_bytes_protected_inner(
+                "https://redirect-geo.invalid/Country.mmdb",
+                std::slice::from_ref(&ca_der),
+                Some(&redir_proxy),
+                |_h, _p| async { Err(ProxyError::Dns("direct blocked".into())) },
+            )
+            .await
+            .expect_err("proxied remote redirect to restricted target must fail");
+            assert!(
+                matches!(err, ProxyError::Config(_)),
+                "case #{i}: expected Config error on restricted redirect, got {err:?}"
+            );
+            assert_eq!(
+                redir_hits.load(Ordering::SeqCst),
+                1,
+                "case #{i}: fallback_proxy must only be used for initial hop, never for SSRF redirect target"
+            );
+        }
+
+        srv_task.abort();
     }
 }

@@ -1110,6 +1110,10 @@ rules:
             }
             if let Some(ref raw_path) = pcfg.path {
                 validate_rule_provider_path(pname, &pt, raw_path)?;
+            } else if pt == "file" {
+                return Err(ProxyError::Config(format!(
+                    "file rule-provider '{pname}' requires a confined relative 'path'"
+                )));
             }
         }
 
@@ -2722,14 +2726,19 @@ fn validate_rule_provider_path(pname: &str, pt: &str, raw_path: &str) -> Result<
             "rule-provider '{pname}' path '{raw_path}' must not contain parent-directory ('..') traversal"
         )));
     }
-    if pt == "http" && !raw_path.is_empty() {
+    if (pt == "http" && !raw_path.is_empty()) || pt == "file" {
         let trimmed = raw_path.trim();
         let p_obj = Path::new(trimmed);
+        let has_normal_component = p_obj
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)));
         let has_root_or_prefix = trimmed.is_empty()
+            || !has_normal_component
             || Path::new(raw_path).is_absolute()
             || p_obj.is_absolute()
             || trimmed.starts_with('/')
             || trimmed.starts_with('\\')
+            || raw_path.contains('\\')
             || (trimmed.len() >= 2
                 && trimmed.as_bytes()[0].is_ascii_alphabetic()
                 && trimmed.as_bytes()[1] == b':')
@@ -2743,7 +2752,7 @@ fn validate_rule_provider_path(pname: &str, pt: &str, raw_path: &str) -> Result<
             });
         if has_root_or_prefix {
             return Err(ProxyError::Config(format!(
-                "http rule-provider '{pname}' path '{raw_path}' must be a confined relative path"
+                "{pt} rule-provider '{pname}' path '{raw_path}' must be a confined relative path"
             )));
         }
     }
@@ -6209,5 +6218,68 @@ rules:
                 .to_string()
                 .contains("sniffer.skip-dst-address")
         );
+    }
+
+    #[test]
+    fn file_rule_provider_requires_confined_relative_path() {
+        for bad_path in [
+            "/etc/passwd",
+            "/tmp/rules.yaml",
+            "../outside.yaml",
+            "sub/../../outside.yaml",
+            r"sub\backslash.yaml",
+            r"C:\Windows\win.ini",
+            r"\\server\share\rules.yaml",
+            "",
+            ".",
+            "./",
+        ] {
+            let yaml = format!(
+                "rule-providers:\n  bad:\n    type: file\n    behavior: domain\n    path: {bad_path:?}\nrules:\n  - MATCH,DIRECT\n"
+            );
+            assert!(
+                ClashConfig::from_yaml_str(&yaml).is_err(),
+                "file rule-provider path {bad_path:?} must be rejected"
+            );
+        }
+
+        let http_backslash = r#"
+rule-providers:
+  bad_http:
+    type: http
+    behavior: domain
+    url: https://example.com/rules.yaml
+    path: "sub\\backslash.yaml"
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(
+            ClashConfig::from_yaml_str(http_backslash).is_err(),
+            "http rule-provider path with backslash must be rejected"
+        );
+
+        let missing_path = r#"
+rule-providers:
+  missing:
+    type: file
+    behavior: domain
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(ClashConfig::from_yaml_str(missing_path).is_err());
+
+        for good_path in [
+            "corp_domains.yaml",
+            "rulesets/corp_domains.yaml",
+            "./local.txt",
+        ] {
+            let yaml = format!(
+                "rule-providers:\n  ok:\n    type: file\n    behavior: domain\n    path: {good_path:?}\nrules:\n  - RULE-SET,ok,DIRECT\n  - MATCH,DIRECT\n"
+            );
+            assert!(
+                ClashConfig::from_yaml_str(&yaml).is_ok(),
+                "relative file rule-provider path {good_path:?} should pass config validation"
+            );
+        }
     }
 }
