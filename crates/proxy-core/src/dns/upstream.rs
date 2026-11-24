@@ -415,8 +415,9 @@ impl BootstrapDnsServer {
                     });
                 }
                 _ => {
+                    let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
                     return Err(ProxyError::Config(format!(
-                        "default-nameserver '{raw}' must use a literal IP address, not a hostname"
+                        "default-nameserver '{safe_raw}' must use a literal IP address, not a hostname"
                     )));
                 }
             }
@@ -425,16 +426,18 @@ impl BootstrapDnsServer {
         let s = trimmed.split('#').next().unwrap_or("").trim();
         if let Some(rest) = strip_prefix_ignore_ascii_case(s, "tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
                 ProxyError::Config(format!(
-                    "default-nameserver '{raw}' must use a literal IP address, not a hostname"
+                    "default-nameserver '{safe_raw}' must use a literal IP address, not a hostname"
                 ))
             })?;
             return Ok(Self::Tcp(sa));
         }
         let rest = strip_prefix_ignore_ascii_case(s, "udp://").unwrap_or(s);
         let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
+            let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
             ProxyError::Config(format!(
-                "default-nameserver '{raw}' must use a literal IP address, not a hostname"
+                "default-nameserver '{safe_raw}' must use a literal IP address, not a hostname"
             ))
         })?;
         Ok(Self::Udp(sa))
@@ -528,11 +531,14 @@ impl DnsUpstream {
 
         if let Some(https_rest) = strip_prefix_ignore_ascii_case(main_part, "https://") {
             let normalized_url = format!("https://{https_rest}");
-            let parsed = Url::parse(&normalized_url)
-                .map_err(|e| ProxyError::Config(format!("invalid DoH URL '{raw}': {e}")))?;
-            let host_str = parsed
-                .host_str()
-                .ok_or_else(|| ProxyError::Config(format!("DoH URL '{raw}' missing host")))?;
+            let parsed = Url::parse(&normalized_url).map_err(|e| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("invalid DoH URL '{safe_raw}': {e}"))
+            })?;
+            let host_str = parsed.host_str().ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("DoH URL '{safe_raw}' missing host"))
+            })?;
             let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
             let host = if let Ok(ip) = clean_host.parse::<IpAddr>() {
                 DnsEndpointHost::Ip(ip)
@@ -576,11 +582,14 @@ impl DnsUpstream {
                 });
             }
             let normalized_url = format!("tls://{tls_rest}");
-            let parsed = Url::parse(&normalized_url)
-                .map_err(|e| ProxyError::Config(format!("invalid DoT URL '{raw}': {e}")))?;
-            let host_str = parsed
-                .host_str()
-                .ok_or_else(|| ProxyError::Config(format!("DoT URL '{raw}' missing host")))?;
+            let parsed = Url::parse(&normalized_url).map_err(|e| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("invalid DoT URL '{safe_raw}': {e}"))
+            })?;
+            let host_str = parsed.host_str().ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("DoT URL '{safe_raw}' missing host"))
+            })?;
             let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
             let host = if let Ok(ip) = clean_host.parse::<IpAddr>() {
                 DnsEndpointHost::Ip(ip)
@@ -598,16 +607,19 @@ impl DnsUpstream {
 
         if let Some(rest) = strip_prefix_ignore_ascii_case(main_part, "tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
                 ProxyError::Config(format!(
-                    "invalid TCP DNS server '{raw}': expected IP[:PORT]"
+                    "invalid TCP DNS server '{safe_raw}': expected IP[:PORT]"
                 ))
             })?;
             return Ok(Self::Tcp(sa));
         }
 
         let udp_rest = strip_prefix_ignore_ascii_case(main_part, "udp://").unwrap_or(main_part);
-        let sa = parse_ip_socket_addr(udp_rest, 53)
-            .ok_or_else(|| ProxyError::Config(format!("invalid DNS nameserver '{raw}'")))?;
+        let sa = parse_ip_socket_addr(udp_rest, 53).ok_or_else(|| {
+            let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+            ProxyError::Config(format!("invalid DNS nameserver '{safe_raw}'"))
+        })?;
         Ok(Self::Udp(sa))
     }
 
@@ -3298,5 +3310,149 @@ mod tests {
                 .is_none()
         );
         assert_eq!(parse_http_response_body(close_delim).unwrap(), b"RAWBODY");
+    }
+
+    #[test]
+    fn dns_upstream_and_bootstrap_parse_errors_sanitize_sensitive_inputs() {
+        // Clean hostname errors remain readable
+        let clean_boot_err = BootstrapDnsServer::parse("dns.google")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            clean_boot_err.contains("'dns.google'"),
+            "clean bootstrap error should stay readable: {clean_boot_err}"
+        );
+        let clean_doh_boot_err = BootstrapDnsServer::parse("https://dns.google/dns-query")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            clean_doh_boot_err.contains("'https://dns.google/dns-query'"),
+            "clean DoH bootstrap error should stay readable: {clean_doh_boot_err}"
+        );
+
+        // Secret-bearing failing bootstrap entries must never leak credentials, stamps, `%`-smuggled hosts, spaces, or tails
+        let boot_cases: [(&str, &[&str]); 12] = [
+            (
+                "https://u:p)BootParenPass@doh.example/dns-query",
+                &["BootParenPass"],
+            ),
+            (
+                "https://dns.nextdns.io/ActiveNextDnsId/Alice's MacBook (Work)",
+                &["ActiveNextDnsId", "Alice", "MacBook"],
+            ),
+            (
+                "tls://dotuser:BootDotPass@dot.corp.example:853/BootDotPath",
+                &["dotuser", "BootDotPass", "BootDotPath"],
+            ),
+            (
+                "https://u\tser:8080\\BootInnerTabPass@doh.example/dns-query",
+                &["BootInnerTabPass", "8080"],
+            ),
+            (
+                "https://user\r:BootCrPass@doh.example/dns-query",
+                &["BootCrPass"],
+            ),
+            (
+                "https://user\n:BootLfPass@doh.example/dns-query",
+                &["BootLfPass"],
+            ),
+            (
+                "sdns://AgcAAAAAAAAABzEuMC4wLjGgBootStampSecret99",
+                &["BootStampSecret99", "AgcAAAAAAAAABzEuMC4wLjGg"],
+            ),
+            (
+                "tls://dot.corp.example%2fBootPctSecret99",
+                &["BootPctSecret99"],
+            ),
+            ("tls://user%3apass%40dot.corp.example", &["user%3apass%40"]),
+            ("tcp://bad%2fBootTcpSecret88", &["BootTcpSecret88"]),
+            ("1.1.1.1:53 BootSpaceSecret99", &["BootSpaceSecret99"]),
+            ("dns.nextdns.io/BootPathSecret99", &["BootPathSecret99"]),
+        ];
+        for (raw, forbidden) in boot_cases {
+            let err = BootstrapDnsServer::parse(raw).unwrap_err().to_string();
+            for secret in forbidden {
+                assert!(
+                    !err.contains(secret),
+                    "BootstrapDnsServer::parse error leaked '{secret}': {err}"
+                );
+            }
+        }
+
+        // Secret-bearing failing DnsUpstream entries must never leak credentials, stamps, `%`-smuggled hosts, spaces, or tails
+        let upstream_cases: [(&str, &[&str]); 11] = [
+            (
+                "https://doh.corp.example:99999/tok)ActiveParenErrPass",
+                &["ActiveParenErrPass"],
+            ),
+            (
+                "https://doh.corp.example:99999/tok ActiveSpaceErrPass",
+                &["ActiveSpaceErrPass"],
+            ),
+            (
+                "tls://dotuser:ActiveDotErrPass@dot.corp.example:99999/ActiveDotErrPath",
+                &["dotuser", "ActiveDotErrPass", "ActiveDotErrPath"],
+            ),
+            (
+                "quic://quicuser:ActiveQuicErrPass@doq.corp.example:853/ActiveQuicErrPath",
+                &["quicuser", "ActiveQuicErrPass", "ActiveQuicErrPath"],
+            ),
+            ("ss://\tActiveSsTabSecret99==", &["ActiveSsTabSecret99"]),
+            (
+                "https://u\tser:ActiveTabErrPass@doh.example:99999/dns-query",
+                &["ActiveTabErrPass"],
+            ),
+            (
+                "sdns://AgcAAAAAAAAABzEuMC4wLjGgPrivateStampSecret99",
+                &["PrivateStampSecret99", "AgcAAAAAAAAABzEuMC4wLjGg"],
+            ),
+            ("tcp://bad%2fTcpSecret88", &["TcpSecret88"]),
+            ("udp://bad%2fUdpSecret77", &["UdpSecret77"]),
+            ("1.1.1.1:53 SpaceSecret99", &["SpaceSecret99"]),
+            ("dns.nextdns.io/PathSecret99", &["PathSecret99"]),
+        ];
+        for (raw, forbidden) in upstream_cases {
+            let err = DnsUpstream::parse(raw).unwrap_err().to_string();
+            for secret in forbidden {
+                assert!(
+                    !err.contains(secret),
+                    "DnsUpstream::parse error leaked '{secret}': {err}"
+                );
+            }
+        }
+
+        // End-to-end `ClashConfig::from_yaml_str` DNS config errors also sanitize `sdns://`,
+        // `%`-smuggled opaque hosts, and space/path non-scheme DNS entries
+        for (field, raw, secret) in [
+            (
+                "nameserver",
+                "sdns://AgcAAAAAAAAABzEuMC4wLjGgCfgErrStampSecret99",
+                "CfgErrStampSecret99",
+            ),
+            (
+                "nameserver",
+                "1.1.1.1:53 CfgErrSpaceSecret99",
+                "CfgErrSpaceSecret99",
+            ),
+            (
+                "nameserver",
+                "dns.nextdns.io/CfgErrPathSecret99",
+                "CfgErrPathSecret99",
+            ),
+            (
+                "default-nameserver",
+                "tls://dot.corp.example%2fCfgErrPctSecret99",
+                "CfgErrPctSecret99",
+            ),
+        ] {
+            let yaml = format!("dns:\n  enable: true\n  {field}:\n    - \"{raw}\"\n");
+            let err = crate::config::ClashConfig::from_yaml_str(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains(secret),
+                "ClashConfig::from_yaml_str leaked '{secret}': {err}"
+            );
+        }
     }
 }

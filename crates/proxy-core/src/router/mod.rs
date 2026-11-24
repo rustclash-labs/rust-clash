@@ -39,7 +39,6 @@ use crate::{
         rules::{CompiledRule, RuleMatcher, RuleSnapshot},
         ruleset::build_rule_sets_with_state_dir,
     },
-    tracker::TelemetryHub,
 };
 
 static ROUTER_EPOCH_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -303,9 +302,7 @@ impl Router {
     }
 
     pub fn latest_delay_age_ms(&self, name: &str) -> Option<u64> {
-        self.delays
-            .latest_delay_with_time(name)
-            .map(|(t, _)| TelemetryHub::now_ms().saturating_sub(t))
+        self.delays.latest_delay_age_ms(name)
     }
 
     pub fn record_passive_delay_if_stale(&self, name: &str, rtt_ms: u64, max_age_ms: u64) {
@@ -1875,10 +1872,17 @@ mod tests {
         // Screen-off low_power_mode preserves an existing node delay against RRC-idle heartbeat spikes,
         // while still allowing an unseeded node to record its first measurement and resuming normal
         // passive refreshes once interactive again.
+        let sleep_at_least = |min_elapsed: Duration| {
+            let start = Instant::now();
+            while start.elapsed() < min_elapsed {
+                let remaining = min_elapsed.saturating_sub(start.elapsed());
+                std::thread::sleep(remaining.max(Duration::from_millis(1)));
+            }
+        };
         router.delays().record("SG-01", 105);
         router.set_low_power_mode(true);
         assert!(router.is_low_power_mode());
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         router.record_passive_delay_if_stale("SG-01", 456, 1);
         assert_eq!(router.delays().latest_delay("SG-01"), Some(105));
         router.record_passive_delay_if_stale("SG-UNSEEDED", 180, 1);
@@ -1886,7 +1890,7 @@ mod tests {
 
         router.set_low_power_mode(false);
         assert!(!router.is_low_power_mode());
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         router.record_passive_delay_if_stale("SG-01", 112, 1);
         assert_eq!(router.delays().latest_delay("SG-01"), Some(112));
     }

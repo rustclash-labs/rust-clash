@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     addr::TargetAddr,
-    config::{ClashConfig, ProxyGroupConfig, ProxyNodeConfig, RunMode, uri::redact_sensitive_text},
+    config::{
+        ClashConfig, ProxyGroupConfig, ProxyNodeConfig, REDACTED_SECRET, RunMode,
+        uri::{has_backslash_before_at_in_authority, redact_sensitive_text},
+    },
     dns::upstream::DnsUpstream,
     router::{
         RouteSimulationPreview, Router,
@@ -1184,6 +1187,106 @@ fn audit_config_inner(
     }
 }
 
+fn is_unsafe_non_scheme_dns_entry(s: &str) -> bool {
+    s.chars().any(char::is_whitespace)
+        || s.contains('/')
+        || s.contains('?')
+        || s.contains('@')
+        || s.contains('\\')
+        || url::Url::parse(s)
+            .is_ok_and(|u| crate::config::uri::is_known_endpoint_scheme_name(u.scheme()))
+}
+
+pub(crate) fn redact_dns_upstream_for_diff(raw: &str) -> String {
+    let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if trimmed.chars().any(char::is_control) {
+        return "***REDACTED_URL***".to_string();
+    }
+    if let Some((_, after_scheme)) = trimmed.split_once("://") {
+        if trimmed.chars().any(char::is_whitespace) || has_backslash_before_at_in_authority(trimmed)
+        {
+            return "***REDACTED_URL***".to_string();
+        }
+        let Ok(parsed) = url::Url::parse(trimmed) else {
+            return "***REDACTED_URL***".to_string();
+        };
+        let is_known_dns_scheme = matches!(
+            parsed.scheme(),
+            "https" | "http" | "tls" | "quic" | "h3" | "doq" | "udp" | "tcp" | "dhcp"
+        );
+        if !is_known_dns_scheme {
+            // For opaque DNS stamps (`sdns://`), proxy share URIs, or unknown schemes, always
+            // scrub everything after `scheme://` so base64 stamps, credentials, and private paths
+            // never leak.
+            return format!("{}://{REDACTED_SECRET}", parsed.scheme());
+        }
+        let Some(raw_host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+            return "***REDACTED_URL***".to_string();
+        };
+        if raw_host.contains('\\')
+            || raw_host.contains('%')
+            || raw_host.contains('@')
+            || raw_host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return "***REDACTED_URL***".to_string();
+        }
+        let raw_path = match after_scheme.find('/') {
+            Some(idx) => &after_scheme[idx..],
+            None => "",
+        };
+        let raw_path_clean = !after_scheme.starts_with('/')
+            && !after_scheme.contains('\\')
+            && !raw_path.contains("..")
+            && !raw_path
+                .as_bytes()
+                .windows(3)
+                .any(|w| w[0] == b'%' && w[1] == b'2' && w[2].eq_ignore_ascii_case(&b'e'))
+            && matches!(
+                raw_path,
+                "" | "/" | "/dns-query" | "/dns-query/" | "/resolve"
+            );
+        let is_standard_public_path = matches!(
+            parsed.path(),
+            "" | "/" | "/dns-query" | "/dns-query/" | "/resolve"
+        );
+        if parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && is_standard_public_path
+            && raw_path_clean
+        {
+            crate::config::uri::restore_placeholder_case(parsed.as_str())
+        } else {
+            let host = crate::config::uri::restore_placeholder_case(raw_host);
+            let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+            format!(
+                "{}://{}{}/{REDACTED_SECRET}",
+                parsed.scheme(),
+                host,
+                port_suffix
+            )
+        }
+    } else {
+        if let Some((main_raw, _frag)) = trimmed.split_once('#') {
+            let main = main_raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+            if main.is_empty()
+                || main.chars().any(|c| c.is_whitespace() || c.is_control())
+                || is_unsafe_non_scheme_dns_entry(main)
+            {
+                return "***REDACTED_URL***".to_string();
+            }
+            return format!("{}#{REDACTED_SECRET}", redact_sensitive_text(main));
+        }
+        if is_unsafe_non_scheme_dns_entry(trimmed) {
+            return "***REDACTED_URL***".to_string();
+        }
+        redact_sensitive_text(trimmed)
+    }
+}
+
 /// Compute a strictly credential-redacted security & routing diff between two `ClashConfig` snapshots
 /// (designed for subscription refresh inspection and before/after profile comparison).
 pub fn diff_configs(prev: &ClashConfig, next: &ClashConfig) -> ConfigDiffSummary {
@@ -1280,28 +1383,38 @@ pub fn diff_configs(prev: &ClashConfig, next: &ClashConfig) -> ConfigDiffSummary
             prev.dns.enhanced_mode, next.dns.enhanced_mode
         ));
     }
+    let redact_dns_list = |items: &[String]| -> Vec<String> {
+        items
+            .iter()
+            .map(|s| redact_dns_upstream_for_diff(s))
+            .collect()
+    };
     if prev.dns.nameserver != next.dns.nameserver {
         dns_changes.push(format!(
             "dns.nameserver: {:?} -> {:?}",
-            prev.dns.nameserver, next.dns.nameserver
+            redact_dns_list(&prev.dns.nameserver),
+            redact_dns_list(&next.dns.nameserver)
         ));
     }
     if prev.dns.direct_nameserver != next.dns.direct_nameserver {
         dns_changes.push(format!(
             "dns.direct-nameserver: {:?} -> {:?}",
-            prev.dns.direct_nameserver, next.dns.direct_nameserver
+            redact_dns_list(&prev.dns.direct_nameserver),
+            redact_dns_list(&next.dns.direct_nameserver)
         ));
     }
     if prev.dns.fallback != next.dns.fallback {
         dns_changes.push(format!(
             "dns.fallback: {:?} -> {:?}",
-            prev.dns.fallback, next.dns.fallback
+            redact_dns_list(&prev.dns.fallback),
+            redact_dns_list(&next.dns.fallback)
         ));
     }
     if prev.dns.proxy_server_nameserver != next.dns.proxy_server_nameserver {
         dns_changes.push(format!(
             "dns.proxy-server-nameserver: {:?} -> {:?}",
-            prev.dns.proxy_server_nameserver, next.dns.proxy_server_nameserver
+            redact_dns_list(&prev.dns.proxy_server_nameserver),
+            redact_dns_list(&next.dns.proxy_server_nameserver)
         ));
     }
     if prev.dns.nameserver_policy != next.dns.nameserver_policy {
@@ -1581,5 +1694,475 @@ rules:
             .find(|f| f.code == "DNS-IMPLICIT-RESOLVE")
             .unwrap();
         assert_eq!(plain_finding.severity, AuditSeverity::High);
+    }
+
+    #[test]
+    fn diff_configs_redacts_doh_credentials_queries_fragments_and_preserves_clean_public_doh() {
+        let mut prev = ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        prev.dns.nameserver = vec![
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://cloudflare-dns.com/dns-query".to_string(),
+            "tls://1.1.1.1:853".to_string(),
+            "1.1.1.1:53".to_string(),
+        ];
+        prev.dns.direct_nameserver =
+            vec!["https://olduser:OldDirectPass@direct.example/dns-query".to_string()];
+        prev.dns.fallback = vec!["https://223.5.5.5/dns-query".to_string()];
+        prev.dns.proxy_server_nameserver =
+            vec!["https://oldp:OldProxyPass@psn.example/dns-query?token=OldPsnTok".to_string()];
+
+        let mut next = prev.clone();
+        next.dns.nameserver = vec![
+            r#"https://user:p"QuotePassSecret@doh.example.com/dns-query?token=TokQuoteSecret"#
+                .to_string(),
+            r#"https://user:p'SQuotePassSecret@doh.example.com/dns-query?token=TokSQuoteSecret"#
+                .to_string(),
+            r#"https://user:p)ParenPassSecret@doh.example.com/dns-query?token=TokParenSecret"#
+                .to_string(),
+            r#"https://user:p,CommaPassSecret@doh.example.com/dns-query?token=TokCommaSecret"#
+                .to_string(),
+            r#"https://user:p;SemiPassSecret@doh.example.com/dns-query?token=TokSemiSecret"#
+                .to_string(),
+            r#"https://doh.example.com/dns-query?q="QuoteQuerySecret"&x=1"#.to_string(),
+            r#"https://secretuser:8080\BackslashPassSecret@doh.example.com/dns-query"#.to_string(),
+            "https://user:pw@[2400:3200::1]:8443/dns-query?token=Ipv6TokSecret".to_string(),
+            "https://doh.example.com/dns-query#FragSecret99".to_string(),
+            "https://bad host/MalformedSecret1".to_string(),
+            "https://[bad-ipv6/MalformedSecret2".to_string(),
+            "https://:bad/MalformedSecret3".to_string(),
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://cloudflare-dns.com/dns-query".to_string(),
+        ];
+        next.dns.direct_nameserver =
+            vec!["https://newuser:NewDirectPass@direct.example/dns-query".to_string()];
+        next.dns.fallback = vec![
+            "https://fbuser:FallbackPassSecret@fb.example.com/dns-query?key=FbKeySecret"
+                .to_string(),
+            "1.1.1.1:53 token=NonUrlTokenSecret".to_string(),
+        ];
+        next.dns.proxy_server_nameserver =
+            vec!["https://newp:NewProxyPass@psn.example/dns-query?token=NewPsnTok".to_string()];
+
+        let diff = diff_configs(&prev, &next);
+        assert!(diff.dns_changed);
+        let joined = diff.dns_changes.join("\n");
+        let json = serde_json::to_string(&diff).unwrap();
+
+        for secret in [
+            "QuotePassSecret",
+            "TokQuoteSecret",
+            "SQuotePassSecret",
+            "TokSQuoteSecret",
+            "ParenPassSecret",
+            "TokParenSecret",
+            "CommaPassSecret",
+            "TokCommaSecret",
+            "SemiPassSecret",
+            "TokSemiSecret",
+            "QuoteQuerySecret",
+            "secretuser",
+            "BackslashPassSecret",
+            "Ipv6TokSecret",
+            "FragSecret99",
+            "MalformedSecret1",
+            "MalformedSecret2",
+            "MalformedSecret3",
+            "OldDirectPass",
+            "NewDirectPass",
+            "FallbackPassSecret",
+            "FbKeySecret",
+            "NonUrlTokenSecret",
+            "OldProxyPass",
+            "OldPsnTok",
+            "NewProxyPass",
+            "NewPsnTok",
+            "olduser",
+            "newuser",
+            "fbuser",
+        ] {
+            assert!(
+                !joined.contains(secret) && !json.contains(secret),
+                "DNS diff leaked secret '{secret}': {joined}"
+            );
+        }
+
+        // IPv6 host keeps brackets + port with credentials/query stripped
+        assert!(
+            joined.contains("https://[2400:3200::1]:8443/***REDACTED***"),
+            "expected bracketed IPv6 host with port in diff: {joined}"
+        );
+        // Authenticated domain DoH preserves host and redacts credentials/query/fragment
+        assert!(
+            joined.contains("https://doh.example.com/***REDACTED***"),
+            "expected redacted domain DoH URL in diff: {joined}"
+        );
+        // Backslash-before-@ and malformed URLs fail closed
+        assert!(
+            joined.contains("***REDACTED_URL***"),
+            "expected ***REDACTED_URL*** for malformed/backslash-before-@ URLs: {joined}"
+        );
+        // Space-containing non-URL DNS upstream fails closed
+        assert!(
+            !joined.contains("NonUrlTokenSecret"),
+            "space-containing non-URL DNS upstream must not leak token: {joined}"
+        );
+        // Clean unauthenticated public DoH/DoT URLs stay readable in diff_configs for UI diffs
+        assert!(
+            joined.contains("https://223.5.5.5/dns-query"),
+            "clean public IP DoH URL should remain intact in diff_configs: {joined}"
+        );
+        assert!(
+            joined.contains("https://cloudflare-dns.com/dns-query"),
+            "clean public domain DoH URL should remain intact in diff_configs: {joined}"
+        );
+        assert!(
+            joined.contains("tls://1.1.1.1:853"),
+            "clean DoT URL should remain intact in diff_configs: {joined}"
+        );
+
+        // Rotating ONLY credentials on an authenticated DoH URL must still set dns_changed = true
+        let mut rot_prev =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        rot_prev.dns.nameserver =
+            vec!["https://user:pass_v1@doh.example.com/dns-query".to_string()];
+        let mut rot_next = rot_prev.clone();
+        rot_next.dns.nameserver =
+            vec!["https://user:pass_v2@doh.example.com/dns-query".to_string()];
+        let rot_diff = diff_configs(&rot_prev, &rot_next);
+        assert!(rot_diff.dns_changed);
+        let rot_joined = rot_diff.dns_changes.join("\n");
+        assert!(!rot_joined.contains("pass_v1") && !rot_joined.contains("pass_v2"));
+        assert!(rot_joined.contains("https://doh.example.com/***REDACTED***"));
+    }
+
+    #[test]
+    fn diff_configs_redacts_private_doh_dot_paths_whatwg_ws_dot_segments_and_proxy_uris() {
+        let mut prev = ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        prev.dns.nameserver = vec![
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://cloudflare-dns.com/dns-query".to_string(),
+            "https://dns.google/resolve".to_string(),
+            "tls://1.1.1.1:853".to_string(),
+            "223.5.5.5".to_string(),
+            "dhcp://en0".to_string(),
+            "https://dns.nextdns.io/old_profile_secret_111/OldDevice".to_string(),
+        ];
+        prev.dns.direct_nameserver = vec![];
+        prev.dns.fallback = vec![];
+        prev.dns.proxy_server_nameserver = vec![];
+
+        let mut next = prev.clone();
+        next.dns.nameserver = vec![
+            // WHATWG \t / \n / \r backslash bypasses (with and without query)
+            "https://\t/tabsecuser:8080\\tabsecpass@doh.example/dns-query".to_string(),
+            "https://\n/lfsecuser:8080\\lfsecpass@doh.example/dns-query".to_string(),
+            "https://\r/crsecuser:8080\\crsecpass@doh.example/dns-query".to_string(),
+            "https:///\t/stsecuser:8080\\stsecpass@doh.example/dns-query".to_string(),
+            "https://\t/tabquser:8080\\tabqpass@doh.example/dns-query?token=TabQTok".to_string(),
+            // NextDNS (with and without spaces/quotes/parens) & AdGuard client IDs
+            "https://dns.nextdns.io/new_profile_secret_222/MyPrivateDevice".to_string(),
+            "https://dns.nextdns.io/a1b2c3/Alice's MacBook (Work)".to_string(),
+            "https://d.adguard-dns.com/dns-query/SecretAdGuardProfile99".to_string(),
+            // UUID, path key=val, matrix ;password=, embedded URI, PQ key, delimiter/space paths
+            "https://doh.example.com/12345678-1234-4321-abcd-998877665544/dns-query".to_string(),
+            "https://doh.example.com/dns-query/token=PathTokenSecret999".to_string(),
+            "https://doh.example.com/dns-query;password=MatrixPassSecret888".to_string(),
+            "https://doh.example.com/https://alice:EmbeddedPass777@evil.example/tok".to_string(),
+            "https://doh.example.com/mlkem768x25519plus.native.0rtt.PQPATHSECRET".to_string(),
+            r#"https://doh.corp.example/dns-query/tok"QuotePathSecret"#.to_string(),
+            "https://doh.corp.example/dns-query/tok)ParenPathSecret".to_string(),
+            "https://doh.corp.example/dns-query/tok,CommaPathSecret".to_string(),
+            "https://doh.corp.example/dns-query/tok;SemiPathSecret".to_string(),
+            "https://doh.example.com/dns-query/tok PathSpaceSecret".to_string(),
+            // Dot-segment and percent-encoded dot-segment smuggling
+            "https://dns.google/SecretTok/../dns-query".to_string(),
+            "https://dns.google/PctSecretTok/%2e%2e/dns-query".to_string(),
+            "https://dns.google/BsSecretTok\\..\\dns-query".to_string(),
+            // Private DoT path token & opaque-host `%`-smuggling
+            "tls://dot.corp.example:853/DotSecretPathToken".to_string(),
+            "tls://dot.corp.example%2fSecretPath99".to_string(),
+            "tls://user%3apass%40dot.corp.example".to_string(),
+            "tcp://bad%2fTcpSecret88".to_string(),
+            "udp://bad%2fUdpSecret77".to_string(),
+            // Opaque DNS stamps, non-DNS proxy URIs, and unknown schemes
+            "sdns://AgcAAAAAAAAABzEuMC4wLjGgPrivateStampSecret99".to_string(),
+            "ss://YWVzLTI1Ni1nY206U0VDUkVUX1NTX1BBU1M".to_string(),
+            "vmess://eyJhZGQiOiIxLjIuMy40IiwiaWQiOiJTRUNSRVRfVk1FU1NfSUQifQ==".to_string(),
+            "customproto://OpaqueCustomSecret?token=123".to_string(),
+            // Malformed backslash schemes without literal `://`
+            r"https:/\slbsuser:8080\slbspass@doh.example/dns-query".to_string(),
+            r"https:\\bsbsuser:8080\bsbspass@doh.example/dns-query".to_string(),
+            // Non-scheme space & path entries fail closed
+            "1.1.1.1:53 NonSchemeDiffSpace99".to_string(),
+            "dns.nextdns.io/NonSchemeDiffPath99".to_string(),
+            // Clean public upstreams preserved verbatim
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://cloudflare-dns.com/dns-query".to_string(),
+            "https://dns.google/resolve".to_string(),
+            "tls://1.1.1.1:853".to_string(),
+            "quic://dns.adguard.com:853".to_string(),
+            "223.5.5.5".to_string(),
+            "dhcp://en0".to_string(),
+            "https://***REDACTED***.example/dns-query".to_string(),
+        ];
+        next.dns.direct_nameserver =
+            vec!["https://dns.nextdns.io/d4e5f6/Bob's Phone (Private)".to_string()];
+        next.dns.fallback =
+            vec!["https://doh.corp.example/dns-query/fb)FallbackPathSecret".to_string()];
+        next.dns.proxy_server_nameserver =
+            vec!["https://doh.corp.example/dns-query/pns;ProxyNsPathSecret".to_string()];
+
+        let diff = diff_configs(&prev, &next);
+        assert!(diff.dns_changed);
+        let joined = diff.dns_changes.join("\n");
+        let json = serde_json::to_string(&diff).unwrap();
+
+        for secret in [
+            "tabsecuser",
+            "tabsecpass",
+            "lfsecuser",
+            "lfsecpass",
+            "crsecuser",
+            "crsecpass",
+            "stsecuser",
+            "stsecpass",
+            "tabquser",
+            "tabqpass",
+            "TabQTok",
+            "old_profile_secret_111",
+            "OldDevice",
+            "new_profile_secret_222",
+            "MyPrivateDevice",
+            "a1b2c3",
+            "Alice",
+            "MacBook",
+            "SecretAdGuardProfile99",
+            "12345678-1234-4321-abcd-998877665544",
+            "PathTokenSecret999",
+            "MatrixPassSecret888",
+            "EmbeddedPass777",
+            "PQPATHSECRET",
+            "QuotePathSecret",
+            "ParenPathSecret",
+            "CommaPathSecret",
+            "SemiPathSecret",
+            "PathSpaceSecret",
+            "SecretTok",
+            "PctSecretTok",
+            "BsSecretTok",
+            "DotSecretPathToken",
+            "SecretPath99",
+            "user%3apass%40",
+            "TcpSecret88",
+            "UdpSecret77",
+            "PrivateStampSecret99",
+            "AgcAAAAAAAAABzEuMC4wLjGg",
+            "NonSchemeDiffSpace99",
+            "NonSchemeDiffPath99",
+            "YWVzLTI1Ni1nY206U0VDUkVUX1NTX1BBU1M",
+            "eyJhZGQiOiIxLjIuMy40IiwiaWQiOiJTRUNSRVRfVk1FU1NfSUQifQ==",
+            "OpaqueCustomSecret",
+            "slbsuser",
+            "slbspass",
+            "bsbsuser",
+            "bsbspass",
+            "d4e5f6",
+            "Bob",
+            "FallbackPathSecret",
+            "ProxyNsPathSecret",
+            "***redacted***",
+        ] {
+            assert!(
+                !joined.contains(secret) && !json.contains(secret),
+                "DNS diff leaked private secret or corrupted placeholder '{secret}': {joined}"
+            );
+        }
+
+        // Clean public upstreams remain verbatim (including uppercase placeholder preservation)
+        for clean in [
+            "https://223.5.5.5/dns-query",
+            "https://cloudflare-dns.com/dns-query",
+            "https://dns.google/resolve",
+            "tls://1.1.1.1:853",
+            "quic://dns.adguard.com:853",
+            "223.5.5.5",
+            "dhcp://en0",
+            "https://***REDACTED***.example/dns-query",
+        ] {
+            assert!(
+                joined.contains(clean),
+                "clean public DNS upstream '{clean}' must remain verbatim: {joined}"
+            );
+        }
+
+        // Host readability preserved for non-whitespace private DoH/DoT paths; stamps & proxy URIs scrubbed
+        assert!(joined.contains("https://dns.nextdns.io/***REDACTED***"));
+        assert!(joined.contains("https://d.adguard-dns.com/***REDACTED***"));
+        assert!(joined.contains("https://dns.google/***REDACTED***"));
+        assert!(joined.contains("tls://dot.corp.example:853/***REDACTED***"));
+        assert!(joined.contains("sdns://***REDACTED***"));
+        assert!(joined.contains("ss://***REDACTED***"));
+        assert!(joined.contains("vmess://***REDACTED***"));
+        assert!(joined.contains("customproto://***REDACTED***"));
+
+        // Rotating ONLY a NextDNS/AdGuard path token must still set `dns_changed = true`
+        let mut rot_prev =
+            ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        rot_prev.dns.nameserver = vec!["https://dns.nextdns.io/profile_v1/DeviceA".to_string()];
+        let mut rot_next = rot_prev.clone();
+        rot_next.dns.nameserver = vec!["https://dns.nextdns.io/profile_v2/DeviceA".to_string()];
+        let rot_diff = diff_configs(&rot_prev, &rot_next);
+        assert!(rot_diff.dns_changed);
+        let rot_joined = rot_diff.dns_changes.join("\n");
+        assert!(!rot_joined.contains("profile_v1") && !rot_joined.contains("profile_v2"));
+        assert!(!rot_joined.contains("DeviceA"));
+        assert!(rot_joined.contains("https://dns.nextdns.io/***REDACTED***"));
+    }
+
+    #[test]
+    fn redact_dns_upstream_for_diff_scrubs_non_scheme_fragments_bom_and_malformed_schemes() {
+        let frag_cases: [(&str, &str, &[&str]); 6] = [
+            (
+                "1.1.1.1:53#sni=SecretUdpSniHost.corp",
+                "1.1.1.1:53#***REDACTED***",
+                &["SecretUdpSniHost"],
+            ),
+            (
+                "1.1.1.1:53#UdpFragSecretToken99",
+                "1.1.1.1:53#***REDACTED***",
+                &["UdpFragSecretToken99"],
+            ),
+            (
+                "system#SystemFragSecret88",
+                "system#***REDACTED***",
+                &["SystemFragSecret88"],
+            ),
+            (
+                "1.1.1.1:53 # Alice's MacBook (Work) UdpSpaceSecret",
+                "1.1.1.1:53#***REDACTED***",
+                &["Alice", "MacBook", "UdpSpaceSecret"],
+            ),
+            (
+                "\u{feff}1.1.1.1:53#BomUdpSecret",
+                "1.1.1.1:53#***REDACTED***",
+                &["BomUdpSecret"],
+            ),
+            (
+                "\u{feff}https://dns.nextdns.io/BomNextDnsId/BomDevice",
+                "https://dns.nextdns.io/***REDACTED***",
+                &["BomNextDnsId", "BomDevice"],
+            ),
+        ];
+        for (input, expected, forbidden) in frag_cases {
+            let out = redact_dns_upstream_for_diff(input);
+            assert_eq!(out, expected, "unexpected DNS redaction for {input:?}");
+            for secret in forbidden {
+                assert!(!out.contains(secret), "leaked '{secret}' in '{out}'");
+            }
+            assert_eq!(redact_dns_upstream_for_diff(&out), out);
+        }
+
+        // Opaque `sdns://` DNS stamps always redact the base64 payload
+        let sdns_out =
+            redact_dns_upstream_for_diff("sdns://AgcAAAAAAAAABzEuMC4wLjGgPrivateStampSecret99");
+        assert_eq!(sdns_out, "sdns://***REDACTED***");
+        assert_eq!(redact_dns_upstream_for_diff(&sdns_out), sdns_out);
+
+        // Clean-path uppercase placeholder case is never lowercased
+        for ph_clean in [
+            "https://***REDACTED***.example/dns-query",
+            "https://***REDACTED***/",
+            "tls://***REDACTED***.example:853",
+        ] {
+            let out = redact_dns_upstream_for_diff(ph_clean);
+            assert_eq!(out, ph_clean);
+            assert!(!out.contains("***redacted***"));
+            assert_eq!(redact_dns_upstream_for_diff(&out), out);
+        }
+
+        // Single-/no-slash known schemes, bare @ credentials, `%`-smuggled opaque hosts,
+        // non-scheme space/path/query entries, and malformed fragments fail closed
+        for fail_closed in [
+            "https:/dns.nextdns.io/SingleSlashSecret99",
+            "https:dns.nextdns.io/NoSlashSecret99",
+            "SecretUserOnly@dns.example",
+            "SecretUserOnly@dns.example#frag",
+            "1.1.1.1:53 token=FooSecret#BarFrag",
+            "#OnlyFragmentSecret",
+            r"tls://dot.corp.example\BackslashOpaqueSecret",
+            "tls://dot.corp.example%2fSecretPath99",
+            "tls://user%3apass%40dot.corp.example",
+            "tcp://bad%2fTcpSecret88",
+            "udp://bad%2fUdpSecret77",
+            "1.1.1.1:53 SpaceSecret99",
+            "1.1.1.1:53 token=PlainSecret99",
+            "dns.nextdns.io/PathSecret99",
+            "dns.nextdns.io?tok=QuerySecret99",
+            r"1.1.1.1:53\BackslashSecret99",
+            r"dns.nextdns.io\DomBsSecret99",
+            r"1.1.1.1:53\BackslashSecret99#frag",
+        ] {
+            let out = redact_dns_upstream_for_diff(fail_closed);
+            assert_eq!(
+                out, "***REDACTED_URL***",
+                "unsafe DNS entry must fail closed: {fail_closed:?}"
+            );
+            assert_eq!(redact_dns_upstream_for_diff(&out), out);
+        }
+
+        // Bare backslash non-scheme DNS entries also never leak via diff_configs, DnsUpstream::parse,
+        // BootstrapDnsServer::parse, or ClashConfig::from_yaml_str
+        let mut bs_prev = ClashConfig::from_yaml_str(&ClashConfig::default_starter_yaml()).unwrap();
+        bs_prev.dns.nameserver = vec!["1.1.1.1:53".to_string()];
+        let mut bs_next = bs_prev.clone();
+        bs_next.dns.nameserver = vec![
+            r"1.1.1.1:53\BackslashSecret99".to_string(),
+            r"dns.nextdns.io\DomBsSecret99".to_string(),
+        ];
+        let bs_diff = diff_configs(&bs_prev, &bs_next);
+        let bs_joined = bs_diff.dns_changes.join("\n");
+        assert!(!bs_joined.contains("BackslashSecret99"));
+        assert!(!bs_joined.contains("DomBsSecret99"));
+        assert!(bs_joined.contains("***REDACTED_URL***"));
+
+        for (raw, secret) in [
+            (r"1.1.1.1:53\BackslashSecret99", "BackslashSecret99"),
+            (r"dns.nextdns.io\DomBsSecret99", "DomBsSecret99"),
+        ] {
+            let up_err = crate::dns::upstream::DnsUpstream::parse(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !up_err.contains(secret),
+                "DnsUpstream::parse leaked: {up_err}"
+            );
+            let bs_err = crate::dns::upstream::BootstrapDnsServer::parse(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !bs_err.contains(secret),
+                "BootstrapDnsServer::parse leaked: {bs_err}"
+            );
+            let yaml = format!("dns:\n  enable: true\n  nameserver:\n    - '{}'\n", raw);
+            let cfg_err = ClashConfig::from_yaml_str(&yaml).unwrap_err().to_string();
+            assert!(
+                !cfg_err.contains(secret),
+                "ClashConfig::from_yaml_str leaked: {cfg_err}"
+            );
+        }
+
+        // Clean bare `hostname:port`, IPv4/IPv6, `dhcp://`, and `system` entries stay readable
+        for clean in [
+            "dns.google:53",
+            "1.1.1.1:53",
+            "[2606:4700:4700::1111]:53",
+            "system",
+            "dhcp://en0",
+            "tls://1.1.1.1:853",
+            "https://223.5.5.5/dns-query",
+            "quic://dns.adguard.com:853",
+        ] {
+            assert_eq!(redact_dns_upstream_for_diff(clean), clean);
+        }
     }
 }

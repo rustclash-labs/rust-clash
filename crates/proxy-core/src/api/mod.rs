@@ -3626,44 +3626,674 @@ async fn patch_autostart_api(
     }
 }
 
-fn scrub_sensitive_substrings(raw: &str, known_secrets: &[String]) -> String {
-    let mut out = raw.to_string();
-    for sec in known_secrets {
-        if sec.len() >= 4 {
-            out = out.replace(sec, "***REDACTED***");
+const REDACTED_URL_PLACEHOLDER: &str = "***REDACTED_URL***";
+
+fn find_placeholder_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'*' {
+            let rest = &s[i..];
+            if rest.starts_with(REDACTED_URL_PLACEHOLDER) {
+                spans.push((i, i + REDACTED_URL_PLACEHOLDER.len()));
+                i += REDACTED_URL_PLACEHOLDER.len();
+                continue;
+            }
+            if rest.starts_with(REDACTED_SECRET) {
+                spans.push((i, i + REDACTED_SECRET.len()));
+                i += REDACTED_SECRET.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
+fn kmp_find_all_matches(
+    haystack: &[u8],
+    needle: &[u8],
+    base_offset: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    let m = needle.len();
+    if m == 0 || haystack.len() < m {
+        return;
+    }
+    let mut lps = vec![0usize; m];
+    let mut len = 0usize;
+    let mut i = 1usize;
+    while i < m {
+        if needle[i] == needle[len] {
+            len += 1;
+            lps[i] = len;
+            i += 1;
+        } else if len != 0 {
+            len = lps[len - 1];
+        } else {
+            lps[i] = 0;
+            i += 1;
         }
     }
-    for scheme in [
-        "ss://",
-        "vless://",
-        "trojan://",
-        "anytls://",
-        "socks5://",
-        "socks5h://",
-        "socks://",
-        "http-proxy://",
-        "https-proxy://",
-        "https://",
-        "http://",
-    ] {
-        let mut cursor = 0usize;
-        while let Some(rel) = out[cursor..].find(scheme) {
-            let start = cursor + rel;
-            let end = out[start..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')')
-                .map(|len| start + len)
-                .unwrap_or(out.len());
-            let candidate = &out[start..end];
-            let replacement = if scheme == "http://" || scheme == "https://" {
-                crate::profile::redact_subscription_url(candidate)
+    let mut j = 0usize;
+    for (idx, &b) in haystack.iter().enumerate() {
+        while j > 0 && b != needle[j] {
+            j = lps[j - 1];
+        }
+        if b == needle[j] {
+            j += 1;
+            if j == m {
+                let match_start = base_offset + idx + 1 - m;
+                out.push((match_start, match_start + m));
+                j = lps[j - 1];
+            }
+        }
+    }
+}
+
+fn merge_overlapping_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if spans.len() <= 1 {
+        return spans;
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        if let Some(last) = merged.last_mut()
+            && s < last.1
+        {
+            if e > last.1 {
+                last.1 = e;
+            }
+            continue;
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
+fn is_placeholder_superstring_secret(sec: &str) -> bool {
+    (sec.contains(REDACTED_SECRET) || sec.contains(REDACTED_URL_PLACEHOLDER))
+        && sec != REDACTED_SECRET
+        && sec != REDACTED_URL_PLACEHOLDER
+}
+
+fn find_secret_spans_outside_placeholders(s: &str, eligible: &[&str]) -> Vec<(usize, usize)> {
+    if s.len() < 4 || eligible.is_empty() {
+        return Vec::new();
+    }
+    let placeholders = find_placeholder_spans(s);
+    let mut raw_matches = Vec::new();
+
+    // 1. Strict-superstring secrets that themselves contain `***REDACTED***` or
+    //    `***REDACTED_URL***` (e.g. `pre-***REDACTED***-INNER_SECRET`) must match directly
+    //    against `s` because no single non-placeholder gap can contain them. Because they are
+    //    strictly longer than bare placeholders, they never corrupt emitted placeholders.
+    for &sec in eligible {
+        if !is_placeholder_superstring_secret(sec) || sec.len() > s.len() {
+            continue;
+        }
+        let Some(first) = s.find(sec) else {
+            continue;
+        };
+        if first + sec.len() == s.len() {
+            raw_matches.push((first, first + sec.len()));
+        } else {
+            kmp_find_all_matches(
+                &s.as_bytes()[first..],
+                sec.as_bytes(),
+                first,
+                &mut raw_matches,
+            );
+        }
+    }
+
+    // 2. Ordinary secrets match strictly inside non-placeholder gaps so short secrets like
+    //    `****`, `REDACTED`, `_URL`, or `***R` never damage emitted placeholders.
+    let mut gap_start = 0usize;
+    for (p_start, p_end) in placeholders
+        .into_iter()
+        .chain(std::iter::once((s.len(), s.len())))
+    {
+        if p_start > gap_start {
+            let gap = &s[gap_start..p_start];
+            if gap.len() >= 4 {
+                for &sec in eligible {
+                    if is_placeholder_superstring_secret(sec) || sec.len() > gap.len() {
+                        continue;
+                    }
+                    let Some(first) = gap.find(sec) else {
+                        continue;
+                    };
+                    if first + sec.len() == gap.len() {
+                        raw_matches.push((gap_start + first, gap_start + first + sec.len()));
+                    } else {
+                        kmp_find_all_matches(
+                            &gap.as_bytes()[first..],
+                            sec.as_bytes(),
+                            gap_start + first,
+                            &mut raw_matches,
+                        );
+                    }
+                }
+            }
+        }
+        gap_start = p_end;
+    }
+    merge_overlapping_spans(raw_matches)
+}
+
+fn has_secret_outside_placeholders(s: &str, eligible: &[&str]) -> bool {
+    if s.len() < 4 || eligible.is_empty() {
+        return false;
+    }
+    if eligible.iter().any(|&sec| {
+        is_placeholder_superstring_secret(sec) && sec.len() <= s.len() && s.contains(sec)
+    }) {
+        return true;
+    }
+    let placeholders = find_placeholder_spans(s);
+    let mut gap_start = 0usize;
+    for (p_start, p_end) in placeholders
+        .into_iter()
+        .chain(std::iter::once((s.len(), s.len())))
+    {
+        if p_start > gap_start {
+            let gap = &s[gap_start..p_start];
+            if gap.len() >= 4
+                && eligible.iter().any(|&sec| {
+                    !is_placeholder_superstring_secret(sec)
+                        && sec.len() <= gap.len()
+                        && gap.contains(sec)
+                })
+            {
+                return true;
+            }
+        }
+        gap_start = p_end;
+    }
+    false
+}
+
+enum ScrubEvent {
+    Structured {
+        start: usize,
+        end: usize,
+        replacement: String,
+    },
+    Secret {
+        start: usize,
+        end: usize,
+    },
+}
+
+impl ScrubEvent {
+    fn span(&self) -> (usize, usize) {
+        match self {
+            Self::Structured { start, end, .. } | Self::Secret { start, end } => (*start, *end),
+        }
+    }
+}
+
+fn find_placeholder_superstring_spans(s: &str, eligible: &[&str]) -> Vec<(usize, usize)> {
+    let mut raw_matches = Vec::new();
+    for &sec in eligible {
+        if !is_placeholder_superstring_secret(sec) || sec.len() > s.len() {
+            continue;
+        }
+        let Some(first) = s.find(sec) else {
+            continue;
+        };
+        if first + sec.len() == s.len() {
+            raw_matches.push((first, first + sec.len()));
+        } else {
+            kmp_find_all_matches(
+                &s.as_bytes()[first..],
+                sec.as_bytes(),
+                first,
+                &mut raw_matches,
+            );
+        }
+    }
+    merge_overlapping_spans(raw_matches)
+}
+
+fn map_base_spans_to_raw(
+    pieces: &[crate::config::uri::RedactPiece],
+    raw: &str,
+    base_spans: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    if pieces.is_empty() || base_spans.is_empty() {
+        return Vec::new();
+    }
+    let mut base_bounds: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    let mut off = 0usize;
+    for p in pieces {
+        let len = p.text(raw).len();
+        base_bounds.push((off, off + len));
+        off += len;
+    }
+
+    let mut out = Vec::with_capacity(base_spans.len());
+    let mut pi_start = 0usize;
+    let mut pi_end = 0usize;
+    for &(bs, be) in base_spans {
+        while pi_start + 1 < pieces.len() && base_bounds[pi_start].1 <= bs {
+            pi_start += 1;
+        }
+        if pi_end < pi_start {
+            pi_end = pi_start;
+        }
+        while pi_end + 1 < pieces.len() && base_bounds[pi_end].1 < be {
+            pi_end += 1;
+        }
+        let p_start = &pieces[pi_start];
+        let raw_start = if p_start.replacement.is_none() {
+            p_start.raw_start + (bs - base_bounds[pi_start].0)
+        } else {
+            p_start.raw_start
+        };
+        let p_end = &pieces[pi_end];
+        let raw_end = if p_end.replacement.is_none() {
+            p_end.raw_start + (be - base_bounds[pi_end].0)
+        } else {
+            p_end.raw_end
+        };
+        if raw_start < raw_end {
+            out.push((raw_start, raw_end));
+        }
+    }
+    out
+}
+
+fn scrub_sensitive_substrings_once(raw: &str, eligible: &[&str]) -> (String, bool) {
+    let pieces = crate::config::uri::redact_sensitive_text_pieces(raw);
+    let mut secret_spans = find_secret_spans_outside_placeholders(raw, eligible);
+
+    // If any configured secret is a placeholder superstring (e.g. `pre-***REDACTED***-x`),
+    // also match it against the structurally-redacted text and map any newly materialized spans
+    // back to `raw` byte coordinates BEFORE prefix-unblocking runs. This prevents chained
+    // `pre-<uuid>-xtoken=Secret` inputs from destroying `token` before `pre-***REDACTED***-x`
+    // unblocks `token=`.
+    if eligible
+        .iter()
+        .any(|&sec| is_placeholder_superstring_secret(sec))
+        && pieces.iter().any(|p| p.replacement.is_some())
+    {
+        let total_len: usize = pieces.iter().map(|p| p.text(raw).len()).sum();
+        let mut base_text = String::with_capacity(total_len);
+        for p in &pieces {
+            base_text.push_str(p.text(raw));
+        }
+        let base_ph_spans = find_placeholder_superstring_spans(&base_text, eligible);
+        if !base_ph_spans.is_empty() {
+            let mapped = map_base_spans_to_raw(&pieces, raw, &base_ph_spans);
+            if !mapped.is_empty() {
+                secret_spans.extend(mapped);
+                secret_spans = merge_overlapping_spans(secret_spans);
+            }
+        }
+    }
+
+    let mut base_structured: Vec<(usize, usize, String)> = pieces
+        .into_iter()
+        .filter_map(|p| p.replacement.map(|rep| (p.raw_start, p.raw_end, rep)))
+        .collect();
+
+    // Second-order prefix-shadowing & trailing-hex UUID unblocker (two disjoint O(N) buffers):
+    // 1. `wb_masked_bytes`: mask ONLY prefix-blocked `WordBoundary` triggers (`token=`, `key=`,
+    //    `Authorization:`, ...) using a single monotone `active_word_val_end` across ALL
+    //    `secret_spans`. Because UUID boundaries are NEVER written into `wb_masked_bytes`, a
+    //    UUID-adjacent secret can never inject a space mid-KV/Auth value, fixed-length UUIDs
+    //    never suppress a following `WordBoundary` trigger, and nested secrets inside an active
+    //    KV/Auth value cannot truncate the outer value scan.
+    // 2. `uuid_masked_bytes`: mask ONLY leading and trailing ASCII hex bytes adjacent to 36-char
+    //    UUIDs covered by `secret_spans`, then run `find_non_nil_uuid_edits` and retain only
+    //    UUID spans not already covered by `base_structured` or `wb_structured`.
+    // Every sweep uses strictly monotone non-backtracking pointers -> guaranteed O(N).
+    let mut extra_structured: Vec<(usize, usize, String)> = Vec::new();
+    if !secret_spans.is_empty() {
+        let trigger_spans = crate::config::uri::find_structural_trigger_spans(raw);
+        if !trigger_spans.is_empty() {
+            let raw_bytes = raw.as_bytes();
+            let wb_triggers: Vec<crate::config::uri::StructuralTriggerSpan> = trigger_spans
+                .iter()
+                .copied()
+                .filter(|t| {
+                    t.kind == crate::config::uri::StructuralTriggerKind::WordBoundary
+                        && t.is_prefix_blocked
+                })
+                .collect();
+            let uuid_triggers: Vec<crate::config::uri::StructuralTriggerSpan> = trigger_spans
+                .iter()
+                .copied()
+                .filter(|t| t.kind == crate::config::uri::StructuralTriggerKind::Uuid)
+                .collect();
+
+            if !wb_triggers.is_empty() {
+                let lower = raw.to_ascii_lowercase();
+                let mut wb_masked_bytes: Option<Vec<u8>> = None;
+                let mut wi = 0usize;
+                let mut active_word_val_end = 0usize;
+                let mut last_unblocked_wb_end: Option<usize> = None;
+                let mut parity = crate::config::uri::LineQuoteParity::default();
+                let mut no_close_quote_until = [0usize; 3];
+                for &(s, e) in &secret_spans {
+                    while wi < wb_triggers.len() && wb_triggers[wi].start <= s {
+                        wi += 1;
+                    }
+                    while wi < wb_triggers.len() && wb_triggers[wi].start <= e {
+                        let t = wb_triggers[wi];
+                        wi += 1;
+                        let block_pos = t.start - 1;
+                        // Skip triggers nested inside an active unblocked KV/Auth value, as well as
+                        // inner KV suffixes sharing the exact same `t.end` already unblocked by an
+                        // outer KV key (e.g. `access_token=` -> `token=`).
+                        if block_pos < active_word_val_end || last_unblocked_wb_end == Some(t.end) {
+                            continue;
+                        }
+                        let buf = wb_masked_bytes.get_or_insert_with(|| raw_bytes.to_vec());
+                        buf[block_pos] = b' ';
+                        parity.advance_to(raw_bytes, t.end);
+                        let val_end = crate::config::uri::scan_word_boundary_trigger_value_end(
+                            raw,
+                            &lower,
+                            t,
+                            parity.open_quotes(),
+                            &mut no_close_quote_until,
+                        );
+                        active_word_val_end = active_word_val_end.max(val_end.max(t.end));
+                        last_unblocked_wb_end = Some(t.end);
+                    }
+                }
+
+                if let Some(buf) = wb_masked_bytes {
+                    let wb_masked = String::from_utf8(buf).expect(
+                        "masking ASCII word-boundary bytes with ASCII spaces preserves UTF-8",
+                    );
+                    let wb_structured: Vec<(usize, usize, String)> =
+                        crate::config::uri::redact_sensitive_text_pieces(&wb_masked)
+                            .into_iter()
+                            .filter_map(|p| p.replacement.map(|rep| (p.raw_start, p.raw_end, rep)))
+                            .collect();
+
+                    // Keep newly revealed, strictly wider, or strictly stronger (same-span upgrade
+                    // over a non-full-placeholder base entry, e.g. `***REDACTED***&next=1` over
+                    // `https://host&next=1`) entries from `wb_structured`.
+                    let is_full_placeholder =
+                        |rep: &str| rep == REDACTED_SECRET || rep == REDACTED_URL_PLACEHOLDER;
+                    let mut bi = 0usize;
+                    for (ms, me, mrep) in wb_structured {
+                        while bi < base_structured.len() && base_structured[bi].1 <= ms {
+                            bi += 1;
+                        }
+                        let upgraded_same_span = bi < base_structured.len()
+                            && base_structured[bi].0 == ms
+                            && base_structured[bi].1 == me
+                            && mrep != base_structured[bi].2
+                            && !is_full_placeholder(&base_structured[bi].2);
+                        let covered_by_base = bi < base_structured.len()
+                            && base_structured[bi].0 <= ms
+                            && me <= base_structured[bi].1
+                            && !upgraded_same_span;
+                        if !covered_by_base {
+                            extra_structured.push((ms, me, mrep));
+                        }
+                    }
+                    if !extra_structured.is_empty() {
+                        let mut mi = 0usize;
+                        base_structured.retain(|&(bs, be, _)| {
+                            while mi < extra_structured.len() && extra_structured[mi].1 <= bs {
+                                mi += 1;
+                            }
+                            !(mi < extra_structured.len()
+                                && extra_structured[mi].0 <= bs
+                                && be <= extra_structured[mi].1)
+                        });
+                    }
+                }
+            }
+
+            if !uuid_triggers.is_empty() {
+                let mut uuid_masked_bytes: Option<Vec<u8>> = None;
+                let mut u_lead = 0usize;
+                let mut u_trail = 0usize;
+                for &(s, e) in &secret_spans {
+                    while u_lead < uuid_triggers.len() && uuid_triggers[u_lead].start <= s {
+                        u_lead += 1;
+                    }
+                    while u_lead < uuid_triggers.len() && uuid_triggers[u_lead].start <= e {
+                        let u = uuid_triggers[u_lead];
+                        u_lead += 1;
+                        if u.is_prefix_blocked {
+                            let buf = uuid_masked_bytes.get_or_insert_with(|| raw_bytes.to_vec());
+                            buf[u.start - 1] = b' ';
+                        }
+                    }
+                    while u_trail < uuid_triggers.len() && uuid_triggers[u_trail].end < s {
+                        u_trail += 1;
+                    }
+                    while u_trail < uuid_triggers.len() && uuid_triggers[u_trail].end < e {
+                        let te = uuid_triggers[u_trail].end;
+                        u_trail += 1;
+                        if te < raw_bytes.len() && raw_bytes[te].is_ascii_hexdigit() {
+                            let buf = uuid_masked_bytes.get_or_insert_with(|| raw_bytes.to_vec());
+                            buf[te] = b' ';
+                        }
+                    }
+                }
+
+                if let Some(buf) = uuid_masked_bytes {
+                    let uuid_masked = String::from_utf8(buf).expect(
+                        "masking ASCII hex boundary bytes with ASCII spaces preserves UTF-8",
+                    );
+                    let uuid_edits = crate::config::uri::find_non_nil_uuid_edits(&uuid_masked);
+                    let mut bi = 0usize;
+                    let mut ei = 0usize;
+                    let mut uuid_extra = Vec::new();
+                    for (us, ue, urep) in uuid_edits {
+                        while bi < base_structured.len() && base_structured[bi].1 <= us {
+                            bi += 1;
+                        }
+                        let covered_by_base = bi < base_structured.len()
+                            && base_structured[bi].0 <= us
+                            && ue <= base_structured[bi].1;
+                        while ei < extra_structured.len() && extra_structured[ei].1 <= us {
+                            ei += 1;
+                        }
+                        let covered_by_extra = ei < extra_structured.len()
+                            && extra_structured[ei].0 <= us
+                            && ue <= extra_structured[ei].1;
+                        if !covered_by_base && !covered_by_extra {
+                            uuid_extra.push((us, ue, urep));
+                        }
+                    }
+                    extra_structured.extend(uuid_extra);
+                }
+            }
+        }
+    }
+
+    let mut events =
+        Vec::with_capacity(base_structured.len() + extra_structured.len() + secret_spans.len());
+    for (start, end, replacement) in base_structured.into_iter().chain(extra_structured) {
+        events.push(ScrubEvent::Structured {
+            start,
+            end,
+            replacement,
+        });
+    }
+    for (start, end) in secret_spans {
+        events.push(ScrubEvent::Secret { start, end });
+    }
+
+    if events.is_empty() {
+        return (raw.to_string(), false);
+    }
+
+    events.sort_by_key(ScrubEvent::span);
+
+    // Merge overlapping structured redactions and known-secret spans on `raw`'s coordinates.
+    // Non-overlapping structured redactions preserve their exact replacement (e.g.
+    // `https://host/***REDACTED***`), while any known-secret overlap expands to redact the
+    // complete union interval so compound secrets and contextual prefixes can never leak.
+    struct MergedCluster {
+        start: usize,
+        end: usize,
+        replacement: String,
+        is_partial_structured: bool,
+    }
+
+    let mut clusters: Vec<MergedCluster> = Vec::with_capacity(events.len());
+    let mut iter = events.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        let (cluster_start, mut cluster_end) = first.span();
+        let mut structured_count = 0usize;
+        let mut secret_count = 0usize;
+        let mut single_structured: Option<(usize, usize, String)> = None;
+
+        match first {
+            ScrubEvent::Structured {
+                start,
+                end,
+                replacement,
+            } => {
+                structured_count = 1;
+                single_structured = Some((start, end, replacement));
+            }
+            ScrubEvent::Secret { .. } => {
+                secret_count = 1;
+            }
+        }
+
+        while let Some(next) = iter.peek() {
+            let (ns, ne) = next.span();
+            let overlaps = ns < cluster_end || (ns == cluster_end && ns == ne);
+            if !overlaps {
+                break;
+            }
+            let ev = iter.next().unwrap();
+            if ne > cluster_end {
+                cluster_end = ne;
+            }
+            match ev {
+                ScrubEvent::Structured {
+                    start,
+                    end,
+                    replacement,
+                } => {
+                    structured_count += 1;
+                    if structured_count == 1 {
+                        single_structured = Some((start, end, replacement));
+                    } else {
+                        single_structured = None;
+                    }
+                }
+                ScrubEvent::Secret { .. } => {
+                    secret_count += 1;
+                }
+            }
+        }
+
+        let (replacement, is_partial_structured) = if structured_count == 1 && secret_count == 0 {
+            let (_, _, rep) = single_structured.unwrap();
+            let is_pure_placeholder = rep == REDACTED_SECRET || rep == REDACTED_URL_PLACEHOLDER;
+            if !is_pure_placeholder && has_secret_outside_placeholders(&rep, eligible) {
+                (REDACTED_SECRET.to_string(), false)
             } else {
-                format!("{scheme}***REDACTED***")
-            };
-            out.replace_range(start..end, &replacement);
-            cursor = start + replacement.len();
-        }
+                (rep, !is_pure_placeholder)
+            }
+        } else if structured_count == 1
+            && let Some((ss, se, rep)) = single_structured
+            && rep == REDACTED_URL_PLACEHOLDER
+            && ss == cluster_start
+            && se == cluster_end
+        {
+            (REDACTED_URL_PLACEHOLDER.to_string(), false)
+        } else {
+            (REDACTED_SECRET.to_string(), false)
+        };
+
+        clusters.push(MergedCluster {
+            start: cluster_start,
+            end: cluster_end,
+            replacement,
+            is_partial_structured,
+        });
     }
-    crate::config::uri::redact_sensitive_text(&out)
+
+    let mut out = String::with_capacity(raw.len());
+    let mut partial_out_spans: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    for c in clusters {
+        out.push_str(&raw[cursor..c.start]);
+        let out_start = out.len();
+        out.push_str(&c.replacement);
+        let out_end = out.len();
+        if c.is_partial_structured {
+            partial_out_spans.push((out_start, out_end));
+        }
+        cursor = c.end;
+    }
+    out.push_str(&raw[cursor..]);
+
+    // Second-order canonicalization guard: if a structured URL canonicalization (e.g. lowercasing
+    // `HTTPS://` or normalizing default port) combined with adjacent literal text to form an
+    // eligible secret, upgrade the entire union with any overlapped partial structured span to
+    // `REDACTED_SECRET` so we never splice placeholders mid-URL.
+    let leftover = find_secret_spans_outside_placeholders(&out, eligible);
+    if !leftover.is_empty() {
+        let mut to_redact = leftover.clone();
+        let mut li = 0usize;
+        for &(ps, pe) in &partial_out_spans {
+            while li < leftover.len() && leftover[li].1 <= ps {
+                li += 1;
+            }
+            if li < leftover.len() && leftover[li].0 < pe {
+                to_redact.push((ps, pe));
+            }
+        }
+        let merged = merge_overlapping_spans(to_redact);
+        let mut scrubbed = String::with_capacity(out.len());
+        let mut pos = 0usize;
+        for (s, e) in merged {
+            scrubbed.push_str(&out[pos..s]);
+            scrubbed.push_str(REDACTED_SECRET);
+            pos = e;
+        }
+        scrubbed.push_str(&out[pos..]);
+        out = scrubbed;
+    }
+
+    let changed = out != raw;
+    (out, changed)
+}
+
+fn scrub_sensitive_substrings(raw: &str, known_secrets: &[String]) -> String {
+    let mut eligible: Vec<&str> = known_secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|sec| sec.len() >= 4 && *sec != REDACTED_SECRET && *sec != REDACTED_URL_PLACEHOLDER)
+        .collect();
+    if eligible.is_empty() {
+        return crate::config::uri::redact_sensitive_text(raw);
+    }
+    eligible.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    eligible.dedup();
+
+    // Bounded fixed-point iteration ensures even second-order boundary exposures (e.g. scrubbing a
+    // secret prefix glued directly onto `token=...` or a UUID) converge in strictly O(N) time and
+    // guarantee mathematical idempotency `f(f(x)) == f(x)` for all inputs and secret sets.
+    let (mut cur, mut changed) = scrub_sensitive_substrings_once(raw, &eligible);
+    for _ in 0..3 {
+        if !changed {
+            break;
+        }
+        let (next, next_changed) = scrub_sensitive_substrings_once(&cur, &eligible);
+        cur = next;
+        changed = next_changed;
+    }
+    cur
 }
 
 async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> impl IntoResponse {
@@ -3778,7 +4408,37 @@ async fn get_diagnostics_export_api(State(engine): State<Arc<ProxyEngine>>) -> i
         }
     }
 
-    let profiles = ensure_profile_manager(&engine).ok().map(|m| m.snapshot());
+    let profiles = ensure_profile_manager(&engine).ok().map(|m| {
+        let mut snap = m.snapshot();
+        for p in &mut snap.profiles {
+            p.name = scrub_sensitive_substrings(&p.name, &known_secrets);
+            if let Some(url) = p.subscription_url_redacted.take() {
+                p.subscription_url_redacted =
+                    Some(scrub_sensitive_substrings(&url, &known_secrets));
+            }
+            if let Some(err) = p.last_error.take() {
+                p.last_error = Some(scrub_sensitive_substrings(&err, &known_secrets));
+            }
+            if let Some(target) = p.match_only_fallback_target.take() {
+                p.match_only_fallback_target =
+                    Some(scrub_sensitive_substrings(&target, &known_secrets));
+            }
+            p.selected_groups = std::mem::take(&mut p.selected_groups)
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        scrub_sensitive_substrings(&k, &known_secrets),
+                        scrub_sensitive_substrings(&v, &known_secrets),
+                    )
+                })
+                .collect();
+            p.custom_rules_backup = std::mem::take(&mut p.custom_rules_backup)
+                .into_iter()
+                .map(|rule| scrub_sensitive_substrings(&rule, &known_secrets))
+                .collect();
+        }
+        snap
+    });
     let router = engine.router();
     let dns = router.dns();
     let logs_redacted: Vec<serde_json::Value> = engine
@@ -5282,6 +5942,968 @@ rules:
 
         let _ = stop_tx.send(true);
         let _ = api_task.await;
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_preserves_inline_delimiters_and_redacts_secrets_and_all_schemes()
+    {
+        let known_secrets = vec!["my-controller-secret-99".to_string(), "ab".to_string()];
+
+        // Inline YAML sequence `[https://223.5.5.5/dns-query]` preserves closing `]`
+        let yaml_inline = "nameserver: [https://223.5.5.5/dns-query, 1.1.1.1:53]";
+        let scrubbed_yaml = scrub_sensitive_substrings(yaml_inline, &known_secrets);
+        assert_eq!(
+            scrubbed_yaml,
+            "nameserver: [https://***REDACTED***, 1.1.1.1:53]"
+        );
+
+        // JSON-escaped authenticated URL preserves `\"`
+        let json_escaped = r#"err: \"https://user:pass@host/path?k=v\""#;
+        let scrubbed_json = scrub_sensitive_substrings(json_escaped, &known_secrets);
+        assert_eq!(scrubbed_json, r#"err: \"https://host/***REDACTED***\""#);
+        assert!(!scrubbed_json.contains("user") && !scrubbed_json.contains("pass"));
+
+        // Known secrets (>= 4 chars) plus all URI schemes (including vmess/hy2/tuic/uppercase HTTPS)
+        let mixed = "secret=my-controller-secret-99 \
+            [vmess://SECRET_VMESS@vm.example:443] \
+            {hy2://HY2PASS@hy2.example:443?obfs-password=OBFS} \
+            (tuic://12345678-1234-4321-abcd-998877665544:TUICPASS@tuic.example:8443) \
+            HTTPS://203.0.113.9/sub?token=UPTOK \
+            HTTPS://alice:s3cr3t@sub.example.com/feed?token=UPTOK2;";
+        let scrubbed_mixed = scrub_sensitive_substrings(mixed, &known_secrets);
+
+        for leaked in [
+            "my-controller-secret-99",
+            "SECRET_VMESS",
+            "HY2PASS",
+            "OBFS",
+            "12345678-1234-4321-abcd-998877665544",
+            "TUICPASS",
+            "203.0.113.9",
+            "UPTOK",
+            "alice",
+            "s3cr3t",
+            "UPTOK2",
+        ] {
+            assert!(
+                !scrubbed_mixed.contains(leaked),
+                "secret '{leaked}' leaked in scrubbed output: {scrubbed_mixed}"
+            );
+        }
+        assert!(scrubbed_mixed.contains("[vmess://***REDACTED***]"));
+        assert!(scrubbed_mixed.contains("{hy2://***REDACTED***}"));
+        assert!(scrubbed_mixed.contains("(tuic://***REDACTED***)"));
+        assert!(scrubbed_mixed.contains("https://***REDACTED***"));
+        assert!(scrubbed_mixed.contains("https://sub.example.com/***REDACTED***;"));
+        // Idempotent
+        assert_eq!(
+            scrub_sensitive_substrings(&scrubbed_mixed, &known_secrets),
+            scrubbed_mixed
+        );
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_resists_secret_prefix_shadowing_and_redaction_self_corruption() {
+        let known_secrets: Vec<String> = [
+            "pass",
+            "https",
+            "REDACTED",
+            "_URL",
+            "super_secret_token_999",
+            "super_secret",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // 1. `pass` must not destroy `password=` before structural KV redaction runs
+        let kv_out =
+            scrub_sensitive_substrings("password=SUPER_SECRET_PASSWORD_999", &known_secrets);
+        assert!(
+            !kv_out.contains("SUPER_SECRET_PASSWORD_999"),
+            "password value leaked: {kv_out}"
+        );
+        assert!(
+            !kv_out.contains("******REDACTED******"),
+            "placeholder self-corruption detected: {kv_out}"
+        );
+        assert_eq!(scrub_sensitive_substrings(&kv_out, &known_secrets), kv_out);
+
+        // 2. `https` must not destroy `https://` before structural URL/IP redaction runs
+        let url_out = scrub_sensitive_substrings(
+            "url=https://alice:ALICE_REAL_PASS@203.0.113.55/secret?token=TOK999",
+            &known_secrets,
+        );
+        for leaked in ["alice", "ALICE_REAL_PASS", "203.0.113.55", "TOK999"] {
+            assert!(
+                !url_out.contains(leaked),
+                "URL secret '{leaked}' leaked: {url_out}"
+            );
+        }
+        assert!(!url_out.contains("******REDACTED******"));
+        assert_eq!(
+            scrub_sensitive_substrings(&url_out, &known_secrets),
+            url_out
+        );
+
+        // 3. Inline DoH IP URLs still scrub non-loopback IP even when `https` is a known secret
+        let doh_out =
+            scrub_sensitive_substrings("[https://223.5.5.5/dns-query, 1.1.1.1:53]", &known_secrets);
+        assert!(
+            !doh_out.contains("223.5.5.5") && !doh_out.contains("dns-query"),
+            "DoH IP/path leaked: {doh_out}"
+        );
+        assert!(doh_out.contains("1.1.1.1:53"));
+        assert!(!doh_out.contains("******REDACTED******"));
+        assert_eq!(
+            scrub_sensitive_substrings(&doh_out, &known_secrets),
+            doh_out
+        );
+
+        // 4. Standalone secret (and longer secret shadowed by shorter prefix) redacts completely
+        let standalone_out =
+            scrub_sensitive_substrings("token_ref=super_secret_token_999", &known_secrets);
+        assert_eq!(standalone_out, "token_ref=***REDACTED***");
+        assert!(!standalone_out.contains("super_secret") && !standalone_out.contains("_token_999"));
+        assert_eq!(
+            scrub_sensitive_substrings(&standalone_out, &known_secrets),
+            standalone_out
+        );
+
+        // 5. `***REDACTED_URL***` must not be corrupted by `REDACTED` or `_URL` in known_secrets
+        let bad_url_out = scrub_sensitive_substrings(
+            r#"failed https://user:p\ass@edge.example/sub"#,
+            &known_secrets,
+        );
+        assert_eq!(bad_url_out, "failed ***REDACTED_URL***");
+        assert!(!bad_url_out.contains("******REDACTED******"));
+        assert_eq!(
+            scrub_sensitive_substrings(&bad_url_out, &known_secrets),
+            bad_url_out
+        );
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_scrubs_compound_secrets_and_guarantees_strict_idempotency() {
+        // 1. Compound configured secrets (Challenger 1 live Cookie / X-Auth / Trojan UUID-tail
+        //    vectors plus contextual prefix and partial-UUID suffix secrets)
+        let compound_secrets: Vec<String> = [
+            "sid=aaa111;session=SUPER_SECRET_COOKIE_888",
+            "token=part1&extra=SUPER_SECRET_EXTRA_777",
+            "token",
+            "pre-12345678-1234-4321-abcd-998877665544-REAL_UUID_TAIL",
+            "part2&tail=CONTEXTUAL_SECRET_666",
+            "998877665544-PARTIAL_UUID_TAIL",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let compound_cases: [(&str, &[&str]); 5] = [
+            (
+                "upstream rejected Cookie: sid=aaa111;session=SUPER_SECRET_COOKIE_888",
+                &["aaa111", "SUPER_SECRET_COOKIE_888", "session="],
+            ),
+            (
+                "upstream rejected X-Auth: token=part1&extra=SUPER_SECRET_EXTRA_777",
+                &["part1", "SUPER_SECRET_EXTRA_777", "extra="],
+            ),
+            (
+                "trojan err: pre-12345678-1234-4321-abcd-998877665544-REAL_UUID_TAIL",
+                &[
+                    "12345678-1234-4321-abcd-998877665544",
+                    "REAL_UUID_TAIL",
+                    "pre-",
+                ],
+            ),
+            (
+                "upstream rejected X-Auth: token=part2&tail=CONTEXTUAL_SECRET_666",
+                &["part2", "CONTEXTUAL_SECRET_666"],
+            ),
+            (
+                "trojan err: 12345678-1234-4321-abcd-998877665544-PARTIAL_UUID_TAIL",
+                &["12345678-1234-4321-abcd-998877665544", "PARTIAL_UUID_TAIL"],
+            ),
+        ];
+
+        for (input, forbidden) in compound_cases {
+            let p1 = scrub_sensitive_substrings(input, &compound_secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &compound_secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &compound_secrets);
+            for secret in forbidden {
+                assert!(
+                    !p1.contains(secret),
+                    "compound secret fragment '{secret}' leaked in '{p1}' (from '{input}')"
+                );
+            }
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+
+        // 2. Zero prefix shadowing across URL, Authorization Bearer, and KV token
+        let prefix_secrets: Vec<String> = ["pass", "https", "token", "bearer"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let prefix_cases: [(&str, &[&str]); 3] = [
+            (
+                "https://user:Secret99@host/path",
+                &["user", "Secret99", "/path"],
+            ),
+            ("Authorization: Bearer SuperSecret99", &["SuperSecret99"]),
+            ("url?token=SuperSecret99", &["SuperSecret99"]),
+        ];
+        for (input, forbidden) in prefix_cases {
+            let p1 = scrub_sensitive_substrings(input, &prefix_secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &prefix_secrets);
+            for secret in forbidden {
+                assert!(
+                    !p1.contains(secret),
+                    "prefix-shadowed secret '{secret}' leaked in '{p1}' (from '{input}')"
+                );
+            }
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+        }
+
+        // 3. Zero placeholder corruption & strict idempotency with `"****"` and placeholder fragments
+        let star_secrets: Vec<String> = [
+            "****",
+            "REDACTED",
+            "_URL",
+            "***R",
+            "***REDACTED***",
+            "***REDACTED_URL***",
+            "secret_long_123",
+            "foo_",
+            "foo_https",
+            "https://sub.example.com",
+            "sub.",
+            "aaaa",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let idempotent_cases = [
+            r"*https://user:p\ass@edge.example/sub",
+            r"**https://user:p\ass@edge.example/sub",
+            r"***https://user:p\ass@edge.example/sub",
+            r"****https://user:p\ass@edge.example/sub",
+            r"*****https://user:p\ass@edge.example/sub",
+            "*secret_long_123*",
+            "*secret_long_123***",
+            "***REDACTED***",
+            "***REDACTED_URL***",
+            "foo_token=BarSecret99",
+            "foo_HTTPS://user:pass@host.example/secret",
+            "https://user:pass@sub.example.com/secret",
+            "aaaa12345678-1234-4321-abcd-998877665544",
+        ];
+
+        for input in idempotent_cases {
+            let p1 = scrub_sensitive_substrings(input, &star_secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &star_secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &star_secrets);
+            assert!(
+                !p1.contains("REDACTED***REDACTED_URL")
+                    && !p1.contains("REDACTED***REDACTED***REDACTED"),
+                "corrupted placeholder detected in '{p1}' (from '{input}')"
+            );
+            assert_eq!(
+                p2, p1,
+                "f(f(x)) != f(x) for '{input}': p1='{p1}', p2='{p2}'"
+            );
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+
+        // Verify intact placeholder retention on star-adjacent inputs
+        assert_eq!(
+            scrub_sensitive_substrings(r"*https://user:p\ass@edge.example/sub", &star_secrets),
+            "****REDACTED_URL***"
+        );
+        assert_eq!(
+            scrub_sensitive_substrings(r"**https://user:p\ass@edge.example/sub", &star_secrets),
+            "*****REDACTED_URL***"
+        );
+        assert_eq!(
+            scrub_sensitive_substrings(r"****https://user:p\ass@edge.example/sub", &star_secrets),
+            "***REDACTED******REDACTED_URL***"
+        );
+        assert_eq!(
+            scrub_sensitive_substrings("*secret_long_123*", &star_secrets),
+            "****REDACTED****"
+        );
+        assert_eq!(
+            scrub_sensitive_substrings("***REDACTED***", &star_secrets),
+            "***REDACTED***"
+        );
+        assert_eq!(
+            scrub_sensitive_substrings("***REDACTED_URL***", &star_secrets),
+            "***REDACTED_URL***"
+        );
+        assert!(
+            !scrub_sensitive_substrings("foo_token=BarSecret99", &star_secrets)
+                .contains("BarSecret99")
+        );
+        assert!(
+            !scrub_sensitive_substrings("aaaa12345678-1234-4321-abcd-998877665544", &star_secrets)
+                .contains("12345678")
+        );
+
+        // Multi-byte UTF-8 safety & idempotency
+        let utf8_secrets = vec![
+            "密码🔥".to_string(),
+            "中文密码123".to_string(),
+            "秘密值".to_string(),
+        ];
+        let utf8_in =
+            "错误：https://用户:密码🔥@doh.example/dns-query 令牌=秘密值 token=中文密码123";
+        let utf8_p1 = scrub_sensitive_substrings(utf8_in, &utf8_secrets);
+        let utf8_p2 = scrub_sensitive_substrings(&utf8_p1, &utf8_secrets);
+        assert!(
+            !utf8_p1.contains("密码🔥")
+                && !utf8_p1.contains("秘密值")
+                && !utf8_p1.contains("中文密码123")
+        );
+        assert_eq!(utf8_p2, utf8_p1);
+
+        // 4. Linear O(N) performance on long self-overlapping secret & backslash inputs
+        let long_a = "a".repeat(50_000);
+        let long_bs = format!("https://example.com/{}x", "\\".repeat(50_000));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            scrub_sensitive_substrings(&long_a, &star_secrets),
+            "***REDACTED***"
+        );
+        assert_eq!(
+            scrub_sensitive_substrings(&long_bs, &star_secrets),
+            "https://example.com/***REDACTED***"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "scrub_sensitive_substrings must scale linearly in O(N)"
+        );
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_fixes_uuid_host_case_second_order_prefix_shadowing_and_placeholder_secrets()
+     {
+        let empty_secrets: Vec<String> = Vec::new();
+        let normal_secrets = vec!["MyNormalTrojanPassword99".to_string()];
+        let shadowing_secrets: Vec<String> = ["foo_", "token", "pass", "https", "word", "bar_"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // 1. UUID in URL hostname keeps canonical uppercase `***REDACTED***` on Pass 1..3
+        //    under BOTH empty `known_secrets` AND normal configured secrets.
+        for secrets in [&empty_secrets, &normal_secrets] {
+            for (input, expected) in [
+                (
+                    "[D2] dial https://12345678-1234-4321-abcd-998877665544.example/secret-path",
+                    "[D2] dial https://***REDACTED***.example/***REDACTED***",
+                ),
+                (
+                    "[D2] dial https://12345678-1234-4321-abcd-998877665544/a",
+                    "[D2] dial https://***REDACTED***/***REDACTED***",
+                ),
+            ] {
+                let p1 = scrub_sensitive_substrings(input, secrets);
+                let p2 = scrub_sensitive_substrings(&p1, secrets);
+                let p3 = scrub_sensitive_substrings(&p2, secrets);
+                assert_eq!(p1, expected, "unexpected p1 for '{input}'");
+                assert!(
+                    !p1.contains("***redacted***"),
+                    "corrupted lowercase placeholder in '{p1}'"
+                );
+                assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+                assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+            }
+        }
+
+        // 2. `<uuid>token=...` under BOTH empty `known_secrets` AND shadowing secrets
+        for secrets in [&empty_secrets, &shadowing_secrets] {
+            let input = "[D2] 12345678-1234-4321-abcd-998877665544token=EmptyCfgSecret999";
+            let p1 = scrub_sensitive_substrings(input, secrets);
+            let p2 = scrub_sensitive_substrings(&p1, secrets);
+            let p3 = scrub_sensitive_substrings(&p2, secrets);
+            assert!(
+                !p1.contains("EmptyCfgSecret999") && !p1.contains("12345678"),
+                "leaked UUID or token in '{p1}'"
+            );
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+
+        // 3. Second-order prefix shadowing (`foo_token=...`, `foo_password=...`, `foo_https://...`,
+        //    mid-keyword secret `"word"`, value-prefix secret `"bar_"`, UUID-tail value)
+        let second_order_cases: [(&str, &[&str]); 7] = [
+            (
+                "[D3-1] 12345678-1234-4321-abcd-998877665544token=UuidGluedTokSecret99",
+                &["12345678", "UuidGluedTokSecret99"],
+            ),
+            (
+                "[D3-2] 12345678-1234-4321-abcd-998877665544password=UuidGluedPassSecret99",
+                &["12345678", "UuidGluedPassSecret99"],
+            ),
+            (
+                "[D3-3] foo_token=FooGluedTokSecret99",
+                &["foo_", "token", "FooGluedTokSecret99"],
+            ),
+            (
+                "[D3-4] foo_password=FooGluedPassSecret99",
+                &["foo_", "pass", "word", "FooGluedPassSecret99"],
+            ),
+            (
+                "[D3-5] foo_https://u:Secret99@h/x",
+                &["foo_", "https", "Secret99"],
+            ),
+            (
+                "[D3-6] foo_token=bar_TailSecret88",
+                &["foo_", "token", "bar_", "TailSecret88"],
+            ),
+            (
+                "[D3-7] foo_token=12345678-1234-4321-abcd-998877665544-GluedUuidTail77",
+                &["foo_", "token", "12345678", "GluedUuidTail77"],
+            ),
+        ];
+        for (input, forbidden) in second_order_cases {
+            let p1 = scrub_sensitive_substrings(input, &shadowing_secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &shadowing_secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &shadowing_secrets);
+            for secret in forbidden {
+                assert!(
+                    !p1.contains(secret),
+                    "second-order shadowed secret '{secret}' leaked in '{p1}' (from '{input}')"
+                );
+            }
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+
+        // Preserve unrelated clean URL host readability alongside second-order unblocking
+        let mixed = "dial https://sub.example.com/a foo_token=MixedSecret77";
+        let mixed_secrets = vec!["foo_".to_string(), "token".to_string()];
+        let mp1 = scrub_sensitive_substrings(mixed, &mixed_secrets);
+        assert!(
+            mp1.starts_with("dial https://sub.example.com/***REDACTED*** "),
+            "unrelated URL host readability should be preserved: {mp1}"
+        );
+        assert!(!mp1.contains("MixedSecret77"));
+        assert_eq!(scrub_sensitive_substrings(&mp1, &mixed_secrets), mp1);
+
+        // 4. Placeholder-containing configured secrets scrub completely while keeping
+        //    `"****"` / `"REDACTED"` / `"_URL"` / `"***R"` placeholder protection intact.
+        let ph_secrets: Vec<String> = [
+            "pre-***REDACTED***-INNER_PH_SECRET99",
+            "***REDACTED_URL***-SUFFIX_SECRET88",
+            "****",
+            "REDACTED",
+            "_URL",
+            "***R",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for (input, expected, forbidden) in [
+            (
+                "auth err: pre-***REDACTED***-INNER_PH_SECRET99",
+                "auth err: ***REDACTED***",
+                "INNER_PH_SECRET99",
+            ),
+            (
+                "url err: ***REDACTED_URL***-SUFFIX_SECRET88",
+                "url err: ***REDACTED***",
+                "SUFFIX_SECRET88",
+            ),
+        ] {
+            let p1 = scrub_sensitive_substrings(input, &ph_secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &ph_secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &ph_secrets);
+            assert_eq!(p1, expected);
+            assert!(!p1.contains(forbidden));
+            assert_eq!(p2, p1);
+            assert_eq!(p3, p1);
+        }
+        assert_eq!(
+            scrub_sensitive_substrings(r"*https://user:p\ass@edge.example/sub", &ph_secrets),
+            "****REDACTED_URL***"
+        );
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_unblocks_nested_kv_trailing_hex_uuid_and_chained_placeholder_secrets()
+     {
+        let secrets: Vec<String> = [
+            "access_",
+            "token",
+            "obfs_",
+            "obfs",
+            "pass",
+            "api_",
+            "public_",
+            "private_",
+            "key=",
+            "12345678",
+            "aaaa",
+            "pre-***REDACTED***-x",
+            "前缀-***REDACTED***-中",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let cases: [(&str, &[&str]); 9] = [
+            (
+                "xaccess_token=NestedTokSecret99",
+                &["access_", "token", "NestedTokSecret99"],
+            ),
+            (
+                "xobfs_password=NestedPassSecret99",
+                &["obfs_", "pass", "NestedPassSecret99"],
+            ),
+            (
+                "xobfspassword=NestedObfsSecret99",
+                &["obfs", "pass", "NestedObfsSecret99"],
+            ),
+            ("xapi_key=NestedKeySecret99", &["api_", "NestedKeySecret99"]),
+            (
+                "xpublic_key=NestedPubSecret99",
+                &["public_", "NestedPubSecret99"],
+            ),
+            (
+                "xprivate_key=NestedPrivSecret99",
+                &["private_", "NestedPrivSecret99"],
+            ),
+            (
+                "12345678-1234-4321-abcd-998877665544aaaa",
+                &["12345678", "998877665544", "aaaa"],
+            ),
+            (
+                "pre-12345678-1234-4321-abcd-998877665544-xtoken=ChainedPhSecret99",
+                &["12345678", "998877665544", "token", "ChainedPhSecret99"],
+            ),
+            (
+                "前缀-12345678-1234-4321-abcd-998877665544-中token=ChainedUtf8Secret99",
+                &["12345678", "998877665544", "token", "ChainedUtf8Secret99"],
+            ),
+        ];
+
+        for (input, forbidden) in cases {
+            let p1 = scrub_sensitive_substrings(input, &secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &secrets);
+            for secret in forbidden {
+                assert!(
+                    !p1.contains(secret),
+                    "leaked '{secret}' in '{p1}' (from '{input}')"
+                );
+            }
+            assert!(
+                !p1.contains("***redacted***"),
+                "corrupted lowercase placeholder in '{p1}'"
+            );
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_preserves_unblocked_keywords_before_uuids_and_urls() {
+        let cases: [(&str, &[&str], &[&str]); 12] = [
+            (
+                "xapi_key=12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["api_", "key="],
+                &["api_", "key=", "12345678", "TailSecret99"],
+            ),
+            (
+                "foo_token=22222222-3333-4444-5555-666666666666-TokTailSec88",
+                &["foo_", "token="],
+                &["foo_", "token=", "22222222", "TokTailSec88"],
+            ),
+            (
+                "xaccess_token=33333333-4444-5555-6666-777777777777-AccTailSec77",
+                &["xaccess_token="],
+                &["access_token", "33333333", "AccTailSec77"],
+            ),
+            (
+                "xapi_key=https://SecretHost99.example",
+                &["api_", "key="],
+                &["api_", "key=", "SecretHost99", "secrethost99", "https://"],
+            ),
+            (
+                "xapi_key=http://LeakHost99.example/",
+                &["api_", "key="],
+                &["api_", "key=", "LeakHost99", "leakhost99", "http://"],
+            ),
+            (
+                r#"xapi_key="https://QuotedHost99.example/p""#,
+                &["api_", "key="],
+                &["api_", "key=", "QuotedHost99", "quotedhost99", "https://"],
+            ),
+            (
+                "xtoken=12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["xtoken=1234"],
+                &["token", "12345678", "TailSecret99"],
+            ),
+            (
+                "xtoken=aaaa12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["xtoken=aaaa"],
+                &["token", "aaaa", "12345678", "TailSecret99"],
+            ),
+            (
+                "xAuthorization: Bearer 12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["xAuthorization: Bearer 1234"],
+                &["Authorization", "12345678", "TailSecret99"],
+            ),
+            (
+                "pre-12345678-1234-4321-abcd-998877665544-xapi_key=12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["pre-***REDACTED***-x", "api_", "key="],
+                &["api_", "key=", "12345678", "TailSecret99"],
+            ),
+            (
+                "xtoken=Sec1 xpassword=Sec2",
+                &["xtoken=Sec1 x", "pass"],
+                &["Sec1", "Sec2", "pass"],
+            ),
+            (
+                "xtoken=foo&xpassword=AmpSecret99",
+                &["xtoken=foo&x", "pass"],
+                &["AmpSecret99", "pass"],
+            ),
+        ];
+
+        for (input, raw_secrets, forbidden) in cases {
+            let secrets: Vec<String> = raw_secrets.iter().map(|s| (*s).to_string()).collect();
+            let p1 = scrub_sensitive_substrings(input, &secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &secrets);
+            for secret in forbidden {
+                assert!(
+                    !p1.contains(secret),
+                    "leaked '{secret}' in '{p1}' (input='{input}', secrets={raw_secrets:?})"
+                );
+            }
+            assert!(
+                !p1.contains("***redacted***"),
+                "corrupted lowercase placeholder in '{p1}'"
+            );
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+
+        // Benign TSV bare-host rows remain strictly uncorrupted through the 3-pass export scrubber
+        let normal_secrets = vec!["MyNormalTrojanPassword99".to_string()];
+        for benign in [
+            "[LIVE] https://a.com\tcol2",
+            "[LIVE] http://example.com\t200\tOK",
+            "[LIVE] ws://a.com\tcol2",
+            "[LIVE] wss://a.com\tcol2",
+        ] {
+            let p1 = scrub_sensitive_substrings(benign, &normal_secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &normal_secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &normal_secrets);
+            assert_eq!(p1, benign, "benign TSV row must remain intact: {benign:?}");
+            assert_eq!(p2, p1);
+            assert_eq!(p3, p1);
+        }
+    }
+
+    #[test]
+    fn scrub_sensitive_substrings_decouples_word_boundary_and_uuid_buffers_with_monotone_value_tracking()
+     {
+        // Covers ALL Wave 6 Reviewer 2 (N_A1..N_A8), Challenger 1 (D2 #1..#9), and
+        // Challenger 2 (D1 #1..#7) live-reproduced credential-leak vectors.
+        let cases: [(&str, &[&str], &[&str]); 25] = [
+            // R2 N_A1..N_A4 (cross-secret & single-secret UUID boundary inside KV / Authorization)
+            (
+                "DOMAIN-KEYWORD,N_A1 xtoken=aaaa12345678-1234-4321-abcd-998877665544-NewLeadHexTail99,DIRECT",
+                &["xtoken=", "aaaa"],
+                &["aaaa", "12345678", "NewLeadHexTail99"],
+            ),
+            (
+                "DOMAIN-KEYWORD,N_A2 xaccess_token=12345678-1234-4321-abcd-998877665544aaaa-NewTrailHexTail99,DIRECT",
+                &["xaccess_token=", "aaaa"],
+                &["aaaa", "12345678", "NewTrailHexTail99"],
+            ),
+            (
+                "DOMAIN-KEYWORD,N_A3 xtoken=12345678-1234-4321-abcd-998877665544aaaa-NewSingleTrailTail99,DIRECT",
+                &["xtoken=12345678-1234-4321-abcd-998877665544aaaa"],
+                &["12345678", "aaaa", "NewSingleTrailTail99"],
+            ),
+            (
+                "DOMAIN-KEYWORD,N_A4 xAuthorization: Bearer aaaa12345678-1234-4321-abcd-998877665544-NewAuthHexTail99,DIRECT",
+                &["xAuthorization: Bearer ", "aaaa"],
+                &["aaaa", "12345678", "NewAuthHexTail99"],
+            ),
+            // R2 N_A5 (same-span upgrade with `&next=1` query tail & path variant)
+            (
+                "DOMAIN-KEYWORD,N_A5 xapi_key=https://NewAmpHost99.example&next=1,DIRECT",
+                &["api_", "key="],
+                &["api_", "key=", "NewAmpHost99", "newamphost99"],
+            ),
+            (
+                "DOMAIN-KEYWORD,N_A5_path xapi_key=https://NewAmpHost99.example/p&next=1,DIRECT",
+                &["api_", "key="],
+                &["api_", "key=", "NewAmpHost99", "newamphost99"],
+            ),
+            // R2 N_A7 & N_A8 (`#` and quote KV separators)
+            (
+                "DOMAIN-KEYWORD,N_A7 xtoken=Sec1#xpassword=NewHashPassSec99,DIRECT",
+                &["xtoken=Sec1#x", "pass"],
+                &["Sec1", "NewHashPassSec99"],
+            ),
+            (
+                r#"DOMAIN-KEYWORD,N_A8 xtoken="Sec1"xpassword=NewQuotePassSec99,DIRECT"#,
+                &[r#"xtoken="Sec1"x"#, "pass"],
+                &["Sec1", "NewQuotePassSec99"],
+            ),
+            // C1 D2 #2..#9 (split-secret UUID lead/trail, Uuid -> WordBoundary, quoted/# chained)
+            (
+                "xtoken=Zaaaa12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["xtoken=", "aaaa"],
+                &["aaaa", "12345678", "TailSecret99"],
+            ),
+            (
+                "xtoken=12345678-1234-4321-abcd-998877665544aaaa-TailSecret99",
+                &["xtoken=", "aaaa"],
+                &["aaaa", "12345678", "TailSecret99"],
+            ),
+            (
+                "xAuthorization: Bearer aaaa12345678-1234-4321-abcd-998877665544-TailSecret99",
+                &["xAuthorization:", "aaaa"],
+                &["aaaa", "12345678", "TailSecret99"],
+            ),
+            (
+                "xAuthorization: Bearer 12345678-1234-4321-abcd-998877665544aaaa-TailSecret99",
+                &["xAuthorization:", "aaaa"],
+                &["aaaa", "12345678", "TailSecret99"],
+            ),
+            (
+                "aaaa11111111-2222-3333-4444-555555555555api_key=TailSecret99",
+                &["aaaa11111111-2222-3333-4444-555555555555api_key="],
+                &["11111111", "api_key", "TailSecret99"],
+            ),
+            (
+                "aaaa11111111-2222-3333-4444-555555555555xtoken=TailSecret99",
+                &["aaaa11111111-2222-3333-4444-555555555555xtoken="],
+                &["11111111", "xtoken", "TailSecret99"],
+            ),
+            (
+                "aaaa11111111-2222-3333-4444-555555555555auth=TailSecret99",
+                &["aaaa11111111-2222-3333-4444-555555555555auth="],
+                &["11111111", "auth", "TailSecret99"],
+            ),
+            (
+                r#"xkey="secret"xtoken=TailSecret99"#,
+                &[r#"xkey="secret"xtoken="#],
+                &["secret", "TailSecret99"],
+            ),
+            (
+                "xkey=val#xtoken=TailSecret99",
+                &["xkey=val#xtoken="],
+                &["TailSecret99"],
+            ),
+            // C2 D1 #1..#7 (cross-secret UUID + cross-secret inline quoted KV split + single-secret)
+            (
+                "DOMAIN-KEYWORD,xtoken=z_aaaa22222222-3333-4444-5555-666666666666-AdvTokLeadTail77,DIRECT",
+                &["xtoken=", "aaaa"],
+                &["aaaa", "22222222", "AdvTokLeadTail77"],
+            ),
+            (
+                "DOMAIN-KEYWORD,xtoken=22222222-3333-4444-5555-666666666666bbbb-AdvTokTrailTail66,DIRECT",
+                &["xtoken=", "bbbb"],
+                &["bbbb", "22222222", "AdvTokTrailTail66"],
+            ),
+            (
+                "DOMAIN-KEYWORD,xapi_key=z_aaaa11111111-2222-3333-4444-555555555555-AdvApiLeadTail99,DIRECT",
+                &["api_", "key=", "aaaa"],
+                &["api_", "key=", "aaaa", "11111111", "AdvApiLeadTail99"],
+            ),
+            (
+                "DOMAIN-KEYWORD,xapi_key=11111111-2222-3333-4444-555555555555bbbb-AdvApiTrailTail88,DIRECT",
+                &["api_", "key=", "bbbb"],
+                &["api_", "key=", "bbbb", "11111111", "AdvApiTrailTail88"],
+            ),
+            (
+                r#"DOMAIN-KEYWORD,xtoken=foo_xkey="a"-AdvQuotedSplitTail55,DIRECT"#,
+                &["xtoken=", "foo_x"],
+                &["xtoken=", "foo_x", "AdvQuotedSplitTail55"],
+            ),
+            (
+                r#"DOMAIN-KEYWORD,xtoken=foo_xkey="a"-AdvQuotedSplitTail55,DIRECT"#,
+                &["xtoken=", "foo_x", "key="],
+                &["xtoken=", "foo_x", "key=", "AdvQuotedSplitTail55"],
+            ),
+            (
+                "DOMAIN-KEYWORD,xAuthorization: Bearer z_aaaa33333333-4444-5555-6666-777777777777-AdvAuthLeadTail44,DIRECT",
+                &["xAuthorization:", "aaaa"],
+                &["aaaa", "33333333", "AdvAuthLeadTail44"],
+            ),
+            (
+                r#"xtoken="q" xapi_key=Sec2 & xtoken=a&xpassword=Sec3"#,
+                &["xtoken=", "xapi_key=", "xpassword="],
+                &["Sec2", "Sec3"],
+            ),
+        ];
+
+        for (input, raw_secrets, forbidden) in cases {
+            let secrets: Vec<String> = raw_secrets.iter().map(|s| (*s).to_string()).collect();
+            let p1 = scrub_sensitive_substrings(input, &secrets);
+            let p2 = scrub_sensitive_substrings(&p1, &secrets);
+            let p3 = scrub_sensitive_substrings(&p2, &secrets);
+            for secret in forbidden {
+                assert!(
+                    !p1.contains(secret),
+                    "leaked '{secret}' in '{p1}' (input='{input}', secrets={raw_secrets:?})"
+                );
+            }
+            assert!(
+                !p1.contains("***redacted***"),
+                "corrupted lowercase placeholder in '{p1}'"
+            );
+            assert_eq!(p2, p1, "f(f(x)) != f(x) for '{input}'");
+            assert_eq!(p3, p1, "f(f(f(x))) != f(x) for '{input}'");
+        }
+
+        // Verify N_A5 keeps `&next=1` intact while redacting `https://NewAmpHost99.example`
+        let na5 = scrub_sensitive_substrings(
+            "DOMAIN-KEYWORD,N_A5 xapi_key=https://NewAmpHost99.example&next=1,DIRECT",
+            &["api_".to_string(), "key=".to_string()],
+        );
+        assert!(
+            na5.contains("&next=1"),
+            "non-secret query sibling lost: {na5}"
+        );
+        assert!(!na5.to_ascii_lowercase().contains("newamphost99"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_export_scrubs_profiles_custom_rules_backup_and_preserves_benign_metadata()
+    {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustclash-api-diag-profiles-scrub-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let yaml = r#"mixed-port: 0
+external-controller: ""
+secret: "export-ctrl-secret-99"
+mode: rule
+proxies:
+  - name: "HK (Fast) [VIP]"
+    type: trojan
+    server: edge.example.test
+    port: 443
+    password: "xtoken="
+  - name: "US-Backup"
+    type: trojan
+    server: us.example.test
+    port: 443
+    password: "aaaa"
+  - name: "JP-Backup"
+    type: trojan
+    server: jp.example.test
+    port: 443
+    password: "foo_x"
+  - name: "SG-Backup"
+    type: trojan
+    server: sg.example.test
+    port: 443
+    password: "api_"
+  - name: "TW-Backup"
+    type: trojan
+    server: tw.example.test
+    port: 443
+    password: "key="
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "HK (Fast) [VIP]"
+      - "US-Backup"
+rules:
+  - 'DOMAIN-KEYWORD,xtoken=aaaa12345678-1234-4321-abcd-998877665544-ProfileBackupLeak99,DIRECT'
+  - 'DOMAIN-KEYWORD,xtoken=foo_xkey="a"-ProfileQuotedLeak88,DIRECT'
+  - 'DOMAIN-KEYWORD,xapi_key=https://ProfileAmpHost77.example&next=1,DIRECT'
+  - "DOMAIN-KEYWORD,https://a.com\tcol2,DIRECT"
+  - MATCH,DIRECT
+"#;
+        let mut cfg = ClashConfig::from_yaml_str(yaml).unwrap();
+        cfg.dns.enable = false;
+        let engine = ProxyEngine::start_with_state_dir(cfg, tmp_dir.clone())
+            .await
+            .unwrap();
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (bound, server_handle) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), stop_rx)
+            .await
+            .unwrap();
+
+        let mut conn = tokio::net::TcpStream::connect(bound).await.unwrap();
+        conn.write_all(
+            format!(
+                "GET /diagnostics/export HTTP/1.1\r\nHost: {bound}\r\nAuthorization: Bearer export-ctrl-secret-99\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut raw = Vec::new();
+        conn.read_to_end(&mut raw).await.unwrap();
+        assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+        let body = extract_http_response_body_str(&raw).unwrap();
+
+        // ZERO plaintext secrets anywhere in the ENTIRE diagnostics export JSON (both
+        // `config_redacted_yaml` AND `profiles.profiles[].custom_rules_backup`)!
+        for leaked in [
+            "export-ctrl-secret-99",
+            "ProfileBackupLeak99",
+            "ProfileQuotedLeak88",
+            "ProfileAmpHost77",
+            "profileamphost77",
+            "12345678-1234-4321-abcd-998877665544",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "secret '{leaked}' leaked in GET /diagnostics/export body: {body}"
+            );
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let profiles = parsed["profiles"]["profiles"]
+            .as_array()
+            .expect("profiles.profiles array");
+        assert!(
+            !profiles.is_empty(),
+            "expected seeded starter profile in diagnostics export"
+        );
+        let backup_rules = profiles[0]["custom_rules_backup"]
+            .as_array()
+            .expect("custom_rules_backup array");
+        assert!(
+            backup_rules
+                .iter()
+                .any(|r| r.as_str() == Some("DOMAIN-KEYWORD,https://a.com\tcol2,DIRECT")),
+            "benign TSV rule should stay intact in custom_rules_backup: {backup_rules:?}"
+        );
+        assert!(
+            backup_rules
+                .iter()
+                .any(|r| r.as_str() == Some("MATCH,DIRECT")),
+            "MATCH,DIRECT should stay intact in custom_rules_backup: {backup_rules:?}"
+        );
+        // Normal selected_groups proxy/group names stay intact
+        if let Some(sel) = profiles[0]["selected_groups"].as_object()
+            && let Some(proxy_sel) = sel.get("PROXY")
+        {
+            assert_eq!(proxy_sel.as_str(), Some("HK (Fast) [VIP]"));
+        }
+
+        let _ = stop_tx.send(true);
+        let _ = server_handle.await;
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

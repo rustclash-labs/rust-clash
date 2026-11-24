@@ -9,7 +9,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::config::uri::redact_sensitive_text;
+use crate::config::uri::{
+    is_escaped_stop_boundary, redact_sensitive_text, scan_quoted_or_escaped_token,
+};
 
 pub const CRASH_LOG_DIR_NAME: &str = "logs";
 pub const CRASH_LOG_FILENAME: &str = "crash.log";
@@ -52,30 +54,56 @@ pub fn sanitize_crash_text(raw: &str) -> String {
 }
 
 fn scrub_bearer_tokens(input: &str) -> String {
-    let mut out = input.to_string();
+    let lower = input.to_ascii_lowercase();
     let needle = "bearer ";
+    if !lower.contains(needle) {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut emitted = 0usize;
     let mut cursor = 0usize;
-    while let Some(rel) = out[cursor..].to_ascii_lowercase().find(needle) {
+    while let Some(rel) = lower[cursor..].find(needle) {
         let start = cursor + rel;
         let tok_start = start + needle.len();
-        let tok_end = out[tok_start..]
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}')
+        let tok_slice = &input[tok_start..];
+        if let Some(span) = scan_quoted_or_escaped_token(tok_slice) {
+            let inner_start = tok_start + span.inner_start;
+            let inner_end = tok_start + span.inner_end;
+            if inner_end > inner_start {
+                out.push_str(&input[emitted..inner_start]);
+                out.push_str("<redacted>");
+                emitted = inner_end;
+            }
+            cursor = tok_start + span.next_offset;
+            continue;
+        }
+        let tok_end = tok_slice
+            .char_indices()
+            .find(|&(idx, c)| {
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}')
+                    || (c == '\\' && is_escaped_stop_boundary(tok_slice, idx, &[]))
             })
-            .map(|len| tok_start + len)
-            .unwrap_or(out.len());
+            .map(|(len, _)| tok_start + len)
+            .unwrap_or(input.len());
         if tok_end > tok_start {
-            out.replace_range(tok_start..tok_end, "<redacted>");
-            cursor = tok_start + "<redacted>".len();
+            out.push_str(&input[emitted..tok_start]);
+            out.push_str("<redacted>");
+            emitted = tok_end;
+            cursor = tok_end;
         } else {
             cursor = tok_start;
         }
     }
+    if emitted == 0 {
+        return input.to_string();
+    }
+    out.push_str(&input[emitted..]);
     out
 }
 
 fn scrub_home_user_segments(input: &str) -> String {
-    let mut out = input.to_string();
+    let mut cur = input.to_string();
     for (prefix, sep) in [
         ("/Users/", '/'),
         ("/home/", '/'),
@@ -85,10 +113,15 @@ fn scrub_home_user_segments(input: &str) -> String {
         ("C:/Users/", '/'),
         ("c:/Users/", '/'),
     ] {
+        if !cur.contains(prefix) {
+            continue;
+        }
+        let mut next = String::with_capacity(cur.len());
+        let mut emitted = 0usize;
         let mut cursor = 0usize;
-        while let Some(rel) = out[cursor..].find(prefix) {
+        while let Some(rel) = cur[cursor..].find(prefix) {
             let user_start = cursor + rel + prefix.len();
-            let user_end = out[user_start..]
+            let user_end = cur[user_start..]
                 .find(|c: char| {
                     c == sep
                         || c == '/'
@@ -97,16 +130,20 @@ fn scrub_home_user_segments(input: &str) -> String {
                         || matches!(c, '"' | '\'' | ':' | ')')
                 })
                 .map(|len| user_start + len)
-                .unwrap_or(out.len());
-            if user_end > user_start && &out[user_start..user_end] != "<redacted>" {
-                out.replace_range(user_start..user_end, "<redacted>");
-                cursor = user_start + "<redacted>".len();
-            } else {
-                cursor = user_end;
+                .unwrap_or(cur.len());
+            if user_end > user_start && &cur[user_start..user_end] != "<redacted>" {
+                next.push_str(&cur[emitted..user_start]);
+                next.push_str("<redacted>");
+                emitted = user_end;
             }
+            cursor = user_end;
+        }
+        if emitted > 0 {
+            next.push_str(&cur[emitted..]);
+            cur = next;
         }
     }
-    out
+    cur
 }
 
 fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
@@ -331,6 +368,24 @@ mod tests {
         assert!(sanitized.contains("C:\\Users\\<redacted>\\桌面"));
         assert!(sanitized.contains("/Users/<redacted>/.cargo/registry"));
         assert!(sanitized.contains("/home/<redacted>/repo"));
+
+        // JSON-escaped Bearer header preserves `\"` without leaking token
+        let escaped_bearer = r#"\"Authorization: Bearer eyJsecret\""#;
+        let sanitized_escaped = sanitize_crash_text(escaped_bearer);
+        assert_eq!(sanitized_escaped, r#"\"Authorization: Bearer <redacted>\""#);
+        assert!(!sanitized_escaped.contains("eyJsecret"));
+        assert_eq!(sanitize_crash_text(&sanitized_escaped), sanitized_escaped);
+
+        // Multi-backslash before closing quote & raw backslash inside bearer token
+        let triple_bs_bearer = r#"\\\"Authorization: Bearer eyJsecret2\\\""#;
+        assert_eq!(
+            sanitize_crash_text(triple_bs_bearer),
+            r#"\\\"Authorization: Bearer <redacted>\\\""#
+        );
+        let raw_bs_bearer = r#"Authorization: Bearer eyJ\secret3"#;
+        let sanitized_raw_bs = sanitize_crash_text(raw_bs_bearer);
+        assert_eq!(sanitized_raw_bs, "Authorization: Bearer <redacted>");
+        assert!(!sanitized_raw_bs.contains("secret3"));
     }
 
     #[test]
@@ -407,5 +462,76 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside).unwrap(), "keep-me");
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn sanitize_crash_text_handles_long_backslash_bearer_run_in_linear_time() {
+        let bs = "\\".repeat(50_000);
+        let input = format!("Authorization: Bearer {bs}x");
+        let started = std::time::Instant::now();
+        let sanitized = sanitize_crash_text(&input);
+        let elapsed = started.elapsed();
+
+        assert_eq!(sanitized, "Authorization: Bearer <redacted>");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "50k-backslash Bearer scrubbing must run in linear O(N) time, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_crash_text_handles_quoted_bearer_and_repeated_bearer_in_linear_time() {
+        for (input, expected, secret) in [
+            (
+                r#"Authorization: Bearer "QuotedBearerSecret789""#,
+                r#"Authorization: Bearer "<redacted>""#,
+                "QuotedBearerSecret789",
+            ),
+            (
+                r#"bearer "QuotedStandalone99""#,
+                r#"bearer "<redacted>""#,
+                "QuotedStandalone99",
+            ),
+            (
+                r#"{"auth":"Authorization: Bearer \"JsonQuotedBearer88\""}"#,
+                r#"{"auth":"Authorization: Bearer \"<redacted>\""}"#,
+                "JsonQuotedBearer88",
+            ),
+            (
+                r#"{"Authorization": "Bearer JsonObjCrashBearer99"}"#,
+                r#"{"Authorization": "Bearer <redacted>"}"#,
+                "JsonObjCrashBearer99",
+            ),
+            (
+                r#"bearer \"part1\\\"EscapedInnerCrashBearer77\""#,
+                r#"bearer \"<redacted>\""#,
+                "EscapedInnerCrashBearer77",
+            ),
+            (
+                r#"Authorization: Bearer \"part1\\\"EscapedAuthCrashBearer66\""#,
+                r#"Authorization: Bearer \"<redacted>\""#,
+                "EscapedAuthCrashBearer66",
+            ),
+        ] {
+            let s1 = sanitize_crash_text(input);
+            let s2 = sanitize_crash_text(&s1);
+            assert_eq!(s1, expected);
+            assert!(!s1.contains(secret));
+            assert_eq!(s2, s1);
+        }
+
+        let repeated_bearer = "bearer a ".repeat(6_000);
+        let repeated_users = "/Users/alice/".repeat(4_000);
+        let started = std::time::Instant::now();
+        let out_bearer = sanitize_crash_text(&repeated_bearer);
+        let out_users = sanitize_crash_text(&repeated_users);
+        let elapsed = started.elapsed();
+
+        assert!(out_bearer.starts_with("bearer <redacted> "));
+        assert!(!out_users.contains("alice"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "50k repeated bearer/user path scrubbing must run in linear O(N) time, took {elapsed:?}"
+        );
     }
 }
