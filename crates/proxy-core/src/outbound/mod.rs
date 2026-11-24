@@ -23,7 +23,6 @@ use tokio::{
     net::UdpSocket,
     sync::OnceCell,
 };
-use url::Url;
 
 use crate::{
     addr::{HostName, TargetAddr},
@@ -151,6 +150,7 @@ pub trait OutboundHandler: std::any::Any + Send + Sync {
     }
 
     /// Perform an HTTP HEAD latency test through this outbound proxy tunnel.
+    /// Rejects non-`http`/`https` schemes and URL userinfo via `crate::probe::parse_probe_url`.
     /// When `unified_delay` is `true` (Mihomo `unified-delay` semantics), establishes the
     /// proxy/TLS tunnel and warms end-to-end keep-alive first so cold DNS, TCP, TLS, and
     /// auth handshakes do not skew node RTT comparisons.
@@ -160,72 +160,152 @@ pub trait OutboundHandler: std::any::Any + Send + Sync {
         timeout: Duration,
         unified_delay: bool,
     ) -> io::Result<u64> {
-        let parsed = Url::parse(test_url).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid test URL: {e}"),
-            )
-        })?;
-        let raw_host = parsed.host_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing host in test URL")
-        })?;
-        let clean_host = raw_host
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(raw_host);
-        let is_https = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if is_https { 443 } else { 80 });
-        let path = match parsed.query() {
-            Some(q) => format!(
-                "{}?{q}",
-                if parsed.path().is_empty() {
-                    "/"
-                } else {
-                    parsed.path()
-                }
-            ),
-            None => {
-                let p = parsed.path();
-                if p.is_empty() {
-                    "/".to_string()
-                } else {
-                    p.to_string()
-                }
-            }
-        };
-        let target = TargetAddr::new_domain(clean_host, port)?;
-        let host_hdr = format_http_host_header(clean_host, port, is_https);
-
-        let connect_started = Instant::now();
-        tokio::time::timeout(timeout, async {
-            let mut stream = self.connect_tcp(&target).await?;
-            if is_https {
-                let tls_cfg = crate::crypto::tls::build_tls_client_config(false, &[], &[])?;
-                let sni = crate::crypto::tls::parse_server_name(clean_host)?;
-                let connector = tokio_rustls::TlsConnector::from(tls_cfg);
-                let mut tls_stream = connector.connect(sni, stream).await?;
-                measure_http_head_latency(
-                    &mut tls_stream,
-                    &host_hdr,
-                    &path,
-                    unified_delay,
-                    connect_started,
-                )
-                .await
-            } else {
-                measure_http_head_latency(
-                    &mut stream,
-                    &host_hdr,
-                    &path,
-                    unified_delay,
-                    connect_started,
-                )
-                .await
-            }
-        })
+        let (is_https, clean_host, port, path, _sanitized) =
+            crate::probe::parse_probe_url(test_url)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let target = TargetAddr::new_domain(&clean_host, port)?;
+        latency_test_on_target(
+            self,
+            &target,
+            &clean_host,
+            port,
+            &path,
+            is_https,
+            timeout,
+            unified_delay,
+        )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "latency probe timed out"))?
     }
+
+    /// Perform an SSRF-policy-enforced HTTP HEAD latency test through this outbound.
+    /// Validates URL scheme/userinfo/endpoint via `crate::probe::validate_probe_url`, and when
+    /// `!allow_private` on a `Direct` outbound targeting a domain, resolves DNS upfront, rejects
+    /// any restricted non-whitelisted IP, and dials the validated IP directly (preventing DNS
+    /// rebinding TOCTOU) while preserving the original HTTP `Host` header and TLS SNI.
+    async fn latency_test_with_policy(
+        &self,
+        test_url: &str,
+        timeout: Duration,
+        unified_delay: bool,
+        allow_private: bool,
+        allowed_private_addrs: &[SocketAddr],
+    ) -> crate::error::Result<u64> {
+        let (is_https, clean_host, port, path, _sanitized) =
+            crate::probe::validate_probe_url(test_url, allow_private, allowed_private_addrs)?;
+
+        if !allow_private
+            && self.protocol().eq_ignore_ascii_case("Direct")
+            && clean_host.parse::<IpAddr>().is_err()
+        {
+            let started = Instant::now();
+            let dial_ip = if clean_host.eq_ignore_ascii_case("localhost") {
+                select_whitelisted_loopback_ip(port, allowed_private_addrs)
+            } else {
+                let addrs = tokio::time::timeout(
+                    timeout,
+                    tokio::net::lookup_host((clean_host.as_str(), port)),
+                )
+                .await
+                .map_err(|_| crate::error::ProxyError::Timeout)?
+                .map_err(crate::error::ProxyError::Io)?;
+                let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+                validate_resolved_probe_ips(&clean_host, port, &ips, allowed_private_addrs)?
+            };
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(crate::error::ProxyError::Timeout);
+            }
+            let dial_target = TargetAddr::new_ip(dial_ip, port);
+            return latency_test_on_target(
+                self,
+                &dial_target,
+                &clean_host,
+                port,
+                &path,
+                is_https,
+                remaining,
+                unified_delay,
+            )
+            .await
+            .map_err(crate::error::ProxyError::Io);
+        }
+
+        self.latency_test_with_mode(test_url, timeout, unified_delay)
+            .await
+            .map_err(crate::error::ProxyError::Io)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn latency_test_on_target<H: OutboundHandler + ?Sized>(
+    outbound: &H,
+    dial_target: &TargetAddr,
+    clean_host: &str,
+    port: u16,
+    path: &str,
+    is_https: bool,
+    timeout: Duration,
+    unified_delay: bool,
+) -> io::Result<u64> {
+    let host_hdr = format_http_host_header(clean_host, port, is_https);
+    let connect_started = Instant::now();
+    tokio::time::timeout(timeout, async {
+        let mut stream = outbound.connect_tcp(dial_target).await?;
+        if is_https {
+            let tls_cfg = crate::crypto::tls::build_tls_client_config(false, &[], &[])?;
+            let sni = crate::crypto::tls::parse_server_name(clean_host)?;
+            let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+            let mut tls_stream = connector.connect(sni, stream).await?;
+            measure_http_head_latency(
+                &mut tls_stream,
+                &host_hdr,
+                path,
+                unified_delay,
+                connect_started,
+            )
+            .await
+        } else {
+            measure_http_head_latency(&mut stream, &host_hdr, path, unified_delay, connect_started)
+                .await
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "latency probe timed out"))?
+}
+
+pub(crate) fn select_whitelisted_loopback_ip(
+    port: u16,
+    allowed_private_addrs: &[SocketAddr],
+) -> IpAddr {
+    allowed_private_addrs
+        .iter()
+        .filter(|sa| sa.port() == port && sa.ip().to_canonical().is_loopback())
+        .map(|sa| sa.ip().to_canonical())
+        .min_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 })
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+pub(crate) fn validate_resolved_probe_ips(
+    dom: &str,
+    port: u16,
+    ips: &[IpAddr],
+    allowed_private_addrs: &[SocketAddr],
+) -> crate::error::Result<IpAddr> {
+    if ips.is_empty() {
+        return Err(crate::error::ProxyError::Dns(format!(
+            "DNS returned no addresses for '{dom}'"
+        )));
+    }
+    for &resolved_ip in ips {
+        if crate::probe::is_restricted_probe_ip(resolved_ip)
+            && !crate::probe::is_whitelisted_private_addr(resolved_ip, port, allowed_private_addrs)
+        {
+            return Err(crate::error::ProxyError::Config(format!(
+                "DNS resolved '{dom}' to restricted internal/private IP {resolved_ip} (blocked by SSRF protection)"
+            )));
+        }
+    }
+    Ok(ips[0])
 }
 
 fn format_http_host_header(clean_host: &str, port: u16, is_https: bool) -> String {
@@ -775,6 +855,61 @@ impl OutboundHandler for DirectOutbound {
         buf.truncate(n);
         Ok(buf)
     }
+
+    async fn latency_test_with_policy(
+        &self,
+        test_url: &str,
+        timeout: Duration,
+        unified_delay: bool,
+        allow_private: bool,
+        allowed_private_addrs: &[SocketAddr],
+    ) -> crate::error::Result<u64> {
+        let (is_https, clean_host, port, path, _sanitized) =
+            crate::probe::validate_probe_url(test_url, allow_private, allowed_private_addrs)?;
+
+        if !allow_private && clean_host.parse::<IpAddr>().is_err() {
+            let started = Instant::now();
+            let dial_ip = if clean_host.eq_ignore_ascii_case("localhost") {
+                select_whitelisted_loopback_ip(port, allowed_private_addrs)
+            } else if let Some(dns) = &self.dns {
+                let ips = tokio::time::timeout(timeout, dns.resolve_direct_ips(&clean_host))
+                    .await
+                    .map_err(|_| crate::error::ProxyError::Timeout)??;
+                validate_resolved_probe_ips(&clean_host, port, &ips, allowed_private_addrs)?
+            } else {
+                let addrs = tokio::time::timeout(
+                    timeout,
+                    tokio::net::lookup_host((clean_host.as_str(), port)),
+                )
+                .await
+                .map_err(|_| crate::error::ProxyError::Timeout)?
+                .map_err(crate::error::ProxyError::Io)?;
+                let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+                validate_resolved_probe_ips(&clean_host, port, &ips, allowed_private_addrs)?
+            };
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(crate::error::ProxyError::Timeout);
+            }
+            let dial_target = TargetAddr::new_ip(dial_ip, port);
+            return latency_test_on_target(
+                self,
+                &dial_target,
+                &clean_host,
+                port,
+                &path,
+                is_https,
+                remaining,
+                unified_delay,
+            )
+            .await
+            .map_err(crate::error::ProxyError::Io);
+        }
+
+        self.latency_test_with_mode(test_url, timeout, unified_delay)
+            .await
+            .map_err(crate::error::ProxyError::Io)
+    }
 }
 
 /// Built-in `REJECT` outbound immediately denying connections.
@@ -1196,5 +1331,172 @@ mod tests {
             "TLS ClientHello must have been transmitted"
         );
         assert_eq!(hellos[0][0], 0x16, "TLS Handshake record type");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn latency_test_with_policy_blocks_bad_schemes_userinfo_and_direct_dns_rebinding() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::{
+            config::DnsConfig,
+            dns::wire::{DnsAnswerData, DnsQueryPacket, QTYPE_A, QTYPE_AAAA},
+        };
+
+        let direct_plain = DirectOutbound::default();
+        for bad_url in [
+            "ftp://example.com/file",
+            "file:///etc/passwd",
+            "http://alice:secret@example.com/generate_204",
+        ] {
+            let err = direct_plain
+                .latency_test_with_mode(bad_url, Duration::from_secs(2), false)
+                .await
+                .expect_err("latency_test_with_mode must reject unsupported scheme/userinfo");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        // Mock upstream UDP DNS returning restricted IPs for public-looking attacker domains
+        let mock_ns = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mock_ns_addr = mock_ns.local_addr().unwrap();
+        let (dns_stop_tx, mut dns_stop_rx) = tokio::sync::watch::channel(false);
+        let ns_bg = Arc::clone(&mock_ns);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    _ = dns_stop_rx.changed() => break,
+                    res = ns_bg.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = res else { continue };
+                        let Ok(pkt) = DnsQueryPacket::parse(&buf[..n]) else { continue };
+                        let q = pkt.question.name.to_ascii_lowercase();
+                        let resp = match (q.as_str(), pkt.question.qtype) {
+                            ("rebind-loopback.attacker.test", QTYPE_A) => pkt.build_response(
+                                &buf[..n],
+                                0,
+                                60,
+                                &[DnsAnswerData::A(Ipv4Addr::LOCALHOST)],
+                            ),
+                            ("rebind-imds.attacker.test", QTYPE_A) => pkt.build_response(
+                                &buf[..n],
+                                0,
+                                60,
+                                &[DnsAnswerData::A(Ipv4Addr::new(169, 254, 169, 254))],
+                            ),
+                            ("rebind-ula.attacker.test", QTYPE_AAAA) => pkt.build_response(
+                                &buf[..n],
+                                0,
+                                60,
+                                &[DnsAnswerData::Aaaa("fd00:ec2::254".parse().unwrap())],
+                            ),
+                            _ => pkt.build_response(&buf[..n], 0, 60, &[]),
+                        };
+                        let _ = ns_bg.send_to(&resp, peer).await;
+                    }
+                }
+            }
+        });
+
+        // Canary TCP listener that MUST NEVER be dialed by DNS-rebound probes,
+        // and IS dialed ONLY when explicitly whitelisted.
+        let canary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let canary_addr = canary.local_addr().unwrap();
+        let canary_hits = Arc::new(AtomicUsize::new(0));
+        let last_host_hdr = Arc::new(parking_lot::Mutex::new(String::new()));
+        let hits_bg = Arc::clone(&canary_hits);
+        let hdr_bg = Arc::clone(&last_host_hdr);
+        let mut canary_stop = dns_stop_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = canary_stop.changed() => break,
+                    acc = canary.accept() => {
+                        let Ok((mut s, _)) = acc else { continue };
+                        hits_bg.fetch_add(1, Ordering::SeqCst);
+                        let hdr_clone = Arc::clone(&hdr_bg);
+                        tokio::spawn(async move {
+                            let mut b = [0u8; 512];
+                            let n = s.read(&mut b).await.unwrap_or(0);
+                            *hdr_clone.lock() = String::from_utf8_lossy(&b[..n]).into_owned();
+                            let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let dns_cfg = DnsConfig {
+            enable: true,
+            listen: "127.0.0.1:0".into(),
+            ipv6: true,
+            nameserver: vec![mock_ns_addr.to_string()],
+            direct_nameserver: vec![mock_ns_addr.to_string()],
+            ..DnsConfig::default()
+        };
+        let dns = Arc::new(FakeIpDnsEngine::new(&dns_cfg).unwrap());
+        let direct = DirectOutbound::with_dns("DIRECT", dns);
+
+        for rebind_url in [
+            format!(
+                "http://rebind-loopback.attacker.test:{}/generate_204",
+                canary_addr.port()
+            ),
+            "http://rebind-imds.attacker.test/latest/meta-data/".to_string(),
+            "http://rebind-ula.attacker.test/latest/meta-data/".to_string(),
+        ] {
+            let err = direct
+                .latency_test_with_policy(&rebind_url, Duration::from_secs(2), false, false, &[])
+                .await
+                .expect_err("DNS-rebound restricted IP must be blocked");
+            assert!(
+                matches!(err, crate::error::ProxyError::Config(_)),
+                "expected ProxyError::Config for SSRF DNS rebinding on {rebind_url}, got: {err:?}"
+            );
+        }
+        assert_eq!(
+            canary_hits.load(Ordering::SeqCst),
+            0,
+            "DNS-rebound loopback probe must never connect to canary socket"
+        );
+
+        // Whitelisted localhost on exact canary port MUST dial loopback directly while preserving Host header!
+        let allowed = [canary_addr];
+        let ok_ms = direct
+            .latency_test_with_policy(
+                &format!("http://localhost:{}/generate_204", canary_addr.port()),
+                Duration::from_secs(2),
+                false,
+                false,
+                &allowed,
+            )
+            .await
+            .expect("whitelisted localhost port must succeed");
+        assert!(ok_ms >= 1);
+        assert_eq!(canary_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            last_host_hdr
+                .lock()
+                .contains(&format!("Host: localhost:{}", canary_addr.port())),
+            "Host header must preserve original hostname"
+        );
+
+        // Different port on localhost MUST still be rejected!
+        let err_port = direct
+            .latency_test_with_policy(
+                &format!(
+                    "http://localhost:{}/generate_204",
+                    canary_addr.port().wrapping_add(1).max(1)
+                ),
+                Duration::from_secs(2),
+                false,
+                false,
+                &allowed,
+            )
+            .await
+            .expect_err("non-whitelisted localhost port must be rejected");
+        assert!(matches!(err_port, crate::error::ProxyError::Config(_)));
+
+        let _ = dns_stop_tx.send(true);
     }
 }

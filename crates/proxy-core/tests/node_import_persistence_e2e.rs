@@ -357,13 +357,28 @@ async fn blank_app_import_save_select_connect_edit_hot_reload_and_restart_e2e() 
     .await;
     assert_eq!(st_sel_vless, 204);
 
+    // Non-demo HTTP `/proxies/{name}/delay` MUST reject localhost targets with 400 (SSRF protection),
+    // while internal hermetic `router.test_delay` still probes RTT through `VLESS-Frankfurt`!
     let delay_path = format!(
         "/proxies/VLESS-Frankfurt/delay?url=http://localhost:{}/generate_204&timeout=3000",
         origin_addr.port()
     );
     let (st_delay, body_delay) =
         api_request(api1_addr, "GET", &delay_path, Some(ctrl_secret), None).await;
-    assert_eq!(st_delay, 200, "VLESS delay probe failed: {body_delay}");
+    assert_eq!(
+        st_delay, 400,
+        "non-demo localhost /delay must be blocked with 400 SSRF protection: {body_delay}"
+    );
+    let vless_rtt_ms = engine1
+        .router()
+        .test_delay(
+            "VLESS-Frankfurt",
+            &format!("http://localhost:{}/generate_204", origin_addr.port()),
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect("internal VLESS delay probe must succeed");
+    assert!(vless_rtt_ms >= 1);
 
     let (st_http_vless, body_http_vless) =
         http_get_via_mixed_proxy(engine1.mixed_addr(), origin_addr.port(), "/hello").await;

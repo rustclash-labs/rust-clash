@@ -4,13 +4,18 @@ use anyhow::{Context, Result, anyhow};
 use proxy_core::{
     api::parse_explain_target,
     audit::audit_config,
-    config::{ClashConfig, uri::redact_sensitive_text},
+    config::{
+        ClashConfig,
+        uri::{
+            contains_endpoint_url_scheme, has_endpoint_url_scheme_prefix, redact_sensitive_text,
+        },
+    },
     engine::ProxyEngine,
     probe::{ProbeOptions, default_matrix_targets, probe_endpoint_matrix, probe_target_waterfall},
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -85,11 +90,13 @@ impl ControllerClient {
         }
         req.push_str("\r\n");
 
+        let mut req_buf = req.into_bytes();
+        if !body_bytes.is_empty() {
+            req_buf.extend_from_slice(&body_bytes);
+        }
+
         let io_fut = async {
-            stream.write_all(req.as_bytes()).await?;
-            if !body_bytes.is_empty() {
-                stream.write_all(&body_bytes).await?;
-            }
+            stream.write_all(&req_buf).await?;
             stream.flush().await?;
 
             let mut resp = Vec::with_capacity(4096);
@@ -141,8 +148,12 @@ fn load_cli_or_profile_config_in_state_dir(
             .with_context(|| format!("failed to load config '{}'", path.display()))?;
         return Ok((cfg, format!("file:{}", path.display())));
     }
-    let mgr = proxy_core::profile::ProfileManager::open_or_init(state_dir)?;
-    let (cfg, active_path) = mgr.load_active_config()?;
+    let mgr = proxy_core::profile::ProfileManager::open_or_init(state_dir)
+        .context("failed to initialize active profile state (raw details redacted)")?;
+    let active_path = mgr.active_profile_path();
+    let (cfg, active_path) = mgr
+        .load_active_config()
+        .with_context(|| sanitize_active_profile_error(&active_path))?;
     Ok((cfg, format!("profile:{}", active_path.display())))
 }
 
@@ -437,6 +448,18 @@ fn sanitize_audit_file_error(path: &std::path::Path) -> &'static str {
     }
 }
 
+fn sanitize_active_profile_error(path: &std::path::Path) -> &'static str {
+    match std::fs::metadata(path) {
+        Err(_) => "failed to load active profile: file does not exist or is unreadable",
+        Ok(meta) if !meta.file_type().is_file() => {
+            "invalid active profile: target must be a regular '.yaml' or '.yml' file"
+        }
+        Ok(_) => {
+            "failed to parse or validate active profile Clash YAML (syntax or schema error; raw file contents redacted)"
+        }
+    }
+}
+
 fn looks_like_ip_or_sockaddr_token(tok: &str) -> bool {
     if tok.is_empty() {
         return false;
@@ -472,7 +495,7 @@ fn scrub_text_network_tokens(raw: &str, extra_needles: &[String]) -> String {
         let core = word.trim_matches(|c: char| {
             matches!(
                 c,
-                '\'' | '"' | '`' | '(' | ')' | ',' | ';' | '.' | '<' | '>'
+                '\'' | '"' | '`' | '(' | ')' | '{' | '}' | ',' | ';' | '.' | '<' | '>'
             )
         });
         if !core.is_empty() && looks_like_ip_or_sockaddr_token(core) {
@@ -486,21 +509,30 @@ fn scrub_text_network_tokens(raw: &str, extra_needles: &[String]) -> String {
 }
 
 fn scrub_quoted_audit_endpoints(raw: &str) -> String {
-    let mut out = raw.to_string();
+    let mut cur = raw.to_string();
     for marker in ["server '", "set to '"] {
-        let mut search_from = 0usize;
-        while let Some(rel_idx) = out[search_from..].find(marker) {
-            let val_start = search_from + rel_idx + marker.len();
-            if let Some(end_rel) = out[val_start..].find('\'') {
+        let mut next = String::with_capacity(cur.len());
+        let mut cursor = 0usize;
+        let mut changed = false;
+        while let Some(rel_idx) = cur[cursor..].find(marker) {
+            let val_start = cursor + rel_idx + marker.len();
+            if let Some(end_rel) = cur[val_start..].find('\'') {
                 let val_end = val_start + end_rel;
-                out.replace_range(val_start..val_end, "<redacted>");
-                search_from = val_start + "<redacted>".len() + 1;
+                next.push_str(&cur[cursor..val_start]);
+                next.push_str("<redacted>");
+                next.push('\'');
+                cursor = val_end + 1;
+                changed = true;
             } else {
                 break;
             }
         }
+        if changed {
+            next.push_str(&cur[cursor..]);
+            cur = next;
+        }
     }
-    out
+    cur
 }
 
 fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
@@ -534,9 +566,12 @@ fn scrub_audit_payload(payload: &mut Value, include_network_metadata: bool) {
                 .map(str::to_string)
             {
                 if loc.starts_with("proxies[")
-                    && let Some(paren_idx) = loc.find(" (")
+                    && let Some(sep_idx) = loc.rfind("] (")
+                    && !loc.ends_with(']')
                 {
-                    let inner = loc[paren_idx + 2..].trim_end_matches(')');
+                    let paren_idx = sep_idx + 1;
+                    let raw_inner = &loc[paren_idx + 2..];
+                    let inner = raw_inner.strip_suffix(')').unwrap_or(raw_inner);
                     if !inner.is_empty() {
                         extracted_needles.push(inner.to_string());
                     }
@@ -996,31 +1031,125 @@ fn summarize_recent_connections(entries: &[Value]) -> Value {
 }
 
 fn redact_network_tokens_in_log(text: &str) -> String {
+    fn trim_punct(s: &str) -> &str {
+        s.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '{' | '}' | ',' | ';' | '\'' | '"' | '`' | '<' | '>' | '.' | '\\' | '!'
+            )
+        })
+    }
+
+    let is_domain_port = |s: &str| -> bool {
+        let Some((raw_host, port)) = s.rsplit_once(':') else {
+            return false;
+        };
+        if port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return false;
+        }
+        let host = raw_host.strip_suffix('.').unwrap_or(raw_host);
+        !host.is_empty()
+            && host.contains('.')
+            && !host.starts_with('.')
+            && !host.starts_with('-')
+            && !host.ends_with('-')
+            && !host.contains("..")
+            && host.bytes().any(|b| b.is_ascii_alphabetic())
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    };
+
+    let matches_endpoint_core = |s: &str| -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        let check_atom = |atom: &str| -> bool {
+            if atom.is_empty() {
+                return false;
+            }
+            let head = atom.split(['/', '?', '#']).next().unwrap_or(atom);
+            atom.parse::<std::net::SocketAddr>().is_ok()
+                || atom.parse::<std::net::IpAddr>().is_ok()
+                || head.parse::<std::net::SocketAddr>().is_ok()
+                || head.parse::<std::net::IpAddr>().is_ok()
+                || has_endpoint_url_scheme_prefix(atom)
+                || is_domain_port(atom)
+                || is_domain_port(head)
+        };
+        // Preserve `[...]` brackets on the first pass so bracketed IPv6 SocketAddrs such as
+        // `[2001:db8::1]:443` and `[::1]:8080` parse cleanly via `SocketAddr::parse`.
+        if check_atom(s) {
+            return true;
+        }
+        if let Some(unwrapped) = s.strip_prefix('[').and_then(|t| t.strip_suffix(']'))
+            && check_atom(unwrapped)
+        {
+            return true;
+        }
+        let inner = s.trim_matches(|c: char| matches!(c, '[' | ']'));
+        inner != s && check_atom(inner)
+    };
+
+    let matches_endpoint = |raw: &str| -> bool {
+        let outer = trim_punct(raw);
+        if matches_endpoint_core(outer) {
+            return true;
+        }
+        // Handle trailing colon (e.g. `10.20.30.40:443:`, `secret-node.corp:8443:`) without
+        // disturbing valid IPv6 addresses ending in `::` (already matched above).
+        if !outer.ends_with("::")
+            && let Some(without_colon) = outer.strip_suffix(':')
+            && matches_endpoint_core(trim_punct(without_colon))
+        {
+            return true;
+        }
+        // Handle arrow-suffixed tokens like `10.20.30.40->DIRECT` after splitting on `>`.
+        if let Some(without_dash) = outer.strip_suffix('-')
+            && matches_endpoint_core(trim_punct(without_dash))
+        {
+            return true;
+        }
+        false
+    };
+
+    let token_has_endpoint = |tok: &str| -> bool {
+        if matches_endpoint(tok) || contains_endpoint_url_scheme(tok) {
+            return true;
+        }
+        // Linearly inspect structural sub-tokens inside JSON / parenthesized / key=value /
+        // comma-separated log tokens so embedded IP/host:port metadata cannot leak.
+        for part in tok.split(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '{' | '}' | ',' | ';' | '\'' | '"' | '`' | '<' | '>' | '=' | '\\'
+            )
+        }) {
+            if part.is_empty() {
+                continue;
+            }
+            if matches_endpoint(part) {
+                return true;
+            }
+            if let Some((prefix, rest)) = part.split_once(':')
+                && !prefix.is_empty()
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                && matches_endpoint(rest)
+            {
+                return true;
+            }
+        }
+        false
+    };
+
     text.split_whitespace()
         .map(|tok| {
-            // Preserve `[...]` brackets on the first pass so bracketed IPv6 SocketAddrs such as
-            // `[2001:db8::1]:443` parse cleanly via `SocketAddr::parse`.
-            let outer = tok.trim_matches(|c: char| {
-                matches!(c, '(' | ')' | ',' | ';' | '\'' | '"' | '<' | '>')
-            });
-            let inner = outer.trim_matches(|c: char| matches!(c, '[' | ']'));
-            let is_domain_port = |s: &str| -> bool {
-                s.contains('.')
-                    && s.contains(':')
-                    && s.rsplit_once(':')
-                        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok())
-            };
-            let looks_like_endpoint = outer.parse::<std::net::SocketAddr>().is_ok()
-                || outer.parse::<std::net::IpAddr>().is_ok()
-                || inner.parse::<std::net::SocketAddr>().is_ok()
-                || inner.parse::<std::net::IpAddr>().is_ok()
-                || outer.starts_with("http://")
-                || outer.starts_with("https://")
-                || inner.starts_with("http://")
-                || inner.starts_with("https://")
-                || is_domain_port(outer)
-                || is_domain_port(inner);
-            if looks_like_endpoint {
+            if token_has_endpoint(tok) {
                 "[redacted-endpoint]"
             } else {
                 tok
@@ -1266,9 +1395,47 @@ fn build_tools_list(allow_mutations: bool) -> Vec<Value> {
     tools
 }
 
+fn redact_json_value(value: &Value) -> Value {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(s) => Value::String(redact_sensitive_text(s)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json_value).collect()),
+        Value::Object(map) => {
+            let entries: Vec<(String, &Value)> = map
+                .iter()
+                .map(|(k, v)| (redact_sensitive_text(k), v))
+                .collect();
+            let mut out = serde_json::Map::with_capacity(map.len());
+            let mut reserved: Option<std::collections::HashSet<&str>> = None;
+            let mut next_suffix: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for (base_key, v) in &entries {
+                let key = if !out.contains_key(base_key.as_str()) {
+                    base_key.clone()
+                } else {
+                    let reserved_set = reserved
+                        .get_or_insert_with(|| entries.iter().map(|(k, _)| k.as_str()).collect());
+                    let suffix = next_suffix.entry(base_key.as_str()).or_insert(2);
+                    loop {
+                        let candidate = format!("{base_key}#{}", *suffix);
+                        *suffix += 1;
+                        if !out.contains_key(&candidate)
+                            && !reserved_set.contains(candidate.as_str())
+                        {
+                            break candidate;
+                        }
+                    }
+                };
+                out.insert(key, redact_json_value(v));
+            }
+            Value::Object(out)
+        }
+    }
+}
+
 fn mcp_tool_result(payload: &Value, is_error: bool) -> Value {
-    let pretty = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_string());
-    let scrubbed = redact_sensitive_text(&pretty);
+    let redacted = redact_json_value(payload);
+    let scrubbed = serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| "{}".to_string());
     json!({
         "content": [
             {
@@ -2313,7 +2480,7 @@ async fn handle_single_mcp_request(req: &Value, opts: &McpServerOptions) -> Opti
             "id": req_id,
             "error": {
                 "code": -32601,
-                "message": format!("Method not found: {method}")
+                "message": format!("Method not found: {}", redact_sensitive_text(method))
             }
         })),
     }
@@ -2330,73 +2497,251 @@ const MAX_MCP_LINE_BYTES: usize = MAX_MCP_FRAME_BYTES + 1024;
 const MAX_MCP_HEADER_LINE_BYTES: usize = 16 * 1024;
 const MAX_MCP_HEADER_LINES: usize = 64;
 
-async fn read_bounded_line<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
-    buf: &mut String,
-    max_bytes: usize,
-) -> Result<usize> {
-    buf.clear();
-    let mut limited = (&mut *reader).take((max_bytes + 1) as u64);
-    let n = limited.read_line(buf).await?;
-    if n > max_bytes && !buf.ends_with('\n') {
-        return Err(anyhow!(
-            "MCP input line exceeds maximum allowed size ({max_bytes} bytes)"
-        ));
-    }
-    Ok(n)
+fn is_rfc7230_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
-async fn read_next_mcp_frame<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
+fn looks_like_header_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return false;
+    }
+    let Some((name, _val)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    !name.is_empty() && name.bytes().all(is_rfc7230_tchar)
+}
+
+/// Pure synchronous parser for buffered MCP frames (both header-framed `Content-Length`
+/// and `NewlineJson`). Only drains `buf` once a complete frame is available (except for
+/// completed leading whitespace-only lines), guaranteeing cancel safety across arbitrary
+/// `tokio::select!` cancellations of `McpFrameReader::read_next_frame`.
+fn try_parse_buffered_frame(
+    buf: &mut Vec<u8>,
     last_mode: &mut FrameMode,
+    eof: bool,
 ) -> Result<Option<(Value, FrameMode)>> {
-    let mut line = String::new();
-    loop {
-        let n = read_bounded_line(reader, &mut line, MAX_MCP_LINE_BYTES).await?;
-        if n == 0 {
+    // Discard any completed leading empty / whitespace-only lines (`\r\n`, `\n`, spaces).
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        if nl > MAX_MCP_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP input line exceeds maximum allowed size ({MAX_MCP_LINE_BYTES} bytes)"
+            ));
+        }
+        if buf[..nl].iter().all(|b| b.is_ascii_whitespace()) {
+            buf.drain(..=nl);
+        } else {
+            break;
+        }
+    }
+
+    let Some(first_nl) = buf.iter().position(|&b| b == b'\n') else {
+        if buf.len() > MAX_MCP_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP input line exceeds maximum allowed size ({MAX_MCP_LINE_BYTES} bytes)"
+            ));
+        }
+        if !eof {
             return Ok(None);
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            buf.clear();
+            return Ok(None);
+        }
+        let line_str = std::str::from_utf8(buf).context("MCP input is not valid UTF-8")?;
+        if looks_like_header_line(line_str) {
+            *last_mode = FrameMode::ContentLength;
+            return Err(anyhow!("unexpected EOF while reading MCP headers"));
+        }
+        *last_mode = FrameMode::NewlineJson;
+        let val: Value =
+            serde_json::from_str(line_str.trim()).context("invalid JSON-RPC line on stdin")?;
+        buf.clear();
+        return Ok(Some((val, FrameMode::NewlineJson)));
+    };
+
+    if first_nl > MAX_MCP_LINE_BYTES {
+        return Err(anyhow!(
+            "MCP input line exceeds maximum allowed size ({MAX_MCP_LINE_BYTES} bytes)"
+        ));
+    }
+
+    let first_line =
+        std::str::from_utf8(&buf[..first_nl]).context("MCP input is not valid UTF-8")?;
+
+    if !looks_like_header_line(first_line) {
+        *last_mode = FrameMode::NewlineJson;
+        let parsed = serde_json::from_str::<Value>(first_line.trim())
+            .context("invalid JSON-RPC line on stdin");
+        buf.drain(..=first_nl);
+        return Ok(Some((parsed?, FrameMode::NewlineJson)));
+    }
+
+    // Header-framed LSP/MCP message (`Content-Length`, `Content-Type`, etc. in any order).
+    *last_mode = FrameMode::ContentLength;
+    let mut cursor = 0usize;
+    let mut header_count = 0usize;
+    let mut content_length: Option<usize> = None;
+
+    let body_start = loop {
+        let remaining = &buf[cursor..];
+        let Some(rel_nl) = remaining.iter().position(|&b| b == b'\n') else {
+            if remaining.len() > MAX_MCP_HEADER_LINE_BYTES {
+                return Err(anyhow!(
+                    "MCP header line exceeds maximum allowed size ({MAX_MCP_HEADER_LINE_BYTES} bytes)"
+                ));
+            }
+            if eof {
+                return Err(anyhow!("unexpected EOF while reading MCP headers"));
+            }
+            return Ok(None);
+        };
+
+        if rel_nl > MAX_MCP_HEADER_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP header line exceeds maximum allowed size ({MAX_MCP_HEADER_LINE_BYTES} bytes)"
+            ));
         }
 
-        if let Some((hdr_name, hdr_val)) = trimmed.split_once(':')
-            && hdr_name.trim().eq_ignore_ascii_case("content-length")
-        {
-            *last_mode = FrameMode::ContentLength;
-            let content_len: usize = hdr_val
-                .trim()
+        let line_str = std::str::from_utf8(&remaining[..rel_nl])
+            .context("MCP header line is not valid UTF-8")?;
+        let trimmed = line_str.trim();
+        cursor += rel_nl + 1;
+
+        // Blank separator line (`\r\n` or `\n`) ends the header block.
+        if trimmed.is_empty() {
+            break cursor;
+        }
+
+        header_count += 1;
+        if header_count > MAX_MCP_HEADER_LINES {
+            return Err(anyhow!(
+                "MCP frame exceeded maximum header count ({MAX_MCP_HEADER_LINES})"
+            ));
+        }
+
+        let Some((raw_name, raw_val)) = trimmed.split_once(':') else {
+            return Err(anyhow!("malformed header line in MCP frame"));
+        };
+        let name = raw_name.trim();
+        if name.is_empty() || !name.bytes().all(is_rfc7230_tchar) {
+            return Err(anyhow!("invalid header name in MCP frame"));
+        }
+
+        if name.eq_ignore_ascii_case("content-length") {
+            let val_trimmed = raw_val.trim();
+            if val_trimmed.is_empty() || !val_trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(anyhow!("invalid Content-Length header in MCP stream"));
+            }
+            let parsed: usize = val_trimmed
                 .parse()
                 .context("invalid Content-Length header in MCP stream")?;
-            if content_len > MAX_MCP_FRAME_BYTES {
+            if parsed > MAX_MCP_FRAME_BYTES {
                 return Err(anyhow!("MCP frame exceeds 8 MiB safety cap"));
             }
-            // Consume remaining headers up to blank line with bounded header count and length.
-            let mut header_count = 1usize;
-            loop {
-                let mut hdr = String::new();
-                let hn = read_bounded_line(reader, &mut hdr, MAX_MCP_HEADER_LINE_BYTES).await?;
-                if hn == 0 || hdr.trim().is_empty() {
-                    break;
-                }
-                header_count += 1;
-                if header_count > MAX_MCP_HEADER_LINES {
+            if let Some(prev) = content_length {
+                if prev != parsed {
                     return Err(anyhow!(
-                        "MCP frame exceeded maximum header count ({MAX_MCP_HEADER_LINES})"
+                        "conflicting duplicate Content-Length headers in MCP frame"
                     ));
                 }
+            } else {
+                content_length = Some(parsed);
             }
-            let mut body = vec![0u8; content_len];
-            reader.read_exact(&mut body).await?;
-            let val: Value = serde_json::from_slice(&body)
-                .context("invalid JSON in Content-Length MCP frame")?;
-            return Ok(Some((val, FrameMode::ContentLength)));
         }
+    };
 
-        *last_mode = FrameMode::NewlineJson;
-        let val: Value = serde_json::from_str(trimmed).context("invalid JSON-RPC line on stdin")?;
-        return Ok(Some((val, FrameMode::NewlineJson)));
+    let Some(content_len) = content_length else {
+        return Err(anyhow!("missing Content-Length header in MCP frame"));
+    };
+
+    let frame_end = body_start
+        .checked_add(content_len)
+        .ok_or_else(|| anyhow!("MCP frame size overflow"))?;
+
+    if buf.len() < frame_end {
+        if eof {
+            return Err(anyhow!(
+                "unexpected EOF while reading MCP Content-Length body (expected {content_len} bytes, got {})",
+                buf.len().saturating_sub(body_start)
+            ));
+        }
+        return Ok(None);
+    }
+
+    let parsed = serde_json::from_slice::<Value>(&buf[body_start..frame_end])
+        .context("invalid JSON in Content-Length MCP frame");
+    buf.drain(..frame_end);
+    Ok(Some((parsed?, FrameMode::ContentLength)))
+}
+
+/// Stateful, cancel-safe MCP stream reader backed by an owned `Vec<u8>` buffer
+/// and Tokio's cancel-safe `AsyncReadExt::read_buf`.
+struct McpFrameReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    last_mode: FrameMode,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> McpFrameReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(4096),
+            last_mode: FrameMode::NewlineJson,
+            eof: false,
+        }
+    }
+
+    fn last_mode(&self) -> FrameMode {
+        self.last_mode
+    }
+
+    /// Reads the next complete MCP frame.
+    ///
+    /// Cancel safety: 100% cancel-safe for use inside `tokio::select!`. Bytes read
+    /// from `self.inner` are accumulated in `self.buf` via `AsyncReadExt::read_buf`
+    /// and are only drained once a full frame has been parsed.
+    async fn read_next_frame(&mut self) -> Result<Option<(Value, FrameMode)>> {
+        loop {
+            if let Some(frame) =
+                try_parse_buffered_frame(&mut self.buf, &mut self.last_mode, self.eof)?
+            {
+                if self.buf.is_empty() && self.buf.capacity() > 64 * 1024 {
+                    self.buf = Vec::with_capacity(16 * 1024);
+                }
+                return Ok(Some(frame));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            if self.buf.capacity().saturating_sub(self.buf.len()) < 4096 {
+                self.buf.reserve(4096);
+            }
+            let n = self.inner.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                self.eof = true;
+            }
+        }
     }
 }
 
@@ -2434,8 +2779,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = BufReader::new(input);
-    let mut last_mode = FrameMode::NewlineJson;
+    let mut reader = McpFrameReader::new(input);
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, FrameMode)>();
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -2446,7 +2790,7 @@ where
                 write_encoded_mcp_frame(&mut output, &encoded, mode).await?;
             }
             Some(_done) = tasks.join_next(), if !tasks.is_empty() => {}
-            frame_res = read_next_mcp_frame(&mut reader, &mut last_mode) => {
+            frame_res = reader.read_next_frame() => {
                 match frame_res {
                     Ok(Some((req, mode))) => {
                         if frame_contains_mutation(&req) {
@@ -2486,7 +2830,7 @@ where
                                 "message": format!("Parse error: {}", redact_sensitive_text(&err.to_string()))
                             }
                         });
-                        write_mcp_frame(&mut output, &err_resp, last_mode).await?;
+                        write_mcp_frame(&mut output, &err_resp, reader.last_mode()).await?;
                         return Ok(());
                     }
                 }
@@ -2518,6 +2862,7 @@ mod tests {
     use super::*;
     use proxy_core::api::spawn_api_server;
     use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::watch;
 
     #[tokio::test]
@@ -2755,6 +3100,9 @@ rules:
         let f10 = by_id(10);
         assert_eq!(f10["result"]["isError"], false);
         let f10_text = f10["result"]["content"][0]["text"].as_str().unwrap();
+        let f10_parsed: Value = serde_json::from_str(f10_text)
+            .expect("audit_config_security output must be valid JSON");
+        assert_eq!(f10_parsed["controller"], "<redacted>");
         assert!(f10_text.contains("SEC-TLS-SKIP-VERIFY"));
         assert!(f10_text.contains("\"controller\": \"<redacted>\""));
 
@@ -3077,6 +3425,9 @@ rules:
         .unwrap();
         let _ = std::fs::remove_file(&draft_yaml_path);
         let audit_text = audit_resp["result"]["content"][0]["text"].as_str().unwrap();
+        let audit_parsed: Value = serde_json::from_str(audit_text)
+            .expect("audit_config_security output must be valid JSON");
+        assert_eq!(audit_parsed["controller"], "<redacted>");
         assert!(audit_text.contains("SEC-PLAINTEXT-NODE"));
         assert!(audit_text.contains("SEC-CONTROLLER-NO-SECRET"));
         assert!(audit_text.contains("\"controller\": \"<redacted>\""));
@@ -4190,5 +4541,3093 @@ rules:
         engine.shutdown_async().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), api_task).await;
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_frame_reader_is_cancel_safe_under_repeated_timeout_mid_header_and_body() {
+        let (mut writer, reader_io) = tokio::io::duplex(256);
+
+        let payload1 = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": { "note": "节点-🚀-cancel-safe-header-and-body" }
+        });
+        let body1 = serde_json::to_vec(&payload1).unwrap();
+        let mut frame1 = format!(
+            "\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+            body1.len()
+        )
+        .into_bytes();
+        frame1.extend_from_slice(&body1);
+
+        let payload2 = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": { "note": "换行JSON-流式取消安全" }
+        });
+        let mut frame2 = serde_json::to_vec(&payload2).unwrap();
+        frame2.push(b'\n');
+
+        let drip_task = tokio::spawn(async move {
+            for b in frame1.into_iter().chain(frame2.into_iter()) {
+                writer.write_all(&[b]).await.unwrap();
+                writer.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let mut frame_reader = McpFrameReader::new(reader_io);
+        let mut total_cancellations = 0usize;
+
+        async fn read_with_cancellations(
+            reader: &mut McpFrameReader<tokio::io::DuplexStream>,
+        ) -> (Option<(Value, FrameMode)>, usize) {
+            let mut cancels = 0usize;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(1), reader.read_next_frame()).await
+                {
+                    Ok(res) => return (res.unwrap(), cancels),
+                    Err(_) => {
+                        cancels += 1;
+                    }
+                }
+            }
+        }
+
+        let (f1, c1) = read_with_cancellations(&mut frame_reader).await;
+        total_cancellations += c1;
+        let (v1, m1) = f1.expect("first frame parsed");
+        assert_eq!(m1, FrameMode::ContentLength);
+        assert_eq!(v1, payload1);
+
+        let (f2, c2) = read_with_cancellations(&mut frame_reader).await;
+        total_cancellations += c2;
+        let (v2, m2) = f2.expect("second frame parsed");
+        assert_eq!(m2, FrameMode::NewlineJson);
+        assert_eq!(v2, payload2);
+
+        assert!(
+            total_cancellations >= 10,
+            "test must exercise repeated mid-frame cancellations (observed {total_cancellations})"
+        );
+
+        let (eof_frame, _) = read_with_cancellations(&mut frame_reader).await;
+        assert!(eof_frame.is_none(), "expected clean EOF after both frames");
+        drip_task.await.unwrap();
+    }
+
+    async fn run_serve_mcp_io_cancel_safety_case(use_content_length: bool) {
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        let (probe_started_tx, probe_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let slow_ctrl_task = tokio::spawn(async move {
+            let (mut sock, _) = slow_listener.accept().await.unwrap();
+            let mut req_buf = vec![0u8; 2048];
+            let _ = sock.read(&mut req_buf).await;
+            let _ = probe_started_tx.send(());
+            let _ = release_probe_rx.await;
+            let body = serde_json::to_vec(&json!({
+                "requested_proxy": "DIRECT",
+                "effective_outbound": "DIRECT",
+                "protocol": "direct",
+                "chains": ["DIRECT"],
+                "url": "https://example.com/",
+                "target_host": "example.com",
+                "target_port": 443,
+                "remote_dns": false,
+                "dns_mode": "local",
+                "total_ms": 10.0,
+                "overall_probe_duration_ms": 10.0,
+                "verdict": "reachable",
+                "cf_mitigated": false,
+                "note": "ok"
+            }))
+            .unwrap();
+            let head = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+
+        let encode_req = |val: &Value, content_type_first: bool| -> Vec<u8> {
+            let body = serde_json::to_vec(val).unwrap();
+            if use_content_length {
+                let hdr = if content_type_first {
+                    format!(
+                        "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!("Content-Length: {}\r\n\r\n", body.len())
+                };
+                let mut out = hdr.into_bytes();
+                out.extend_from_slice(&body);
+                out
+            } else {
+                let mut out = body;
+                out.push(b'\n');
+                out
+            }
+        };
+
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, client_out) = tokio::io::duplex(16 * 1024);
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: Some(slow_addr.to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let mcp_task = tokio::spawn(async move {
+            serve_mcp_io(server_in, server_out, opts).await.unwrap();
+        });
+
+        // 1. Send slow read-only request (id=501) so `resp_rx` will fire mid-read of request 2.
+        let req1 = json!({
+            "jsonrpc": "2.0",
+            "id": 501,
+            "method": "tools/call",
+            "params": {
+                "name": "probe_waterfall",
+                "arguments": { "proxy": "DIRECT", "url": "https://example.com/", "timeout_ms": 5000 }
+            }
+        });
+        client_in
+            .write_all(&encode_req(&req1, false))
+            .await
+            .unwrap();
+        client_in.flush().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), probe_started_rx)
+            .await
+            .expect("slow request started")
+            .unwrap();
+
+        // 2. Drip the first half of request 2 (id=502) byte-by-byte so `read_next_frame()`
+        //    has partially buffered request 2 and is awaiting more bytes.
+        let req2 = json!({
+            "jsonrpc": "2.0",
+            "id": 502,
+            "method": "ping"
+        });
+        let req2_bytes = encode_req(&req2, true);
+        let split_at = req2_bytes.len() / 2;
+        for &b in &req2_bytes[..split_at] {
+            client_in.write_all(&[b]).await.unwrap();
+            client_in.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Let `serve_mcp_io` consume the first half into `McpFrameReader.buf` and park on `read_buf`.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // 3. Release request 1 so `resp_rx.recv()` wins `tokio::select!` and CANCELS `read_next_frame()`!
+        let _ = release_probe_tx.send(());
+
+        let mut resp_reader = McpFrameReader::new(client_out);
+        let (first_resp, first_mode) =
+            tokio::time::timeout(Duration::from_secs(2), resp_reader.read_next_frame())
+                .await
+                .expect("request 1 response arrives while request 2 is half-sent")
+                .unwrap()
+                .expect("request 1 frame present");
+        assert_eq!(
+            first_mode,
+            if use_content_length {
+                FrameMode::ContentLength
+            } else {
+                FrameMode::NewlineJson
+            }
+        );
+        assert_eq!(first_resp["id"], 501);
+        assert!(
+            first_resp.get("error").is_none(),
+            "unexpected error on request 1: {first_resp}"
+        );
+
+        // 4. Now drip the remaining bytes of request 2 one byte every 1ms.
+        for &b in &req2_bytes[split_at..] {
+            client_in.write_all(&[b]).await.unwrap();
+            client_in.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let (second_resp, second_mode) =
+            tokio::time::timeout(Duration::from_secs(2), resp_reader.read_next_frame())
+                .await
+                .expect("request 2 response arrives with zero desync / -32700")
+                .unwrap()
+                .expect("request 2 frame present");
+        assert_eq!(
+            second_mode,
+            if use_content_length {
+                FrameMode::ContentLength
+            } else {
+                FrameMode::NewlineJson
+            }
+        );
+        assert_eq!(second_resp["id"], 502);
+        assert!(
+            second_resp.get("error").is_none(),
+            "must never produce -32700 parse error after select! cancellation: {second_resp}"
+        );
+        assert!(second_resp.get("result").is_some());
+
+        drop(client_in);
+        mcp_task.await.unwrap();
+        slow_ctrl_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_serve_io_survives_select_cancellation_mid_frame_in_both_framing_modes() {
+        run_serve_mcp_io_cancel_safety_case(true).await;
+        run_serve_mcp_io_cancel_safety_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_accepts_content_type_and_custom_headers_in_any_order_and_rejects_invalid_headers()
+    {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. `Content-Type` BEFORE `Content-Length`, custom headers around `Content-Length`,
+        //    LF-only headers, and identical duplicate `Content-Length` all dispatch cleanly!
+        let b1 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})).unwrap();
+        let b2 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})).unwrap();
+        let b3 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})).unwrap();
+        let b4 = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 4, "method": "ping"})).unwrap();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(
+            format!(
+                "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                b1.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b1);
+
+        stream.extend_from_slice(
+            format!(
+                "X-Custom: foo\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                b2.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b2);
+
+        // LF-only header block
+        stream.extend_from_slice(
+            format!(
+                "\nContent-Type: application/json\nContent-Length: {}\n\n",
+                b3.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b3);
+
+        // Identical duplicate Content-Length
+        stream.extend_from_slice(
+            format!(
+                "Content-Length: {}\r\nContent-Length: {}\r\n\r\n",
+                b4.len(),
+                b4.len()
+            )
+            .as_bytes(),
+        );
+        stream.extend_from_slice(&b4);
+
+        let mut out_bytes = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(stream),
+            &mut out_bytes,
+            ro_opts.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut resp_reader = McpFrameReader::new(std::io::Cursor::new(out_bytes));
+        let mut seen_ids = Vec::new();
+        while let Some((val, mode)) = resp_reader.read_next_frame().await.unwrap() {
+            assert_eq!(mode, FrameMode::ContentLength);
+            assert!(val.get("error").is_none(), "unexpected error: {val}");
+            seen_ids.push(val["id"].as_i64().unwrap());
+        }
+        seen_ids.sort_unstable();
+        assert_eq!(seen_ids, vec![1, 2, 3, 4]);
+
+        // 2. Header block missing `Content-Length` returns clean -32700 parse error with Content-Length framing.
+        let missing_cl =
+            b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n{}".to_vec();
+        let mut missing_out = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(missing_cl),
+            &mut missing_out,
+            ro_opts.clone(),
+        )
+        .await
+        .unwrap();
+        let missing_str = String::from_utf8(missing_out).unwrap();
+        assert!(
+            missing_str.starts_with("Content-Length: "),
+            "missing Content-Length error must preserve Content-Length framing: {missing_str}"
+        );
+        assert!(missing_str.contains("-32700"));
+        assert!(missing_str.contains("missing Content-Length"));
+
+        // 3. Conflicting duplicate `Content-Length` returns clean -32700 parse error.
+        let conflict_cl = b"Content-Length: 2\r\nContent-Length: 4\r\n\r\n{}".to_vec();
+        let mut conflict_out = Vec::new();
+        serve_mcp_io(
+            std::io::Cursor::new(conflict_cl),
+            &mut conflict_out,
+            ro_opts.clone(),
+        )
+        .await
+        .unwrap();
+        let conflict_str = String::from_utf8(conflict_out).unwrap();
+        assert!(conflict_str.starts_with("Content-Length: "));
+        assert!(conflict_str.contains("-32700"));
+        assert!(conflict_str.contains("conflicting duplicate Content-Length"));
+
+        // 4. Signed / non-numeric / oversized `Content-Length` and truncated body on EOF all return clean errors.
+        for bad_input in [
+            b"Content-Length: +2\r\n\r\n{}".as_slice(),
+            b"Content-Length: abc\r\n\r\n{}".as_slice(),
+            b"Content-Length: 99999999\r\n\r\n".as_slice(),
+            b"Content-Length: 20\r\n\r\n{\"partial\":".as_slice(),
+        ] {
+            let mut mode = FrameMode::NewlineJson;
+            let mut buf = bad_input.to_vec();
+            let err = try_parse_buffered_frame(&mut buf, &mut mode, true)
+                .expect_err("expected malformed/truncated header frame to fail");
+            assert_eq!(mode, FrameMode::ContentLength);
+            assert!(
+                !err.to_string().is_empty(),
+                "error message must not be empty"
+            );
+        }
+
+        // 5. Trailing NewlineJson without trailing `\n` at EOF still parses cleanly.
+        let no_nl = b"{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"ping\"}".to_vec();
+        let mut no_nl_out = Vec::new();
+        serve_mcp_io(std::io::Cursor::new(no_nl), &mut no_nl_out, ro_opts)
+            .await
+            .unwrap();
+        let no_nl_val: Value =
+            serde_json::from_str(String::from_utf8(no_nl_out).unwrap().trim()).unwrap();
+        assert_eq!(no_nl_val["id"], 77);
+        assert!(no_nl_val.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_audit_config_security_diff_with_doh_urls_produces_valid_redacted_json() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!(
+            "rc-mcp-audit-doh-diff-{}-{nanos}",
+            std::process::id()
+        ));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let draft_yaml_path = tmp_root.join("draft.yaml");
+        std::fs::write(
+            &draft_yaml_path,
+            r#"
+mixed-port: 7890
+external-controller: 127.0.0.1:9090
+dns:
+  enable: true
+  nameserver:
+    - https://user:secretpass@doh.example.com/dns-query?token=tok123
+  direct-nameserver:
+    - 127.0.0.1:5353
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": draft_yaml_path.to_string_lossy() }),
+            &opts,
+            &state_dir,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        assert_eq!(res["isError"], false, "unexpected tool error: {res}");
+        let text = res["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text string");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_else(|err| {
+            panic!("audit_config_security returned invalid JSON ({err}): {text}")
+        });
+
+        assert_eq!(parsed["diff"]["dns_changed"], true);
+        let dns_changes = parsed["diff"]["dns_changes"]
+            .as_array()
+            .expect("diff.dns_changes must be an array");
+        assert!(
+            !dns_changes.is_empty(),
+            "expected diff.dns_changes entries comparing starter DoH URLs to draft: {parsed}"
+        );
+        let joined_dns_changes = dns_changes
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined_dns_changes.contains("https://***REDACTED***"),
+            "starter IP DoH URL should be redacted in diff.dns_changes: {joined_dns_changes}"
+        );
+        assert!(
+            joined_dns_changes.contains("https://doh.example.com/***REDACTED***"),
+            "draft authenticated DoH URL should be host-preserved & path/creds redacted: {joined_dns_changes}"
+        );
+
+        for forbidden in [
+            "secretpass",
+            "tok123",
+            "user:secretpass",
+            "223.5.5.5/dns-query",
+            "1.12.12.12/dns-query",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "audit_config_security leaked '{forbidden}': {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tool_result_preserves_valid_json_for_escaped_quotes_urls_kv_and_serde_string_markers() {
+        let mut dynamic_map = serde_json::Map::new();
+        dynamic_map.insert(
+            "vless://11111111-1111-4111-8111-111111111111@secret-a.example:443?pbk=PUB_KEY_A#n1"
+                .to_string(),
+            json!("first_entry"),
+        );
+        dynamic_map.insert(
+            "vless://22222222-2222-4222-8222-222222222222@secret-b.example:443?pbk=PUB_KEY_B#n2"
+                .to_string(),
+            json!("second_entry"),
+        );
+        dynamic_map.insert(
+            "vless://33333333-3333-4333-8333-333333333333@secret-c.example:443?pbk=PUB_KEY_C#n3"
+                .to_string(),
+            json!("third_entry"),
+        );
+
+        let mut uuid_collision_map = serde_json::Map::new();
+        uuid_collision_map.insert(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            json!("uuid_one"),
+        );
+        uuid_collision_map.insert(
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            json!("uuid_two"),
+        );
+        uuid_collision_map.insert("***REDACTED***#2".to_string(), json!("literal_reserved"));
+
+        let payload = json!({
+            "dns_debug": "dns.nameserver: [\"https://223.5.5.5/dns-query\", \"1.1.1.1:53\"]",
+            "vless_debug": "node [\"vless://12345678-1234-4321-abcd-998877665544@edge.secret.example:443?pbk=REALITY_PBK_99#tag\"]",
+            "kv_quote": "err key=TOP_SECRET_KV\" trailing",
+            "pq_quote": "pq \"mlkem768x25519plus.native.0rtt.SECRET_PQ_TOKEN\" done",
+            "hint": "expected string ",
+            "next_after_hint": "must_survive_intact",
+            "serde_err": "invalid type: string \"secret_val\", expected u16",
+            "unclosed_backtick": "unterminated string `foo",
+            "later_backtick": "pass `config_path` instead",
+            "dynamic_map": Value::Object(dynamic_map),
+            "uuid_collision_map": Value::Object(uuid_collision_map),
+            "primitives": [null, true, 42, "plain_ok"]
+        });
+
+        let tool_res = mcp_tool_result(&payload, false);
+        assert_eq!(tool_res["isError"], false);
+        let raw_text = tool_res["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text string");
+
+        let parsed: Value = serde_json::from_str(raw_text).unwrap_or_else(|err| {
+            panic!("mcp_tool_result emitted invalid JSON ({err}): {raw_text}")
+        });
+
+        assert_eq!(
+            parsed["dns_debug"],
+            "dns.nameserver: [\"https://***REDACTED***\", \"1.1.1.1:53\"]"
+        );
+        assert_eq!(parsed["vless_debug"], "node [\"vless://***REDACTED***\"]");
+        assert_eq!(parsed["kv_quote"], "err key=***REDACTED***\" trailing");
+        assert_eq!(
+            parsed["pq_quote"],
+            "pq \"mlkem768x25519plus.***REDACTED***\" done"
+        );
+        assert_eq!(parsed["hint"], "expected string ");
+        assert_eq!(parsed["next_after_hint"], "must_survive_intact");
+        assert_eq!(
+            parsed["serde_err"],
+            "invalid type: string \"***REDACTED***\", expected u16"
+        );
+        assert_eq!(parsed["unclosed_backtick"], "unterminated string `foo");
+        assert_eq!(parsed["later_backtick"], "pass `config_path` instead");
+        assert_eq!(parsed["primitives"], json!([null, true, 42, "plain_ok"]));
+
+        let dyn_obj = parsed["dynamic_map"]
+            .as_object()
+            .expect("dynamic_map object");
+        assert_eq!(
+            dyn_obj.len(),
+            3,
+            "all colliding redacted keys must be preserved without overwriting: {dyn_obj:?}"
+        );
+        assert_eq!(
+            dyn_obj.get("vless://***REDACTED***"),
+            Some(&json!("first_entry"))
+        );
+        assert_eq!(
+            dyn_obj.get("vless://***REDACTED***#2"),
+            Some(&json!("second_entry"))
+        );
+        assert_eq!(
+            dyn_obj.get("vless://***REDACTED***#3"),
+            Some(&json!("third_entry"))
+        );
+
+        let uuid_obj = parsed["uuid_collision_map"]
+            .as_object()
+            .expect("uuid_collision_map object");
+        assert_eq!(
+            uuid_obj.len(),
+            3,
+            "colliding UUID keys must not overwrite pre-existing literal #2 key: {uuid_obj:?}"
+        );
+        assert_eq!(uuid_obj.get("***REDACTED***"), Some(&json!("uuid_one")));
+        assert_eq!(uuid_obj.get("***REDACTED***#3"), Some(&json!("uuid_two")));
+        assert_eq!(
+            uuid_obj.get("***REDACTED***#2"),
+            Some(&json!("literal_reserved"))
+        );
+
+        for secret in [
+            "223.5.5.5/dns-query",
+            "12345678-1234-4321-abcd-998877665544",
+            "edge.secret.example",
+            "REALITY_PBK_99",
+            "TOP_SECRET_KV",
+            "SECRET_PQ_TOKEN",
+            "secret_val",
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "secret-a.example",
+            "secret-b.example",
+            "secret-c.example",
+            "PUB_KEY_A",
+            "PUB_KEY_B",
+            "PUB_KEY_C",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ] {
+            assert!(
+                !raw_text.contains(secret),
+                "mcp_tool_result leaked secret '{secret}': {raw_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_unknown_method_error_redacts_sensitive_uri() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "vless://55555555-6666-4777-8888-999999999999@method-secret.example:443?pbk=METHOD_PBK_SEC#m"
+            }),
+            &ro_opts,
+        )
+        .await
+        .expect("unknown method returns JSON-RPC error response");
+
+        assert_eq!(resp["id"], 6);
+        assert_eq!(resp["error"]["code"], -32601);
+        let msg = resp["error"]["message"]
+            .as_str()
+            .expect("error.message string");
+        assert!(
+            msg.starts_with("Method not found: "),
+            "unexpected -32601 message prefix: {msg}"
+        );
+        assert!(
+            msg.contains("vless://***REDACTED***"),
+            "expected redacted vless URI in -32601 error message: {msg}"
+        );
+
+        let serialized = serde_json::to_string(&resp).unwrap();
+        for secret in [
+            "55555555-6666-4777-8888-999999999999",
+            "method-secret.example",
+            "METHOD_PBK_SEC",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "-32601 error leaked secret '{secret}': {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_audit_payload_preserves_parenthetical_proxy_names_and_handles_edge_cases() {
+        let mut payload = json!({
+            "audit": {
+                "findings": [
+                    {
+                        "code": "SEC-PLAINTEXT-NODE",
+                        "location": "proxies[My Node (Premium HK)] (198.51.100.19:1080)",
+                        "detail": "Node 'My Node (Premium HK)' (socks5) targets non-loopback server '198.51.100.19:1080' and raw 198.51.100.19:1080 without TLS."
+                    },
+                    {
+                        "code": "SEC-PLAINTEXT-NODE",
+                        "location": "proxies[Edge (US West)] (edge.secret.internal:1080)",
+                        "detail": "Node 'Edge (US West)' (socks5) connects directly to edge.secret.internal:1080 without TLS."
+                    },
+                    {
+                        "code": "SEC-CUSTOM-NO-ENDPOINT",
+                        "location": "proxies[My Node (Premium HK)]",
+                        "detail": "Node 'My Node (Premium HK)' has a config warning."
+                    },
+                    {
+                        "code": "SEC-CUSTOM-UNCLOSED-NAME",
+                        "location": "proxies[My Node (unclosed]",
+                        "detail": "Node 'My Node (unclosed' has a config warning."
+                    },
+                    {
+                        "code": "SEC-CUSTOM-TRUNCATED-ENDPOINT",
+                        "location": "proxies[My Node (Premium HK)] (198.51.100.20:1080",
+                        "detail": "Node 'My Node (Premium HK)' targets 198.51.100.20:1080 without TLS."
+                    },
+                    {
+                        "code": "SEC-CUSTOM-BRACKET-IN-NAME",
+                        "location": "proxies[a] (b]",
+                        "detail": "Node 'a] (b' has a config warning."
+                    }
+                ]
+            }
+        });
+
+        scrub_audit_payload(&mut payload, false);
+        let findings = payload["audit"]["findings"].as_array().unwrap();
+
+        // 1. Parenthetical proxy name + IP endpoint
+        assert_eq!(
+            findings[0]["location"],
+            "proxies[My Node (Premium HK)] ([endpoint-redacted])"
+        );
+        let d0 = findings[0]["detail"].as_str().unwrap();
+        assert!(
+            d0.contains("My Node (Premium HK)"),
+            "proxy name must be preserved in detail: {d0}"
+        );
+        assert!(
+            !d0.contains("198.51.100.19"),
+            "endpoint IP must be redacted in detail: {d0}"
+        );
+
+        // 2. Parenthetical proxy name + hostname endpoint (unquoted in detail)
+        assert_eq!(
+            findings[1]["location"],
+            "proxies[Edge (US West)] ([endpoint-redacted])"
+        );
+        let d1 = findings[1]["detail"].as_str().unwrap();
+        assert!(
+            d1.contains("Edge (US West)"),
+            "proxy name must be preserved in detail: {d1}"
+        );
+        assert!(
+            !d1.contains("edge.secret.internal"),
+            "extracted hostname endpoint needle must be redacted in detail: {d1}"
+        );
+
+        // 3. Parenthetical proxy name without trailing endpoint
+        assert_eq!(findings[2]["location"], "proxies[My Node (Premium HK)]");
+        assert_eq!(
+            findings[2]["detail"],
+            "Node 'My Node (Premium HK)' has a config warning."
+        );
+
+        // 4. Unclosed paren inside proxy name without trailing endpoint
+        assert_eq!(findings[3]["location"], "proxies[My Node (unclosed]");
+        assert_eq!(
+            findings[3]["detail"],
+            "Node 'My Node (unclosed' has a config warning."
+        );
+
+        // 5. Truncated endpoint missing trailing ')' fails closed while preserving proxy name
+        assert_eq!(
+            findings[4]["location"],
+            "proxies[My Node (Premium HK)] ([endpoint-redacted])"
+        );
+        let d4 = findings[4]["detail"].as_str().unwrap();
+        assert!(
+            d4.contains("My Node (Premium HK)"),
+            "proxy name must be preserved in detail: {d4}"
+        );
+        assert!(
+            !d4.contains("198.51.100.20"),
+            "truncated endpoint IP must be redacted in detail: {d4}"
+        );
+
+        // 6. Proxy name containing `] (` with no endpoint stays untouched
+        assert_eq!(findings[5]["location"], "proxies[a] (b]");
+        assert_eq!(findings[5]["detail"], "Node 'a] (b' has a config warning.");
+    }
+
+    #[tokio::test]
+    async fn mcp_audit_config_security_redacts_delimiter_bearing_authenticated_doh_urls() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!(
+            "rc-mcp-audit-doh-delims-{}-{nanos}",
+            std::process::id()
+        ));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let draft_yaml_path = tmp_root.join("draft.yaml");
+        std::fs::write(
+            &draft_yaml_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 'https://user:p"QuotePassSecret@doh.example.com/dns-query?token=TokQuoteSecret'
+    - "https://user:p'SQuotePassSecret@doh.example.com/dns-query?token=TokSQuoteSecret"
+    - 'https://user:p)ParenPassSecret@doh.example.com/dns-query?token=TokParenSecret'
+    - 'https://user:p,CommaPassSecret@doh.example.com/dns-query?token=TokCommaSecret'
+    - 'https://user:p;SemiPassSecret@doh.example.com/dns-query?token=TokSemiSecret'
+    - 'https://doh.example.com/dns-query?q="QuoteQuerySecret"&x=1'
+    - 'https://doh.example.com/dns-query?q=a\BackslashQuerySecret&x=1'
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": draft_yaml_path.to_string_lossy() }),
+            &opts,
+            &state_dir,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        assert_eq!(res["isError"], false, "unexpected tool error: {res}");
+        let text = res["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text string");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_else(|err| {
+            panic!("audit_config_security returned invalid JSON ({err}): {text}")
+        });
+
+        assert_eq!(parsed["diff"]["dns_changed"], true);
+        let dns_changes = parsed["diff"]["dns_changes"]
+            .as_array()
+            .expect("diff.dns_changes must be an array");
+        assert!(
+            !dns_changes.is_empty(),
+            "expected diff.dns_changes comparing starter DoH URLs to draft: {parsed}"
+        );
+
+        for forbidden in [
+            "QuotePassSecret",
+            "SQuotePassSecret",
+            "ParenPassSecret",
+            "CommaPassSecret",
+            "SemiPassSecret",
+            "QuoteQuerySecret",
+            "BackslashQuerySecret",
+            "TokQuoteSecret",
+            "TokSQuoteSecret",
+            "TokParenSecret",
+            "TokCommaSecret",
+            "TokSemiSecret",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "audit_config_security leaked secret '{forbidden}': {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_audit_config_security_redacts_private_doh_dot_paths_and_tab_whatwg_urls_across_all_dns_lists()
+     {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!(
+            "rc-mcp-audit-b2-paths-{}-{nanos}",
+            std::process::id()
+        ));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let draft_yaml_path = tmp_root.join("draft.yaml");
+        std::fs::write(
+            &draft_yaml_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - "https://dns.nextdns.io/a1b2c3/Alice's MacBook (Work)"
+    - "https://dns.nextdns.io/NextDnsProfileSecret99/MyPrivateDevice"
+    - "https://d.adguard-dns.com/dns-query/AdGuardClientSecret88"
+    - 'https://doh.corp.example/dns-query/tok"QuotePathSecret'
+    - 'https://doh.corp.example/dns-query/tok)ParenPathSecret'
+    - 'https://doh.corp.example/dns-query/tok,CommaPathSecret'
+    - 'https://doh.corp.example/dns-query/tok;SemiPathSecret'
+    - 'https://doh.example.com/dns-query/tok PathSpaceSecret'
+    - 'tls://dot.corp.example:853/DotSecretPathToken'
+    - "https://\t/tabsecuser:8080\\tabsecpass@doh.example/dns-query"
+    - "https://\t/tabquser:8080\\tabqpass@doh.example/dns-query?token=TabQTok"
+    - https://cloudflare-dns.com/dns-query
+    - https://dns.google/resolve
+    - tls://1.1.1.1:853
+  direct-nameserver:
+    - "https://dns.nextdns.io/d4e5f6/Bob's Phone (Private)"
+    - "https://d.adguard-dns.com/dns-query/DirectAdGuardSecret77"
+  fallback:
+    - 'https://doh.corp.example/dns-query/fb)FallbackPathSecret'
+    - 'tls://dot-fb.corp.example:853/FallbackDotSecret66'
+    - "https://\t/fbtabuser:8080\\fbtabpass@doh.example/dns-query"
+  proxy-server-nameserver:
+    - 'https://doh.corp.example/dns-query/pns;ProxyNsPathSecret'
+    - "https://dns.nextdns.io/pns987/Carol's Tablet (Secret)"
+    - 'tls://dot-pns.corp.example:853/ProxyNsDotSecret55'
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let mut outputs = Vec::new();
+        for include_network_metadata in [false, true] {
+            let opts = McpServerOptions {
+                config_path: None,
+                controller: Some("127.0.0.1:1".to_string()),
+                secret: None,
+                allow_mutations: false,
+                include_network_metadata,
+            };
+            let res = execute_tool_call_with_state_dir(
+                "audit_config_security",
+                &json!({ "config_path": draft_yaml_path.to_string_lossy() }),
+                &opts,
+                &state_dir,
+            )
+            .await;
+            outputs.push((include_network_metadata, res));
+        }
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        for (include_network_metadata, res) in outputs {
+            assert_eq!(
+                res["isError"], false,
+                "unexpected tool error (include_network_metadata={include_network_metadata}): {res}"
+            );
+            let text = res["content"][0]["text"]
+                .as_str()
+                .expect("content[0].text string");
+            let parsed: Value = serde_json::from_str(text).unwrap_or_else(|err| {
+                panic!(
+                    "audit_config_security returned invalid JSON (include_network_metadata={include_network_metadata}, {err}): {text}"
+                )
+            });
+
+            assert_eq!(parsed["diff"]["dns_changed"], true);
+            let dns_changes = parsed["diff"]["dns_changes"]
+                .as_array()
+                .expect("diff.dns_changes must be an array");
+            let entries: Vec<&str> = dns_changes.iter().filter_map(Value::as_str).collect();
+            for field_prefix in [
+                "dns.nameserver:",
+                "dns.direct-nameserver:",
+                "dns.fallback:",
+                "dns.proxy-server-nameserver:",
+            ] {
+                assert!(
+                    entries.iter().any(|entry| entry.starts_with(field_prefix)),
+                    "missing {field_prefix} in diff.dns_changes: {entries:?}"
+                );
+            }
+
+            let joined_dns_changes = entries.join("\n");
+            let diff_json = serde_json::to_string(&parsed["diff"]).unwrap();
+
+            assert!(
+                joined_dns_changes.contains("***REDACTED***"),
+                "expected ***REDACTED*** marker in diff.dns_changes: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("***REDACTED_URL***"),
+                "expected ***REDACTED_URL*** marker for space/tab URLs in diff.dns_changes: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("https://dns.nextdns.io/***REDACTED***"),
+                "non-whitespace NextDNS URL should redact path while preserving host: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("https://d.adguard-dns.com/***REDACTED***"),
+                "AdGuard Private DNS URL should redact client path while preserving host: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("https://doh.corp.example/***REDACTED***"),
+                "delimiter-bearing DoH URLs should redact path while preserving host: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("tls://dot.corp.example:853/***REDACTED***")
+                    || joined_dns_changes.contains("tls://***REDACTED***"),
+                "DoT tls:// path URL should be redacted in diff.dns_changes: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("https://cloudflare-dns.com/dns-query")
+                    || joined_dns_changes.contains("https://cloudflare-dns.com/***REDACTED***"),
+                "clean Cloudflare DoH upstream should appear cleanly in diff.dns_changes: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("https://dns.google/resolve")
+                    || joined_dns_changes.contains("https://dns.google/***REDACTED***"),
+                "clean Google DoH upstream should appear cleanly in diff.dns_changes: {joined_dns_changes}"
+            );
+            assert!(
+                joined_dns_changes.contains("tls://1.1.1.1:853")
+                    || joined_dns_changes.contains("tls://***REDACTED***"),
+                "clean public DoT upstream should appear cleanly in diff.dns_changes: {joined_dns_changes}"
+            );
+
+            for forbidden in [
+                "a1b2c3",
+                "Alice",
+                "MacBook",
+                "Work",
+                "d4e5f6",
+                "Bob",
+                "Phone",
+                "Private",
+                "NextDnsProfileSecret99",
+                "MyPrivateDevice",
+                "AdGuardClientSecret88",
+                "DirectAdGuardSecret77",
+                "QuotePathSecret",
+                "ParenPathSecret",
+                "CommaPathSecret",
+                "SemiPathSecret",
+                "PathSpaceSecret",
+                "DotSecretPathToken",
+                "FallbackPathSecret",
+                "FallbackDotSecret66",
+                "ProxyNsPathSecret",
+                "pns987",
+                "Carol",
+                "Tablet",
+                "Secret",
+                "ProxyNsDotSecret55",
+                "tabsecuser",
+                "tabsecpass",
+                "tabquser",
+                "tabqpass",
+                "TabQTok",
+                "fbtabuser",
+                "fbtabpass",
+            ] {
+                assert!(
+                    !diff_json.contains(forbidden),
+                    "diff leaked secret substring '{forbidden}' (include_network_metadata={include_network_metadata}): {diff_json}"
+                );
+            }
+
+            // Also verify none of the unique secret tokens appear anywhere in the entire MCP response.
+            for forbidden in [
+                "a1b2c3",
+                "Alice",
+                "MacBook",
+                "(Work)",
+                "d4e5f6",
+                "Bob",
+                "Phone",
+                "(Private)",
+                "NextDnsProfileSecret99",
+                "MyPrivateDevice",
+                "AdGuardClientSecret88",
+                "DirectAdGuardSecret77",
+                "QuotePathSecret",
+                "ParenPathSecret",
+                "CommaPathSecret",
+                "SemiPathSecret",
+                "PathSpaceSecret",
+                "DotSecretPathToken",
+                "FallbackPathSecret",
+                "FallbackDotSecret66",
+                "ProxyNsPathSecret",
+                "pns987",
+                "Carol",
+                "Tablet",
+                "(Secret)",
+                "ProxyNsDotSecret55",
+                "tabsecuser",
+                "tabsecpass",
+                "tabquser",
+                "tabqpass",
+                "TabQTok",
+                "fbtabuser",
+                "fbtabpass",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "audit_config_security leaked secret '{forbidden}' (include_network_metadata={include_network_metadata}): {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_audit_config_security_detects_private_dns_path_token_rotation_and_preserves_clean_public_upstreams()
+     {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!(
+            "rc-mcp-audit-b2-rotate-{}-{nanos}",
+            std::process::id()
+        ));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // 1. Path-token-only rotation across all 4 DNS lists: active vs candidate differ ONLY in path tokens.
+        let active_rot_path = tmp_root.join("active_rotate.yaml");
+        let candidate_rot_path = tmp_root.join("candidate_rotate.yaml");
+        std::fs::write(
+            &active_rot_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - "https://dns.nextdns.io/OldNextDnsTok111/OldDeviceAlpha"
+    - "https://d.adguard-dns.com/dns-query/OldAdGuardTok111"
+  direct-nameserver:
+    - "https://dns.nextdns.io/OldDirTok333/Alice's MacBook (OfficeOld)"
+  fallback:
+    - 'tls://dot.corp.example:853/OldFallbackDotTok555'
+  proxy-server-nameserver:
+    - "https://d.adguard-dns.com/dns-query/OldProxyNsTok777"
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &candidate_rot_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - "https://dns.nextdns.io/NewNextDnsTok222/NewDeviceBeta"
+    - "https://d.adguard-dns.com/dns-query/NewAdGuardTok222"
+  direct-nameserver:
+    - "https://dns.nextdns.io/NewDirTok444/Bob's Phone (HomeNew)"
+  fallback:
+    - 'tls://dot.corp.example:853/NewFallbackDotTok666'
+  proxy-server-nameserver:
+    - "https://d.adguard-dns.com/dns-query/NewProxyNsTok888"
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let rot_opts = McpServerOptions {
+            config_path: Some(active_rot_path),
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let rot_res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": candidate_rot_path.to_string_lossy() }),
+            &rot_opts,
+            &state_dir,
+        )
+        .await;
+
+        // 2. Clean public upstreams diff: verify Cloudflare DoH, Google DoH, and public DoT preserve valid JSON without fail-closed redaction.
+        let active_clean_path = tmp_root.join("active_clean.yaml");
+        let candidate_clean_path = tmp_root.join("candidate_clean.yaml");
+        std::fs::write(
+            &active_clean_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - 1.1.1.1:53
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &candidate_clean_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - https://cloudflare-dns.com/dns-query
+    - https://dns.google/resolve
+    - tls://1.1.1.1:853
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let clean_opts = McpServerOptions {
+            config_path: Some(active_clean_path),
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let clean_res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": candidate_clean_path.to_string_lossy() }),
+            &clean_opts,
+            &state_dir,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        // Assertions for (1) path-token-only rotation
+        assert_eq!(
+            rot_res["isError"], false,
+            "unexpected tool error: {rot_res}"
+        );
+        let rot_text = rot_res["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text string");
+        let rot_parsed: Value = serde_json::from_str(rot_text).unwrap_or_else(|err| {
+            panic!("path-token rotation returned invalid JSON ({err}): {rot_text}")
+        });
+        assert_eq!(
+            rot_parsed["diff"]["dns_changed"], true,
+            "path-token-only rotation must set dns_changed=true: {rot_parsed}"
+        );
+        let rot_entries: Vec<&str> = rot_parsed["diff"]["dns_changes"]
+            .as_array()
+            .expect("diff.dns_changes array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for field_prefix in [
+            "dns.nameserver:",
+            "dns.direct-nameserver:",
+            "dns.fallback:",
+            "dns.proxy-server-nameserver:",
+        ] {
+            assert!(
+                rot_entries.iter().any(|e| e.starts_with(field_prefix)),
+                "path-token rotation must report {field_prefix} change: {rot_entries:?}"
+            );
+        }
+        let rot_joined = rot_entries.join("\n");
+        assert!(
+            rot_joined.contains("https://dns.nextdns.io/***REDACTED***"),
+            "rotated NextDNS URL should show host-preserved redaction: {rot_joined}"
+        );
+        assert!(
+            rot_joined.contains("https://d.adguard-dns.com/***REDACTED***"),
+            "rotated AdGuard URL should show host-preserved redaction: {rot_joined}"
+        );
+        assert!(
+            rot_joined.contains("***REDACTED_URL***"),
+            "rotated space-bearing NextDNS URL should fail closed to ***REDACTED_URL***: {rot_joined}"
+        );
+        assert!(
+            rot_joined.contains("tls://dot.corp.example:853/***REDACTED***")
+                || rot_joined.contains("tls://***REDACTED***"),
+            "rotated DoT tls:// path URL should show redaction marker: {rot_joined}"
+        );
+        for forbidden in [
+            "OldNextDnsTok111",
+            "OldDeviceAlpha",
+            "NewNextDnsTok222",
+            "NewDeviceBeta",
+            "OldAdGuardTok111",
+            "NewAdGuardTok222",
+            "OldDirTok333",
+            "Alice",
+            "MacBook",
+            "OfficeOld",
+            "NewDirTok444",
+            "Bob",
+            "Phone",
+            "HomeNew",
+            "OldFallbackDotTok555",
+            "NewFallbackDotTok666",
+            "OldProxyNsTok777",
+            "NewProxyNsTok888",
+        ] {
+            assert!(
+                !rot_text.contains(forbidden),
+                "path-token rotation leaked secret '{forbidden}': {rot_text}"
+            );
+        }
+
+        // Assertions for (2) clean public upstreams
+        assert_eq!(
+            clean_res["isError"], false,
+            "unexpected tool error for clean public upstreams: {clean_res}"
+        );
+        let clean_text = clean_res["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text string");
+        let clean_parsed: Value = serde_json::from_str(clean_text).unwrap_or_else(|err| {
+            panic!("clean public upstreams returned invalid JSON ({err}): {clean_text}")
+        });
+        assert_eq!(clean_parsed["diff"]["dns_changed"], true);
+        let clean_joined = clean_parsed["diff"]["dns_changes"]
+            .as_array()
+            .expect("diff.dns_changes array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            clean_joined.contains("dns.nameserver:"),
+            "expected dns.nameserver diff entry: {clean_joined}"
+        );
+        assert!(
+            !clean_joined.contains("***REDACTED_URL***"),
+            "clean public upstreams must not fail closed to ***REDACTED_URL***: {clean_joined}"
+        );
+        assert!(
+            clean_joined.contains("https://cloudflare-dns.com/dns-query")
+                || clean_joined.contains("https://cloudflare-dns.com/***REDACTED***"),
+            "clean Cloudflare DoH upstream must remain intact: {clean_joined}"
+        );
+        assert!(
+            clean_joined.contains("https://dns.google/resolve")
+                || clean_joined.contains("https://dns.google/***REDACTED***"),
+            "clean Google DoH upstream must remain intact: {clean_joined}"
+        );
+        assert!(
+            clean_joined.contains("tls://1.1.1.1:853")
+                || clean_joined.contains("tls://***REDACTED***"),
+            "clean public DoT upstream must remain intact: {clean_joined}"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_result_preserves_valid_json_for_redacted_doh_dot_dns_changes() {
+        let mut payload = json!({
+            "source": "file:draft.yaml",
+            "controller": "127.0.0.1:9090",
+            "audit": { "findings": [] },
+            "diff": {
+                "dns_changed": true,
+                "dns_changes": [
+                    "dns.nameserver: [\"1.1.1.1:53\"] -> [\"https://dns.nextdns.io/***REDACTED***\", \"https://d.adguard-dns.com/***REDACTED***\", \"tls://dot.corp.example:853/***REDACTED***\", \"***REDACTED_URL***\"]",
+                    "dns.direct-nameserver: [] -> [\"https://cloudflare-dns.com/dns-query\", \"https://dns.google/resolve\", \"tls://1.1.1.1:853\"]"
+                ]
+            }
+        });
+        scrub_audit_payload(&mut payload, false);
+        let tool_res = mcp_tool_result(&payload, false);
+        assert_eq!(tool_res["isError"], false);
+
+        let raw_text = tool_res["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text string");
+        let parsed: Value = serde_json::from_str(raw_text).unwrap_or_else(|err| {
+            panic!("mcp_tool_result produced invalid JSON ({err}): {raw_text}")
+        });
+        let changes = parsed["diff"]["dns_changes"]
+            .as_array()
+            .expect("diff.dns_changes array");
+        assert_eq!(changes.len(), 2);
+
+        let ns = changes[0].as_str().unwrap();
+        assert!(
+            ns.contains("https://dns.nextdns.io/***REDACTED***"),
+            "pre-redacted NextDNS entry must survive idempotently: {ns}"
+        );
+        assert!(
+            ns.contains("https://d.adguard-dns.com/***REDACTED***"),
+            "pre-redacted AdGuard entry must survive idempotently: {ns}"
+        );
+        assert!(
+            ns.contains("tls://dot.corp.example:853/***REDACTED***")
+                || ns.contains("tls://***REDACTED***"),
+            "pre-redacted DoT entry must remain cleanly redacted: {ns}"
+        );
+        assert!(
+            ns.contains("***REDACTED_URL***"),
+            "fail-closed ***REDACTED_URL*** marker must survive intact: {ns}"
+        );
+
+        let direct_ns = changes[1].as_str().unwrap();
+        assert!(
+            !direct_ns.contains("***REDACTED_URL***"),
+            "clean public upstreams must not turn into ***REDACTED_URL***: {direct_ns}"
+        );
+        assert!(
+            direct_ns.contains("https://cloudflare-dns.com/dns-query")
+                || direct_ns.contains("https://cloudflare-dns.com/***REDACTED***"),
+            "Cloudflare DoH entry must survive cleanly: {direct_ns}"
+        );
+        assert!(
+            direct_ns.contains("https://dns.google/resolve")
+                || direct_ns.contains("https://dns.google/***REDACTED***"),
+            "Google DoH entry must survive cleanly: {direct_ns}"
+        );
+        assert!(
+            direct_ns.contains("tls://1.1.1.1:853") || direct_ns.contains("tls://***REDACTED***"),
+            "public DoT entry must survive cleanly: {direct_ns}"
+        );
+    }
+
+    #[test]
+    fn mcp_b3_redact_network_tokens_in_log_redacts_dot_doq_doh3_case_insensitively() {
+        let log_line = concat!(
+            "dial tls://dotu:LogDotPass999@dot.corp.example:853/LogDotPath000 ",
+            "TLS://dot-upper.corp.example:853/UpDotPath ",
+            "quic://quicu:LogQuicPass888@doq.corp.example:853/LogQuicPath777 ",
+            "QUIC://doq-upper.corp.example:853/UpQuicPath ",
+            "h3://h3u:LogH3Pass666@h3.corp.example/LogH3Path555 ",
+            "H3://h3-upper.corp.example/UpH3Path ",
+            "doq://doqu:LogDoqPass444@doq2.corp.example:853/LogDoqPath333 ",
+            "DOQ://doq2-upper.corp.example:853/UpDoqPath ",
+            "(HTTP://plain.corp.example/PlainPath), ",
+            "`HTTPS://doh.corp.example/dns-query/DohPath` ",
+            "upstream=tls://kv.corp.example:853/KvDotPath ",
+            "[tls://[2001:db8::1]:853/V6DotPath] ",
+            "password=***REDACTED*** ok"
+        );
+
+        let redacted = redact_network_tokens_in_log(log_line);
+        assert_eq!(
+            redacted,
+            concat!(
+                "dial [redacted-endpoint] [redacted-endpoint] [redacted-endpoint] ",
+                "[redacted-endpoint] [redacted-endpoint] [redacted-endpoint] ",
+                "[redacted-endpoint] [redacted-endpoint] [redacted-endpoint] ",
+                "[redacted-endpoint] [redacted-endpoint] [redacted-endpoint] ",
+                "password=***REDACTED*** ok"
+            )
+        );
+
+        for forbidden in [
+            "dotu",
+            "LogDotPass999",
+            "dot.corp.example",
+            "LogDotPath000",
+            "dot-upper.corp.example",
+            "UpDotPath",
+            "quicu",
+            "LogQuicPass888",
+            "doq.corp.example",
+            "LogQuicPath777",
+            "doq-upper.corp.example",
+            "UpQuicPath",
+            "h3u",
+            "LogH3Pass666",
+            "h3.corp.example",
+            "LogH3Path555",
+            "h3-upper.corp.example",
+            "UpH3Path",
+            "doqu",
+            "LogDoqPass444",
+            "doq2.corp.example",
+            "LogDoqPath333",
+            "doq2-upper.corp.example",
+            "UpDoqPath",
+            "plain.corp.example",
+            "PlainPath",
+            "doh.corp.example",
+            "DohPath",
+            "kv.corp.example",
+            "KvDotPath",
+            "2001:db8::1",
+            "V6DotPath",
+            "853",
+        ] {
+            assert!(
+                !redacted.contains(forbidden),
+                "redact_network_tokens_in_log leaked '{forbidden}': {redacted}"
+            );
+        }
+
+        // Verify `extract_recent_logs_filtered` in default redacted mode emits `[redacted-endpoint]`
+        // with 0 host/port/credential/path leaks, and in full metadata mode still leaks 0 creds/paths.
+        let logs_val = json!({
+            "logs": [
+                {
+                    "timestamp_ms": 1,
+                    "type": "warn",
+                    "payload": "dot tls://dotu:LogDotPass999@dot.corp.example:853/LogDotPath000 quic quic://quicu:LogQuicPass888@doq.corp.example:853/LogQuicPath777 h3 h3://h3u:LogH3Pass666@h3.corp.example/LogH3Path555 doq doq://doqu:LogDoqPass444@doq2.corp.example:853/LogDoqPath333"
+                }
+            ]
+        });
+
+        let default_logs =
+            extract_recent_logs_filtered(Some(&logs_val), LogFilterLevel::Warn, 10, false);
+        let default_payload = default_logs[0]["payload"]
+            .as_str()
+            .expect("redacted log payload");
+        assert!(
+            default_payload.contains("[redacted-endpoint]"),
+            "expected [redacted-endpoint] in default privacy mode: {default_payload}"
+        );
+        for forbidden in [
+            "dotu",
+            "LogDotPass999",
+            "dot.corp.example",
+            "LogDotPath000",
+            "quicu",
+            "LogQuicPass888",
+            "doq.corp.example",
+            "LogQuicPath777",
+            "h3u",
+            "LogH3Pass666",
+            "h3.corp.example",
+            "LogH3Path555",
+            "doqu",
+            "LogDoqPass444",
+            "doq2.corp.example",
+            "LogDoqPath333",
+            "853",
+        ] {
+            assert!(
+                !default_payload.contains(forbidden),
+                "default get_recent_logs leaked '{forbidden}': {default_payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_b3_redacts_dot_doq_doh3_across_methods_tools_controller_and_rule_linter() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        // 1. `-32601` unknown `method` across `tls://`, `quic://`, `h3://`, `doq://` (and uppercase)
+        let method_cases: &[(&str, &[&str])] = &[
+            (
+                "tls://dotuser:DotPassSecret99@dot.corp.example:853/DotPathSecret88",
+                &["dotuser", "DotPassSecret99", "DotPathSecret88"],
+            ),
+            (
+                "TLS://updotuser:UpDotPassSecret99@dot.corp.example:853/UpDotPathSecret88",
+                &["updotuser", "UpDotPassSecret99", "UpDotPathSecret88"],
+            ),
+            (
+                "quic://quicuser:QuicPassSecret77@doq.corp.example:853/QuicPathSecret66",
+                &["quicuser", "QuicPassSecret77", "QuicPathSecret66"],
+            ),
+            (
+                "h3://h3user:H3PassSecret55@h3.corp.example/H3PathSecret44",
+                &["h3user", "H3PassSecret55", "H3PathSecret44"],
+            ),
+            (
+                "doq://doquser:DoqPassSecret33@doq.corp.example:853/DoqPathSecret22",
+                &["doquser", "DoqPassSecret33", "DoqPathSecret22"],
+            ),
+        ];
+
+        for (idx, (method, secrets)) in method_cases.iter().enumerate() {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 300 + idx,
+                    "method": method
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            let msg = resp["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("***REDACTED***") || msg.contains("***REDACTED_URL***"),
+                "expected redaction marker in -32601 error for '{method}': {msg}"
+            );
+            for secret in *secrets {
+                assert!(
+                    !serialized.contains(secret),
+                    "-32601 error leaked '{secret}' for '{method}': {serialized}"
+                );
+            }
+        }
+
+        // 2. `mcp_tool_result` controller payload redaction
+        let controller_payload = json!({
+            "status_note": "tls://dotu:CtrlDotPass444@dot.corp.example:853/CtrlDotPath555",
+            "probe_note": "fail quic://quicu:ProbeQuicPass@doq.corp:853/ProbeQuicPath",
+            "rule_payload": "h3://h3u:ExplainH3Pass@h3.corp/ExplainH3Path",
+            "put_error": "PUT fail doq://doqu:PutDoqPass@doq.corp:853/PutDoqPath",
+            "audit": {
+                "raw": "ERR tls://u:RawAuditDotPass@dot.corp:853/RawAuditDotPath"
+            }
+        });
+        let tool_res = mcp_tool_result(&controller_payload, false);
+        assert_eq!(tool_res["isError"], false);
+        let tool_text = tool_res["content"][0]["text"].as_str().unwrap();
+        let parsed_tool: Value = serde_json::from_str(tool_text)
+            .unwrap_or_else(|e| panic!("mcp_tool_result emitted invalid JSON ({e}): {tool_text}"));
+        assert!(parsed_tool.is_object());
+        for secret in [
+            "dotu",
+            "CtrlDotPass444",
+            "CtrlDotPath555",
+            "quicu",
+            "ProbeQuicPass",
+            "ProbeQuicPath",
+            "h3u",
+            "ExplainH3Pass",
+            "ExplainH3Path",
+            "doqu",
+            "PutDoqPass",
+            "PutDoqPath",
+            "RawAuditDotPass",
+            "RawAuditDotPath",
+        ] {
+            assert!(
+                !tool_text.contains(secret),
+                "mcp_tool_result leaked '{secret}': {tool_text}"
+            );
+        }
+
+        // 3. Unknown MCP tool name (`tools/call`)
+        for (tool_name, secrets) in [
+            (
+                "tls://u:UnknownToolDotPass@dot.corp:853/UnknownToolDotPath",
+                &["UnknownToolDotPass", "UnknownToolDotPath"][..],
+            ),
+            (
+                "quic://u:UnknownToolQuicPass@doq.corp:853/UnknownToolQuicPath",
+                &["UnknownToolQuicPass", "UnknownToolQuicPath"][..],
+            ),
+            (
+                "h3://u:UnknownToolH3Pass@h3.corp/UnknownToolH3Path",
+                &["UnknownToolH3Pass", "UnknownToolH3Path"][..],
+            ),
+            (
+                "doq://u:UnknownToolDoqPass@doq.corp:853/UnknownToolDoqPath",
+                &["UnknownToolDoqPass", "UnknownToolDoqPath"][..],
+            ),
+        ] {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 350,
+                    "method": "tools/call",
+                    "params": { "name": tool_name, "arguments": {} }
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown tool returns JSON-RPC result");
+            assert_eq!(resp["result"]["isError"], true);
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            let _: Value = serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("unknown tool emitted invalid JSON ({e}): {text}"));
+            for secret in secrets {
+                assert!(
+                    !text.contains(secret),
+                    "unknown MCP tool leaked '{secret}': {text}"
+                );
+            }
+        }
+
+        // 4. `audit_config_security` rule-linter findings (`RULE-SHADOWED-DOMAIN` & `RULE-DEAD-AFTER-MATCH`)
+        //    plus clean `tls://1.1.1.1:853` preserved in `diff.dns_changes`.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root =
+            std::env::temp_dir().join(format!("rc-mcp-b3-rules-{}-{nanos}", std::process::id()));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let base_yaml_path = tmp_root.join("base.yaml");
+        let candidate_yaml_path = tmp_root.join("candidate.yaml");
+        std::fs::write(
+            &base_yaml_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - 1.1.1.1:53
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &candidate_yaml_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - tls://1.1.1.1:853
+    - tls://dns.quad9.net:853
+rules:
+  - DOMAIN-KEYWORD,corp,DIRECT
+  - DOMAIN-KEYWORD,tls://u:ShadowDotPass@dot.corp:853/ShadowDotPath,DIRECT
+  - DOMAIN-KEYWORD,quic://u:ShadowQuicPass@doq.corp:853/ShadowQuicPath,DIRECT
+  - DOMAIN-KEYWORD,h3://u:ShadowH3Pass@h3.corp/ShadowH3Path,DIRECT
+  - DOMAIN-KEYWORD,doq://u:ShadowDoqPass@doq.corp:853/ShadowDoqPath,DIRECT
+  - MATCH,DIRECT
+  - DOMAIN-KEYWORD,tls://u:DeadDotPass@dot.corp:853/DeadDotPath,DIRECT
+"#,
+        )
+        .unwrap();
+
+        let audit_opts = McpServerOptions {
+            config_path: Some(base_yaml_path),
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let audit_res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": candidate_yaml_path.to_string_lossy() }),
+            &audit_opts,
+            &state_dir,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        assert_eq!(audit_res["isError"], false, "unexpected error: {audit_res}");
+        let audit_text = audit_res["content"][0]["text"].as_str().unwrap();
+        let audit_parsed: Value = serde_json::from_str(audit_text)
+            .unwrap_or_else(|e| panic!("audit_config_security invalid JSON ({e}): {audit_text}"));
+        let findings = audit_parsed["audit"]["findings"]
+            .as_array()
+            .expect("audit.findings array");
+        assert!(
+            findings.iter().any(|f| f["code"] == "RULE-SHADOWED-DOMAIN"),
+            "expected RULE-SHADOWED-DOMAIN finding: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["code"] == "RULE-DEAD-AFTER-MATCH"),
+            "expected RULE-DEAD-AFTER-MATCH finding: {findings:?}"
+        );
+
+        let audit_lower = audit_text.to_ascii_lowercase();
+        for secret in [
+            "ShadowDotPass",
+            "ShadowDotPath",
+            "ShadowQuicPass",
+            "ShadowQuicPath",
+            "ShadowH3Pass",
+            "ShadowH3Path",
+            "ShadowDoqPass",
+            "ShadowDoqPath",
+            "DeadDotPass",
+            "DeadDotPath",
+        ] {
+            assert!(
+                !audit_text.contains(secret) && !audit_lower.contains(&secret.to_ascii_lowercase()),
+                "audit_config_security rule linter leaked '{secret}': {audit_text}"
+            );
+        }
+
+        assert_eq!(audit_parsed["diff"]["dns_changed"], true);
+        let dns_changes = audit_parsed["diff"]["dns_changes"]
+            .as_array()
+            .expect("diff.dns_changes array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !dns_changes.contains("***REDACTED_URL***"),
+            "clean public DoT upstreams must not fail closed to ***REDACTED_URL***: {dns_changes}"
+        );
+        assert!(
+            dns_changes.contains("tls://1.1.1.1:853")
+                || dns_changes.contains("tls://***REDACTED***"),
+            "clean tls://1.1.1.1:853 must remain intact in diff.dns_changes: {dns_changes}"
+        );
+        assert!(
+            dns_changes.contains("tls://dns.quad9.net:853")
+                || dns_changes.contains("tls://***REDACTED***"),
+            "clean tls://dns.quad9.net:853 must remain intact in diff.dns_changes: {dns_changes}"
+        );
+
+        // 5. Full-metadata `extract_recent_logs_filtered` must still redact credentials/paths on
+        //    `tls://`, `quic://`, `h3://`, `doq://` via `redact_sensitive_text`.
+        let logs_val = json!({
+            "logs": [
+                {
+                    "timestamp_ms": 1,
+                    "type": "warn",
+                    "payload": "dot tls://dotu:LogDotPass999@dot.corp.example:853/LogDotPath000 quic quic://quicu:LogQuicPass888@doq.corp.example:853/LogQuicPath777 h3 h3://h3u:LogH3Pass666@h3.corp.example/LogH3Path555 doq doq://doqu:LogDoqPass444@doq2.corp.example:853/LogDoqPath333"
+                }
+            ]
+        });
+        let full_logs =
+            extract_recent_logs_filtered(Some(&logs_val), LogFilterLevel::Warn, 10, true);
+        let full_payload = full_logs[0]["payload"].as_str().expect("full log payload");
+        for secret in [
+            "dotu",
+            "LogDotPass999",
+            "LogDotPath000",
+            "quicu",
+            "LogQuicPass888",
+            "LogQuicPath777",
+            "h3u",
+            "LogH3Pass666",
+            "LogH3Path555",
+            "doqu",
+            "LogDoqPass444",
+            "LogDoqPath333",
+        ] {
+            assert!(
+                !full_payload.contains(secret),
+                "full-metadata get_recent_logs leaked credential/path '{secret}': {full_payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_b4_redacts_mid_authority_and_scheme_whatwg_tabs_and_tabbed_proxy_uris() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "https://u\tser:8080\\InnerTabPass@doh.example/dns-query",
+                &["InnerTabPass"],
+            ),
+            (
+                "https://user\t:TabColonPass@doh.example/dns-query",
+                &["TabColonPass"],
+            ),
+            (
+                "https://user:8080\t\\TabBsPass@doh.example/dns-query",
+                &["TabBsPass"],
+            ),
+            (
+                "https://\t/u\tser:8080\\DoubleTabPass@doh.example/dns-query",
+                &["DoubleTabPass"],
+            ),
+            (
+                "https://user\r:CrColonPass@doh.example/dns-query",
+                &["CrColonPass"],
+            ),
+            (
+                "https://user\n:LfColonPass@doh.example/dns-query",
+                &["LfColonPass"],
+            ),
+            (
+                "https://dns.nextdns.io/a1b2c3\t/TabNextDnsDevice",
+                &["a1b2c3", "TabNextDnsDevice"],
+            ),
+            (
+                "https:\t//user:8080\\SchemeTabPass@doh.example/dns-query",
+                &["SchemeTabPass"],
+            ),
+            (
+                "http:\t//user:HttpSchemeTabPass@doh.example/dns-query",
+                &["HttpSchemeTabPass"],
+            ),
+            (
+                "ss://\tYWVzLTI1Ni1nY206U2VjcmV0U3NQYXNz==",
+                &["YWVzLTI1Ni1nY206U2VjcmV0U3NQYXNz"],
+            ),
+            (
+                "vmess://\teyJhZGQiOiIxLjIuMy40IiwiaWQiOiJWbWVzc1NlY3JldCJ9",
+                &["eyJhZGQiOiIxLjIuMy40IiwiaWQiOiJWbWVzc1NlY3JldCJ9"],
+            ),
+        ];
+
+        // 1. `-32601` unknown `method`
+        for (idx, (method, secrets)) in cases.iter().enumerate() {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 400 + idx,
+                    "method": method
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            for secret in *secrets {
+                assert!(
+                    !serialized.contains(secret),
+                    "-32601 leaked B4 secret '{secret}' for '{method}': {serialized}"
+                );
+            }
+        }
+
+        // 2. `mcp_tool_result` (both values and object keys)
+        let mut map = serde_json::Map::new();
+        for (idx, (sample, _)) in cases.iter().enumerate() {
+            map.insert(format!("val_{idx}"), json!(format!("note {sample} end")));
+            map.insert((*sample).to_string(), json!(format!("key_{idx}")));
+        }
+        let tool_res = mcp_tool_result(&Value::Object(map), false);
+        assert_eq!(tool_res["isError"], false);
+        let text = tool_res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("mcp_tool_result produced invalid JSON ({e}): {text}"));
+        assert!(parsed.is_object());
+        for (_, secrets) in cases {
+            for secret in *secrets {
+                assert!(
+                    !text.contains(secret),
+                    "mcp_tool_result leaked B4 secret '{secret}': {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_b5_active_profile_load_errors_are_sanitized_across_all_offline_tools() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!(
+            "rc-mcp-b5-active-err-{}-{nanos}",
+            std::process::id()
+        ));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mgr = proxy_core::profile::ProfileManager::open_or_init(&state_dir)
+            .expect("initialize profile manager");
+        let active_path = mgr.active_profile_path();
+
+        let invalid_cases: &[(&str, &str, &[&str])] = &[
+            (
+                "default-ns-delim-doh",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 'https://u:p)BootParenPass@doh.example/dns-query'
+  nameserver:
+    - 1.1.1.1:53
+rules:
+  - MATCH,DIRECT
+"#,
+                &["BootParenPass", "doh.example"],
+            ),
+            (
+                "default-ns-nextdns-space-tail",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - "https://dns.nextdns.io/ActiveNextDnsId/Alice's MacBook (Work)"
+  nameserver:
+    - 1.1.1.1:53
+rules:
+  - MATCH,DIRECT
+"#,
+                &["ActiveNextDnsId", "Alice", "MacBook", "Work"],
+            ),
+            (
+                "default-ns-tls-creds",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  default-nameserver:
+    - 'tls://dotuser:BootDotPass@dot.corp.example:853/BootDotPath'
+  nameserver:
+    - 1.1.1.1:53
+rules:
+  - MATCH,DIRECT
+"#,
+                &["dotuser", "BootDotPass", "BootDotPath", "dot.corp.example"],
+            ),
+            (
+                "default-ns-mid-tab",
+                "mixed-port: 7890\ndns:\n  enable: true\n  default-nameserver:\n    - \"https://u\\tser:8080\\\\BootInnerTabPass@doh.example/dns-query\"\n  nameserver:\n    - 1.1.1.1:53\nrules:\n  - MATCH,DIRECT\n",
+                &["BootInnerTabPass", "doh.example"],
+            ),
+            (
+                "nameserver-delim-doh",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 'https://doh.corp.example:99999/tok)ActiveParenErrPass'
+rules:
+  - MATCH,DIRECT
+"#,
+                &["ActiveParenErrPass", "doh.corp.example"],
+            ),
+            (
+                "nameserver-space-doh",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 'https://doh.corp.example:99999/tok ActiveSpaceErrPass'
+rules:
+  - MATCH,DIRECT
+"#,
+                &["ActiveSpaceErrPass", "doh.corp.example"],
+            ),
+            (
+                "nameserver-tls-bad-port",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 'tls://dotuser:ActiveDotErrPass@dot.corp.example:99999/ActiveDotErrPath'
+rules:
+  - MATCH,DIRECT
+"#,
+                &[
+                    "dotuser",
+                    "ActiveDotErrPass",
+                    "ActiveDotErrPath",
+                    "dot.corp.example",
+                ],
+            ),
+            (
+                "nameserver-quic-creds",
+                r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 'quic://quicuser:ActiveQuicErrPass@doq.corp.example:853/ActiveQuicErrPath'
+rules:
+  - MATCH,DIRECT
+"#,
+                &[
+                    "quicuser",
+                    "ActiveQuicErrPass",
+                    "ActiveQuicErrPath",
+                    "doq.corp.example",
+                ],
+            ),
+            (
+                "nameserver-mid-tab-bad-port",
+                "mixed-port: 7890\ndns:\n  enable: true\n  nameserver:\n    - \"https://u\\tser:ActiveTabErrPass@doh.example:99999/dns-query\"\nrules:\n  - MATCH,DIRECT\n",
+                &["ActiveTabErrPass", "doh.example"],
+            ),
+            (
+                "raw-yaml-syntax-secret",
+                "{ActiveRawYamlSecret999: [unclosed_yaml_secret_line\n",
+                &["ActiveRawYamlSecret999", "unclosed_yaml_secret_line"],
+            ),
+        ];
+
+        let mut results = Vec::new();
+        for (label, yaml, secrets) in invalid_cases {
+            std::fs::write(&active_path, yaml).unwrap();
+            for include_network_metadata in [false, true] {
+                let opts = McpServerOptions {
+                    config_path: None,
+                    controller: Some("127.0.0.1:1".to_string()),
+                    secret: None,
+                    allow_mutations: false,
+                    include_network_metadata,
+                };
+                for (tool, args) in [
+                    ("audit_config_security", json!({})),
+                    ("get_proxy_status", json!({})),
+                    ("explain_route", json!({ "target": "example.com:443" })),
+                ] {
+                    let res =
+                        execute_tool_call_with_state_dir(tool, &args, &opts, &state_dir).await;
+                    results.push((*label, tool, include_network_metadata, *secrets, res));
+                }
+            }
+        }
+
+        // Also verify `ProfileManager::open_or_init` failures (e.g. non-directory state path)
+        // never leak filesystem path segments or raw OS errors into MCP tool output.
+        let bad_state_file = tmp_root.join("SecretStateDirPath999");
+        std::fs::write(&bad_state_file, "not-a-directory").unwrap();
+        let bad_state_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        for (tool, args) in [
+            ("audit_config_security", json!({})),
+            ("get_proxy_status", json!({})),
+            ("explain_route", json!({ "target": "example.com:443" })),
+        ] {
+            let res =
+                execute_tool_call_with_state_dir(tool, &args, &bad_state_opts, &bad_state_file)
+                    .await;
+            results.push((
+                "bad-state-dir-init",
+                tool,
+                false,
+                &["SecretStateDirPath999"],
+                res,
+            ));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        for (label, tool, include_network_metadata, secrets, res) in results {
+            assert_eq!(
+                res["isError"], true,
+                "{label}/{tool} (include_network_metadata={include_network_metadata}) must return isError=true: {res}"
+            );
+            let text = res["content"][0]["text"]
+                .as_str()
+                .expect("content[0].text string");
+            let parsed: Value = serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("{label}/{tool} returned invalid JSON ({e}): {text}"));
+            let err_msg = parsed["error"].as_str().unwrap_or("");
+            assert!(
+                err_msg.contains("active profile") && err_msg.contains("redacted"),
+                "{label}/{tool} must emit sanitized active-profile load error, got: {err_msg}"
+            );
+            for secret in secrets {
+                assert!(
+                    !text.contains(secret),
+                    "{label}/{tool} (include_network_metadata={include_network_metadata}) leaked '{secret}': {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_b5_audit_config_security_redacts_non_scheme_dns_fragments_and_bom() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root =
+            std::env::temp_dir().join(format!("rc-mcp-b5-dns-frag-{}-{nanos}", std::process::id()));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let draft_yaml_path = tmp_root.join("draft_frag.yaml");
+        let yaml = format!(
+            concat!(
+                "mixed-port: 7890\n",
+                "dns:\n",
+                "  enable: true\n",
+                "  default-nameserver:\n",
+                "    - 223.5.5.5\n",
+                "  nameserver:\n",
+                "    - \"1.1.1.1:53#sni=SecretUdpSniHost.corp\"\n",
+                "    - \"1.1.1.1:53#UdpFragSecretToken99\"\n",
+                "    - \"system#SystemFragSecret88\"\n",
+                "    - \"1.1.1.1:53 # Alice's MacBook (Work) UdpSpaceSecret\"\n",
+                "    - \"{}1.1.1.1:53#BomUdpSecret\"\n",
+                "    - tls://1.1.1.1:853\n",
+                "rules:\n",
+                "  - MATCH,DIRECT\n",
+            ),
+            '\u{feff}'
+        );
+        std::fs::write(&draft_yaml_path, yaml).unwrap();
+
+        let mut outputs = Vec::new();
+        for include_network_metadata in [false, true] {
+            let opts = McpServerOptions {
+                config_path: None,
+                controller: Some("127.0.0.1:1".to_string()),
+                secret: None,
+                allow_mutations: false,
+                include_network_metadata,
+            };
+            let res = execute_tool_call_with_state_dir(
+                "audit_config_security",
+                &json!({ "config_path": draft_yaml_path.to_string_lossy() }),
+                &opts,
+                &state_dir,
+            )
+            .await;
+            outputs.push((include_network_metadata, res));
+        }
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        for (include_network_metadata, res) in outputs {
+            assert_eq!(
+                res["isError"], false,
+                "valid non-scheme DNS #fragment config must succeed (include_network_metadata={include_network_metadata}): {res}"
+            );
+            let text = res["content"][0]["text"]
+                .as_str()
+                .expect("content[0].text string");
+            let parsed: Value = serde_json::from_str(text).unwrap_or_else(|e| {
+                panic!("audit_config_security returned invalid JSON ({e}): {text}")
+            });
+            assert_eq!(parsed["diff"]["dns_changed"], true);
+            let dns_changes = parsed["diff"]["dns_changes"]
+                .as_array()
+                .expect("diff.dns_changes array")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                dns_changes.contains("dns.nameserver:"),
+                "expected dns.nameserver diff entry: {dns_changes}"
+            );
+            assert!(
+                dns_changes.contains("tls://1.1.1.1:853")
+                    || dns_changes.contains("tls://***REDACTED***"),
+                "clean tls://1.1.1.1:853 should remain cleanly represented: {dns_changes}"
+            );
+
+            for forbidden in [
+                "SecretUdpSniHost.corp",
+                "SecretUdpSniHost",
+                "UdpFragSecretToken99",
+                "SystemFragSecret88",
+                "Alice",
+                "MacBook",
+                "Work",
+                "UdpSpaceSecret",
+                "BomUdpSecret",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "audit_config_security leaked non-scheme DNS fragment '{forbidden}' (include_network_metadata={include_network_metadata}): {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_m1_unknown_method_and_tool_result_redact_quoted_authorization_tokens() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"Authorization: Bearer "QuotedBearerSecret789""#,
+                "QuotedBearerSecret789",
+            ),
+            (
+                r#"Authorization: Basic "QuotedBasicSecret456""#,
+                "QuotedBasicSecret456",
+            ),
+            (
+                "Authorization: Bearer 'SingleQuotedBearer123'",
+                "SingleQuotedBearer123",
+            ),
+            (
+                "Authorization: Basic `TickQuotedBasic321`",
+                "TickQuotedBasic321",
+            ),
+        ];
+
+        for (idx, (method, secret)) in cases.iter().enumerate() {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 600 + idx,
+                    "method": method
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            let parsed_back: Value = serde_json::from_str(&serialized).unwrap();
+            let msg = parsed_back["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("***REDACTED***"),
+                "expected ***REDACTED*** in -32601 message for '{method}': {msg}"
+            );
+            assert!(
+                !serialized.contains(secret),
+                "-32601 leaked quoted auth secret '{secret}': {serialized}"
+            );
+        }
+
+        let tool_res = mcp_tool_result(
+            &json!({
+                "bearer_dq": r#"Authorization: Bearer "QuotedBearerSecret789""#,
+                "basic_dq": r#"Authorization: Basic "QuotedBasicSecret456""#,
+                "bearer_sq": "Authorization: Bearer 'SingleQuotedBearer123'",
+                "basic_bt": "Authorization: Basic `TickQuotedBasic321`"
+            }),
+            false,
+        );
+        let text = tool_res["content"][0]["text"].as_str().unwrap();
+        let _: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("mcp_tool_result returned invalid JSON ({e}): {text}"));
+        for (_, secret) in cases {
+            assert!(
+                !text.contains(secret),
+                "mcp_tool_result leaked quoted auth secret '{secret}': {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_b6_backslash_and_tabbed_scheme_and_local_scrubbers_scale_linearly() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let patterns = [
+            "https:\\\\a\t",
+            "http:\\\\a\t",
+            "https:\t\\\\a\t",
+            "https:\t\\\\[a]\t",
+        ];
+
+        for (idx, pattern) in patterns.iter().enumerate() {
+            let repeats = (32 * 1024) / pattern.len();
+            let payload = pattern.repeat(repeats);
+
+            let t0 = std::time::Instant::now();
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 700 + idx,
+                    "method": payload
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            let method_elapsed = t0.elapsed();
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            let _: Value = serde_json::from_str(&serialized).unwrap_or_else(|e| {
+                panic!("B6 -32601 emitted invalid JSON ({e}) for pattern {pattern:?}")
+            });
+            assert!(
+                method_elapsed < Duration::from_secs(3),
+                "B6 -32601 scaling regressed for {pattern:?}: took {method_elapsed:?}"
+            );
+
+            let t1 = std::time::Instant::now();
+            let tool_res = mcp_tool_result(&json!({ "status_note": payload }), false);
+            let tool_elapsed = t1.elapsed();
+            let text = tool_res["content"][0]["text"].as_str().unwrap();
+            let _: Value = serde_json::from_str(text).unwrap_or_else(|e| {
+                panic!("B6 mcp_tool_result emitted invalid JSON ({e}) for pattern {pattern:?}")
+            });
+            assert!(
+                tool_elapsed < Duration::from_secs(3),
+                "B6 mcp_tool_result scaling regressed for {pattern:?}: took {tool_elapsed:?}"
+            );
+        }
+
+        // Verify `scrub_quoted_audit_endpoints` and `redact_network_tokens_in_log` also stay
+        // strictly linear on large repeated inputs.
+        let repeated_audit = "server '198.51.100.9:443' ".repeat(3000);
+        let t_audit = std::time::Instant::now();
+        let scrubbed_audit = scrub_quoted_audit_endpoints(&repeated_audit);
+        let audit_elapsed = t_audit.elapsed();
+        assert!(
+            !scrubbed_audit.contains("198.51.100.9"),
+            "scrub_quoted_audit_endpoints leaked IP on repeated input"
+        );
+        assert!(
+            scrubbed_audit.contains("server '<redacted>'"),
+            "scrub_quoted_audit_endpoints did not emit <redacted>"
+        );
+        assert!(
+            audit_elapsed < Duration::from_secs(2),
+            "scrub_quoted_audit_endpoints scaling regressed: took {audit_elapsed:?}"
+        );
+
+        let repeated_logs =
+            r#"{"url":"https://secret-edge.corp:8443/v1"} 10.20.30.40. err:tls://dot.corp:853/p "#
+                .repeat(1000);
+        let t_logs = std::time::Instant::now();
+        let scrubbed_logs = redact_network_tokens_in_log(&repeated_logs);
+        let logs_elapsed = t_logs.elapsed();
+        for forbidden in ["secret-edge.corp", "10.20.30.40", "dot.corp", "8443", "853"] {
+            assert!(
+                !scrubbed_logs.contains(forbidden),
+                "redact_network_tokens_in_log leaked '{forbidden}' on large input"
+            );
+        }
+        assert!(
+            logs_elapsed < Duration::from_secs(2),
+            "redact_network_tokens_in_log scaling regressed: took {logs_elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_b7_redacts_quoted_and_json_escaped_kv_secrets_across_all_surfaces() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                r#"level=warn msg="auth fail" password="QuotedKvPassword999""#,
+                r#"password="***REDACTED***""#,
+                &["QuotedKvPassword999"],
+            ),
+            (
+                "level=warn token='SingleKvToken888'",
+                "token='***REDACTED***'",
+                &["SingleKvToken888"],
+            ),
+            (
+                "level=warn api_key=`BacktickKvApiKey777`",
+                "api_key=`***REDACTED***`",
+                &["BacktickKvApiKey777"],
+            ),
+            (
+                r#"{"msg":"fail secret=\"JsonEscapedKvSecret666\""}"#,
+                r#"secret=\"***REDACTED***\""#,
+                &["JsonEscapedKvSecret666"],
+            ),
+            (
+                r#"{"msg":"fail secret=\"part1\\\"part2\""}"#,
+                r#"secret=\"***REDACTED***\""#,
+                &["part1", "part2"],
+            ),
+            (
+                r#"private_key="QuotedPrivKey555" pbk="QuotedPbk444""#,
+                r#"private_key="***REDACTED***" pbk="***REDACTED***""#,
+                &["QuotedPrivKey555", "QuotedPbk444"],
+            ),
+        ];
+
+        // 1. `-32601` unknown `method`
+        for (idx, (sample, expected_frag, secrets)) in cases.iter().enumerate() {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 750 + idx,
+                    "method": sample
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            let parsed_back: Value = serde_json::from_str(&serialized).unwrap();
+            let msg = parsed_back["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains(expected_frag),
+                "-32601 did not redact inside quotes as '{expected_frag}': {msg}"
+            );
+            for secret in *secrets {
+                assert!(
+                    !serialized.contains(secret),
+                    "-32601 leaked B7 secret '{secret}': {serialized}"
+                );
+            }
+        }
+
+        // 2. `mcp_tool_result` (values & object keys)
+        let mut obj = serde_json::Map::new();
+        for (idx, (sample, _, _)) in cases.iter().enumerate() {
+            obj.insert(format!("field_{idx}"), json!(sample));
+            obj.insert((*sample).to_string(), json!(idx));
+        }
+        let tool_res = mcp_tool_result(&Value::Object(obj), false);
+        let text = tool_res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("B7 mcp_tool_result invalid JSON ({e}): {text}"));
+        assert!(parsed.is_object());
+        for (_, _, secrets) in cases {
+            for secret in *secrets {
+                assert!(
+                    !text.contains(secret),
+                    "B7 mcp_tool_result leaked '{secret}': {text}"
+                );
+            }
+        }
+
+        // 3. `extract_recent_logs_filtered` in BOTH privacy modes
+        let logs_val = json!({
+            "logs": [
+                {
+                    "timestamp_ms": 1,
+                    "type": "warn",
+                    "payload": r#"auth failed password="QuotedKvPassword999" token='SingleKvToken888' api_key=`BacktickKvApiKey777` secret=\"JsonEscapedKvSecret666\" secret=\"part1\\\"part2\" private_key="QuotedPrivKey555" pbk="QuotedPbk444""#
+                }
+            ]
+        });
+        for include_network_metadata in [false, true] {
+            let logs = extract_recent_logs_filtered(
+                Some(&logs_val),
+                LogFilterLevel::Warn,
+                10,
+                include_network_metadata,
+            );
+            let payload = logs[0]["payload"].as_str().unwrap();
+            for secret in [
+                "QuotedKvPassword999",
+                "SingleKvToken888",
+                "BacktickKvApiKey777",
+                "JsonEscapedKvSecret666",
+                "part1",
+                "part2",
+                "QuotedPrivKey555",
+                "QuotedPbk444",
+            ] {
+                assert!(
+                    !payload.contains(secret),
+                    "B7 get_recent_logs (include_network_metadata={include_network_metadata}) leaked '{secret}': {payload}"
+                );
+            }
+        }
+
+        // 4. Unknown MCP tool name and `get_recent_logs` invalid `level` error
+        let unknown_tool_resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 760,
+                "method": "tools/call",
+                "params": {
+                    "name": r#"tool password="UnknownToolKvPass99""#,
+                    "arguments": {}
+                }
+            }),
+            &ro_opts,
+        )
+        .await
+        .expect("unknown tool returns JSON-RPC response");
+        assert_eq!(unknown_tool_resp["result"]["isError"], true);
+        let unknown_text = unknown_tool_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let _: Value = serde_json::from_str(unknown_text).unwrap();
+        assert!(
+            !unknown_text.contains("UnknownToolKvPass99"),
+            "B7 unknown tool leaked secret: {unknown_text}"
+        );
+
+        let bad_level_resp = handle_mcp_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 761,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_recent_logs",
+                    "arguments": { "level": r#"password="LvlErrKvSecret99""# }
+                }
+            }),
+            &ro_opts,
+        )
+        .await
+        .expect("invalid level returns JSON-RPC response");
+        assert_eq!(bad_level_resp["result"]["isError"], true);
+        let bad_level_text = bad_level_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let _: Value = serde_json::from_str(bad_level_text).unwrap();
+        assert!(
+            !bad_level_text
+                .to_ascii_lowercase()
+                .contains("lvlerrkvsecret99"),
+            "B7 invalid log level leaked secret: {bad_level_text}"
+        );
+
+        // 5. `audit_config_security` rule-linter (`RULE-SHADOWED-DOMAIN` & `RULE-DEAD-AFTER-MATCH`)
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root =
+            std::env::temp_dir().join(format!("rc-mcp-b7-rules-{}-{nanos}", std::process::id()));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let candidate_yaml_path = tmp_root.join("candidate_b7.yaml");
+        std::fs::write(
+            &candidate_yaml_path,
+            r#"
+mixed-port: 7890
+dns:
+  enable: true
+  nameserver:
+    - 1.1.1.1:53
+rules:
+  - DOMAIN-KEYWORD,corp,DIRECT
+  - 'DOMAIN-KEYWORD,corp password="RuleKvPass99" token=''RuleSingleTok88'',DIRECT'
+  - MATCH,DIRECT
+  - 'DOMAIN-KEYWORD,dead secret="RuleDeadKvSec99" pbk="RuleDeadPbk77",DIRECT'
+"#,
+        )
+        .unwrap();
+
+        let audit_res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": candidate_yaml_path.to_string_lossy() }),
+            &ro_opts,
+            &state_dir,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        assert_eq!(audit_res["isError"], false, "unexpected error: {audit_res}");
+        let audit_text = audit_res["content"][0]["text"].as_str().unwrap();
+        let audit_parsed: Value = serde_json::from_str(audit_text).unwrap();
+        let findings = audit_parsed["audit"]["findings"].as_array().unwrap();
+        assert!(
+            findings.iter().any(|f| f["code"] == "RULE-SHADOWED-DOMAIN"),
+            "expected RULE-SHADOWED-DOMAIN finding: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["code"] == "RULE-DEAD-AFTER-MATCH"),
+            "expected RULE-DEAD-AFTER-MATCH finding: {findings:?}"
+        );
+        for secret in [
+            "RuleKvPass99",
+            "RuleSingleTok88",
+            "RuleDeadKvSec99",
+            "RuleDeadPbk77",
+        ] {
+            assert!(
+                !audit_text
+                    .to_ascii_lowercase()
+                    .contains(&secret.to_ascii_lowercase()),
+                "B7 audit_config_security rule linter leaked '{secret}': {audit_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_b8_redacts_whatwg_whitespace_and_ws_wss_schemes_across_all_surfaces() {
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "https://dns.nextdns.io/\ta1b2c3/RootSlashTabSecret",
+                &["a1b2c3", "RootSlashTabSecret"],
+            ),
+            (
+                "https://dns.nextdns.io/\ra1b2c3/RootSlashCrSecret",
+                &["a1b2c3", "RootSlashCrSecret"],
+            ),
+            (
+                "tls://dot.corp.example:853/\tDotRootTabSecret",
+                &["DotRootTabSecret"],
+            ),
+            (
+                "https://dns.nextdns.io/a1b2c3/\nLfAfterSlashSecret",
+                &["a1b2c3", "LfAfterSlashSecret"],
+            ),
+            (
+                "https://dns.nextdns.io/a1b2c3/\tdev=EqAfterSlashSecret",
+                &["a1b2c3", "EqAfterSlashSecret"],
+            ),
+            (
+                "https://doh\t.example/a1b2c3/HostMidTabSecret",
+                &["a1b2c3", "HostMidTabSecret"],
+            ),
+            (
+                "tls://dot\t.corp.example:853/DotHostTabSecret",
+                &["DotHostTabSecret"],
+            ),
+            (
+                "https://dns.nextdns.io/a1\tb2c3/MidSegTabSecret",
+                &["b2c3", "MidSegTabSecret"],
+            ),
+            (
+                "https://doh.example/dns-query?token=abc\tQueryMidTabSecret",
+                &["QueryMidTabSecret"],
+            ),
+            (
+                "ws://wsuser:WsPlainPass99@ws.corp.example:80/WsPlainPath88",
+                &["wsuser", "WsPlainPass99", "WsPlainPath88"],
+            ),
+            (
+                "wss://wssuser:WssPlainPass99@ws.corp.example:443/WssPlainPath88",
+                &["wssuser", "WssPlainPass99", "WssPlainPath88"],
+            ),
+            (
+                "ws\ts://wsuser:WssTabPass99@ws.corp.example:443/WssTabPath88",
+                &["wsuser", "WssTabPass99", "WssTabPath88"],
+            ),
+        ];
+
+        // 1. `-32601` unknown `method`
+        for (idx, (sample, secrets)) in cases.iter().enumerate() {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 800 + idx,
+                    "method": sample
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            let _: Value = serde_json::from_str(&serialized).unwrap();
+            for secret in *secrets {
+                assert!(
+                    !serialized.contains(secret),
+                    "B8 -32601 leaked '{secret}' for {sample:?}: {serialized}"
+                );
+            }
+        }
+
+        // 2. `mcp_tool_result` (values & keys)
+        let mut map = serde_json::Map::new();
+        for (idx, (sample, _)) in cases.iter().enumerate() {
+            map.insert(format!("v_{idx}"), json!(format!("dial {sample} done")));
+            map.insert((*sample).to_string(), json!(idx));
+        }
+        let tool_res = mcp_tool_result(&Value::Object(map), false);
+        let text = tool_res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("B8 mcp_tool_result invalid JSON ({e}): {text}"));
+        assert!(parsed.is_object());
+        for (_, secrets) in cases {
+            for secret in *secrets {
+                assert!(
+                    !text.contains(secret),
+                    "B8 mcp_tool_result leaked '{secret}': {text}"
+                );
+            }
+        }
+
+        // 3. `extract_recent_logs_filtered` in BOTH default redacted and full metadata modes
+        let log_entries: Vec<Value> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (sample, _))| {
+                json!({
+                    "timestamp_ms": i + 1,
+                    "type": "warn",
+                    "payload": format!("upstream {sample} failed")
+                })
+            })
+            .collect();
+        let logs_val = json!({ "logs": log_entries });
+        for include_network_metadata in [false, true] {
+            let logs = extract_recent_logs_filtered(
+                Some(&logs_val),
+                LogFilterLevel::Warn,
+                30,
+                include_network_metadata,
+            );
+            let logs_json = serde_json::to_string(&logs).unwrap();
+            for (_, secrets) in cases {
+                for secret in *secrets {
+                    assert!(
+                        !logs_json.contains(secret),
+                        "B8 get_recent_logs (include_network_metadata={include_network_metadata}) leaked '{secret}': {logs_json}"
+                    );
+                }
+            }
+            if !include_network_metadata {
+                assert!(
+                    !logs_json.contains("ws.corp.example"),
+                    "B8 default redacted logs leaked ws/wss host: {logs_json}"
+                );
+            }
+        }
+
+        // 4. Offline `explain_route` with root-slash `\t` target URL + `audit_config_security`
+        //    rule-linter with WHATWG tab and ws/wss rules.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root =
+            std::env::temp_dir().join(format!("rc-mcp-b8-e2e-{}-{nanos}", std::process::id()));
+        let state_dir = tmp_root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cfg_path = tmp_root.join("b8.yaml");
+        std::fs::write(
+            &cfg_path,
+            concat!(
+                "mixed-port: 7890\n",
+                "dns:\n",
+                "  enable: true\n",
+                "  nameserver:\n",
+                "    - 1.1.1.1:53\n",
+                "rules:\n",
+                "  - DOMAIN-KEYWORD,corp,DIRECT\n",
+                "  - \"DOMAIN-KEYWORD,https://dns.nextdns.io/\\ta1b2c3/RuleRootTabSec corp,DIRECT\"\n",
+                "  - \"DOMAIN-KEYWORD,https://doh\\t.example/a1b2c3/RuleHostTabSec corp,DIRECT\"\n",
+                "  - \"DOMAIN-KEYWORD,ws://wsuser:RuleWsPass99@ws.corp.example:80/RuleWsPath88,DIRECT\"\n",
+                "  - MATCH,DIRECT\n",
+                "  - \"DOMAIN-KEYWORD,wss://wssuser:DeadWssPass99@ws.corp.example:443/DeadWssPath88,DIRECT\"\n",
+            ),
+        )
+        .unwrap();
+
+        let explain_opts = McpServerOptions {
+            config_path: Some(cfg_path.clone()),
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let explain_res = execute_tool_call_with_state_dir(
+            "explain_route",
+            &json!({ "target": "https://dns.nextdns.io/\ta1b2c3/TgtTabSecret99" }),
+            &explain_opts,
+            &state_dir,
+        )
+        .await;
+        assert_eq!(
+            explain_res["isError"], false,
+            "unexpected explain_route error: {explain_res}"
+        );
+        let explain_text = explain_res["content"][0]["text"].as_str().unwrap();
+        let explain_parsed: Value = serde_json::from_str(explain_text).unwrap();
+        assert_eq!(explain_parsed["normalized_target"], "dns.nextdns.io:443");
+        for secret in ["a1b2c3", "TgtTabSecret99"] {
+            assert!(
+                !explain_text.contains(secret),
+                "B8 explain_route leaked '{secret}': {explain_text}"
+            );
+        }
+
+        let audit_res = execute_tool_call_with_state_dir(
+            "audit_config_security",
+            &json!({ "config_path": cfg_path.to_string_lossy() }),
+            &ro_opts,
+            &state_dir,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp_root);
+
+        assert_eq!(
+            audit_res["isError"], false,
+            "unexpected audit error: {audit_res}"
+        );
+        let audit_text = audit_res["content"][0]["text"].as_str().unwrap();
+        let audit_parsed: Value = serde_json::from_str(audit_text).unwrap();
+        let findings = audit_parsed["audit"]["findings"].as_array().unwrap();
+        assert!(
+            findings.iter().any(|f| f["code"] == "RULE-SHADOWED-DOMAIN"),
+            "expected RULE-SHADOWED-DOMAIN finding: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["code"] == "RULE-DEAD-AFTER-MATCH"),
+            "expected RULE-DEAD-AFTER-MATCH finding: {findings:?}"
+        );
+        let audit_lower = audit_text.to_ascii_lowercase();
+        for secret in [
+            "RuleRootTabSec",
+            "RuleHostTabSec",
+            "RuleWsPass99",
+            "RuleWsPath88",
+            "DeadWssPass99",
+            "DeadWssPath88",
+        ] {
+            assert!(
+                !audit_text.contains(secret) && !audit_lower.contains(&secret.to_ascii_lowercase()),
+                "B8 audit_config_security rule linter leaked '{secret}': {audit_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_m2_redacts_log_metadata_punctuation_and_json_authorization_headers() {
+        // Part 1: Default redacted mode (`include_network_metadata: false`) log metadata scrubbing
+        // for JSON-wrapped URLs, trailing-dot IPs & host:ports, prefixed/braced/parenthesized
+        // endpoints, bracketed IPv6 SocketAddrs, and UTF-8 surrounding prose.
+        let logs_val = json!({
+            "logs": [
+                {
+                    "timestamp_ms": 1,
+                    "type": "warn",
+                    "payload": r#"{"url":"https://secret-edge.corp:8443/v1"} connect 10.20.30.40. dial secret-node.corp:8443."#
+                },
+                {
+                    "timestamp_ms": 2,
+                    "type": "warn",
+                    "payload": "err:tls://dot.corp.example:853/path dial(tls://dot2.corp.example:853/p) {tls://dot3.corp.example:853/p}"
+                },
+                {
+                    "timestamp_ms": 3,
+                    "type": "warn",
+                    "payload": r#"[2001:db8::1]:443 [::1]:8080 [2001:db8::2]:443. {[::1]:9090} {"ip":"10.20.30.41"} {"host":"node2.corp:8443"} dial(10.20.30.42:443) err:10.20.30.43 10.20.30.44:443: {\"ip\":\"10.20.30.45\"} 连接失败 err:tls://utf8-dot.corp:853/p"#
+                },
+                {
+                    "timestamp_ms": 4,
+                    "type": "warn",
+                    "payload": r#"version v0.5.15. done. password=***REDACTED*** {"status":"ok","code":200,"version":"v0.5.15."} elapsed=12.5ms 2026-11-24T09:57:16Z 1.2.3. 完成."#
+                }
+            ]
+        });
+
+        let redacted_logs =
+            extract_recent_logs_filtered(Some(&logs_val), LogFilterLevel::Warn, 10, false);
+        let arr = redacted_logs.as_array().expect("logs array");
+        assert_eq!(arr.len(), 4);
+
+        // Entries are returned newest-first (`timestamp_ms` 4, 3, 2, 1).
+        let benign_payload = arr[0]["payload"].as_str().unwrap();
+        assert_eq!(
+            benign_payload,
+            r#"version v0.5.15. done. password=***REDACTED*** {"status":"ok","code":200,"version":"v0.5.15."} elapsed=12.5ms 2026-11-24T09:57:16Z 1.2.3. 完成."#,
+            "benign prose/version/JSON status tokens must not be falsely redacted"
+        );
+
+        let all_redacted = arr[1..]
+            .iter()
+            .map(|e| e["payload"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_redacted.contains("[redacted-endpoint]"),
+            "expected [redacted-endpoint] markers in redacted logs: {all_redacted}"
+        );
+        assert!(
+            all_redacted.contains("连接失败"),
+            "UTF-8 prose around endpoints must be preserved cleanly: {all_redacted}"
+        );
+        for forbidden in [
+            "secret-edge.corp",
+            "10.20.30.40",
+            "10.20.30.41",
+            "10.20.30.42",
+            "10.20.30.43",
+            "10.20.30.44",
+            "10.20.30.45",
+            "secret-node.corp",
+            "node2.corp",
+            "8443",
+            "dot.corp.example",
+            "dot2.corp.example",
+            "dot3.corp.example",
+            "utf8-dot.corp",
+            "853",
+            "2001:db8::1",
+            "2001:db8::2",
+            "::1",
+            "8080",
+            "9090",
+        ] {
+            assert!(
+                !all_redacted.contains(forbidden),
+                "M2 default-mode log redaction leaked '{forbidden}': {all_redacted}"
+            );
+        }
+
+        // Part 2: JSON-serialized `"Authorization": "Bearer ..."` / `"Basic ..."` and
+        // double-escaped `Authorization: Bearer \"part1\\\"EscapedInnerBearer777\"`.
+        let ro_opts = McpServerOptions {
+            config_path: None,
+            controller: Some("127.0.0.1:1".to_string()),
+            secret: None,
+            allow_mutations: false,
+            include_network_metadata: false,
+        };
+        let auth_cases: &[(&str, &[&str])] = &[
+            (
+                r#"{"Authorization": "Bearer JsonObjBearerSecret999"}"#,
+                &["JsonObjBearerSecret999"],
+            ),
+            (
+                r#"{"Authorization": "Basic JsonObjBasicSecret888"}"#,
+                &["JsonObjBasicSecret888"],
+            ),
+            (
+                r#"Authorization: Bearer \"part1\\\"EscapedInnerBearer777\""#,
+                &["part1", "EscapedInnerBearer777"],
+            ),
+        ];
+
+        for (idx, (sample, secrets)) in auth_cases.iter().enumerate() {
+            let resp = handle_mcp_request(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 850 + idx,
+                    "method": sample
+                }),
+                &ro_opts,
+            )
+            .await
+            .expect("unknown method returns JSON-RPC error");
+            assert_eq!(resp["error"]["code"], -32601);
+            let serialized = serde_json::to_string(&resp).unwrap();
+            let parsed_back: Value = serde_json::from_str(&serialized).unwrap();
+            let msg = parsed_back["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("***REDACTED***"),
+                "M2 -32601 did not redact Authorization header for {sample:?}: {msg}"
+            );
+            for secret in *secrets {
+                assert!(
+                    !serialized.contains(secret),
+                    "M2 -32601 leaked '{secret}' for {sample:?}: {serialized}"
+                );
+            }
+        }
+
+        let tool_res = mcp_tool_result(
+            &json!({
+                "json_bearer": r#"{"Authorization": "Bearer JsonObjBearerSecret999"}"#,
+                "json_basic": r#"{"Authorization": "Basic JsonObjBasicSecret888"}"#,
+                "escaped_inner": r#"Authorization: Bearer \"part1\\\"EscapedInnerBearer777\""#,
+            }),
+            false,
+        );
+        let tool_text = tool_res["content"][0]["text"].as_str().unwrap();
+        let _: Value = serde_json::from_str(tool_text)
+            .unwrap_or_else(|e| panic!("M2 mcp_tool_result invalid JSON ({e}): {tool_text}"));
+        for (_, secrets) in auth_cases {
+            for secret in *secrets {
+                assert!(
+                    !tool_text.contains(secret),
+                    "M2 mcp_tool_result leaked '{secret}': {tool_text}"
+                );
+            }
+        }
+
+        let auth_logs_val = json!({
+            "logs": [
+                {
+                    "timestamp_ms": 1,
+                    "type": "warn",
+                    "payload": r#"hdr {"Authorization": "Bearer JsonObjBearerSecret999"} {"Authorization": "Basic JsonObjBasicSecret888"} Authorization: Bearer \"part1\\\"EscapedInnerBearer777\""#
+                }
+            ]
+        });
+        for include_network_metadata in [false, true] {
+            let auth_logs = extract_recent_logs_filtered(
+                Some(&auth_logs_val),
+                LogFilterLevel::Warn,
+                10,
+                include_network_metadata,
+            );
+            let payload = auth_logs[0]["payload"].as_str().unwrap();
+            for (_, secrets) in auth_cases {
+                for secret in *secrets {
+                    assert!(
+                        !payload.contains(secret),
+                        "M2 get_recent_logs (include_network_metadata={include_network_metadata}) leaked '{secret}': {payload}"
+                    );
+                }
+            }
+        }
     }
 }

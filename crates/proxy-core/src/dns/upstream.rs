@@ -415,8 +415,9 @@ impl BootstrapDnsServer {
                     });
                 }
                 _ => {
+                    let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
                     return Err(ProxyError::Config(format!(
-                        "default-nameserver '{raw}' must use a literal IP address, not a hostname"
+                        "default-nameserver '{safe_raw}' must use a literal IP address, not a hostname"
                     )));
                 }
             }
@@ -425,16 +426,18 @@ impl BootstrapDnsServer {
         let s = trimmed.split('#').next().unwrap_or("").trim();
         if let Some(rest) = strip_prefix_ignore_ascii_case(s, "tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
                 ProxyError::Config(format!(
-                    "default-nameserver '{raw}' must use a literal IP address, not a hostname"
+                    "default-nameserver '{safe_raw}' must use a literal IP address, not a hostname"
                 ))
             })?;
             return Ok(Self::Tcp(sa));
         }
         let rest = strip_prefix_ignore_ascii_case(s, "udp://").unwrap_or(s);
         let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
+            let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
             ProxyError::Config(format!(
-                "default-nameserver '{raw}' must use a literal IP address, not a hostname"
+                "default-nameserver '{safe_raw}' must use a literal IP address, not a hostname"
             ))
         })?;
         Ok(Self::Udp(sa))
@@ -528,11 +531,14 @@ impl DnsUpstream {
 
         if let Some(https_rest) = strip_prefix_ignore_ascii_case(main_part, "https://") {
             let normalized_url = format!("https://{https_rest}");
-            let parsed = Url::parse(&normalized_url)
-                .map_err(|e| ProxyError::Config(format!("invalid DoH URL '{raw}': {e}")))?;
-            let host_str = parsed
-                .host_str()
-                .ok_or_else(|| ProxyError::Config(format!("DoH URL '{raw}' missing host")))?;
+            let parsed = Url::parse(&normalized_url).map_err(|e| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("invalid DoH URL '{safe_raw}': {e}"))
+            })?;
+            let host_str = parsed.host_str().ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("DoH URL '{safe_raw}' missing host"))
+            })?;
             let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
             let host = if let Ok(ip) = clean_host.parse::<IpAddr>() {
                 DnsEndpointHost::Ip(ip)
@@ -576,11 +582,14 @@ impl DnsUpstream {
                 });
             }
             let normalized_url = format!("tls://{tls_rest}");
-            let parsed = Url::parse(&normalized_url)
-                .map_err(|e| ProxyError::Config(format!("invalid DoT URL '{raw}': {e}")))?;
-            let host_str = parsed
-                .host_str()
-                .ok_or_else(|| ProxyError::Config(format!("DoT URL '{raw}' missing host")))?;
+            let parsed = Url::parse(&normalized_url).map_err(|e| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("invalid DoT URL '{safe_raw}': {e}"))
+            })?;
+            let host_str = parsed.host_str().ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+                ProxyError::Config(format!("DoT URL '{safe_raw}' missing host"))
+            })?;
             let clean_host = host_str.trim_start_matches('[').trim_end_matches(']');
             let host = if let Ok(ip) = clean_host.parse::<IpAddr>() {
                 DnsEndpointHost::Ip(ip)
@@ -598,16 +607,19 @@ impl DnsUpstream {
 
         if let Some(rest) = strip_prefix_ignore_ascii_case(main_part, "tcp://") {
             let sa = parse_ip_socket_addr(rest, 53).ok_or_else(|| {
+                let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
                 ProxyError::Config(format!(
-                    "invalid TCP DNS server '{raw}': expected IP[:PORT]"
+                    "invalid TCP DNS server '{safe_raw}': expected IP[:PORT]"
                 ))
             })?;
             return Ok(Self::Tcp(sa));
         }
 
         let udp_rest = strip_prefix_ignore_ascii_case(main_part, "udp://").unwrap_or(main_part);
-        let sa = parse_ip_socket_addr(udp_rest, 53)
-            .ok_or_else(|| ProxyError::Config(format!("invalid DNS nameserver '{raw}'")))?;
+        let sa = parse_ip_socket_addr(udp_rest, 53).ok_or_else(|| {
+            let safe_raw = crate::audit::redact_dns_upstream_for_diff(raw);
+            ProxyError::Config(format!("invalid DNS nameserver '{safe_raw}'"))
+        })?;
         Ok(Self::Udp(sa))
     }
 
@@ -1259,7 +1271,14 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn try_extract_complete_http_body(raw: &[u8]) -> Result<Option<(Vec<u8>, bool)>> {
+struct HttpResponseMeta {
+    hdr_end: usize,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    server_closed: bool,
+}
+
+fn parse_http_response_headers(raw: &[u8]) -> Result<Option<HttpResponseMeta>> {
     let Some(hdr_end) = find_header_end(raw) else {
         return Ok(None);
     };
@@ -1285,7 +1304,18 @@ fn try_extract_complete_http_body(raw: &[u8]) -> Result<Option<(Vec<u8>, bool)>>
         if let Some((k, v)) = line.split_once(':') {
             let k_trim = k.trim();
             if k_trim.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse::<usize>().ok();
+                let parsed_cl = v
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| ProxyError::Dns("invalid DoH Content-Length header".into()))?;
+                if let Some(prev) = content_length
+                    && prev != parsed_cl
+                {
+                    return Err(ProxyError::Dns(
+                        "conflicting DoH Content-Length headers".into(),
+                    ));
+                }
+                content_length = Some(parsed_cl);
             } else if k_trim.eq_ignore_ascii_case("transfer-encoding")
                 && v.to_ascii_lowercase().contains("chunked")
             {
@@ -1297,20 +1327,39 @@ fn try_extract_complete_http_body(raw: &[u8]) -> Result<Option<(Vec<u8>, bool)>>
             }
         }
     }
+    if is_chunked && content_length.is_some() {
+        // RFC 9112 §6.3: Transfer-Encoding overrides Content-Length, and mixed framing must not
+        // reuse the keep-alive connection.
+        server_closed = true;
+    }
 
-    let body_slice = &raw[hdr_end + 4..];
-    if let Some(cl) = content_length {
+    Ok(Some(HttpResponseMeta {
+        hdr_end,
+        content_length,
+        is_chunked,
+        server_closed,
+    }))
+}
+
+fn try_extract_complete_http_body(raw: &[u8]) -> Result<Option<(Vec<u8>, bool)>> {
+    let Some(meta) = parse_http_response_headers(raw)? else {
+        return Ok(None);
+    };
+
+    let body_slice = &raw[meta.hdr_end + 4..];
+    if meta.is_chunked {
+        return Ok(decode_chunked_if_complete(body_slice)?
+            .map(|(decoded, exact_end)| (decoded, meta.server_closed || !exact_end)));
+    }
+    if let Some(cl) = meta.content_length {
         if body_slice.len() >= cl {
             let exact_end = body_slice.len() == cl;
             return Ok(Some((
                 body_slice[..cl].to_vec(),
-                server_closed || !exact_end,
+                meta.server_closed || !exact_end,
             )));
         }
         return Ok(None);
-    }
-    if is_chunked {
-        return Ok(decode_chunked_if_complete(body_slice)?.map(|decoded| (decoded, server_closed)));
     }
     Ok(None)
 }
@@ -1319,27 +1368,48 @@ fn parse_http_response_body(raw: &[u8]) -> Result<Vec<u8>> {
     if let Some((done, _)) = try_extract_complete_http_body(raw)? {
         return Ok(done);
     }
-    let hdr_end = find_header_end(raw)
+    let meta = parse_http_response_headers(raw)?
         .ok_or_else(|| ProxyError::Dns("incomplete DoH HTTP response headers".into()))?;
-    let head_str = std::str::from_utf8(&raw[..hdr_end])
-        .map_err(|_| ProxyError::Dns("invalid UTF-8 in DoH HTTP header".into()))?;
-    let status_code = head_str
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    if status_code != 200 {
-        return Err(ProxyError::Dns(format!(
-            "DoH server returned HTTP status {status_code}"
-        )));
+    if meta.content_length.is_some() || meta.is_chunked {
+        return Err(ProxyError::Dns("truncated DoH response body".into()));
     }
-    Ok(raw[hdr_end + 4..].to_vec())
+    Ok(raw[meta.hdr_end + 4..].to_vec())
 }
 
 const MAX_DNS_MESSAGE_SIZE: usize = 65_535;
+const MAX_CHUNKED_TRAILER_SIZE: usize = 4096;
 
-fn decode_chunked_if_complete(mut input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn validate_chunked_trailers(mut trailers: &[u8]) -> Result<()> {
+    loop {
+        let (line, rest) = match trailers.windows(2).position(|w| w == b"\r\n") {
+            Some(pos) => (&trailers[..pos], Some(&trailers[pos + 2..])),
+            None => (trailers, None),
+        };
+        if line.is_empty() || line.contains(&b'\r') || line.contains(&b'\n') {
+            return Err(ProxyError::Dns("invalid DoH chunked trailer line".into()));
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            return Err(ProxyError::Dns(
+                "malformed DoH chunked trailer header".into(),
+            ));
+        };
+        if colon == 0 {
+            return Err(ProxyError::Dns(
+                "empty field name in DoH chunked trailer".into(),
+            ));
+        }
+        match rest {
+            Some(next) => trailers = next,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Decode an HTTP/1.1 chunked body when complete (including empty `\r\n` or bounded trailer
+/// headers terminated by `\r\n\r\n`). Returns `Ok(Some((decoded_body, exact_end)))`, where
+/// `exact_end` is `true` only when zero unread trailing bytes remain past the final terminator.
+fn decode_chunked_if_complete(mut input: &[u8]) -> Result<Option<(Vec<u8>, bool)>> {
     let mut out = Vec::new();
     loop {
         let Some(crlf) = input.windows(2).position(|w| w == b"\r\n") else {
@@ -1363,10 +1433,33 @@ fn decode_chunked_if_complete(mut input: &[u8]) -> Result<Option<Vec<u8>>> {
             .ok_or_else(|| ProxyError::Dns("DoH chunk header offset overflow".into()))?;
         input = &input[after_hdr..];
         if chunk_len == 0 {
-            if input.len() < 2 {
+            if input.is_empty() || input == b"\r" {
                 return Ok(None);
             }
-            return Ok(Some(out));
+            if input.starts_with(b"\r\n") {
+                let remaining = &input[2..];
+                return Ok(Some((out, remaining.is_empty())));
+            }
+            if input[0] == b'\r' || input[0] == b'\n' {
+                return Err(ProxyError::Dns("invalid DoH chunked terminator".into()));
+            }
+            let Some(trailer_end) = find_header_end(input) else {
+                if input.len() > MAX_CHUNKED_TRAILER_SIZE {
+                    return Err(ProxyError::Dns(
+                        "DoH chunked trailer exceeds maximum size".into(),
+                    ));
+                }
+                return Ok(None);
+            };
+            let consumed = trailer_end + 4;
+            if consumed > MAX_CHUNKED_TRAILER_SIZE {
+                return Err(ProxyError::Dns(
+                    "DoH chunked trailer exceeds maximum size".into(),
+                ));
+            }
+            validate_chunked_trailers(&input[..trailer_end])?;
+            let remaining = &input[consumed..];
+            return Ok(Some((out, remaining.is_empty())));
         }
         let total_len = out
             .len()
@@ -2239,10 +2332,13 @@ fn decode_hpack_int(input: &[u8], prefix_bits: u8) -> Result<(usize, usize)> {
     let Some(&first) = input.first() else {
         return Err(ProxyError::Dns("unexpected EOF in HPACK integer".into()));
     };
+    if prefix_bits == 0 || prefix_bits > 8 {
+        return Err(ProxyError::Dns("invalid HPACK integer prefix bits".into()));
+    }
     let mask = ((1u16 << prefix_bits) - 1) as u8;
-    let mut val = (first & mask) as usize;
+    let mut val = u64::from(first & mask);
     if (first & mask) < mask {
-        return Ok((val, 1));
+        return Ok((val as usize, 1));
     }
     let mut shift = 0u32;
     let mut idx = 1usize;
@@ -2254,11 +2350,21 @@ fn decode_hpack_int(input: &[u8], prefix_bits: u8) -> Result<(usize, usize)> {
         if shift > 28 {
             return Err(ProxyError::Dns("HPACK integer overflow".into()));
         }
-        val = val
-            .checked_add(((b & 0x7f) as usize) << shift)
+        // Accumulate in `u64` using checked arithmetic so `shift == 28` never silently truncates
+        // upper bits on 32-bit `usize` platforms, and enforce a portable `u32::MAX` upper bound.
+        let shifted = u64::from(b & 0x7f)
+            .checked_shl(shift)
             .ok_or_else(|| ProxyError::Dns("HPACK integer overflow".into()))?;
+        val = val
+            .checked_add(shifted)
+            .ok_or_else(|| ProxyError::Dns("HPACK integer overflow".into()))?;
+        if val > u64::from(u32::MAX) {
+            return Err(ProxyError::Dns("HPACK integer overflow".into()));
+        }
         if (b & 0x80) == 0 {
-            return Ok((val, idx));
+            let out = usize::try_from(val)
+                .map_err(|_| ProxyError::Dns("HPACK integer overflow".into()))?;
+            return Ok((out, idx));
         }
         shift += 7;
     }
@@ -2270,16 +2376,19 @@ fn decode_hpack_str(input: &[u8]) -> Result<(Vec<u8>, usize)> {
     };
     let is_huffman = (first & 0x80) != 0;
     let (slen, hdr_used) = decode_hpack_int(input, 7)?;
-    if input.len() < hdr_used + slen {
+    let end = hdr_used
+        .checked_add(slen)
+        .ok_or_else(|| ProxyError::Dns("HPACK string length overflow".into()))?;
+    if input.len() < end {
         return Err(ProxyError::Dns("truncated HPACK string literal".into()));
     }
-    let raw = &input[hdr_used..hdr_used + slen];
+    let raw = &input[hdr_used..end];
     let decoded = if is_huffman {
         hpack_huffman_decode(raw)?
     } else {
         raw.to_vec()
     };
-    Ok((decoded, hdr_used + slen))
+    Ok((decoded, end))
 }
 
 fn hpack_decode_block_status(
@@ -2557,11 +2666,12 @@ mod tests {
         );
 
         // Valid chunked DNS payload still decodes cleanly
-        let decoded =
+        let (decoded, exact_end) =
             decode_chunked_if_complete(b"4\r\n\x12\x34\x81\x80\r\n2\r\n\x00\x01\r\n0\r\n\r\n")
                 .unwrap()
                 .unwrap();
         assert_eq!(decoded, vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x01]);
+        assert!(exact_end);
     }
 
     async fn mock_write_h2_doh_response<S: AsyncWrite + Unpin>(
@@ -3076,5 +3186,273 @@ mod tests {
                 "[2001:4860:4860::8888]:53".parse::<SocketAddr>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn hpack_int_and_str_reject_32bit_shift_overflow_and_checked_lengths() {
+        // Basic RFC 7541 §C.1 examples
+        assert_eq!(decode_hpack_int(&[0x0a], 5).unwrap(), (10, 1));
+        assert_eq!(decode_hpack_int(&[0x1f, 0x9a, 0x0a], 5).unwrap(), (1337, 3));
+
+        // Exact `u32::MAX` boundary (0x7f + 0 + (0x7f<<7) + (0x7f<<14) + (0x7f<<21) + (0x0f<<28))
+        let max_u32_wire = [0x7f, 0x80, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(
+            decode_hpack_int(&max_u32_wire, 7).unwrap(),
+            (u32::MAX as usize, 6)
+        );
+
+        // `u32::MAX + 1` must be rejected with overflow
+        let u32_plus_one = [0x7f, 0x81, 0xff, 0xff, 0xff, 0x0f];
+        assert!(decode_hpack_int(&u32_plus_one, 7).is_err());
+
+        // 32-bit `<< 28` silent wraparound vector (`0x10 << 28` == `2^32`) must error on ALL arches
+        let shift28_wrap = [0x7f, 0x80, 0x80, 0x80, 0x80, 0x10];
+        assert!(decode_hpack_int(&shift28_wrap, 7).is_err());
+
+        // Shift > 28 (6 continuation bytes) must error
+        let shift35 = [0x7f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        assert!(decode_hpack_int(&shift35, 7).is_err());
+
+        // `decode_hpack_str` with `u32::MAX` length must reject cleanly without arithmetic wraparound
+        assert!(decode_hpack_str(&max_u32_wire).is_err());
+        assert!(decode_hpack_str(&shift28_wrap).is_err());
+
+        // Valid raw HPACK string decodes cleanly
+        let (s, used) = decode_hpack_str(b"\x03200").unwrap();
+        assert_eq!(s, b"200");
+        assert_eq!(used, 4);
+    }
+
+    #[test]
+    fn doh_http11_chunked_trailers_exact_end_and_eof_truncation_guards() {
+        // 1. Chunked with non-empty trailer headers terminated by `\r\n\r\n`
+        let with_trailers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+            4\r\nABCD\r\n0\r\nTrailer: foo\r\nX-Check: ok\r\n\r\n";
+        let (body, server_closed) = try_extract_complete_http_body(with_trailers)
+            .unwrap()
+            .expect("chunked response with valid trailers must complete");
+        assert_eq!(body, b"ABCD");
+        assert!(
+            !server_closed,
+            "exact end after chunked trailers must remain eligible for keep-alive pooling"
+        );
+
+        // 2. Incomplete chunked trailer returns `Ok(None)` while streaming and errors on EOF
+        for incomplete in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n0\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n0\r\n\r"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n0\r\nTrailer: foo\r\n"[..],
+        ] {
+            assert!(
+                try_extract_complete_http_body(incomplete).unwrap().is_none(),
+                "incomplete chunked trailer must wait for terminator"
+            );
+            let err = parse_http_response_body(incomplete).unwrap_err();
+            assert!(
+                err.to_string().contains("truncated DoH response body"),
+                "EOF mid-trailer must fail as truncated, got: {err}"
+            );
+        }
+
+        // 3. Chunked with trailing unread garbage flags `server_closed = true` (never pooled!)
+        let trailing_after_empty = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+            4\r\nABCD\r\n0\r\n\r\nGARBAGE";
+        let (b1, closed1) = try_extract_complete_http_body(trailing_after_empty)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b1, b"ABCD");
+        assert!(
+            closed1,
+            "trailing bytes after empty chunked terminator must disable connection reuse"
+        );
+
+        let trailing_after_trailer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+            4\r\nABCD\r\n0\r\nTrailer: foo\r\n\r\nEXTRA";
+        let (b2, closed2) = try_extract_complete_http_body(trailing_after_trailer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b2, b"ABCD");
+        assert!(
+            closed2,
+            "trailing bytes after chunked trailers must disable connection reuse"
+        );
+
+        // 4. Oversized or malformed chunked trailers return Err
+        let mut huge_trailer = b"4\r\nABCD\r\n0\r\nX-Pad: ".to_vec();
+        huge_trailer.extend(std::iter::repeat_n(b'a', MAX_CHUNKED_TRAILER_SIZE + 16));
+        assert!(decode_chunked_if_complete(&huge_trailer).is_err());
+        assert!(decode_chunked_if_complete(b"4\r\nABCD\r\n0\r\n\rX").is_err());
+        assert!(
+            decode_chunked_if_complete(b"4\r\nABCD\r\n0\r\nmalformed-no-colon\r\n\r\n").is_err()
+        );
+
+        // 5. EOF truncation rejection for declared `Content-Length` and `Transfer-Encoding: chunked`
+        let trunc_cl = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort";
+        assert!(try_extract_complete_http_body(trunc_cl).unwrap().is_none());
+        let err_cl = parse_http_response_body(trunc_cl).unwrap_err();
+        assert!(err_cl.to_string().contains("truncated DoH response body"));
+
+        let trunc_chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nAB";
+        assert!(
+            try_extract_complete_http_body(trunc_chunked)
+                .unwrap()
+                .is_none()
+        );
+        let err_ch = parse_http_response_body(trunc_chunked).unwrap_err();
+        assert!(err_ch.to_string().contains("truncated DoH response body"));
+
+        // 6. Close-delimited HTTP response (neither Content-Length nor Transfer-Encoding) still accepts EOF
+        let close_delim =
+            b"HTTP/1.0 200 OK\r\nContent-Type: application/dns-message\r\n\r\nRAWBODY";
+        assert!(
+            try_extract_complete_http_body(close_delim)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(parse_http_response_body(close_delim).unwrap(), b"RAWBODY");
+    }
+
+    #[test]
+    fn dns_upstream_and_bootstrap_parse_errors_sanitize_sensitive_inputs() {
+        // Clean hostname errors remain readable
+        let clean_boot_err = BootstrapDnsServer::parse("dns.google")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            clean_boot_err.contains("'dns.google'"),
+            "clean bootstrap error should stay readable: {clean_boot_err}"
+        );
+        let clean_doh_boot_err = BootstrapDnsServer::parse("https://dns.google/dns-query")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            clean_doh_boot_err.contains("'https://dns.google/dns-query'"),
+            "clean DoH bootstrap error should stay readable: {clean_doh_boot_err}"
+        );
+
+        // Secret-bearing failing bootstrap entries must never leak credentials, stamps, `%`-smuggled hosts, spaces, or tails
+        let boot_cases: [(&str, &[&str]); 12] = [
+            (
+                "https://u:p)BootParenPass@doh.example/dns-query",
+                &["BootParenPass"],
+            ),
+            (
+                "https://dns.nextdns.io/ActiveNextDnsId/Alice's MacBook (Work)",
+                &["ActiveNextDnsId", "Alice", "MacBook"],
+            ),
+            (
+                "tls://dotuser:BootDotPass@dot.corp.example:853/BootDotPath",
+                &["dotuser", "BootDotPass", "BootDotPath"],
+            ),
+            (
+                "https://u\tser:8080\\BootInnerTabPass@doh.example/dns-query",
+                &["BootInnerTabPass", "8080"],
+            ),
+            (
+                "https://user\r:BootCrPass@doh.example/dns-query",
+                &["BootCrPass"],
+            ),
+            (
+                "https://user\n:BootLfPass@doh.example/dns-query",
+                &["BootLfPass"],
+            ),
+            (
+                "sdns://AgcAAAAAAAAABzEuMC4wLjGgBootStampSecret99",
+                &["BootStampSecret99", "AgcAAAAAAAAABzEuMC4wLjGg"],
+            ),
+            (
+                "tls://dot.corp.example%2fBootPctSecret99",
+                &["BootPctSecret99"],
+            ),
+            ("tls://user%3apass%40dot.corp.example", &["user%3apass%40"]),
+            ("tcp://bad%2fBootTcpSecret88", &["BootTcpSecret88"]),
+            ("1.1.1.1:53 BootSpaceSecret99", &["BootSpaceSecret99"]),
+            ("dns.nextdns.io/BootPathSecret99", &["BootPathSecret99"]),
+        ];
+        for (raw, forbidden) in boot_cases {
+            let err = BootstrapDnsServer::parse(raw).unwrap_err().to_string();
+            for secret in forbidden {
+                assert!(
+                    !err.contains(secret),
+                    "BootstrapDnsServer::parse error leaked '{secret}': {err}"
+                );
+            }
+        }
+
+        // Secret-bearing failing DnsUpstream entries must never leak credentials, stamps, `%`-smuggled hosts, spaces, or tails
+        let upstream_cases: [(&str, &[&str]); 11] = [
+            (
+                "https://doh.corp.example:99999/tok)ActiveParenErrPass",
+                &["ActiveParenErrPass"],
+            ),
+            (
+                "https://doh.corp.example:99999/tok ActiveSpaceErrPass",
+                &["ActiveSpaceErrPass"],
+            ),
+            (
+                "tls://dotuser:ActiveDotErrPass@dot.corp.example:99999/ActiveDotErrPath",
+                &["dotuser", "ActiveDotErrPass", "ActiveDotErrPath"],
+            ),
+            (
+                "quic://quicuser:ActiveQuicErrPass@doq.corp.example:853/ActiveQuicErrPath",
+                &["quicuser", "ActiveQuicErrPass", "ActiveQuicErrPath"],
+            ),
+            ("ss://\tActiveSsTabSecret99==", &["ActiveSsTabSecret99"]),
+            (
+                "https://u\tser:ActiveTabErrPass@doh.example:99999/dns-query",
+                &["ActiveTabErrPass"],
+            ),
+            (
+                "sdns://AgcAAAAAAAAABzEuMC4wLjGgPrivateStampSecret99",
+                &["PrivateStampSecret99", "AgcAAAAAAAAABzEuMC4wLjGg"],
+            ),
+            ("tcp://bad%2fTcpSecret88", &["TcpSecret88"]),
+            ("udp://bad%2fUdpSecret77", &["UdpSecret77"]),
+            ("1.1.1.1:53 SpaceSecret99", &["SpaceSecret99"]),
+            ("dns.nextdns.io/PathSecret99", &["PathSecret99"]),
+        ];
+        for (raw, forbidden) in upstream_cases {
+            let err = DnsUpstream::parse(raw).unwrap_err().to_string();
+            for secret in forbidden {
+                assert!(
+                    !err.contains(secret),
+                    "DnsUpstream::parse error leaked '{secret}': {err}"
+                );
+            }
+        }
+
+        // End-to-end `ClashConfig::from_yaml_str` DNS config errors also sanitize `sdns://`,
+        // `%`-smuggled opaque hosts, and space/path non-scheme DNS entries
+        for (field, raw, secret) in [
+            (
+                "nameserver",
+                "sdns://AgcAAAAAAAAABzEuMC4wLjGgCfgErrStampSecret99",
+                "CfgErrStampSecret99",
+            ),
+            (
+                "nameserver",
+                "1.1.1.1:53 CfgErrSpaceSecret99",
+                "CfgErrSpaceSecret99",
+            ),
+            (
+                "nameserver",
+                "dns.nextdns.io/CfgErrPathSecret99",
+                "CfgErrPathSecret99",
+            ),
+            (
+                "default-nameserver",
+                "tls://dot.corp.example%2fCfgErrPctSecret99",
+                "CfgErrPctSecret99",
+            ),
+        ] {
+            let yaml = format!("dns:\n  enable: true\n  {field}:\n    - \"{raw}\"\n");
+            let err = crate::config::ClashConfig::from_yaml_str(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains(secret),
+                "ClashConfig::from_yaml_str leaked '{secret}': {err}"
+            );
+        }
     }
 }

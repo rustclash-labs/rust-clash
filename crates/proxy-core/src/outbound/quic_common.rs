@@ -376,14 +376,14 @@ pub fn build_quinn_client_config(
     enable_early_data: bool,
     transport: Arc<TransportConfig>,
 ) -> io::Result<QuinnClientConfig> {
-    let base_tls = crate::crypto::tls::build_tls_client_config(
+    let tls_cfg = crate::crypto::tls::build_quic_tls_client_config(
         skip_cert_verify,
         extra_ca_der,
         alpn_protocols,
+        enable_early_data,
+        false,
     )?;
-    let mut tls_cfg = (*base_tls).clone();
-    tls_cfg.enable_early_data = enable_early_data;
-    let quic_crypto = QuicClientConfig::try_from(Arc::new(tls_cfg))
+    let quic_crypto = QuicClientConfig::try_from(tls_cfg)
         .map_err(|e| io::Error::other(format!("failed building Quinn TLS 1.3 config: {e}")))?;
     let mut client_cfg = QuinnClientConfig::new(Arc::new(quic_crypto));
     client_cfg.transport_config(transport);
@@ -558,9 +558,19 @@ async fn dial_single_quic_addr(
     salamander: Option<SalamanderObfs>,
     use_0rtt: bool,
     handshake_timeout: Duration,
-) -> io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> {
+) -> io::Result<(
+    Endpoint,
+    quinn::Connection,
+    Option<quinn::ZeroRttAccepted>,
+    QuicPreDialEpoch,
+)> {
     let pre_epoch = QuicPreDialEpoch::capture();
-    let attempt: io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> = async {
+    let attempt: io::Result<(
+        Endpoint,
+        quinn::Connection,
+        Option<quinn::ZeroRttAccepted>,
+        QuicPreDialEpoch,
+    )> = async {
         let scoped_ep = ScopedQuinnEndpoint::new(bind_protected_quinn_client_endpoint(
             remote_addr,
             salamander,
@@ -577,10 +587,12 @@ async fn dial_single_quic_addr(
         if use_0rtt {
             match connecting.into_0rtt() {
                 Ok((conn, zero_rtt_accepted)) => {
-                    tokio::spawn(async move {
-                        let _ = zero_rtt_accepted.await;
-                    });
-                    return Ok((scoped_ep.into_inner(), conn, true, pre_epoch));
+                    return Ok((
+                        scoped_ep.into_inner(),
+                        conn,
+                        Some(zero_rtt_accepted),
+                        pre_epoch,
+                    ));
                 }
                 Err(connecting) => {
                     let conn = tokio::time::timeout(handshake_timeout, connecting)
@@ -600,7 +612,7 @@ async fn dial_single_quic_addr(
                                 format!("QUIC handshake failed: {e}"),
                             )
                         })?;
-                    return Ok((scoped_ep.into_inner(), conn, false, pre_epoch));
+                    return Ok((scoped_ep.into_inner(), conn, None, pre_epoch));
                 }
             }
         }
@@ -621,7 +633,7 @@ async fn dial_single_quic_addr(
                     format!("QUIC handshake failed: {e}"),
                 )
             })?;
-        Ok((scoped_ep.into_inner(), conn, false, pre_epoch))
+        Ok((scoped_ep.into_inner(), conn, None, pre_epoch))
     }
     .await;
 
@@ -638,7 +650,12 @@ pub async fn dial_protected_quic_addrs_happy_eyeballs(
     use_0rtt: bool,
     stagger_delay: Duration,
     per_attempt_timeout: Duration,
-) -> io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> {
+) -> io::Result<(
+    Endpoint,
+    quinn::Connection,
+    Option<quinn::ZeroRttAccepted>,
+    QuicPreDialEpoch,
+)> {
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::HostUnreachable,
@@ -654,6 +671,10 @@ pub async fn dial_protected_quic_addrs_happy_eyeballs(
     } else {
         clean_sni.to_string()
     };
+    // Never allow synchronous `into_0rtt()` to win a multi-address Happy Eyeballs race in 0ms:
+    // otherwise a blackholed IPv6 candidate with a cached TLS ticket for `sni_host` immediately
+    // cancels the live IPv4 fallback without receiving a single server packet.
+    let effective_0rtt = use_0rtt && addrs.len() == 1;
     let cfg_template = client_cfg.clone();
     let salamander_template = salamander.cloned();
 
@@ -665,7 +686,14 @@ pub async fn dial_protected_quic_addrs_happy_eyeballs(
             let sni = effective_sni.clone();
             let cfg = cfg_template.clone();
             let obfs = salamander_template.clone();
-            dial_single_quic_addr(remote_addr, sni, cfg, obfs, use_0rtt, per_attempt_timeout)
+            dial_single_quic_addr(
+                remote_addr,
+                sni,
+                cfg,
+                obfs,
+                effective_0rtt,
+                per_attempt_timeout,
+            )
         },
     )
     .await
@@ -681,7 +709,12 @@ pub async fn dial_protected_quic_connection(
     salamander: Option<&SalamanderObfs>,
     use_0rtt: bool,
     dns: Option<&crate::dns::FakeIpDnsEngine>,
-) -> io::Result<(Endpoint, quinn::Connection, bool, QuicPreDialEpoch)> {
+) -> io::Result<(
+    Endpoint,
+    quinn::Connection,
+    Option<quinn::ZeroRttAccepted>,
+    QuicPreDialEpoch,
+)> {
     let addrs = resolve_protected_host_addrs(server_host, port, dns).await?;
     if addrs.is_empty() {
         return Err(io::Error::new(
@@ -1359,7 +1392,7 @@ mod tests {
         .unwrap();
 
         let start = std::time::Instant::now();
-        let (ep, conn, _used_0rtt, pre_dial) = dial_protected_quic_addrs_happy_eyeballs(
+        let (ep, conn, _zero_rtt, pre_dial) = dial_protected_quic_addrs_happy_eyeballs(
             &[blackhole_addr, live_addr],
             sni,
             &cli_cfg,
@@ -1380,6 +1413,137 @@ mod tests {
         );
 
         // Verify stalled primary candidate was recorded in `RECENT_FAILED_ADDRS` so subsequent dials prefer `live_addr` immediately!
+        let reordered = prioritize_healthy_happy_eyeballs_addrs(&[blackhole_addr, live_addr]);
+        assert_eq!(reordered[0], live_addr);
+
+        lease.close_immediately(b"done");
+        drop(blackhole_udp);
+        srv_ep.close(quinn::VarInt::from_u32(0), b"done");
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn quic_happy_eyeballs_with_0rtt_ticket_still_falls_back_from_blackhole_to_live() {
+        use crate::platform::socket_protect::prioritize_healthy_happy_eyeballs_addrs;
+
+        let blackhole_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blackhole_addr = blackhole_udp.local_addr().unwrap();
+
+        let sni = "quic.happy.eyeballs.0rtt.test";
+        let (srv_tls, ca_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &[sni.to_string(), "127.0.0.1".to_string()],
+            &[b"h3".to_vec()],
+        )
+        .unwrap();
+        let srv_transport = build_quinn_transport_config(
+            QuicCongestionControl::Bbr,
+            Some(Duration::from_secs(15)),
+            Duration::from_secs(30),
+            true,
+        );
+        let srv_cfg = build_quinn_server_config(srv_tls, srv_transport).unwrap();
+        let srv_ep =
+            bind_quinn_server_endpoint("127.0.0.1:0".parse().unwrap(), srv_cfg, None).unwrap();
+        let live_addr = srv_ep.local_addr().unwrap();
+
+        let srv_bg = srv_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(inc) = srv_bg.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = inc.await {
+                        // Keep the accepted connection alive briefly so NewSessionTicket is delivered.
+                        let _ = conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        let cli_transport = build_quinn_transport_config(
+            QuicCongestionControl::Bbr,
+            Some(Duration::from_secs(15)),
+            Duration::from_secs(30),
+            true,
+        );
+        let cli_cfg = build_quinn_client_config(
+            false,
+            std::slice::from_ref(&ca_der),
+            &[b"h3".to_vec()],
+            true,
+            cli_transport,
+        )
+        .unwrap();
+
+        // 1. Warm a TLS 1.3 0-RTT session ticket against `live_addr`.
+        let (warm_ep, warm_conn, warm_0rtt, _) = dial_protected_quic_addrs_happy_eyeballs(
+            &[live_addr],
+            sni,
+            &cli_cfg,
+            None,
+            true,
+            HAPPY_EYEBALLS_DELAY,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("initial warm-up dial must succeed");
+        assert!(
+            warm_0rtt.is_none(),
+            "cold dial has no cached ticket yet and must use 1-RTT"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        warm_conn.close(VarInt::from_u32(0), b"warm done");
+        warm_ep.close(VarInt::from_u32(0), b"warm done");
+
+        // 2. Prove a single-address dial genuinely activates 0-RTT with the warmed ticket.
+        let (probe_ep, probe_conn, probe_0rtt, _) = dial_protected_quic_addrs_happy_eyeballs(
+            &[live_addr],
+            sni,
+            &cli_cfg,
+            None,
+            true,
+            HAPPY_EYEBALLS_DELAY,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("single-address 0-RTT dial must succeed");
+        let zero_rtt_fut =
+            probe_0rtt.expect("single-address dial must enter 0-RTT with warm ticket");
+        assert!(
+            zero_rtt_fut.await,
+            "server must accept 0-RTT on warmed session ticket"
+        );
+        probe_conn.close(VarInt::from_u32(0), b"probe done");
+        probe_ep.close(VarInt::from_u32(0), b"probe done");
+
+        // 3. Now race `[blackhole_addr, live_addr]` with `use_0rtt = true`: blackhole MUST NOT
+        //    win in 0ms; Happy Eyeballs MUST stagger and connect to `live_addr`!
+        let start = std::time::Instant::now();
+        let (ep, conn, multi_0rtt, pre_dial) = dial_protected_quic_addrs_happy_eyeballs(
+            &[blackhole_addr, live_addr],
+            sni,
+            &cli_cfg,
+            None,
+            true,
+            HAPPY_EYEBALLS_DELAY,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("0-RTT Happy Eyeballs must fall back from blackhole to live address");
+        let elapsed = start.elapsed();
+        let lease = QuicSessionLease::new_with_epoch(pre_dial, ep, conn);
+
+        assert!(
+            multi_0rtt.is_none(),
+            "multi-address Happy Eyeballs must complete real handshake rather than unconfirmed 0-RTT"
+        );
+        assert_eq!(
+            lease.conn.remote_address(),
+            live_addr,
+            "blackholed primary must not win Happy Eyeballs over live secondary"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(2000),
+            "expected ~250ms staggered Happy Eyeballs fallback, got {elapsed:?}"
+        );
         let reordered = prioritize_healthy_happy_eyeballs_addrs(&[blackhole_addr, live_addr]);
         assert_eq!(reordered[0], live_addr);
 

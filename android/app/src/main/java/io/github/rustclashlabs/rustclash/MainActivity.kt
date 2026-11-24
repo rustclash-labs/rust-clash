@@ -103,23 +103,305 @@ import io.github.rustclashlabs.rustclash.vpn.NativeBridge
 import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.RustClashVpnService
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.OutputStream
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Coordinates the Activity-side YAML export lifecycle: synchronous reentrancy gating across
+ * ViewModel IO + disk staging + SAF launch, safe cleanup when the Activity finishes/destroys
+ * mid-flight, and pending-picker protection until SAF result delivery or resume.
+ */
+internal class YamlExportSafCoordinator(
+    private val scope: CoroutineScope,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val cacheDirProvider: () -> File,
+    private val isActivityInvalid: () -> Boolean,
+    private val requestActiveYaml: (onReady: (String) -> Unit, onFailure: () -> Unit) -> Boolean,
+    private val launchSafPicker: (suggestedFileName: String) -> Unit,
+    private val emitMessage: (String) -> Unit,
+    private val stageFile: (cacheDir: File, yamlContent: String, previousPendingFile: File?) -> File = { dir, content, prev ->
+        MainActivity.stagePendingYamlExportFile(
+            cacheDir = dir,
+            yamlContent = content,
+            previousPendingFile = prev,
+        )
+    },
+    private val deleteFile: (File) -> Unit = { file ->
+        runCatching { file.delete() }
+    },
+) {
+    var isStagingYamlExport: Boolean = false
+        private set
+
+    var isSafPickerPending: Boolean = false
+        private set
+
+    var pendingExportYamlFile: File? = null
+
+    fun onExportYamlClicked() {
+        if (isStagingYamlExport || isSafPickerPending) return
+        if (isActivityInvalid() || !scope.isActive) return
+        isStagingYamlExport = true
+        val accepted = try {
+            requestActiveYaml(
+                { yaml -> onYamlReady(yaml) },
+                { isStagingYamlExport = false },
+            )
+        } catch (t: Throwable) {
+            isStagingYamlExport = false
+            throw t
+        }
+        if (!accepted) {
+            isStagingYamlExport = false
+        }
+    }
+
+    private fun onYamlReady(yaml: String) {
+        if (isActivityInvalid() || !scope.isActive) {
+            isStagingYamlExport = false
+            return
+        }
+        val previousFile = pendingExportYamlFile
+        pendingExportYamlFile = null
+        val createdFileRef = AtomicReference<File?>(null)
+        val stagingJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                val stagedFile = withContext(ioDispatcher) {
+                    runCatching {
+                        stageFile(cacheDirProvider(), yaml, previousFile).also { file ->
+                            createdFileRef.set(file)
+                        }
+                    }.getOrNull()
+                }
+                if (stagedFile == null) {
+                    emitMessage("导出 YAML 配置文件失败")
+                    return@launch
+                }
+                if (isActivityInvalid()) {
+                    createdFileRef.set(null)
+                    withContext(NonCancellable + ioDispatcher) {
+                        deleteFile(stagedFile)
+                    }
+                    return@launch
+                }
+                pendingExportYamlFile = stagedFile
+                isSafPickerPending = true
+                runCatching {
+                    launchSafPicker("rustclash-config.yaml")
+                }.onFailure {
+                    isSafPickerPending = false
+                    pendingExportYamlFile = null
+                    createdFileRef.set(null)
+                    withContext(NonCancellable + ioDispatcher) {
+                        deleteFile(stagedFile)
+                    }
+                    emitMessage("导出 YAML 配置文件失败")
+                }
+            } catch (ce: CancellationException) {
+                val orphan = createdFileRef.getAndSet(null)
+                if (orphan != null && pendingExportYamlFile !== orphan) {
+                    withContext(NonCancellable + ioDispatcher) {
+                        deleteFile(orphan)
+                    }
+                }
+                throw ce
+            } finally {
+                isStagingYamlExport = false
+            }
+        }
+        if (!stagingJob.isActive && isStagingYamlExport) {
+            isStagingYamlExport = false
+        }
+    }
+
+    fun consumePendingFileForSafResult(): File? {
+        isSafPickerPending = false
+        val srcFile = pendingExportYamlFile
+        pendingExportYamlFile = null
+        return srcFile
+    }
+
+    fun onActivityResumed() {
+        // ActivityResult callbacks always run before onResume(); if the SAF picker was ever
+        // abandoned without delivering a result, release the pending-picker guard on resume.
+        isSafPickerPending = false
+    }
+}
 
 class MainActivity : AppCompatActivity() {
     private val viewModel: RustClashViewModel by viewModels()
     private var pendingCameraQrFile: File? = null
-    private var pendingExportYamlContent: String? = null
     private var pendingExportDebugFile: File? = null
+    @Volatile
+    private var activeCopyYamlFile: File? = null
     private var vpnConsentInFlight: Boolean = false
+    private val yamlExportCoordinator: YamlExportSafCoordinator by lazy {
+        YamlExportSafCoordinator(
+            scope = lifecycleScope,
+            ioDispatcher = Dispatchers.IO,
+            cacheDirProvider = { cacheDir },
+            isActivityInvalid = { isFinishing || isDestroyed },
+            requestActiveYaml = { onReady, onFailure ->
+                viewModel.exportActiveYamlForSaf(
+                    onReady = onReady,
+                    onFailure = onFailure,
+                )
+            },
+            launchSafPicker = { suggestedName ->
+                safExportYamlLauncher.launch(suggestedName)
+            },
+            emitMessage = { msg -> viewModel.emitUiMessage(msg) },
+            stageFile = { dir, content, prev ->
+                stagePendingYamlExportFile(
+                    cacheDir = dir,
+                    yamlContent = content,
+                    previousPendingFile = prev,
+                    keepActiveCopyFile = activeCopyYamlFile,
+                )
+            },
+        )
+    }
+
+    internal data class PendingActivityFiles(
+        val cameraQrFile: File? = null,
+        val exportDebugFile: File? = null,
+        val exportYamlFile: File? = null,
+    )
 
     companion object {
         private const val KEY_VPN_CONSENT_IN_FLIGHT = "vpn_consent_in_flight"
+        internal const val KEY_PENDING_CAMERA_QR_PATH = "pending_camera_qr_path"
+        internal const val KEY_PENDING_EXPORT_DEBUG_PATH = "pending_export_debug_path"
+        internal const val KEY_PENDING_EXPORT_YAML_PATH = "pending_export_yaml_path"
+        internal const val PENDING_YAML_EXPORT_PREFIX = "export_yaml_pending_"
+        internal const val PENDING_YAML_EXPORT_SUFFIX = ".yaml"
+        private const val STALE_PENDING_YAML_MAX_AGE_MS = 60L * 60L * 1000L
+
+        internal fun savePendingFilePaths(
+            putString: (key: String, value: String) -> Unit,
+            pendingFiles: PendingActivityFiles,
+        ) {
+            pendingFiles.cameraQrFile?.absolutePath?.takeIf { it.isNotBlank() }?.let {
+                putString(KEY_PENDING_CAMERA_QR_PATH, it)
+            }
+            pendingFiles.exportDebugFile?.absolutePath?.takeIf { it.isNotBlank() }?.let {
+                putString(KEY_PENDING_EXPORT_DEBUG_PATH, it)
+            }
+            pendingFiles.exportYamlFile?.absolutePath?.takeIf { it.isNotBlank() }?.let {
+                putString(KEY_PENDING_EXPORT_YAML_PATH, it)
+            }
+        }
+
+        internal fun restorePendingFilePaths(
+            getString: (key: String) -> String?,
+        ): PendingActivityFiles = PendingActivityFiles(
+            cameraQrFile = getString(KEY_PENDING_CAMERA_QR_PATH)?.takeIf { it.isNotBlank() }?.let(::File),
+            exportDebugFile = getString(KEY_PENDING_EXPORT_DEBUG_PATH)?.takeIf { it.isNotBlank() }?.let(::File),
+            exportYamlFile = getString(KEY_PENDING_EXPORT_YAML_PATH)?.takeIf { it.isNotBlank() }?.let(::File),
+        )
+
+        internal fun savePendingFilePathsToBundle(
+            outState: Bundle,
+            pendingFiles: PendingActivityFiles,
+        ) {
+            savePendingFilePaths(
+                putString = { key, value -> outState.putString(key, value) },
+                pendingFiles = pendingFiles,
+            )
+        }
+
+        internal fun restorePendingFilePathsFromBundle(
+            savedInstanceState: Bundle?,
+        ): PendingActivityFiles {
+            if (savedInstanceState == null) return PendingActivityFiles()
+            return restorePendingFilePaths(
+                getString = { key -> savedInstanceState.getString(key) },
+            )
+        }
+
+        internal fun cleanupStalePendingYamlExports(
+            cacheDir: File,
+            keepFile: File? = null,
+            nowMs: Long = System.currentTimeMillis(),
+            maxAgeMs: Long = STALE_PENDING_YAML_MAX_AGE_MS,
+        ) {
+            val keepPath = keepFile?.absolutePath
+            val entries = cacheDir.listFiles() ?: return
+            for (entry in entries) {
+                if (!entry.isFile) continue
+                val name = entry.name
+                if (!name.startsWith(PENDING_YAML_EXPORT_PREFIX) || !name.endsWith(PENDING_YAML_EXPORT_SUFFIX)) {
+                    continue
+                }
+                if (keepPath != null && entry.absolutePath == keepPath) continue
+                if (maxAgeMs <= 0L || (nowMs - entry.lastModified()) >= maxAgeMs) {
+                    runCatching { entry.delete() }
+                }
+            }
+        }
+
+        internal fun stagePendingYamlExportFile(
+            cacheDir: File,
+            yamlContent: String,
+            previousPendingFile: File? = null,
+            nowMs: Long = System.currentTimeMillis(),
+            keepActiveCopyFile: File? = null,
+        ): File {
+            require(yamlContent.isNotBlank()) { "empty yaml content" }
+            if (!cacheDir.exists()) {
+                cacheDir.mkdirs()
+            }
+            if (previousPendingFile != null && previousPendingFile.absolutePath != keepActiveCopyFile?.absolutePath) {
+                runCatching { previousPendingFile.delete() }
+            }
+            // Only one SAF YAML export is active per Activity; prune any orphaned staged YAML files.
+            cleanupStalePendingYamlExports(
+                cacheDir = cacheDir,
+                keepFile = keepActiveCopyFile,
+                nowMs = nowMs,
+                maxAgeMs = 0L,
+            )
+            val stagedFile = File.createTempFile(
+                "${PENDING_YAML_EXPORT_PREFIX}${nowMs}_",
+                PENDING_YAML_EXPORT_SUFFIX,
+                cacheDir,
+            )
+            try {
+                stagedFile.writeText(yamlContent, Charsets.UTF_8)
+            } catch (t: Throwable) {
+                runCatching { stagedFile.delete() }
+                throw t
+            }
+            return stagedFile
+        }
+
+        internal fun copyPendingFileToOutputStream(
+            srcFile: File,
+            openOutputStream: () -> OutputStream?,
+        ): Boolean = runCatching {
+            if (!srcFile.isFile) error("missing source file")
+            srcFile.inputStream().use { input ->
+                val output = openOutputStream() ?: error("null output stream")
+                output.use { out ->
+                    input.copyTo(out)
+                    out.flush()
+                }
+            }
+            true
+        }.getOrDefault(false)
     }
 
     private fun exitDemoModeIfActive() {
@@ -135,8 +417,15 @@ class MainActivity : AppCompatActivity() {
         val demoPref = prefs.getBoolean(RustClashVpnService.KEY_DEMO_MODE, false)
         if (!current.demoMode && !demoPref) return
         if (current.vpnState != VpnLifecycleState.RUNNING) {
-            if (NativeBridge.ensureLoaded()) {
+            if (NativeBridge.isLoadedFast) {
                 viewModel.setDemoMode(false)
+            } else {
+                lifecycleScope.launch {
+                    val loaded = withContext(Dispatchers.IO) { NativeBridge.ensureLoaded() }
+                    if (loaded && viewModel.uiState.value.vpnState != VpnLifecycleState.RUNNING) {
+                        viewModel.setDemoMode(false)
+                    }
+                }
             }
             return
         }
@@ -145,7 +434,7 @@ class MainActivity : AppCompatActivity() {
                 delay(waitMs)
                 val st = viewModel.uiState.value
                 if (!st.demoMode || st.vpnState != VpnLifecycleState.RUNNING) break
-                if (!NativeBridge.isNativeLoaded) break
+                if (!NativeBridge.isLoadedFast) break
                 val demoStillActive = withContext(Dispatchers.IO) {
                     runCatching {
                         JSONObject(NativeBridge.nativeGetStatusJson()).optBoolean("demoActive", true)
@@ -249,24 +538,45 @@ class MainActivity : AppCompatActivity() {
     private val safExportYamlLauncher = registerForActivityResult(
         ActivityResultContracts.CreateDocument("application/x-yaml"),
     ) { uri: Uri? ->
-        val content = pendingExportYamlContent
-        pendingExportYamlContent = null
-        if (uri != null && !content.isNullOrBlank()) {
-            lifecycleScope.launch {
-                val ok = withContext(Dispatchers.IO) {
-                    runCatching {
-                        contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { writer ->
-                            writer.write(content)
-                        }
-                        true
-                    }.getOrDefault(false)
-                }
-                if (ok) {
-                    viewModel.emitUiMessage("已导出脱敏 YAML（密码已隐去为 ***REDACTED***，适合排障分享，不可跨设备恢复密钥）")
-                } else {
-                    viewModel.emitUiMessage("导出 YAML 配置文件失败")
+        val srcFile = yamlExportCoordinator.consumePendingFileForSafResult()
+        if (uri == null) {
+            if (srcFile != null) {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    runCatching { srcFile.delete() }
                 }
             }
+            return@registerForActivityResult
+        }
+        if (srcFile == null) {
+            viewModel.emitUiMessage("导出 YAML 配置文件失败")
+            return@registerForActivityResult
+        }
+        activeCopyYamlFile = srcFile
+        val copyJob = lifecycleScope.launch {
+            val ok = try {
+                withContext(Dispatchers.IO) {
+                    try {
+                        copyPendingFileToOutputStream(
+                            srcFile = srcFile,
+                            openOutputStream = { contentResolver.openOutputStream(uri) },
+                        )
+                    } finally {
+                        runCatching { srcFile.delete() }
+                    }
+                }
+            } finally {
+                if (activeCopyYamlFile === srcFile) {
+                    activeCopyYamlFile = null
+                }
+            }
+            if (ok) {
+                viewModel.emitUiMessage("已导出脱敏 YAML（密码已隐去为 ***REDACTED***，适合排障分享，不可跨设备恢复密钥）")
+            } else {
+                viewModel.emitUiMessage("导出 YAML 配置文件失败")
+            }
+        }
+        if (!copyJob.isActive && activeCopyYamlFile === srcFile) {
+            activeCopyYamlFile = null
         }
     }
 
@@ -275,17 +585,13 @@ class MainActivity : AppCompatActivity() {
     ) { uri: Uri? ->
         val srcFile = pendingExportDebugFile
         pendingExportDebugFile = null
-        if (uri != null && srcFile != null && srcFile.isFile) {
+        if (uri != null && srcFile != null) {
             lifecycleScope.launch {
                 val ok = withContext(Dispatchers.IO) {
-                    runCatching {
-                        srcFile.inputStream().use { input ->
-                            contentResolver.openOutputStream(uri)?.use { output ->
-                                input.copyTo(output)
-                            } ?: error("null output stream")
-                        }
-                        true
-                    }.getOrDefault(false)
+                    copyPendingFileToOutputStream(
+                        srcFile = srcFile,
+                        openOutputStream = { contentResolver.openOutputStream(uri) },
+                    )
                 }
                 if (ok) {
                     viewModel.emitUiMessage("已保存脱敏诊断报告")
@@ -299,7 +605,15 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        val restoredPendingFiles = restorePendingFilePathsFromBundle(savedInstanceState)
+        pendingCameraQrFile = restoredPendingFiles.cameraQrFile
+        pendingExportDebugFile = restoredPendingFiles.exportDebugFile
+        yamlExportCoordinator.pendingExportYamlFile = restoredPendingFiles.exportYamlFile
         vpnConsentInFlight = savedInstanceState?.getBoolean(KEY_VPN_CONSENT_IN_FLIGHT, false) ?: false
+        val activePendingYaml = yamlExportCoordinator.pendingExportYamlFile
+        lifecycleScope.launch(Dispatchers.IO) {
+            cleanupStalePendingYamlExports(cacheDir = cacheDir, keepFile = activePendingYaml)
+        }
         requestNotificationPermissionIfNeeded()
         handleIncomingShareOrDeepLinkIntent(intent)
 
@@ -315,6 +629,7 @@ class MainActivity : AppCompatActivity() {
 
             // Reconcile UI + SharedPreferences `demoMode` whenever a live engine mutation exits Demo Sandbox.
             LaunchedEffect(
+                state.nativeLoaded,
                 state.vpnState,
                 state.demoMode,
                 state.nodes,
@@ -323,7 +638,7 @@ class MainActivity : AppCompatActivity() {
             ) {
                 if (state.vpnState == VpnLifecycleState.RUNNING &&
                     state.demoMode &&
-                    NativeBridge.isNativeLoaded
+                    NativeBridge.isLoadedFast
                 ) {
                     val liveDemoActive = withContext(Dispatchers.IO) {
                         runCatching {
@@ -358,10 +673,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     },
                     onExportYamlFile = {
-                        viewModel.exportActiveYamlForSaf { yaml ->
-                            pendingExportYamlContent = yaml
-                            runCatching { safExportYamlLauncher.launch("rustclash-config.yaml") }
-                        }
+                        yamlExportCoordinator.onExportYamlClicked()
                     },
                     onShareDebugReport = {
                         viewModel.prepareDebugReportForExport { reportFile ->
@@ -385,6 +697,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        // Always persist pending Camera/SAF file paths even when NOT changing configurations:
+        // Android frequently destroys/recreates Activities under memory pressure while external
+        // Camera or SAF Document pickers are in the foreground.
+        savePendingFilePathsToBundle(
+            outState = outState,
+            pendingFiles = PendingActivityFiles(
+                cameraQrFile = pendingCameraQrFile,
+                exportDebugFile = pendingExportDebugFile,
+                exportYamlFile = yamlExportCoordinator.pendingExportYamlFile,
+            ),
+        )
         if (isChangingConfigurations && vpnConsentInFlight) {
             outState.putBoolean(KEY_VPN_CONSENT_IN_FLIGHT, true)
         }
@@ -398,6 +721,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        yamlExportCoordinator.onActivityResumed()
         if (!vpnConsentInFlight && RustClashVpnService.stateTracker.state == VpnLifecycleState.PREPARING) {
             RustClashVpnService.stateTracker.onStopped()
             viewModel.syncServiceStateImmediate()
@@ -513,7 +837,7 @@ class MainActivity : AppCompatActivity() {
             val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
                 action = RustClashVpnService.ACTION_STOP_VPN
             }
-            startService(stopIntent)
+            RustClashVpnService.safeRequestStopVpn(this, stopIntent)
             viewModel.syncServiceStateImmediate()
             return
         }
@@ -555,7 +879,12 @@ class MainActivity : AppCompatActivity() {
             action = RustClashVpnService.ACTION_START_VPN
             putExtra(RustClashVpnService.EXTRA_DEMO_MODE, demoMode)
         }
-        ContextCompat.startForegroundService(this, startIntent)
+        if (!RustClashVpnService.safeStartVpnForegroundService(this, startIntent)) {
+            val errMsg = "系统限制了 VPN 前台服务启动，请保持应用在前台后重试连接"
+            RustClashVpnService.stateTracker.onError(errMsg)
+            viewModel.syncServiceStateImmediate()
+            viewModel.emitUiMessage(errMsg)
+        }
     }
 
     private fun readSystemClipboardText(): String? {

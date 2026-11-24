@@ -50,6 +50,26 @@ pub fn decode_darwin_utun_packet(utun_frame: &[u8]) -> io::Result<&[u8]> {
     }
 }
 
+/// Action for the macOS `utun` RX loop when non-blocking `read(2)` returns an OS error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UtunReadAction {
+    /// Signal interruption (`EINTR`): immediately retry `read(2)` without exiting the RX loop.
+    Retry,
+    /// Non-blocking descriptor drained (`EAGAIN`/`EWOULDBLOCK`): return to `poll(2)`.
+    DrainDone,
+    /// Unrecoverable descriptor error (`EBADF`, `EIO`, etc.): log and stop the RX loop.
+    Fatal,
+}
+
+/// Classify an `io::Error` returned by non-blocking `read(2)` on a Darwin `utun` socket.
+pub fn classify_utun_read_error(err: &io::Error) -> UtunReadAction {
+    match err.kind() {
+        io::ErrorKind::Interrupted => UtunReadAction::Retry,
+        io::ErrorKind::WouldBlock => UtunReadAction::DrainDone,
+        _ => UtunReadAction::Fatal,
+    }
+}
+
 /// Parse `route -n get default` (or `route -n get -inet6 default`) output on macOS to extract `(interface, gateway)`.
 pub fn parse_macos_route_get_default(output: &str) -> (Option<String>, Option<String>) {
     let mut iface = None;
@@ -291,8 +311,11 @@ pub fn parse_scutil_dns_output(output: &str) -> Vec<IpAddr> {
 
 /// Parse `networksetup -listnetworkserviceorder` output to map BSD device `en0` -> macOS Service `"Wi-Fi"`.
 pub fn map_bsd_device_to_network_service(output: &str, bsd_device: &str) -> Option<String> {
+    let bsd_device = bsd_device.trim();
+    if bsd_device.is_empty() {
+        return None;
+    }
     let mut last_service: Option<String> = None;
-    let needle = format!("Device: {bsd_device}");
     for line in output.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix('(')
@@ -305,8 +328,15 @@ pub fn map_bsd_device_to_network_service(output: &str, bsd_device: &str) -> Opti
                 last_service = Some(svc.to_string());
             }
         }
-        if trimmed.contains(&needle) {
-            return last_service;
+        if let Some((_, after_dev)) = trimmed.split_once("Device:") {
+            let dev = after_dev
+                .trim_start()
+                .split(|c: char| c == ')' || c == ',' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            if dev == bsd_device {
+                return last_service;
+            }
         }
     }
     None
@@ -479,13 +509,13 @@ mod darwin_impl {
     use parking_lot::Mutex;
 
     use super::{
-        build_macos_bypass_route_commands, build_macos_exclude_route_commands,
-        decode_darwin_utun_packet, encode_darwin_utun_packet, is_utun_split_route_del_arg,
-        map_bsd_device_to_network_service, merge_macos_protector_indices,
-        normalize_macos_ipv6_gateway, parse_ipconfig_dns_output, parse_macos_route_get_default,
-        parse_scutil_dns_output, resolve_macos_default_egress_outputs,
-        restore_macos_dns_backups_with_runner, rollback_macos_record_with_runner,
-        select_macos_physical_bypass_ips,
+        UtunReadAction, build_macos_bypass_route_commands, build_macos_exclude_route_commands,
+        classify_utun_read_error, decode_darwin_utun_packet, encode_darwin_utun_packet,
+        is_utun_split_route_del_arg, map_bsd_device_to_network_service,
+        merge_macos_protector_indices, normalize_macos_ipv6_gateway, parse_ipconfig_dns_output,
+        parse_macos_route_get_default, parse_scutil_dns_output,
+        resolve_macos_default_egress_outputs, restore_macos_dns_backups_with_runner,
+        rollback_macos_record_with_runner, select_macos_physical_bypass_ips,
     };
 
     /// Snapshot of pre-TUN physical network service DNS servers captured before `MacOsUtunSession`
@@ -1080,6 +1110,7 @@ mod darwin_impl {
 
             let stop_rx = Arc::clone(&stop_flag);
             let rx_cnt = Arc::clone(&rx_packets);
+            let last_err_rx = Arc::clone(&last_error);
             let rx_thread = match std::thread::Builder::new()
                 .name("tun-macos-rx".into())
                 .spawn(move || {
@@ -1091,7 +1122,35 @@ mod darwin_impl {
                             revents: 0,
                         };
                         // SAFETY: `pfd` references `utun_fd` which lives for the entire thread.
-                        if unsafe { libc::poll(&raw mut pfd, 1, 50) } <= 0 {
+                        let prc = unsafe { libc::poll(&raw mut pfd, 1, 50) };
+                        if prc < 0 {
+                            let perr = io::Error::last_os_error();
+                            if perr.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            if !stop_rx.load(Ordering::Acquire) {
+                                let msg = format!("macOS utun RX poll failed: {perr}");
+                                tracing::error!("{msg}");
+                                *last_err_rx.lock() = Some(msg);
+                            }
+                            return;
+                        }
+                        if prc == 0 {
+                            continue;
+                        }
+                        if (pfd.revents & libc::POLLIN) == 0 {
+                            if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                            {
+                                if !stop_rx.load(Ordering::Acquire) {
+                                    let msg = format!(
+                                        "macOS utun RX poll fatal revents=0x{:x}",
+                                        pfd.revents
+                                    );
+                                    tracing::error!("{msg}");
+                                    *last_err_rx.lock() = Some(msg);
+                                }
+                                return;
+                            }
                             continue;
                         }
                         loop {
@@ -1108,10 +1167,18 @@ mod darwin_impl {
                             };
                             if n < 0 {
                                 let err = io::Error::last_os_error();
-                                if err.kind() == io::ErrorKind::WouldBlock {
-                                    break;
+                                match classify_utun_read_error(&err) {
+                                    UtunReadAction::Retry => continue,
+                                    UtunReadAction::DrainDone => break,
+                                    UtunReadAction::Fatal => {
+                                        if !stop_rx.load(Ordering::Acquire) {
+                                            let msg = format!("macOS utun RX read failed: {err}");
+                                            tracing::error!("{msg}");
+                                            *last_err_rx.lock() = Some(msg);
+                                        }
+                                        return;
+                                    }
                                 }
-                                return;
                             }
                             if n == 0 {
                                 return;
@@ -1794,5 +1861,71 @@ resolver #1
                 "fe80::1".parse::<IpAddr>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn classify_utun_read_error_retries_eintr_drains_wouldblock_and_fails_on_fatal() {
+        assert_eq!(
+            classify_utun_read_error(&io::Error::new(io::ErrorKind::Interrupted, "EINTR")),
+            UtunReadAction::Retry
+        );
+        assert_eq!(
+            classify_utun_read_error(&io::Error::new(io::ErrorKind::WouldBlock, "EAGAIN")),
+            UtunReadAction::DrainDone
+        );
+        assert_eq!(
+            classify_utun_read_error(&io::Error::other("EIO")),
+            UtunReadAction::Fatal
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                classify_utun_read_error(&io::Error::from_raw_os_error(libc::EINTR)),
+                UtunReadAction::Retry
+            );
+            assert_eq!(
+                classify_utun_read_error(&io::Error::from_raw_os_error(libc::EAGAIN)),
+                UtunReadAction::DrainDone
+            );
+            assert_eq!(
+                classify_utun_read_error(&io::Error::from_raw_os_error(libc::EBADF)),
+                UtunReadAction::Fatal
+            );
+            assert_eq!(
+                classify_utun_read_error(&io::Error::from_raw_os_error(libc::EIO)),
+                UtunReadAction::Fatal
+            );
+        }
+    }
+
+    #[test]
+    fn map_bsd_device_to_network_service_matches_exact_device_token_not_prefix() {
+        let ns_out = "\
+An asterisk (*) denotes that a network service is disabled.
+(1) USB LAN
+(Hardware Port: USB 10/100/1000 LAN, Device: en10)
+
+(2) Thunderbolt
+(Hardware Port: Thunderbolt Ethernet, Device: en11)
+
+(3) Ethernet
+(Hardware Port: Ethernet, Device: en1)
+";
+        assert_eq!(
+            map_bsd_device_to_network_service(ns_out, "en1").as_deref(),
+            Some("Ethernet"),
+            "en1 must NOT prefix-match en10 or en11"
+        );
+        assert_eq!(
+            map_bsd_device_to_network_service(ns_out, "en10").as_deref(),
+            Some("USB LAN")
+        );
+        assert_eq!(
+            map_bsd_device_to_network_service(ns_out, "en11").as_deref(),
+            Some("Thunderbolt")
+        );
+        assert_eq!(map_bsd_device_to_network_service(ns_out, "en2"), None);
+        assert_eq!(map_bsd_device_to_network_service(ns_out, ""), None);
+        assert_eq!(map_bsd_device_to_network_service(ns_out, "   "), None);
     }
 }

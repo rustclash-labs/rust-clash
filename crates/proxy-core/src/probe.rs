@@ -165,6 +165,7 @@ fn is_restricted_probe_ipv4(v4: Ipv4Addr) -> bool {
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
+        || oct[0] == 0 // RFC 1122 / 6890 "this network" 0.0.0.0/8
         || v4.is_broadcast()
         || v4.is_multicast()
         || v4.is_documentation()
@@ -175,8 +176,10 @@ fn is_restricted_probe_ipv4(v4: Ipv4Addr) -> bool {
 }
 
 /// Returns `true` if `raw_ip` belongs to loopback, private, link-local / cloud metadata (`169.254.0.0/16`),
-/// CGNAT (`100.64.0.0/10`), Fake-IP/benchmarking (`198.18.0.0/15`), IPv6 ULA (`fc00::/7`), NAT64/6to4/Teredo
-/// transition prefixes embedding restricted IPv4s, multicast, unspecified, documentation, or reserved ranges.
+/// RFC 1122 `0.0.0.0/8`, CGNAT (`100.64.0.0/10`), Fake-IP/benchmarking (`198.18.0.0/15`), IPv6 ULA (`fc00::/7`),
+/// deprecated site-local (`fec0::/10`), RFC 6666 discard-only (`100::/64`), deprecated IPv4-compatible (`::/96`),
+/// RFC 2765 SIIT IPv4-translated (`::ffff:0:0:0/96`), NAT64/6to4/Teredo transition prefixes embedding restricted
+/// IPv4s, multicast, unspecified, documentation, or reserved ranges.
 pub fn is_restricted_probe_ip(raw_ip: IpAddr) -> bool {
     match raw_ip.to_canonical() {
         IpAddr::V4(v4) => is_restricted_probe_ipv4(v4),
@@ -187,9 +190,13 @@ pub fn is_restricted_probe_ip(raw_ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // Unique Local fc00::/7 (incl. fd00:ec2::254)
                 || (seg[0] & 0xffc0) == 0xfe80 // Link-Local fe80::/10
+                || (seg[0] & 0xffc0) == 0xfec0 // Deprecated Site-Local fec0::/10 (RFC 3879)
+                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // RFC 6666 Discard-Only 100::/64
                 || (seg[0] == 0x2001 && seg[1] == 0x0db8) // Documentation 2001:db8::/32
-                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 1)
-            // RFC 8215 local-use NAT64 64:ff9b:1::/48
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 1) // RFC 8215 local-use NAT64 64:ff9b:1::/48
+                || seg[..6] == [0, 0, 0, 0, 0, 0] // Deprecated IPv4-compatible IPv6 ::/96 (RFC 4291)
+                || seg[..6] == [0, 0, 0, 0, 0xffff, 0]
+            // RFC 2765 SIIT IPv4-translated ::ffff:0:0:0/96
             {
                 return true;
             }
@@ -252,7 +259,7 @@ pub fn is_restricted_probe_hostname(host: &str) -> bool {
         || h == "instance-data"
 }
 
-fn is_whitelisted_private_addr(ip: IpAddr, port: u16, allowed: &[SocketAddr]) -> bool {
+pub fn is_whitelisted_private_addr(ip: IpAddr, port: u16, allowed: &[SocketAddr]) -> bool {
     let canon = ip.to_canonical();
     allowed
         .iter()
@@ -283,7 +290,7 @@ pub fn validate_probe_endpoint(
     if clean.eq_ignore_ascii_case("localhost")
         && allowed_addrs
             .iter()
-            .any(|sa| sa.port() == port && sa.ip().is_loopback())
+            .any(|sa| sa.port() == port && sa.ip().to_canonical().is_loopback())
     {
         return Ok(());
     }
@@ -325,7 +332,7 @@ fn format_probe_host_header(host_str: &str, port: u16, is_https: bool) -> String
     }
 }
 
-fn parse_probe_url(raw_url: &str) -> Result<(bool, String, u16, String, String)> {
+pub fn parse_probe_url(raw_url: &str) -> Result<(bool, String, u16, String, String)> {
     let parsed = Url::parse(raw_url.trim())
         .map_err(|e| ProxyError::Config(format!("invalid probe URL: {e}")))?;
     let is_https = match parsed.scheme() {
@@ -380,6 +387,16 @@ fn parse_probe_url(raw_url: &str) -> Result<(bool, String, u16, String, String)>
         }
     );
     Ok((is_https, clean_host, port, path, sanitized_url))
+}
+
+pub fn validate_probe_url(
+    raw_url: &str,
+    allow_private: bool,
+    allowed_addrs: &[SocketAddr],
+) -> Result<(bool, String, u16, String, String)> {
+    let parsed = parse_probe_url(raw_url)?;
+    validate_probe_endpoint(&parsed.1, parsed.2, allow_private, allowed_addrs)?;
+    Ok(parsed)
 }
 
 struct ParsedHttpHead {
@@ -813,6 +830,28 @@ pub async fn probe_target_waterfall(
     raw_url: &str,
     opts: ProbeOptions<'_>,
 ) -> Result<WaterfallProbeReport> {
+    probe_target_waterfall_with_udp_allowlist(
+        router,
+        config,
+        proxy_or_group,
+        raw_url,
+        opts,
+        opts.allowed_private_addrs,
+    )
+    .await
+}
+
+/// Like [`probe_target_waterfall`], but validates HTTP/HTTPS URL targets strictly against
+/// `opts.allowed_private_addrs` and UDP DNS probe targets strictly against
+/// `allowed_private_udp_addrs` (preventing Demo UDP DNS ports from being probed over HTTP).
+pub async fn probe_target_waterfall_with_udp_allowlist(
+    router: &Router,
+    config: &ClashConfig,
+    proxy_or_group: &str,
+    raw_url: &str,
+    opts: ProbeOptions<'_>,
+    allowed_private_udp_addrs: &[SocketAddr],
+) -> Result<WaterfallProbeReport> {
     let (is_https, host_str, port, path_and_query, sanitized_url) = parse_probe_url(raw_url)?;
     validate_probe_endpoint(
         &host_str,
@@ -899,7 +938,7 @@ pub async fn probe_target_waterfall(
                     opts.udp_dns_target,
                     opts.timeout,
                     opts.allow_private_targets,
-                    opts.allowed_private_addrs,
+                    allowed_private_udp_addrs,
                 )
                 .await,
             )
@@ -1200,6 +1239,27 @@ pub async fn probe_endpoint_matrix(
     targets: Vec<MatrixEndpointSpec>,
     opts: ProbeOptions<'_>,
 ) -> Result<EndpointMatrixReport> {
+    probe_endpoint_matrix_with_udp_allowlist(
+        router,
+        config,
+        proxy_or_group,
+        targets,
+        opts,
+        opts.allowed_private_addrs,
+    )
+    .await
+}
+
+/// Like [`probe_endpoint_matrix`], but keeps HTTP matrix URL allowlists (`opts.allowed_private_addrs`)
+/// strictly separate from the UDP DNS probe allowlist (`allowed_private_udp_addrs`).
+pub async fn probe_endpoint_matrix_with_udp_allowlist(
+    router: &Router,
+    config: &ClashConfig,
+    proxy_or_group: &str,
+    targets: Vec<MatrixEndpointSpec>,
+    opts: ProbeOptions<'_>,
+    allowed_private_udp_addrs: &[SocketAddr],
+) -> Result<EndpointMatrixReport> {
     let dummy_target = TargetAddr::new_domain("example.com", 443)?;
     let (outbound, chains) = router.resolve_chain(proxy_or_group, &dummy_target);
     if outbound.name() == "ROUTING-ERROR" {
@@ -1221,8 +1281,15 @@ pub async fn probe_endpoint_matrix(
                 allow_private_targets: opts.allow_private_targets,
                 allowed_private_addrs: opts.allowed_private_addrs,
             };
-            let report =
-                probe_target_waterfall(router, config, proxy_or_group, &spec.url, sub_opts).await?;
+            let report = probe_target_waterfall_with_udp_allowlist(
+                router,
+                config,
+                proxy_or_group,
+                &spec.url,
+                sub_opts,
+                &[],
+            )
+            .await?;
             Ok::<EndpointMatrixItem, ProxyError>(EndpointMatrixItem {
                 id: spec.id,
                 label: spec.label,
@@ -1239,7 +1306,7 @@ pub async fn probe_endpoint_matrix(
             opts.udp_dns_target,
             opts.timeout,
             opts.allow_private_targets,
-            opts.allowed_private_addrs,
+            allowed_private_udp_addrs,
         )
     );
 
@@ -1458,6 +1525,28 @@ pub async fn diagnose_site(
     raw_input: &str,
     takeover: SiteTakeoverContext,
     opts: ProbeOptions<'_>,
+) -> Result<SiteDiagnosisReport> {
+    diagnose_site_with_udp_allowlist(
+        router,
+        config,
+        raw_input,
+        takeover,
+        opts,
+        opts.allowed_private_addrs,
+    )
+    .await
+}
+
+/// Like [`diagnose_site`], but validates HTTP/HTTPS site targets strictly against
+/// `opts.allowed_private_addrs` and UDP DNS probe targets strictly against
+/// `allowed_private_udp_addrs`.
+pub async fn diagnose_site_with_udp_allowlist(
+    router: &Router,
+    config: &ClashConfig,
+    raw_input: &str,
+    takeover: SiteTakeoverContext,
+    opts: ProbeOptions<'_>,
+    allowed_private_udp_addrs: &[SocketAddr],
 ) -> Result<SiteDiagnosisReport> {
     let (normalized_url, wire_url, route_target) =
         normalize_site_check_input_with_wire_url(raw_input)?;
@@ -1709,7 +1798,15 @@ pub async fn diagnose_site(
         .first()
         .cloned()
         .unwrap_or_else(|| effective_outbound.clone());
-    let wf = probe_target_waterfall(router, config, &probe_entry, &wire_url, opts).await?;
+    let wf = probe_target_waterfall_with_udp_allowlist(
+        router,
+        config,
+        &probe_entry,
+        &wire_url,
+        opts,
+        allowed_private_udp_addrs,
+    )
+    .await?;
 
     let mut stage_checks = Vec::with_capacity(6);
     stage_checks.push(SiteStageCheck {
@@ -3484,5 +3581,230 @@ X-Pad: ";
             assert_eq!(verdict, ProbeVerdict::BlockedOrChallenged);
             writer.abort();
         }
+    }
+
+    #[test]
+    fn validate_probe_url_enforces_scheme_userinfo_ssrf_and_exact_whitelist() {
+        // Non-http/https schemes and URL userinfo MUST always be rejected even when allow_private = true.
+        for bad in [
+            "ftp://example.com/file",
+            "file:///etc/passwd",
+            "gopher://127.0.0.1:6379/_INFO",
+            "http://user:pass@example.com/generate_204",
+            "https://token@example.com/generate_204",
+        ] {
+            assert!(
+                parse_probe_url(bad).is_err(),
+                "parse_probe_url must reject {bad}"
+            );
+            assert!(
+                validate_probe_url(bad, true, &[]).is_err(),
+                "validate_probe_url(allow_private=true) must still reject {bad}"
+            );
+        }
+
+        // Private/loopback/metadata/ULA/reserved/IPv4-embedded IPv6/internal hostnames MUST be rejected when allow_private = false.
+        for blocked in [
+            "http://127.0.0.1:8080/generate_204",
+            "http://localhost:8080/generate_204",
+            "http://[::1]:8080/generate_204",
+            "http://[::ffff:127.0.0.1]:8080/generate_204",
+            "http://0.1.2.3/generate_204",
+            "http://0.0.0.0/generate_204",
+            "http://[::127.0.0.1]/generate_204",
+            "http://[::169.254.169.254]/latest/meta-data/",
+            "http://[::10.0.0.1]/admin",
+            "http://[::0.1.2.3]/admin",
+            "http://[::ffff:0:127.0.0.1]/generate_204",
+            "http://[::ffff:0:169.254.169.254]/latest/meta-data/",
+            "http://[fec0::1]/admin",
+            "http://[100::1]/admin",
+            "http://[::ffff:0.1.2.3]/admin",
+            "http://[64:ff9b::0.1.2.3]/admin",
+            "http://[2002:0001:0203::1]/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/admin",
+            "http://172.16.0.1/admin",
+            "http://192.168.1.1/admin",
+            "http://100.64.0.1/admin",
+            "http://198.18.0.1/admin",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://printer.local/",
+        ] {
+            assert!(
+                validate_probe_url(blocked, false, &[]).is_err(),
+                "validate_probe_url(allow_private=false) must reject {blocked}"
+            );
+        }
+
+        // Direct IP check for newly added reserved & IPv4-embedded IPv6 ranges vs public IPs.
+        for restricted_ip in [
+            "0.1.2.3",
+            "0.255.255.255",
+            "::127.0.0.1",
+            "::169.254.169.254",
+            "::10.0.0.1",
+            "::0.1.2.3",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:169.254.169.254",
+            "fec0::1",
+            "feff::1",
+            "100::1",
+            "::ffff:0.1.2.3",
+        ] {
+            let ip: IpAddr = restricted_ip.parse().unwrap();
+            assert!(
+                is_restricted_probe_ip(ip),
+                "is_restricted_probe_ip must block {restricted_ip}"
+            );
+        }
+        for public_ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
+            let ip: IpAddr = public_ip.parse().unwrap();
+            assert!(
+                !is_restricted_probe_ip(ip),
+                "is_restricted_probe_ip must allow public IP {public_ip}"
+            );
+        }
+
+        // Exact whitelisted addr allows ONLY that IP+port (and localhost on the same loopback port).
+        let allowed = [SocketAddr::from(([127, 0, 0, 1], 18080))];
+        assert!(is_whitelisted_private_addr(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            18080,
+            &allowed
+        ));
+        assert!(is_whitelisted_private_addr(
+            "::ffff:127.0.0.1".parse().unwrap(),
+            18080,
+            &allowed
+        ));
+        assert!(!is_whitelisted_private_addr(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            18081,
+            &allowed
+        ));
+        assert!(validate_probe_url("http://127.0.0.1:18080/generate_204", false, &allowed).is_ok());
+        assert!(validate_probe_url("http://localhost:18080/generate_204", false, &allowed).is_ok());
+        assert!(
+            validate_probe_url("http://127.0.0.1:18081/generate_204", false, &allowed).is_err()
+        );
+        assert!(
+            validate_probe_url("http://localhost:18081/generate_204", false, &allowed).is_err()
+        );
+        assert!(validate_probe_url("https://www.gstatic.com/generate_204", false, &[]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn waterfall_probe_with_udp_allowlist_isolates_http_and_udp_allowlists() {
+        use tokio::net::{TcpListener, UdpSocket};
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = http_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let dns_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = dns_udp.local_addr().unwrap();
+        let dns_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = dns_udp.recv_from(&mut buf).await {
+                if n >= 12 {
+                    let mut resp = buf[..n].to_vec();
+                    resp[2] = 0x81;
+                    resp[3] = 0x80;
+                    let _ = dns_udp.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        let cfg = ClashConfig::default();
+        let dns = Arc::new(FakeIpDnsEngine::new(&DnsConfig::default()).unwrap());
+        let router = Router::new(RunMode::Rule, HashMap::new(), &[], &cfg.rules, dns).unwrap();
+        let http_allow = [http_addr];
+        let udp_allow = [dns_addr];
+        let dns_target_str = dns_addr.to_string();
+
+        // 1. HTTP URL targeting the UDP-only whitelisted DNS port MUST fail with Config error!
+        let err = probe_target_waterfall_with_udp_allowlist(
+            &router,
+            &cfg,
+            "DIRECT",
+            &format!("http://{dns_addr}/"),
+            ProbeOptions {
+                check_udp: false,
+                allowed_private_addrs: &http_allow,
+                ..ProbeOptions::default()
+            },
+            &udp_allow,
+        )
+        .await
+        .expect_err("HTTP probe to UDP-only whitelisted DNS port must be rejected");
+        assert!(matches!(err, ProxyError::Config(_)));
+
+        // 2. HTTP URL targeting the HTTP-whitelisted origin + UDP targeting the UDP-whitelisted DNS port BOTH succeed!
+        let rep = probe_target_waterfall_with_udp_allowlist(
+            &router,
+            &cfg,
+            "DIRECT",
+            &format!("http://{http_addr}/generate_204"),
+            ProbeOptions {
+                check_udp: true,
+                udp_dns_target: Some(&dns_target_str),
+                allowed_private_addrs: &http_allow,
+                ..ProbeOptions::default()
+            },
+            &udp_allow,
+        )
+        .await
+        .expect("HTTP origin + UDP DNS probe with separated allowlists must succeed");
+        assert_eq!(rep.verdict, ProbeVerdict::Reachable);
+        assert_eq!(
+            rep.udp_probe.as_ref().map(|u| u.status.as_str()),
+            Some("verified")
+        );
+
+        // 3. UDP probe targeting the HTTP-only whitelisted port MUST be blocked!
+        let http_target_str = http_addr.to_string();
+        let rep_udp_blocked = probe_target_waterfall_with_udp_allowlist(
+            &router,
+            &cfg,
+            "DIRECT",
+            &format!("http://{http_addr}/generate_204"),
+            ProbeOptions {
+                check_udp: true,
+                udp_dns_target: Some(&http_target_str),
+                allowed_private_addrs: &http_allow,
+                ..ProbeOptions::default()
+            },
+            &udp_allow,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rep_udp_blocked
+                .udp_probe
+                .as_ref()
+                .map(|u| u.status.as_str()),
+            Some("blocked")
+        );
+
+        http_task.abort();
+        dns_task.abort();
     }
 }

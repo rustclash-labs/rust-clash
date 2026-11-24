@@ -28,6 +28,12 @@ pub struct DelayHistoryItem {
     pub delay: u64,
 }
 
+#[derive(Clone, Debug)]
+struct DelayRecordEntry {
+    item: DelayHistoryItem,
+    recorded_at: Instant,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProxyInfoSnapshot {
     pub name: String,
@@ -50,7 +56,7 @@ pub struct ProxyInfoSnapshot {
 /// Thread-safe latency history store shared between Concrete Outbounds and Proxy Groups.
 #[derive(Default)]
 pub struct DelayStore {
-    records: DashMap<String, VecDeque<DelayHistoryItem>>,
+    records: DashMap<String, VecDeque<DelayRecordEntry>>,
     revision: AtomicU64,
 }
 
@@ -64,9 +70,12 @@ impl DelayStore {
         if entry.len() >= 16 {
             entry.pop_front();
         }
-        entry.push_back(DelayHistoryItem {
-            time: TelemetryHub::now_ms(),
-            delay: delay_ms,
+        entry.push_back(DelayRecordEntry {
+            item: DelayHistoryItem {
+                time: TelemetryHub::now_ms(),
+                delay: delay_ms,
+            },
+            recorded_at: Instant::now(),
         });
         drop(entry);
         self.revision.fetch_add(1, Ordering::Release);
@@ -77,20 +86,31 @@ impl DelayStore {
     }
 
     pub fn latest_delay(&self, name: &str) -> Option<u64> {
-        self.latest_delay_with_time(name).map(|(_, d)| d)
+        self.records
+            .get(name)
+            .and_then(|q| q.back().map(|entry| entry.item.delay))
+            .filter(|d| *d > 0)
     }
 
     pub fn latest_delay_with_time(&self, name: &str) -> Option<(u64, u64)> {
         self.records
             .get(name)
-            .and_then(|q| q.back().map(|item| (item.time, item.delay)))
+            .and_then(|q| q.back().map(|entry| (entry.item.time, entry.item.delay)))
             .filter(|(_, d)| *d > 0)
+    }
+
+    pub fn latest_delay_age_ms(&self, name: &str) -> Option<u64> {
+        self.records.get(name).and_then(|q| {
+            q.back().filter(|entry| entry.item.delay > 0).map(|entry| {
+                u64::try_from(entry.recorded_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+            })
+        })
     }
 
     pub fn is_known_failed(&self, name: &str) -> bool {
         self.records
             .get(name)
-            .and_then(|q| q.back().map(|item| item.delay == 0))
+            .and_then(|q| q.back().map(|entry| entry.item.delay == 0))
             .unwrap_or(false)
     }
 
@@ -109,9 +129,12 @@ impl DelayStore {
         }
         let mut entry = self.records.entry(name.to_string()).or_default();
         if entry.is_empty() {
-            entry.push_back(DelayHistoryItem {
-                time: TelemetryHub::now_ms(),
-                delay: delay_ms,
+            entry.push_back(DelayRecordEntry {
+                item: DelayHistoryItem {
+                    time: TelemetryHub::now_ms(),
+                    delay: delay_ms,
+                },
+                recorded_at: Instant::now(),
             });
             drop(entry);
             self.revision.fetch_add(1, Ordering::Release);
@@ -122,19 +145,23 @@ impl DelayStore {
         if rtt_ms == 0 {
             return;
         }
-        let now_ms = TelemetryHub::now_ms();
-        match self.latest_delay_with_time(name) {
+        let latest = self.records.get(name).and_then(|q| {
+            q.back()
+                .filter(|entry| entry.item.delay > 0)
+                .map(|entry| (entry.recorded_at, entry.item.delay))
+        });
+        match latest {
             None => self.record(name, rtt_ms),
             Some(_) if max_age_ms == 0 => self.record(name, rtt_ms),
-            Some((last_time, last_delay)) => {
-                if now_ms.saturating_sub(last_time) >= max_age_ms {
+            Some((recorded_at, last_delay)) => {
+                if recorded_at.elapsed() >= Duration::from_millis(max_age_ms) {
                     // Dampen single-connection RRC-wakeup / bootstrap outliers when refreshing a
                     // previously healthy node so moderate (+50% and >= +60ms) or severe spikes
                     // cannot ratchet the displayed delay badge upward in a single sample.
                     let effective_ms = if rtt_ms.saturating_mul(2) >= last_delay.saturating_mul(3)
                         && rtt_ms.saturating_sub(last_delay) >= 60
                     {
-                        ((last_delay.saturating_mul(3) + rtt_ms) / 4)
+                        (last_delay.saturating_mul(3).saturating_add(rtt_ms) / 4)
                             .min(last_delay.saturating_mul(2))
                     } else {
                         rtt_ms
@@ -157,7 +184,7 @@ impl DelayStore {
     pub fn history(&self, name: &str) -> Vec<DelayHistoryItem> {
         self.records
             .get(name)
-            .map(|q| q.iter().cloned().collect())
+            .map(|q| q.iter().map(|entry| entry.item.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -243,7 +270,7 @@ impl ProxyGroup {
                         delays
                             .records
                             .get(*m)
-                            .and_then(|q| q.back().map(|i| i.delay > 0))
+                            .and_then(|q| q.back().map(|i| i.item.delay > 0))
                             .unwrap_or(true)
                     })
                     .collect();
@@ -419,7 +446,7 @@ impl ProxyGroup {
                         delays
                             .records
                             .get(*m)
-                            .and_then(|q| q.back().map(|i| i.delay > 0))
+                            .and_then(|q| q.back().map(|i| i.item.delay > 0))
                             .unwrap_or(true)
                     })
                     .collect();
@@ -520,6 +547,17 @@ mod tests {
         assert!(store.is_known_failed("HK-Auto"));
     }
 
+    /// Sleep until at least `min_elapsed` has genuinely passed on `Instant`'s monotonic clock,
+    /// avoiding spurious flakes on virtualized kernels where a single short `nanosleep` can wake
+    /// slightly ahead of `CLOCK_MONOTONIC` under load.
+    fn sleep_at_least(min_elapsed: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < min_elapsed {
+            let remaining = min_elapsed.saturating_sub(start.elapsed());
+            std::thread::sleep(remaining.max(Duration::from_millis(1)));
+        }
+    }
+
     #[test]
     fn passive_delay_dampens_upward_wake_spike_and_recovers_fast_downward() {
         let store = DelayStore::default();
@@ -544,12 +582,12 @@ mod tests {
 
         // 3. Stale refresh with a 3094ms single-connection outlier is dampened (<= 2x prior 128ms)
         store.record_passive_if_stale("sg-vless", 3094, 1);
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         store.record_passive_if_stale("sg-vless", 3094, 1);
         let dampened = store.latest_delay("sg-vless").unwrap();
         assert!(
-            dampened <= 128 * 2 * 2,
-            "expected dampened spike <= 512ms, got {dampened}ms"
+            (256..=128 * 2 * 2).contains(&dampened),
+            "expected dampened spike in [256, 512]ms, got {dampened}ms"
         );
         // Next normal 105ms connection brings it right back down without waiting 3 minutes
         store.record_passive_if_stale("sg-vless", 105, 180_000);
@@ -557,19 +595,78 @@ mod tests {
 
         // 4. Moderate cellular RRC wake spike (105ms -> 277ms on stale refresh) is dampened
         //    to (3*105 + 277)/4 = 148ms instead of ratcheting directly to 277ms -> 335ms -> 456ms.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         store.record_passive_if_stale("sg-vless", 277, 1);
         assert_eq!(store.latest_delay("sg-vless"), Some(148));
 
         // 5. Moderate stale spike (108ms -> 217ms) is dampened to (3*108 + 217)/4 = 135ms;
         //    and if an initial cold-start recorded 217ms, a subsequent 112ms dial recovers immediately.
         store.record("sg-mod", 108);
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         store.record_passive_if_stale("sg-mod", 217, 1);
         assert_eq!(store.latest_delay("sg-mod"), Some(135));
 
         store.record("sg-cold", 217);
         store.record_passive_if_stale("sg-cold", 112, 180_000);
         assert_eq!(store.latest_delay("sg-cold"), Some(112));
+    }
+
+    #[test]
+    fn monotonic_delay_staleness_survives_backward_wall_clock_step() {
+        let store = DelayStore::default();
+        let future_wall_ms = TelemetryHub::now_ms().saturating_add(600_000);
+        let mut q = VecDeque::new();
+        q.push_back(DelayRecordEntry {
+            item: DelayHistoryItem {
+                time: future_wall_ms,
+                delay: 105,
+            },
+            recorded_at: Instant::now(),
+        });
+        store.records.insert("node-skew".to_string(), q);
+
+        // External history & latest_delay_with_time still expose the wall-clock item unchanged
+        assert_eq!(
+            store.latest_delay_with_time("node-skew"),
+            Some((future_wall_ms, 105))
+        );
+        assert_eq!(store.history("node-skew").len(), 1);
+        assert_eq!(store.history("node-skew")[0].time, future_wall_ms);
+
+        // Sleep monotonically; age and staleness must advance even while wall clock lags 10 min behind `item.time`
+        sleep_at_least(Duration::from_millis(5));
+        let age = store
+            .latest_delay_age_ms("node-skew")
+            .expect("positive delay must report monotonic age");
+        assert!(
+            (1..5_000).contains(&age),
+            "expected positive monotonic age despite future wall-clock timestamp, got {age}ms"
+        );
+
+        // `import_from` must preserve monotonic `recorded_at` across hot-reloads
+        let reloaded = DelayStore::default();
+        let valid: std::collections::HashSet<String> = ["node-skew".to_string()].into();
+        reloaded.import_from(&store, &valid);
+        assert!(
+            reloaded
+                .latest_delay_age_ms("node-skew")
+                .is_some_and(|ms| ms >= 1),
+            "imported entry must retain monotonic age"
+        );
+
+        // Passive refresh with max_age_ms = 1 must NOT freeze when `item.time` is in the future
+        reloaded.record_passive_if_stale("node-skew", 277, 1);
+        assert_eq!(reloaded.latest_delay("node-skew"), Some(148));
+
+        // Unknown and failed (delay == 0) entries report `None` for age
+        assert_eq!(reloaded.latest_delay_age_ms("missing-node"), None);
+        reloaded.record_failure("failed-node");
+        assert_eq!(reloaded.latest_delay_age_ms("failed-node"), None);
+
+        // Synthetic u64::MAX RTT on stale refresh saturates cleanly without overflow/panic
+        reloaded.record("node-max", 100);
+        sleep_at_least(Duration::from_millis(2));
+        reloaded.record_passive_if_stale("node-max", u64::MAX, 1);
+        assert_eq!(reloaded.latest_delay("node-max"), Some(200));
     }
 }

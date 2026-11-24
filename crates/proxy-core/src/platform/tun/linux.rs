@@ -21,7 +21,10 @@ use parking_lot::Mutex;
 use crate::{
     inbound::tun::VirtualTunHandle,
     platform::{
-        recovery::{LinuxRecoveryRecord, update_current_journal},
+        recovery::{
+            LinuxRecoveryRecord, RecoveryOutcome, finalize_linux_tun_teardown_journal,
+            update_current_journal,
+        },
         socket_protect::{
             DEFAULT_LINUX_FWMARK, LinuxFwmarkProtector, clear_global_socket_protector,
             global_socket_protector, set_global_socket_protector,
@@ -311,6 +314,375 @@ pub fn all_nameservers_bypass_tun(
     })
 }
 
+/// Returns `true` when a Linux `ip` rule/route/link deletion error indicates the target rule,
+/// route, or TUN interface is already absent (`ENOENT` / `ESRCH` / missing device), while
+/// explicitly returning `false` for permission errors (`EPERM` / `EACCES` / `"Operation not permitted"`).
+pub fn is_linux_benign_absent_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return false;
+    }
+    #[cfg(unix)]
+    if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+        return false;
+    }
+    let low = err.to_string().to_ascii_lowercase();
+    if low.contains("operation not permitted") || low.contains("permission denied") {
+        return false;
+    }
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) {
+        return true;
+    }
+    low.contains("no such file or directory")
+        || low.contains("no such process")
+        || low.contains("cannot find device")
+        || low.contains("rtnetlink answers: no such file")
+        || low.contains("rtnetlink answers: no such process")
+        || (low.contains("device") && low.contains("does not exist"))
+}
+
+/// Roll back owned Linux policy rules, routes, and TUN link from a `LinuxRecoveryRecord`,
+/// pruning items that succeeded or were already absent while returning `Some(remaining)` for any
+/// genuinely failed mutations (e.g. non-root `EPERM`) so they stay in `network_recovery.json`
+/// for subsequent recovery instead of leaving orphaned host routing state behind.
+pub fn rollback_linux_record_with_runner<F>(
+    rec: &crate::platform::recovery::LinuxRecoveryRecord,
+    outcome: &mut crate::platform::recovery::RecoveryOutcome,
+    run_cmd: &mut F,
+) -> Option<crate::platform::recovery::LinuxRecoveryRecord>
+where
+    F: FnMut(&str, &[String]) -> std::io::Result<()>,
+{
+    let mut failed_v4_rev = Vec::new();
+    for args in rec.owned_v4_rule_del_args.iter().rev() {
+        let desc = format!("ip {}", args.join(" "));
+        match run_cmd("ip", args) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                if !is_linux_benign_absent_error(&e) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    failed_v4_rev.push(args.clone());
+                }
+            }
+        }
+    }
+    failed_v4_rev.reverse();
+
+    let mut failed_v6_rev = Vec::new();
+    for args in rec.owned_v6_rule_del_args.iter().rev() {
+        let desc = format!("ip {}", args.join(" "));
+        match run_cmd("ip", args) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                if !is_linux_benign_absent_error(&e) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    failed_v6_rev.push(args.clone());
+                }
+            }
+        }
+    }
+    failed_v6_rev.reverse();
+
+    let mut failed_routes_rev = Vec::new();
+    for args in rec.owned_route_del_args.iter().rev() {
+        let desc = format!("ip {}", args.join(" "));
+        match run_cmd("ip", args) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                if !is_linux_benign_absent_error(&e) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    failed_routes_rev.push(args.clone());
+                }
+            }
+        }
+    }
+    failed_routes_rev.reverse();
+
+    let mut remaining_device_name = String::new();
+    if !rec.device_name.is_empty() {
+        let del_link = vec![
+            "link".to_string(),
+            "delete".to_string(),
+            "dev".to_string(),
+            rec.device_name.clone(),
+        ];
+        let desc = format!("ip link delete dev {}", rec.device_name);
+        match run_cmd("ip", &del_link) {
+            Ok(()) => outcome.actions_executed.push(desc),
+            Err(e) => {
+                if !is_linux_benign_absent_error(&e) {
+                    outcome.warnings.push(format!("{desc}: {e}"));
+                    remaining_device_name = rec.device_name.clone();
+                }
+            }
+        }
+    }
+
+    let remaining = crate::platform::recovery::LinuxRecoveryRecord {
+        device_name: remaining_device_name,
+        route_table_id: rec.route_table_id,
+        fwmark: rec.fwmark,
+        owned_v4_rule_del_args: failed_v4_rev,
+        owned_v6_rule_del_args: failed_v6_rev,
+        owned_route_del_args: failed_routes_rev,
+    };
+    (!remaining.is_empty()).then_some(remaining)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ParsedLinuxIpRule {
+    priority: Option<u32>,
+    negated: bool,
+    src: Option<ipnet::IpNet>,
+    dst: Option<ipnet::IpNet>,
+    fwmark: Option<(u32, u32)>,
+    table: Option<String>,
+    suppress_prefixlength: Option<u32>,
+    extra: Vec<String>,
+}
+
+fn parse_rule_prefix(raw: &str) -> Option<Option<ipnet::IpNet>> {
+    if raw.eq_ignore_ascii_case("all") {
+        return Some(None);
+    }
+    let net = if let Ok(net) = raw.parse::<ipnet::IpNet>() {
+        net.trunc()
+    } else if let Ok(v4) = raw.parse::<std::net::Ipv4Addr>() {
+        ipnet::IpNet::V4(ipnet::Ipv4Net::new(v4, 32).ok()?)
+    } else if let Ok(v6) = raw.parse::<std::net::Ipv6Addr>() {
+        ipnet::IpNet::V6(ipnet::Ipv6Net::new(v6, 128).ok()?)
+    } else {
+        return None;
+    };
+    if net.prefix_len() == 0 {
+        Some(None)
+    } else {
+        Some(Some(net))
+    }
+}
+
+fn parse_u32_hex_or_dec(raw: &str) -> Option<u32> {
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u32>().ok()
+    }
+}
+
+fn parse_rule_fwmark(raw: &str) -> Option<(u32, u32)> {
+    if let Some((mark_s, mask_s)) = raw.split_once('/') {
+        let mark = parse_u32_hex_or_dec(mark_s)?;
+        let mask = parse_u32_hex_or_dec(mask_s)?;
+        Some((mark, mask))
+    } else {
+        let mark = parse_u32_hex_or_dec(raw)?;
+        Some((mark, u32::MAX))
+    }
+}
+
+fn normalize_rule_table(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
+        "255" | "local" => "local".to_string(),
+        "254" | "main" => "main".to_string(),
+        "253" | "default" => "default".to_string(),
+        "0" | "unspec" => "unspec".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_linux_ip_rule_tokens(tokens: &[&str]) -> Option<ParsedLinuxIpRule> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut rule = ParsedLinuxIpRule::default();
+    let mut idx = 0;
+
+    if let Some(prio_str) = tokens[0].strip_suffix(':')
+        && let Ok(prio) = prio_str.parse::<u32>()
+    {
+        rule.priority = Some(prio);
+        idx = 1;
+    }
+
+    while idx < tokens.len() {
+        match tokens[idx] {
+            "not" => {
+                rule.negated = true;
+                idx += 1;
+            }
+            "pref" | "priority" | "order" => {
+                let val = tokens.get(idx + 1)?;
+                rule.priority = Some(val.parse::<u32>().ok()?);
+                idx += 2;
+            }
+            "from" => {
+                let val = tokens.get(idx + 1)?;
+                rule.src = parse_rule_prefix(val)?;
+                idx += 2;
+            }
+            "to" => {
+                let val = tokens.get(idx + 1)?;
+                rule.dst = parse_rule_prefix(val)?;
+                idx += 2;
+            }
+            "fwmark" | "mark" => {
+                let val = tokens.get(idx + 1)?;
+                rule.fwmark = Some(parse_rule_fwmark(val)?);
+                idx += 2;
+            }
+            "lookup" | "table" => {
+                let val = tokens.get(idx + 1)?;
+                rule.table = Some(normalize_rule_table(val));
+                idx += 2;
+            }
+            "suppress_prefixlength" | "suppress_prefixlen" => {
+                let val = tokens.get(idx + 1)?;
+                rule.suppress_prefixlength = Some(val.parse::<u32>().ok()?);
+                idx += 2;
+            }
+            other => {
+                rule.extra.push(other.to_ascii_lowercase());
+                idx += 1;
+            }
+        }
+    }
+    Some(rule)
+}
+
+/// Returns `true` if `ip [-4|-6] rule show` output (`show_output`) already contains a rule
+/// semantically equivalent to `rule_spec`, handling real iproute2 formatting (`<pref>:\tfrom all`,
+/// omitted `/32` or `/128` host masks, `not` placement, hex/decimal `fwmark` and implied
+/// `/0xffffffff` mask, `lookup`/`table`, `pref`/`priority`, and `suppress_prefixlength`).
+pub fn linux_ip_rule_exists(show_output: &str, rule_spec: &[&str]) -> bool {
+    let Some(target) = parse_linux_ip_rule_tokens(rule_spec) else {
+        return false;
+    };
+    show_output.lines().any(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(existing) = parse_linux_ip_rule_tokens(&tokens) else {
+            return false;
+        };
+        let prio_matches = target.priority.is_none() || existing.priority == target.priority;
+        prio_matches
+            && existing.negated == target.negated
+            && existing.src == target.src
+            && existing.dst == target.dst
+            && existing.fwmark == target.fwmark
+            && existing.table == target.table
+            && existing.suppress_prefixlength == target.suppress_prefixlength
+            && existing.extra == target.extra
+    })
+}
+
+/// Add a Linux policy rule only when no semantically equivalent rule already exists in
+/// `ip <family> rule show`. Persists the planned `del` command into `network_recovery.json`
+/// BEFORE invoking `ip <family> rule add` so an abrupt `SIGKILL` mid-setup leaves full
+/// rollback commands on disk.
+pub fn add_owned_rule_with_runner<F>(
+    state_dir: &std::path::Path,
+    rec: &mut crate::platform::recovery::LinuxRecoveryRecord,
+    family_flag: &str,
+    rule_spec: &[&str],
+    run_ip_fn: &mut F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&[&str]) -> std::io::Result<String>,
+{
+    // Check if an identical rule already exists so we NEVER delete pre-existing host rules on teardown!
+    let existing = run_ip_fn(&[family_flag, "rule", "show"]).unwrap_or_default();
+    if linux_ip_rule_exists(&existing, rule_spec) {
+        return Ok(());
+    }
+
+    let mut del_args = Vec::with_capacity(rule_spec.len() + 3);
+    del_args.push(family_flag.to_string());
+    del_args.push("rule".to_string());
+    del_args.push("del".to_string());
+    del_args.extend(rule_spec.iter().map(|s| (*s).to_string()));
+
+    let is_v6 = family_flag == "-6";
+    if is_v6 {
+        rec.owned_v6_rule_del_args.push(del_args);
+    } else {
+        rec.owned_v4_rule_del_args.push(del_args);
+    }
+
+    // Persist planned rollback command BEFORE mutating kernel policy rules.
+    let rec_snap = rec.clone();
+    if let Err(err) = crate::platform::recovery::update_current_journal(state_dir, |j| {
+        j.linux_tun = Some(rec_snap);
+    }) {
+        tracing::warn!("Linux TUN: failed persisting recovery journal before rule add: {err}");
+    }
+
+    let mut add_args = Vec::with_capacity(rule_spec.len() + 3);
+    add_args.push(family_flag);
+    add_args.push("rule");
+    add_args.push("add");
+    add_args.extend_from_slice(rule_spec);
+    if let Err(err) = run_ip_fn(&add_args) {
+        if is_v6 {
+            rec.owned_v6_rule_del_args.pop();
+        } else {
+            rec.owned_v4_rule_del_args.pop();
+        }
+        let rec_after = rec.clone();
+        let _ = crate::platform::recovery::update_current_journal(state_dir, |j| {
+            j.linux_tun = Some(rec_after);
+        });
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Add/replace a Linux route, persisting its planned `del` command into `network_recovery.json`
+/// BEFORE invoking `ip <family> route replace` so an abrupt `SIGKILL` mid-setup leaves full
+/// rollback commands on disk.
+pub fn add_owned_route_with_runner<F>(
+    state_dir: &std::path::Path,
+    rec: &mut crate::platform::recovery::LinuxRecoveryRecord,
+    family_flag: &str,
+    route_spec: &[&str],
+    del_spec: &[&str],
+    run_ip_fn: &mut F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&[&str]) -> std::io::Result<String>,
+{
+    let mut del_args = Vec::with_capacity(del_spec.len() + 3);
+    del_args.push(family_flag.to_string());
+    del_args.push("route".to_string());
+    del_args.push("del".to_string());
+    del_args.extend(del_spec.iter().map(|s| (*s).to_string()));
+    rec.owned_route_del_args.push(del_args);
+
+    // Persist planned rollback command BEFORE mutating kernel routing tables.
+    let rec_snap = rec.clone();
+    if let Err(err) = crate::platform::recovery::update_current_journal(state_dir, |j| {
+        j.linux_tun = Some(rec_snap);
+    }) {
+        tracing::warn!("Linux TUN: failed persisting recovery journal before route replace: {err}");
+    }
+
+    let mut add_args = Vec::with_capacity(route_spec.len() + 3);
+    add_args.push(family_flag);
+    add_args.push("route");
+    add_args.push("replace");
+    add_args.extend_from_slice(route_spec);
+    if let Err(err) = run_ip_fn(&add_args) {
+        rec.owned_route_del_args.pop();
+        let rec_after = rec.clone();
+        let _ = crate::platform::recovery::update_current_journal(state_dir, |j| {
+            j.linux_tun = Some(rec_after);
+        });
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub fn has_cap_net_admin() -> bool {
     // SAFETY: `geteuid` has no preconditions.
@@ -458,71 +830,69 @@ fn allocate_free_route_table() -> io::Result<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn rollback_linux_record(rec: &LinuxRecoveryRecord) {
-    for args in rec.owned_v4_rule_del_args.iter().rev() {
-        let _ = run_ip_owned(args);
+fn linux_ip_cmd_runner(program: &str, args: &[String]) -> io::Result<()> {
+    if program == "ip" {
+        run_ip_owned(args).map(|_| ())
+    } else {
+        let out = std::process::Command::new(program).args(args).output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err(io::Error::other(format!(
+                "`{program} {}` failed ({}): {}",
+                args.join(" "),
+                out.status,
+                stderr.trim()
+            )))
+        }
     }
-    for args in rec.owned_v6_rule_del_args.iter().rev() {
-        let _ = run_ip_owned(args);
+}
+
+#[cfg(target_os = "linux")]
+fn rollback_linux_record_and_finalize(
+    rec: &LinuxRecoveryRecord,
+    state_dir: &Path,
+) -> RecoveryOutcome {
+    let mut outcome = RecoveryOutcome::default();
+    let remaining = rollback_linux_record_with_runner(rec, &mut outcome, &mut linux_ip_cmd_runner);
+    for warn_msg in &outcome.warnings {
+        tracing::warn!("Linux TUN teardown recovery warning: {warn_msg}");
     }
-    for args in rec.owned_route_del_args.iter().rev() {
-        let _ = run_ip_owned(args);
+    if let Err(e) = finalize_linux_tun_teardown_journal(state_dir, remaining) {
+        let msg = format!("failed updating Linux recovery journal: {e}");
+        tracing::warn!("{msg}");
+        outcome.warnings.push(msg);
     }
-    if !rec.device_name.is_empty() {
-        let _ = run_ip(&["link", "set", "dev", &rec.device_name, "down"]);
-    }
+    outcome
 }
 
 #[cfg(target_os = "linux")]
 fn add_owned_rule(
+    state_dir: &Path,
+    rec: &mut LinuxRecoveryRecord,
     family_flag: &str,
     rule_spec: &[&str],
-    ledger: &mut Vec<Vec<String>>,
 ) -> io::Result<()> {
-    // Check if an identical rule already exists so we NEVER delete pre-existing host rules on teardown!
-    let existing = run_ip(&[family_flag, "rule", "show"]).unwrap_or_default();
-    let needle = rule_spec.join(" ");
-    if existing.lines().any(|l| l.contains(&needle)) {
-        return Ok(());
-    }
-
-    let mut add_args = Vec::with_capacity(rule_spec.len() + 3);
-    add_args.push(family_flag);
-    add_args.push("rule");
-    add_args.push("add");
-    add_args.extend_from_slice(rule_spec);
-    run_ip(&add_args)?;
-
-    let mut del_args = Vec::with_capacity(rule_spec.len() + 3);
-    del_args.push(family_flag.to_string());
-    del_args.push("rule".to_string());
-    del_args.push("del".to_string());
-    del_args.extend(rule_spec.iter().map(|s| (*s).to_string()));
-    ledger.push(del_args);
-    Ok(())
+    add_owned_rule_with_runner(state_dir, rec, family_flag, rule_spec, &mut run_ip)
 }
 
 #[cfg(target_os = "linux")]
 fn add_owned_route(
+    state_dir: &Path,
+    rec: &mut LinuxRecoveryRecord,
     family_flag: &str,
     route_spec: &[&str],
     del_spec: &[&str],
-    ledger: &mut Vec<Vec<String>>,
 ) -> io::Result<()> {
-    let mut add_args = Vec::with_capacity(route_spec.len() + 3);
-    add_args.push(family_flag);
-    add_args.push("route");
-    add_args.push("replace");
-    add_args.extend_from_slice(route_spec);
-    run_ip(&add_args)?;
-
-    let mut del_args = Vec::with_capacity(del_spec.len() + 3);
-    del_args.push(family_flag.to_string());
-    del_args.push("route".to_string());
-    del_args.push("del".to_string());
-    del_args.extend(del_spec.iter().map(|s| (*s).to_string()));
-    ledger.push(del_args);
-    Ok(())
+    add_owned_route_with_runner(
+        state_dir,
+        rec,
+        family_flag,
+        route_spec,
+        del_spec,
+        &mut run_ip,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -653,16 +1023,18 @@ impl LinuxSystemTunSession {
 
             // 1. Populate our dedicated collision-free policy table `<table_id>`
             add_owned_route(
+                &spec.state_dir,
+                &mut rec,
                 "-4",
                 &["default", "dev", &actual_name, "table", &table_str],
                 &["default", "dev", &actual_name, "table", &table_str],
-                &mut rec.owned_route_del_args,
             )?;
             add_owned_route(
+                &spec.state_dir,
+                &mut rec,
                 "-4",
                 &[&fake_cidr, "dev", &actual_name],
                 &[&fake_cidr, "dev", &actual_name],
-                &mut rec.owned_route_del_args,
             )?;
 
             // 2. High-priority explicit bypasses for proxy server IPs (plus upstream DNS IPs only
@@ -680,17 +1052,19 @@ impl LinuxSystemTunSession {
                     IpAddr::V4(v4) if !v4.is_loopback() && !spec.fake_ip_net.contains(v4) => {
                         let host_cidr = format!("{v4}/32");
                         add_owned_rule(
+                            &spec.state_dir,
+                            &mut rec,
                             "-4",
                             &["pref", "8990", "to", &host_cidr, "lookup", "main"],
-                            &mut rec.owned_v4_rule_del_args,
                         )?;
                     }
                     IpAddr::V6(v6) if spec.enable_ipv6 && !v6.is_loopback() => {
                         let host_cidr = format!("{v6}/128");
                         if let Err(err) = add_owned_rule(
+                            &spec.state_dir,
+                            &mut rec,
                             "-6",
                             &["pref", "8990", "to", &host_cidr, "lookup", "main"],
-                            &mut rec.owned_v6_rule_del_args,
                         ) {
                             tracing::warn!(
                                 "Linux TUN: failed adding IPv6 bypass rule for {host_cidr} ({err}); IPv6 catch-all TUN capture will be skipped to prevent routing loops"
@@ -711,16 +1085,18 @@ impl LinuxSystemTunSession {
             );
             for cidr in &exclude_v4 {
                 add_owned_rule(
+                    &spec.state_dir,
+                    &mut rec,
                     "-4",
                     &["pref", "8995", "to", cidr, "lookup", "main"],
-                    &mut rec.owned_v4_rule_del_args,
                 )?;
             }
             for cidr in &exclude_v6 {
                 if let Err(err) = add_owned_rule(
+                    &spec.state_dir,
+                    &mut rec,
                     "-6",
                     &["pref", "8995", "to", cidr, "lookup", "main"],
-                    &mut rec.owned_v6_rule_del_args,
                 ) {
                     tracing::warn!(
                         "Linux TUN: failed adding IPv6 route-exclude-address rule for {cidr} ({err})"
@@ -744,22 +1120,26 @@ impl LinuxSystemTunSession {
             };
             for cidr in v4_bypasses {
                 add_owned_rule(
+                    &spec.state_dir,
+                    &mut rec,
                     "-4",
                     &["pref", "9000", "to", cidr, "lookup", "main"],
-                    &mut rec.owned_v4_rule_del_args,
                 )?;
             }
 
             // 4. Route Fake-IP range unconditionally to `<table_id>`
             add_owned_rule(
+                &spec.state_dir,
+                &mut rec,
                 "-4",
                 &["pref", "9010", "to", &fake_cidr, "lookup", &table_str],
-                &mut rec.owned_v4_rule_del_args,
             )?;
 
             // 5. Consult `main` for all non-default local subnet routes (`suppress_prefixlength 0`),
             //    then capture all unmarked (`not fwmark 0x1a5`) default IPv4 traffic into `<table_id>`!
             add_owned_rule(
+                &spec.state_dir,
+                &mut rec,
                 "-4",
                 &[
                     "pref",
@@ -769,14 +1149,14 @@ impl LinuxSystemTunSession {
                     "suppress_prefixlength",
                     "0",
                 ],
-                &mut rec.owned_v4_rule_del_args,
             )?;
             add_owned_rule(
+                &spec.state_dir,
+                &mut rec,
                 "-4",
                 &[
                     "pref", "9020", "not", "fwmark", &mark_hex, "lookup", &table_str,
                 ],
-                &mut rec.owned_v4_rule_del_args,
             )?;
 
             // 6. IPv6 default-route interception when `tun.ipv6: true`
@@ -785,9 +1165,10 @@ impl LinuxSystemTunSession {
             if spec.enable_ipv6 {
                 for v6_local in ["::1/128", "fe80::/10"] {
                     if let Err(err) = add_owned_rule(
+                        &spec.state_dir,
+                        &mut rec,
                         "-6",
                         &["pref", "9000", "to", v6_local, "lookup", "main"],
-                        &mut rec.owned_v6_rule_del_args,
                     ) {
                         tracing::warn!(
                             "Linux TUN: failed adding IPv6 local bypass rule for {v6_local} ({err})"
@@ -796,6 +1177,8 @@ impl LinuxSystemTunSession {
                     }
                 }
                 if let Err(err) = add_owned_rule(
+                    &spec.state_dir,
+                    &mut rec,
                     "-6",
                     &[
                         "pref",
@@ -805,7 +1188,6 @@ impl LinuxSystemTunSession {
                         "suppress_prefixlength",
                         "0",
                     ],
-                    &mut rec.owned_v6_rule_del_args,
                 ) {
                     tracing::warn!(
                         "Linux TUN: failed adding IPv6 suppress_prefixlength 0 rule ({err})"
@@ -815,17 +1197,19 @@ impl LinuxSystemTunSession {
 
                 if ipv6_bypass_ok {
                     add_owned_route(
+                        &spec.state_dir,
+                        &mut rec,
                         "-6",
                         &["default", "dev", &actual_name, "table", &table_str],
                         &["default", "dev", &actual_name, "table", &table_str],
-                        &mut rec.owned_route_del_args,
                     )?;
                     add_owned_rule(
+                        &spec.state_dir,
+                        &mut rec,
                         "-6",
                         &[
                             "pref", "9020", "not", "fwmark", &mark_hex, "lookup", &table_str,
                         ],
-                        &mut rec.owned_v6_rule_del_args,
                     )?;
                 } else {
                     tracing::warn!(
@@ -906,9 +1290,9 @@ impl LinuxSystemTunSession {
         let route_table_id = match setup_res {
             Ok(id) => id,
             Err(err) => {
-                rollback_linux_record(&rec);
+                drop(file);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                let _ = rollback_linux_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
         };
@@ -916,9 +1300,9 @@ impl LinuxSystemTunSession {
         let writer_file = match file.try_clone() {
             Ok(wf) => wf,
             Err(err) => {
-                rollback_linux_record(&rec);
+                drop(file);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                let _ = rollback_linux_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
         };
@@ -1000,9 +1384,9 @@ impl LinuxSystemTunSession {
             Err(err) => {
                 stop_flag.store(true, Ordering::Release);
                 let _ = stop_watch_tx.send(true);
-                rollback_linux_record(&rec);
+                drop(writer_file);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                let _ = rollback_linux_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
         };
@@ -1044,9 +1428,8 @@ impl LinuxSystemTunSession {
                 stop_flag.store(true, Ordering::Release);
                 let _ = stop_watch_tx.send(true);
                 let _ = rx_thread.join();
-                rollback_linux_record(&rec);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                let _ = rollback_linux_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
         };
@@ -1087,9 +1470,8 @@ impl LinuxSystemTunSession {
                 let _ = stop_watch_tx.send(true);
                 let _ = rx_thread.join();
                 let _ = tx_thread.join();
-                rollback_linux_record(&rec);
                 clear_global_socket_protector();
-                let _ = update_current_journal(&spec.state_dir, |j| j.linux_tun = None);
+                let _ = rollback_linux_record_and_finalize(&rec, &spec.state_dir);
                 return Err(err);
             }
         };
@@ -1154,19 +1536,15 @@ impl SystemTunSession for LinuxSystemTunSession {
         if let Some(h) = self.watch_thread.take() {
             let _ = h.join();
         }
-        rollback_linux_record(&self.recovery_record);
-        flush_linux_resolved_cache();
-        clear_global_socket_protector();
-        if let Err(err) = update_current_journal(&self.spec.state_dir, |j| j.linux_tun = None) {
-            tracing::warn!("Linux TUN: failed clearing recovery journal on stop: {err}");
-        }
-
         if let Some(h) = self.rx_thread.take() {
             let _ = h.join();
         }
         if let Some(h) = self.tx_thread.take() {
             let _ = h.join();
         }
+        let _ = rollback_linux_record_and_finalize(&self.recovery_record, &self.spec.state_dir);
+        flush_linux_resolved_cache();
+        clear_global_socket_protector();
     }
 }
 
@@ -1356,5 +1734,410 @@ mod tests {
         let (v4_only, v6_disabled) = plan_linux_exclude_cidr_rules(&cidrs, fake_net, tun_v6, false);
         assert_eq!(v4_only, vec!["192.168.0.0/16", "10.0.0.0/8"]);
         assert!(v6_disabled.is_empty());
+    }
+
+    #[test]
+    fn linux_ip_rule_exists_matches_real_iproute2_v4_and_v6_formats() {
+        let show_v4 = "\
+0:\tfrom all lookup local
+8990:\tfrom all to 1.2.3.4 lookup main
+8995:\tfrom all to 192.168.0.0/16 lookup main
+9000:\tfrom all to 127.0.0.0/8 lookup main
+9010:\tfrom all to 198.18.0.0/15 lookup 20220
+9015:\tfrom all lookup main suppress_prefixlength 0
+9020:\tnot from all fwmark 0x1a5 lookup 20220
+9021:\tnot from all fwmark 0x1a5/0xffff lookup 20220
+9025:\tfrom 10.0.0.1 to 1.2.3.4 lookup main
+9026:\tfrom all to 1.2.3.40 lookup main
+9027:\tfrom all to 1.2.3.4 iif eth0 lookup main
+32766:\tfrom all lookup main
+32767:\tfrom all lookup default
+";
+        let show_v6 = "\
+0:\tfrom all lookup local
+8990:\tfrom all to 2001:db8::1 lookup main
+8995:\tfrom all to fc00::/7 lookup main
+9000:\tfrom all to ::1 lookup main
+9000:\tfrom all to fe80::/10 lookup main
+9015:\tfrom all lookup main suppress_prefixlength 0
+9020:\tnot from all fwmark 0x1a5/0xffffffff lookup 20220
+32766:\tfrom all lookup main
+";
+
+        // Positive matches normalizing bare `/32`, `/128`, `from all`, `not`, hex/dec fwmark & mask,
+        // `pref`/`priority`, `lookup`/`table`, `254`/`main`, and `suppress_prefixlength`.
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &["pref", "8990", "to", "1.2.3.4/32", "lookup", "main"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &["priority", "8990", "to", "1.2.3.4/32", "table", "254"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9010", "to", "198.18.0.0/15", "lookup", "20220"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &[
+                "pref",
+                "9015",
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0"
+            ]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9020", "not", "fwmark", "0x1a5", "lookup", "20220"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9020", "not", "fwmark", "421", "lookup", "20220"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &[
+                "pref",
+                "9020",
+                "not",
+                "fwmark",
+                "0x1a5/0xffffffff",
+                "lookup",
+                "20220"
+            ]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v4,
+            &[
+                "pref",
+                "9021",
+                "not",
+                "fwmark",
+                "421/65535",
+                "lookup",
+                "20220"
+            ]
+        ));
+
+        // IPv6 canonicalization (`2001:0db8::1/128` == `2001:db8::1`, `::1/128` == `::1`)
+        assert!(linux_ip_rule_exists(
+            show_v6,
+            &["pref", "8990", "to", "2001:0db8::1/128", "lookup", "main"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v6,
+            &["pref", "9000", "to", "::1/128", "lookup", "main"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v6,
+            &["pref", "9000", "to", "fe80::/10", "lookup", "main"]
+        ));
+        assert!(linux_ip_rule_exists(
+            show_v6,
+            &["pref", "9020", "not", "fwmark", "0x1a5", "lookup", "20220"]
+        ));
+
+        // Negative cases: MUST NOT produce false positives!
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "8991", "to", "1.2.3.4/32", "lookup", "main"]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9026", "to", "1.2.3.4/32", "lookup", "main"]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9025", "to", "1.2.3.4/32", "lookup", "main"]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9027", "to", "1.2.3.4/32", "lookup", "main"]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9020", "fwmark", "0x1a5", "lookup", "20220"]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9021", "not", "fwmark", "0x1a5", "lookup", "20220"]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &[
+                "pref",
+                "9015",
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "1"
+            ]
+        ));
+        assert!(!linux_ip_rule_exists(
+            show_v4,
+            &["pref", "9015", "lookup", "main"]
+        ));
+        assert!(!linux_ip_rule_exists(show_v4, &[]));
+    }
+
+    #[test]
+    fn is_linux_benign_absent_error_distinguishes_absent_from_eperm() {
+        assert!(is_linux_benign_absent_error(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory",
+        )));
+        assert!(is_linux_benign_absent_error(&std::io::Error::other(
+            "RTNETLINK answers: No such file or directory",
+        )));
+        assert!(is_linux_benign_absent_error(&std::io::Error::other(
+            "RTNETLINK answers: No such process",
+        )));
+        assert!(is_linux_benign_absent_error(&std::io::Error::other(
+            "Cannot find device \"Clash0\"",
+        )));
+        assert!(is_linux_benign_absent_error(&std::io::Error::other(
+            "Device \"Clash0\" does not exist.",
+        )));
+
+        assert!(!is_linux_benign_absent_error(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
+        assert!(!is_linux_benign_absent_error(&std::io::Error::other(
+            "RTNETLINK answers: Operation not permitted",
+        )));
+        assert!(!is_linux_benign_absent_error(&std::io::Error::other(
+            "RTNETLINK answers: File exists",
+        )));
+        #[cfg(unix)]
+        {
+            assert!(is_linux_benign_absent_error(
+                &std::io::Error::from_raw_os_error(libc::ENOENT)
+            ));
+            assert!(is_linux_benign_absent_error(
+                &std::io::Error::from_raw_os_error(libc::ESRCH)
+            ));
+            assert!(!is_linux_benign_absent_error(
+                &std::io::Error::from_raw_os_error(libc::EPERM)
+            ));
+            assert!(!is_linux_benign_absent_error(
+                &std::io::Error::from_raw_os_error(libc::EACCES)
+            ));
+        }
+    }
+
+    #[test]
+    fn rollback_linux_record_with_runner_prunes_succeeded_and_benign_absent_retains_eperm() {
+        let r1 = vec![
+            "-4".into(),
+            "rule".into(),
+            "del".into(),
+            "pref".into(),
+            "8990".into(),
+        ];
+        let r2 = vec![
+            "-4".into(),
+            "rule".into(),
+            "del".into(),
+            "pref".into(),
+            "9020".into(),
+        ];
+        let r6 = vec![
+            "-6".into(),
+            "rule".into(),
+            "del".into(),
+            "pref".into(),
+            "9020".into(),
+        ];
+        let rt = vec![
+            "-4".into(),
+            "route".into(),
+            "del".into(),
+            "default".into(),
+            "dev".into(),
+            "Clash0".into(),
+            "table".into(),
+            "20220".into(),
+        ];
+        let rec = crate::platform::recovery::LinuxRecoveryRecord {
+            device_name: "Clash0".into(),
+            route_table_id: 20220,
+            fwmark: 0x1a5,
+            owned_v4_rule_del_args: vec![r1.clone(), r2.clone()],
+            owned_v6_rule_del_args: vec![r6.clone()],
+            owned_route_del_args: vec![rt.clone()],
+        };
+
+        let mut outcome = crate::platform::recovery::RecoveryOutcome::default();
+        let mut seen = Vec::new();
+        let rem = rollback_linux_record_with_runner(&rec, &mut outcome, &mut |prog, args| {
+            let cmd = format!("{prog} {}", args.join(" "));
+            seen.push(cmd.clone());
+            if cmd.contains("pref 9020") && cmd.contains("-4") {
+                Err(std::io::Error::other(
+                    "RTNETLINK answers: Operation not permitted",
+                ))
+            } else if cmd.contains("pref 8990") {
+                Ok(())
+            } else if cmd.contains("-6") {
+                Err(std::io::Error::other("RTNETLINK answers: No such process"))
+            } else {
+                Err(std::io::Error::other("Cannot find device \"Clash0\""))
+            }
+        })
+        .expect("EPERM rule must remain");
+
+        // LIFO order for v4 rules (`9020` before `8990`), followed by v6, routes, and link delete.
+        assert_eq!(seen[0], "ip -4 rule del pref 9020");
+        assert_eq!(seen[1], "ip -4 rule del pref 8990");
+        assert_eq!(seen[2], "ip -6 rule del pref 9020");
+        assert_eq!(seen[3], "ip -4 route del default dev Clash0 table 20220");
+        assert_eq!(seen[4], "ip link delete dev Clash0");
+
+        assert_eq!(rem.owned_v4_rule_del_args, vec![r2]);
+        assert!(rem.owned_v6_rule_del_args.is_empty());
+        assert!(rem.owned_route_del_args.is_empty());
+        assert!(rem.device_name.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.actions_executed, vec!["ip -4 rule del pref 8990"]);
+    }
+
+    #[test]
+    fn add_owned_rule_and_route_persist_journal_before_mutation_and_dedup_existing() {
+        let dir = std::env::temp_dir().join(format!(
+            "rc-linux-prepersist-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rec = crate::platform::recovery::LinuxRecoveryRecord {
+            device_name: "Clash0".into(),
+            route_table_id: 20220,
+            fwmark: 0x1a5,
+            owned_v4_rule_del_args: Vec::new(),
+            owned_v6_rule_del_args: Vec::new(),
+            owned_route_del_args: Vec::new(),
+        };
+
+        // 1. Pre-existing host rule formatted as real `ip -4 rule show` output MUST be deduplicated
+        //    without running `rule add` or recording into `rec` / `network_recovery.json`.
+        let mut add_called = false;
+        add_owned_rule_with_runner(
+            &dir,
+            &mut rec,
+            "-4",
+            &["pref", "8990", "to", "1.2.3.4/32", "lookup", "main"],
+            &mut |args| {
+                if args == ["-4", "rule", "show"] {
+                    Ok("8990:\tfrom all to 1.2.3.4 lookup main\n".into())
+                } else {
+                    add_called = true;
+                    Ok(String::new())
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            !add_called,
+            "existing host rule must not be re-added or recorded as owned"
+        );
+        assert!(rec.owned_v4_rule_del_args.is_empty());
+
+        // 2. Adding a new route MUST persist its `del` command on disk BEFORE `route replace` executes!
+        let mut saw_route_on_disk_before_exec = false;
+        add_owned_route_with_runner(
+            &dir,
+            &mut rec,
+            "-4",
+            &["default", "dev", "Clash0", "table", "20220"],
+            &["default", "dev", "Clash0", "table", "20220"],
+            &mut |args| {
+                assert_eq!(args[1], "route");
+                assert_eq!(args[2], "replace");
+                let on_disk = crate::platform::recovery::RecoveryJournal::load_from(&dir)
+                    .unwrap()
+                    .expect("journal must already exist on disk before route replace executes");
+                let lt = on_disk.linux_tun.expect("linux_tun present on disk");
+                saw_route_on_disk_before_exec = lt.owned_route_del_args.iter().any(|d| {
+                    d == &vec![
+                        "-4".to_string(),
+                        "route".to_string(),
+                        "del".to_string(),
+                        "default".to_string(),
+                        "dev".to_string(),
+                        "Clash0".to_string(),
+                        "table".to_string(),
+                        "20220".to_string(),
+                    ]
+                });
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+        assert!(saw_route_on_disk_before_exec);
+
+        // 3. Adding a new rule MUST persist its `del` command on disk BEFORE `rule add` executes!
+        let mut saw_rule_on_disk_before_exec = false;
+        add_owned_rule_with_runner(
+            &dir,
+            &mut rec,
+            "-4",
+            &["pref", "9020", "not", "fwmark", "0x1a5", "lookup", "20220"],
+            &mut |args| {
+                if args == ["-4", "rule", "show"] {
+                    return Ok("0:\tfrom all lookup local\n32766:\tfrom all lookup main\n".into());
+                }
+                assert_eq!(args[1], "rule");
+                assert_eq!(args[2], "add");
+                let on_disk = crate::platform::recovery::RecoveryJournal::load_from(&dir)
+                    .unwrap()
+                    .expect("journal must already exist on disk before rule add executes");
+                let lt = on_disk.linux_tun.expect("linux_tun present on disk");
+                saw_rule_on_disk_before_exec = lt.owned_v4_rule_del_args.iter().any(|d| {
+                    d == &vec![
+                        "-4".to_string(),
+                        "rule".to_string(),
+                        "del".to_string(),
+                        "pref".to_string(),
+                        "9020".to_string(),
+                        "not".to_string(),
+                        "fwmark".to_string(),
+                        "0x1a5".to_string(),
+                        "lookup".to_string(),
+                        "20220".to_string(),
+                    ]
+                });
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+        assert!(saw_rule_on_disk_before_exec);
+
+        // 4. If `rule add` fails cleanly, the un-added `del_args` is popped and re-synced cleanly.
+        let err = add_owned_rule_with_runner(
+            &dir,
+            &mut rec,
+            "-6",
+            &["pref", "9000", "to", "::1/128", "lookup", "main"],
+            &mut |args| {
+                if args == ["-6", "rule", "show"] {
+                    return Ok(String::new());
+                }
+                Err(std::io::Error::other("EAFNOSUPPORT"))
+            },
+        );
+        assert!(err.is_err());
+        assert!(rec.owned_v6_rule_del_args.is_empty());
+        let on_disk_after_fail = crate::platform::recovery::RecoveryJournal::load_from(&dir)
+            .unwrap()
+            .unwrap()
+            .linux_tun
+            .unwrap();
+        assert!(on_disk_after_fail.owned_v6_rule_del_args.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

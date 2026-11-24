@@ -1,7 +1,7 @@
 {
   "name": "rust-clash-ui",
   "private": true,
-  "version": "0.5.15",
+  "version": "0.5.16",
   "license": "MIT OR Apache-2.0",
   "author": "RustClash Labs <rustclash.labs@proton.me>",
   "repository": {
@@ -11,7 +11,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --test src/utils/statusModel.test.mjs",
+    "test": "node --test \"src/utils/*.test.mjs\"",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },

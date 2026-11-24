@@ -75,7 +75,7 @@
 
 ## 下载
 
-从 [`v0.5.15` 最新正式版](https://github.com/rustclash-labs/rust-clash/releases/latest) 获取对应平台安装包（所有构建产物均附带 `SHA256SUMS.txt` 校验文件）。
+从 [`v0.5.16` 最新正式版](https://github.com/rustclash-labs/rust-clash/releases/latest) 获取对应平台安装包（所有构建产物均附带 `SHA256SUMS.txt` 校验文件）。
 
 | 平台 | 安装包 | 说明 |
 | --- | --- | --- |

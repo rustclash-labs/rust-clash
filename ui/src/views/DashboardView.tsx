@@ -49,6 +49,13 @@ import {
   splitSpeedParts,
 } from "../utils/format";
 import {
+  decideMasterToggleProbeAction,
+  decideModeSwitchProbeAction,
+  decideSysProxyToggleProbeAction,
+  decideTunToggleProbeAction,
+  isCurrentProbe,
+} from "../utils/dashboardProbes.mjs";
+import {
   deriveExitIpDisplay,
   deriveThreeLayerStatus,
   planMasterToggle,
@@ -184,6 +191,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   // Live 1s uptime ticker
   const bootMsRef = useRef<number>(Date.now());
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const mountedRef = useRef(true);
+  const exitIpSeqRef = useRef(0);
+  const probeSeqRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -261,24 +278,40 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       ? effectiveOutbound
       : "DIRECT");
 
+  const invalidateDashboardProbes = useCallback(() => {
+    exitIpSeqRef.current += 1;
+    probeSeqRef.current += 1;
+    if (!mountedRef.current) return;
+    setIpLoading(false);
+    setServiceLatency((prev) =>
+      prev.probing ? { ...prev, probing: false } : prev,
+    );
+  }, []);
+
   const loadExitIp = useCallback(async (forceRefresh = false) => {
+    const seq = ++exitIpSeqRef.current;
     setIpLoading(true);
     try {
       const info = await fetchExitIp(forceRefresh);
+      if (!isCurrentProbe(seq, exitIpSeqRef.current, mountedRef.current)) return;
       if (info && info.ip && info.ok !== false) {
         setExitIp(info);
       } else {
         setExitIp({ ip: "", country_code: "", country: "", ok: false });
       }
     } catch {
+      if (!isCurrentProbe(seq, exitIpSeqRef.current, mountedRef.current)) return;
       setExitIp({ ip: "", country_code: "", country: "", ok: false });
     } finally {
-      setIpLoading(false);
+      if (isCurrentProbe(seq, exitIpSeqRef.current, mountedRef.current)) {
+        setIpLoading(false);
+      }
     }
   }, []);
 
   const probeConnectivity = useCallback(async () => {
     if (!online) return;
+    const seq = ++probeSeqRef.current;
     setServiceLatency((prev) => ({ ...prev, probing: true }));
     const demoOrigin =
       config?.demo.enabled && config.demo.http_benchmark_origin
@@ -287,22 +320,32 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     const googleUrl = demoOrigin ?? "https://www.gstatic.com/generate_204";
     const githubUrl = demoOrigin ?? "https://api.github.com/";
 
-    const [gRes, ghRes] = await Promise.allSettled([
-      testProxyDelay(probeTargetName, googleUrl, 4000),
-      testProxyDelay(probeTargetName, githubUrl, 4000),
-    ]);
+    try {
+      const [gRes, ghRes] = await Promise.allSettled([
+        testProxyDelay(probeTargetName, googleUrl, 4000),
+        testProxyDelay(probeTargetName, githubUrl, 4000),
+      ]);
 
-    setServiceLatency({
-      google:
-        gRes.status === "fulfilled" && gRes.value.delay > 0
-          ? gRes.value.delay
-          : null,
-      github:
-        ghRes.status === "fulfilled" && ghRes.value.delay > 0
-          ? ghRes.value.delay
-          : null,
-      probing: false,
-    });
+      if (!isCurrentProbe(seq, probeSeqRef.current, mountedRef.current)) return;
+
+      setServiceLatency({
+        google:
+          gRes.status === "fulfilled" && gRes.value.delay > 0
+            ? gRes.value.delay
+            : null,
+        github:
+          ghRes.status === "fulfilled" && ghRes.value.delay > 0
+            ? ghRes.value.delay
+            : null,
+        probing: false,
+      });
+    } finally {
+      if (isCurrentProbe(seq, probeSeqRef.current, mountedRef.current)) {
+        setServiceLatency((prev) =>
+          prev.probing ? { ...prev, probing: false } : prev,
+        );
+      }
+    }
   }, [online, config?.demo.enabled, config?.demo.http_benchmark_origin, probeTargetName]);
 
   const loadAuxActivity = useCallback(async () => {
@@ -312,6 +355,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       clashApi.getConnectionDiagnostics(50, true),
       clashApi.getFakeIpPool(),
     ]);
+    if (!mountedRef.current) return;
     if (diagRes.status === "fulfilled") {
       setRecentDiagnostics(diagRes.value.diagnostics);
     }
@@ -332,7 +376,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const proxyRunning = sysproxyEnabled || tunEnabled;
 
   useEffect(() => {
-    if (!online || (!proxyRunning && !config?.demo.enabled)) return;
+    if (!online || (!proxyRunning && !config?.demo.enabled)) {
+      invalidateDashboardProbes();
+      return;
+    }
     void loadExitIp(false);
     void probeConnectivity();
   }, [
@@ -343,6 +390,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     config?.mode,
     loadExitIp,
     probeConnectivity,
+    invalidateDashboardProbes,
   ]);
 
   useEffect(() => {
@@ -521,9 +569,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         }
       }
 
+      const masterProbeAction = decideMasterToggleProbeAction({
+        action: plan.action,
+        demoEnabled: Boolean(config?.demo.enabled),
+      });
+      if (masterProbeAction === "invalidate") {
+        invalidateDashboardProbes();
+      }
       await onRefreshAll();
-      void loadExitIp(true);
-      void probeConnectivity();
+      if (masterProbeAction === "probe") {
+        void loadExitIp(true);
+        void probeConnectivity();
+      } else {
+        invalidateDashboardProbes();
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setToast({
@@ -543,8 +602,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     if (busyKey || config?.mode === mode) return;
     void runControl(`mode-${mode}`, async () => {
       await patchConfig({ mode });
-      void loadExitIp(true);
-      void probeConnectivity();
+      if (
+        decideModeSwitchProbeAction({
+          proxyRunning,
+          demoEnabled: Boolean(config?.demo.enabled),
+        }) === "probe"
+      ) {
+        void loadExitIp(true);
+        void probeConnectivity();
+      } else {
+        invalidateDashboardProbes();
+      }
     });
   };
 
@@ -556,7 +624,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       if (nextSys || tunEnabled) {
         saveTakeoverPref({ sysproxy: nextSys, tun: tunEnabled });
       }
-      void loadExitIp(true);
+      if (
+        decideSysProxyToggleProbeAction({
+          nextSysproxyEnabled: nextSys,
+          tunEnabled,
+          demoEnabled: Boolean(config?.demo.enabled),
+        }) === "probe"
+      ) {
+        void loadExitIp(true);
+      } else {
+        invalidateDashboardProbes();
+      }
     });
   };
 
@@ -578,8 +656,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         if (sysproxyEnabled || nextEnable) {
           saveTakeoverPref({ sysproxy: sysproxyEnabled, tun: nextEnable });
         }
+        const tunProbeAction = decideTunToggleProbeAction({
+          sysproxyEnabled,
+          nextTunEnabled: nextEnable,
+          demoEnabled: Boolean(config?.demo.enabled),
+        });
+        if (tunProbeAction === "invalidate") {
+          invalidateDashboardProbes();
+        }
         await onRefreshAll();
-        void loadExitIp(true);
+        if (tunProbeAction === "probe") {
+          void loadExitIp(true);
+        } else {
+          invalidateDashboardProbes();
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setToast({ ok: false, text: msg });

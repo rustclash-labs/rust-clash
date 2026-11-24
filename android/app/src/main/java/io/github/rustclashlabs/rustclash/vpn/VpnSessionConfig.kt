@@ -2,6 +2,7 @@ package io.github.rustclashlabs.rustclash.vpn
 
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicLong
 
 enum class VpnLifecycleState {
     DISCONNECTED,
@@ -750,14 +751,17 @@ class VpnStateTracker(initial: VpnLifecycleState = VpnLifecycleState.DISCONNECTE
 
     @Synchronized
     fun onStopRequested() {
-        if (state != VpnLifecycleState.DISCONNECTED && state != VpnLifecycleState.REVOKED) {
+        if (state != VpnLifecycleState.DISCONNECTED &&
+            state != VpnLifecycleState.REVOKED &&
+            state != VpnLifecycleState.ERROR
+        ) {
             state = VpnLifecycleState.STOPPING
         }
     }
 
     @Synchronized
     fun onStopped() {
-        if (state != VpnLifecycleState.REVOKED) {
+        if (state != VpnLifecycleState.REVOKED && state != VpnLifecycleState.ERROR) {
             state = VpnLifecycleState.DISCONNECTED
         }
     }
@@ -780,5 +784,197 @@ class VpnStateTracker(initial: VpnLifecycleState = VpnLifecycleState.DISCONNECTE
         if (state == VpnLifecycleState.ERROR || state == VpnLifecycleState.REVOKED) {
             state = VpnLifecycleState.DISCONNECTED
         }
+    }
+}
+
+data class RevokeRequestResult(
+    val epoch: Long,
+    val capturedCommandId: Int,
+)
+
+/**
+ * Thread-safe monotonic-epoch lifecycle coordinator for `RustClashVpnService`.
+ *
+ * Separates permanent `serviceDestroyed` (set ONLY in `Service.onDestroy()`) from per-session
+ * `onRevoke()` events so that an Android-reused `RustClashVpnService` instance recovers cleanly
+ * when a new `ACTION_START_VPN` arrives after `onRevoke()` before `onDestroy()`.
+ */
+class VpnServiceLifecycleCoordinator {
+    private val lock = Any()
+    private val lifecycleEpoch = AtomicLong(0L)
+    private val lastRevokedEpoch = AtomicLong(0L)
+
+    @Volatile
+    private var serviceDestroyed: Boolean = false
+
+    @Volatile
+    private var latestStartEpoch: Long = 0L
+
+    @Volatile
+    private var latestStopOrRevokeEpoch: Long = 0L
+
+    @Volatile
+    private var latestStartCommandId: Int = 0
+
+    @Volatile
+    private var latestStopCommandId: Int = 0
+
+    @Volatile
+    private var latestDeliveredCommandId: Int = 0
+
+    @Volatile
+    private var revokedSinceLastStart: Boolean = false
+
+    val currentEpoch: Long
+        get() = lifecycleEpoch.get()
+
+    val isDestroyed: Boolean
+        get() = serviceDestroyed
+
+    val isRevokedForCurrentSession: Boolean
+        get() = revokedSinceLastStart
+
+    val lastRevokeEpoch: Long
+        get() = lastRevokedEpoch.get()
+
+    val lastDeliveredCommandId: Int
+        get() = latestDeliveredCommandId
+
+    /**
+     * Records any delivered `Service.onStartCommand` `startId` so `onRevoke()` teardown can pass
+     * an exact command ID to `stopSelfResult(capturedCommandId)` instead of unconditional `stopSelf()`.
+     */
+    fun recordDeliveredCommandId(startId: Int) = synchronized(lock) {
+        if (startId > latestDeliveredCommandId) {
+            latestDeliveredCommandId = startId
+        }
+    }
+
+    /**
+     * Records a new `ACTION_START_VPN` / `SERVICE_INTERFACE` start request.
+     * Increments `lifecycleEpoch` and resets per-session revocation so a reused service instance
+     * recovers cleanly after `onRevoke()`.
+     * Returns the assigned monotonic `startEpoch`, or `0L` if the service is permanently destroyed.
+     */
+    fun onStartRequested(startCommandId: Int): Long = synchronized(lock) {
+        if (startCommandId > latestDeliveredCommandId) {
+            latestDeliveredCommandId = startCommandId
+        }
+        if (serviceDestroyed) {
+            return 0L
+        }
+        val epoch = lifecycleEpoch.incrementAndGet()
+        latestStartEpoch = epoch
+        latestStartCommandId = startCommandId
+        revokedSinceLastStart = false
+        epoch
+    }
+
+    /**
+     * Marks a start request aborted before entering the session worker (e.g., Android 12–15 FGS
+     * promotion rejected in `onStartCommand`) so older stops do not mistake it for an active start.
+     */
+    fun onStartAbortedBeforeLaunch(startEpoch: Long) = synchronized(lock) {
+        if (startEpoch > 0L && latestStartEpoch == startEpoch) {
+            val epoch = lifecycleEpoch.incrementAndGet()
+            latestStopOrRevokeEpoch = epoch
+        }
+    }
+
+    /**
+     * Records an explicit `ACTION_STOP_VPN` command and advances `lifecycleEpoch`.
+     */
+    fun onStopRequested(stopCommandId: Int): Long = synchronized(lock) {
+        if (stopCommandId > latestDeliveredCommandId) {
+            latestDeliveredCommandId = stopCommandId
+        }
+        val epoch = lifecycleEpoch.incrementAndGet()
+        latestStopOrRevokeEpoch = epoch
+        latestStopCommandId = stopCommandId
+        epoch
+    }
+
+    /**
+     * Records Android `VpnService.onRevoke()`.
+     * Deduplicated per session (not permanently across the entire Service lifetime): repeated
+     * `onRevoke()` callbacks for the same session return `null`, whereas a subsequent `onRevoke()`
+     * after a new `onStartRequested()` succeeds and returns a fresh epoch together with the latest
+     * delivered `onStartCommand` ID.
+     */
+    fun onRevokeRequested(): RevokeRequestResult? = synchronized(lock) {
+        if (serviceDestroyed || revokedSinceLastStart) {
+            return null
+        }
+        val epoch = lifecycleEpoch.incrementAndGet()
+        lastRevokedEpoch.set(epoch)
+        latestStopOrRevokeEpoch = epoch
+        revokedSinceLastStart = true
+        RevokeRequestResult(
+            epoch = epoch,
+            capturedCommandId = latestDeliveredCommandId,
+        )
+    }
+
+    /**
+     * Marks this service instance permanently destroyed (`Service.onDestroy()`).
+     */
+    fun onDestroy(): Long = synchronized(lock) {
+        serviceDestroyed = true
+        val epoch = lifecycleEpoch.incrementAndGet()
+        latestStopOrRevokeEpoch = epoch
+        epoch
+    }
+
+    /**
+     * True when a start worker for `(startEpoch, startCommandId)` has been superseded by a newer
+     * start, cancelled by a stop/revoke, or invalidated by `onDestroy()`.
+     */
+    fun isStartSupersededOrCancelled(
+        startEpoch: Long,
+        startCommandId: Int,
+        scopeActive: Boolean = true,
+    ): Boolean = synchronized(lock) {
+        !scopeActive ||
+            serviceDestroyed ||
+            startEpoch <= 0L ||
+            revokedSinceLastStart ||
+            lastRevokedEpoch.get() > startEpoch ||
+            latestStopOrRevokeEpoch > startEpoch ||
+            latestStartEpoch > startEpoch ||
+            latestStopCommandId > startCommandId ||
+            latestStartCommandId > startCommandId
+    }
+
+    /**
+     * True when a newer `ACTION_START_VPN` has superseded `epoch` and has not itself been
+     * cancelled/revoked/destroyed.
+     */
+    fun hasPendingNewerStart(epoch: Long): Boolean = synchronized(lock) {
+        !serviceDestroyed &&
+            latestStartEpoch > epoch &&
+            latestStartEpoch > latestStopOrRevokeEpoch &&
+            !revokedSinceLastStart
+    }
+
+    /**
+     * True when a stop or revoke for `expectedEpoch` has been superseded by a newer active
+     * (non-aborted, non-revoked) start request.
+     */
+    fun isStopSupersededByNewerStart(expectedEpoch: Long): Boolean = synchronized(lock) {
+        !serviceDestroyed &&
+            latestStartEpoch > expectedEpoch &&
+            latestStartEpoch > latestStopOrRevokeEpoch &&
+            !revokedSinceLastStart
+    }
+
+    /**
+     * True when a failed or aborted start `(startEpoch, startCommandId)` should finalize
+     * foreground notification and service shutdown without clobbering a newer pending start.
+     */
+    fun shouldFinalizeFailedOrAbortedStart(
+        startEpoch: Long,
+        startCommandId: Int,
+    ): Boolean = synchronized(lock) {
+        !hasPendingNewerStart(startEpoch) && latestStartCommandId <= startCommandId
     }
 }

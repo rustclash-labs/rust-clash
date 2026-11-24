@@ -155,9 +155,9 @@ impl AnyTlsClientSession {
         .await
     }
 
-    fn spawn_io_tasks(
+    fn spawn_io_tasks<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         self: &Arc<Self>,
-        tls_stream: TlsStream<TcpStream>,
+        tls_stream: S,
         mut rx: mpsc::Receiver<OutboundCmd>,
         scheme_snapshot: PaddingScheme,
         shared_scheme: Arc<RwLock<PaddingScheme>>,
@@ -168,12 +168,16 @@ impl AnyTlsClientSession {
         let session_wr = Arc::clone(self);
         let wr_join = tokio::spawn(async move {
             let mut pkt_idx = 1u32;
+            let mut write_failed = false;
+            let mut exit_reason = "AnyTLS writer channel closed";
             while let Some(req) = rx.recv().await {
                 let mut batch = BytesMut::new();
                 match req {
                     OutboundCmd::RawBatch(b) => batch.extend_from_slice(&b),
                     OutboundCmd::Frame(f) => {
                         if f.encode_into(&mut batch).is_err() {
+                            write_failed = true;
+                            exit_reason = "AnyTLS frame encode error";
                             break;
                         }
                     }
@@ -191,7 +195,6 @@ impl AnyTlsClientSession {
                     }
                 }
                 let chunks = scheme_snapshot.shape_tls_writes(&mut pkt_idx, batch);
-                let mut write_failed = false;
                 for chunk in chunks {
                     if wr.write_all(&chunk).await.is_err() {
                         write_failed = true;
@@ -199,11 +202,15 @@ impl AnyTlsClientSession {
                     }
                 }
                 if write_failed || wr.flush().await.is_err() {
-                    session_wr.mark_unhealthy("TLS write error");
+                    write_failed = true;
+                    exit_reason = "TLS write error";
                     break;
                 }
             }
-            let _ = wr.shutdown().await;
+            session_wr.abort_reader_on_writer_exit(exit_reason);
+            if !write_failed {
+                let _ = wr.shutdown().await;
+            }
         });
 
         // Reader task: demuxes frames, updates `shared_scheme` on `cmdUpdatePaddingScheme`, replies to heartbeats
@@ -212,7 +219,7 @@ impl AnyTlsClientSession {
         let tx_pong = self.tx.clone();
         let seq = self.seq;
         let rd_join = tokio::spawn(async move {
-            loop {
+            let exit_reason = loop {
                 match Frame::read_from(&mut rd).await {
                     Ok(frame) => {
                         session_rd.pending_ping_at_ms.store(0, Ordering::Relaxed);
@@ -254,8 +261,7 @@ impl AnyTlsClientSession {
                             Command::Alert => {
                                 let msg = String::from_utf8_lossy(&frame.data).into_owned();
                                 tracing::warn!("AnyTLS server alert on session #{seq}: {msg}");
-                                session_rd.mark_unhealthy(&format!("AnyTLS server alert: {msg}"));
-                                break;
+                                break format!("AnyTLS server alert: {msg}");
                             }
                             Command::SynAck => {
                                 if let Some((_, waiter)) =
@@ -326,13 +332,25 @@ impl AnyTlsClientSession {
                         }
                     }
                     Err(err) => {
-                        session_rd.mark_unhealthy(&format!("session read closed: {err}"));
-                        break;
+                        break format!("session read closed: {err}");
                     }
                 }
-            }
+            };
+            session_rd.abort_writer_on_reader_exit(&exit_reason);
         });
-        *self.io_aborts.lock() = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+        let abort_now = {
+            let mut guard = self.io_aborts.lock();
+            if !self.healthy.load(Ordering::SeqCst) {
+                true
+            } else {
+                *guard = (Some(wr_join.abort_handle()), Some(rd_join.abort_handle()));
+                false
+            }
+        };
+        if abort_now {
+            wr_join.abort();
+            rd_join.abort();
+        }
     }
 
     fn finish_cold_synack(
@@ -730,7 +748,7 @@ impl AnyTlsClientSession {
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.healthy.load(Ordering::Acquire)
     }
 
     pub fn active_stream_count(&self) -> u32 {
@@ -793,8 +811,35 @@ impl AnyTlsClientSession {
         }
     }
 
-    fn mark_unhealthy(&self, reason: &str) {
+    /// Called by `rd_join` whenever it exits (server `Command::Alert`, read EOF, or error).
+    /// Marks the session unhealthy and aborts `wr_join` so the `Arc<AnyTlsClientSession>` +
+    /// `mpsc::Sender` cycle breaks immediately and the underlying socket does not linger in
+    /// `CLOSE_WAIT`.
+    fn abort_writer_on_reader_exit(&self, reason: &str) {
         let _ = self.mark_unhealthy_inner(reason);
+        let wr_abort = {
+            let mut guard = self.io_aborts.lock();
+            let _ = guard.1.take();
+            guard.0.take()
+        };
+        if let Some(a) = wr_abort {
+            a.abort();
+        }
+    }
+
+    /// Called by `wr_join` whenever it exits (TLS write/flush error or outbound queue close).
+    /// Marks the session unhealthy and aborts `rd_join` symmetrically so neither task nor the
+    /// underlying socket leaks.
+    fn abort_reader_on_writer_exit(&self, reason: &str) {
+        let _ = self.mark_unhealthy_inner(reason);
+        let rd_abort = {
+            let mut guard = self.io_aborts.lock();
+            let _ = guard.0.take();
+            guard.1.take()
+        };
+        if let Some(a) = rd_abort {
+            a.abort();
+        }
     }
 
     /// Fail all multiplexed streams and abort the underlying TLS reader/writer tasks immediately
@@ -1594,5 +1639,274 @@ mod tests {
         assert_eq!(read_err.kind(), io::ErrorKind::TimedOut);
         drop(stream);
         popped.abort_session("test cleanup");
+    }
+
+    async fn wait_weak_dropped(weak: &Weak<AnyTlsClientSession>, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while weak.strong_count() > 0 {
+            if Instant::now() >= deadline {
+                panic!(
+                    "AnyTlsClientSession leaked: Weak::strong_count() remained {} after {:?}",
+                    weak.strong_count(),
+                    timeout
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn server_alert_and_tcp_eof_abort_writer_and_drop_session() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let (server_cfg, cert_der) = crate::crypto::tls::generate_self_signed_server_config(
+            &["localhost".to_string(), "127.0.0.1".to_string()],
+            &[],
+        )
+        .expect("generate self-signed cert");
+        let client_cfg = crate::crypto::tls::build_tls_client_config(false, &[cert_der], &[])
+            .expect("build client tls config");
+        let tls_connector = TlsConnector::from(client_cfg);
+        let acceptor = TlsAcceptor::from(server_cfg);
+
+        for send_alert in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor_clone = acceptor.clone();
+            let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
+            let (_hold_tx, hold_rx) = oneshot::channel::<()>();
+
+            let srv = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor_clone.accept(tcp).await.unwrap();
+
+                // Packet 0: 32B sha256(password) + 2B pad0_len + pad0
+                let mut auth_hdr = [0u8; 34];
+                tls.read_exact(&mut auth_hdr).await.unwrap();
+                let pad0_len = u16::from_be_bytes([auth_hdr[32], auth_hdr[33]]) as usize;
+                if pad0_len > 0 {
+                    let mut pad0 = vec![0u8; pad0_len];
+                    tls.read_exact(&mut pad0).await.unwrap();
+                }
+
+                // Read Settings + HeartRequest from preconnect_idle, then reply v=2 + HeartResponse.
+                loop {
+                    let frame = Frame::read_from(&mut tls).await.unwrap();
+                    if frame.cmd == Command::HeartRequest {
+                        let mut resp = BytesMut::new();
+                        Frame::new(Command::ServerSettings, 0, Bytes::from_static(b"v=2"))
+                            .encode_into(&mut resp)
+                            .unwrap();
+                        Frame::empty(Command::HeartResponse, frame.stream_id)
+                            .encode_into(&mut resp)
+                            .unwrap();
+                        tls.write_all(&resp).await.unwrap();
+                        tls.flush().await.unwrap();
+                        break;
+                    }
+                }
+
+                let _ = trigger_rx.await;
+                if send_alert {
+                    // Send Command::Alert and deliberately keep the TLS/TCP socket open so only
+                    // `abort_writer_on_reader_exit` can terminate `wr_join`.
+                    let mut alert = BytesMut::new();
+                    Frame::new(Command::Alert, 0, Bytes::from_static(b"policy rejected"))
+                        .encode_into(&mut alert)
+                        .unwrap();
+                    tls.write_all(&alert).await.unwrap();
+                    tls.flush().await.unwrap();
+                    let _ = hold_rx.await;
+                } else {
+                    // Abruptly close TLS/TCP connection (EOF).
+                    drop(tls);
+                }
+            });
+
+            let pool = AnyTlsSessionPool::new(Duration::from_secs(60), Duration::from_secs(300), 0);
+            pool.set_low_power_mode(true);
+            let shared_scheme = Arc::new(RwLock::new(PaddingScheme::default()));
+
+            let preconnected = AnyTlsClientSession::preconnect_idle(
+                pool.next_seq(),
+                "127.0.0.1",
+                addr.port(),
+                "localhost",
+                "secret-pass",
+                &tls_connector,
+                Arc::clone(&shared_scheme),
+                pool.pool_context(),
+                None,
+            )
+            .await
+            .expect("preconnect_idle");
+
+            // Pop from `pool.idle` so `pool` only holds a `Weak` in `live`, and drop all external
+            // `Arc` handles (`active_streams == 0`, so `AnyTlsStream::drop` cannot mask leaks).
+            let popped = pool
+                .pop_latest_idle()
+                .expect("pop preconnected idle session");
+            assert!(Arc::ptr_eq(&preconnected, &popped));
+            let weak = Arc::downgrade(&popped);
+            drop(preconnected);
+            drop(popped);
+            assert_eq!(
+                weak.strong_count(),
+                2,
+                "only wr_join and rd_join should hold Arc before trigger"
+            );
+
+            let _ = trigger_tx.send(());
+            wait_weak_dropped(&weak, Duration::from_millis(200)).await;
+            drop(_hold_tx);
+            let _ = srv.await;
+        }
+    }
+
+    struct WriteFailsReadHangs {
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for WriteFailsReadHangs {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for WriteFailsReadHangs {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated broken TLS socket",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct ImmediateEofStream;
+
+    impl AsyncRead for ImmediateEofStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ImmediateEofStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_error_aborts_reader_and_startup_eof_race_never_leaks() {
+        let pool = AnyTlsSessionPool::new(Duration::from_secs(60), Duration::from_secs(300), 0);
+        pool.set_low_power_mode(true);
+        let ctx = pool.pool_context();
+        let shared_scheme = Arc::new(RwLock::new(PaddingScheme::default()));
+
+        // 1. Symmetric write-error path: `poll_read` hangs forever, `poll_write` fails immediately.
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(SESSION_OUTBOUND_QUEUE_CAP);
+        let session = Arc::new(AnyTlsClientSession {
+            seq: 100,
+            session_epoch: ctx.session_epoch,
+            pool_epoch: Arc::clone(&ctx.pool_epoch),
+            next_stream_id: AtomicU32::new(1),
+            active_streams: AtomicU32::new(0),
+            healthy: AtomicBool::new(true),
+            negotiated_v2: AtomicBool::new(true),
+            v2_notify: Notify::new(),
+            pending_ping_at_ms: AtomicU64::new(0),
+            tx,
+            streams: Arc::new(DashMap::new()),
+            aborted_streams: DashMap::new(),
+            synack_waiters: Arc::new(DashMap::new()),
+            preconnect_pong: Mutex::new(None),
+            pool_return: Arc::clone(&ctx.idle),
+            io_aborts: Mutex::new((None, None)),
+        });
+        session.spawn_io_tasks(
+            WriteFailsReadHangs {
+                shutdown_called: Arc::clone(&shutdown_called),
+            },
+            rx,
+            PaddingScheme::default(),
+            Arc::clone(&shared_scheme),
+        );
+        let weak = Arc::downgrade(&session);
+        assert!(session.send_ping());
+        drop(session);
+
+        wait_weak_dropped(&weak, Duration::from_millis(200)).await;
+        assert!(
+            !shutdown_called.load(Ordering::SeqCst),
+            "wr_join must skip wr.shutdown() after write_failed so broken sockets drop immediately"
+        );
+
+        // 2. Startup race: immediate EOF on first read poll must never leak `wr_join` even if
+        // `rd_join` exits before `spawn_io_tasks` stores `io_aborts`.
+        for i in 0..32u64 {
+            let (tx, rx) = mpsc::channel(SESSION_OUTBOUND_QUEUE_CAP);
+            let session = Arc::new(AnyTlsClientSession {
+                seq: 200 + i,
+                session_epoch: ctx.session_epoch,
+                pool_epoch: Arc::clone(&ctx.pool_epoch),
+                next_stream_id: AtomicU32::new(1),
+                active_streams: AtomicU32::new(0),
+                healthy: AtomicBool::new(true),
+                negotiated_v2: AtomicBool::new(true),
+                v2_notify: Notify::new(),
+                pending_ping_at_ms: AtomicU64::new(0),
+                tx,
+                streams: Arc::new(DashMap::new()),
+                aborted_streams: DashMap::new(),
+                synack_waiters: Arc::new(DashMap::new()),
+                preconnect_pong: Mutex::new(None),
+                pool_return: Arc::clone(&ctx.idle),
+                io_aborts: Mutex::new((None, None)),
+            });
+            session.spawn_io_tasks(
+                ImmediateEofStream,
+                rx,
+                PaddingScheme::default(),
+                Arc::clone(&shared_scheme),
+            );
+            let weak = Arc::downgrade(&session);
+            drop(session);
+            wait_weak_dropped(&weak, Duration::from_millis(200)).await;
+        }
     }
 }

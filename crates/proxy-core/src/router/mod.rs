@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -39,7 +39,6 @@ use crate::{
         rules::{CompiledRule, RuleMatcher, RuleSnapshot},
         ruleset::build_rule_sets_with_state_dir,
     },
-    tracker::TelemetryHub,
 };
 
 static ROUTER_EPOCH_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -303,9 +302,7 @@ impl Router {
     }
 
     pub fn latest_delay_age_ms(&self, name: &str) -> Option<u64> {
-        self.delays
-            .latest_delay_with_time(name)
-            .map(|(t, _)| TelemetryHub::now_ms().saturating_sub(t))
+        self.delays.latest_delay_age_ms(name)
     }
 
     pub fn record_passive_delay_if_stale(&self, name: &str, rtt_ms: u64, max_age_ms: u64) {
@@ -1241,38 +1238,153 @@ impl Router {
         topo_groups.push(Arc::clone(grp));
     }
 
+    async fn probe_concrete_outbound_with_policy(
+        &self,
+        outbound: &DynOutbound,
+        probe_url: &str,
+        timeout: Duration,
+        unified: bool,
+        allow_private: bool,
+        allowed_private_addrs: &[SocketAddr],
+    ) -> Result<u64> {
+        let (is_https, clean_host, port, path, _sanitized) =
+            crate::probe::validate_probe_url(probe_url, allow_private, allowed_private_addrs)?;
+
+        if !allow_private
+            && outbound.protocol().eq_ignore_ascii_case("Direct")
+            && clean_host.parse::<IpAddr>().is_err()
+        {
+            let started = Instant::now();
+            let dial_ip = if clean_host.eq_ignore_ascii_case("localhost") {
+                crate::outbound::select_whitelisted_loopback_ip(port, allowed_private_addrs)
+            } else {
+                let ips = tokio::time::timeout(timeout, self.dns.resolve_direct_ips(&clean_host))
+                    .await
+                    .map_err(|_| ProxyError::Timeout)??;
+                crate::outbound::validate_resolved_probe_ips(
+                    &clean_host,
+                    port,
+                    &ips,
+                    allowed_private_addrs,
+                )?
+            };
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(ProxyError::Timeout);
+            }
+            let dial_target = TargetAddr::new_ip(dial_ip, port);
+            return crate::outbound::latency_test_on_target(
+                outbound.as_ref(),
+                &dial_target,
+                &clean_host,
+                port,
+                &path,
+                is_https,
+                remaining,
+                unified,
+            )
+            .await
+            .map_err(ProxyError::Io);
+        }
+
+        outbound
+            .latency_test_with_policy(
+                probe_url,
+                timeout,
+                unified,
+                allow_private,
+                allowed_private_addrs,
+            )
+            .await
+    }
+
+    async fn run_concrete_probes_with_policy(
+        &self,
+        unique_probes: HashSet<(String, String)>,
+        timeout: Duration,
+        allow_private: bool,
+        allowed_private_addrs: &[SocketAddr],
+    ) -> Result<HashMap<(String, String), Option<u64>>> {
+        for (_, probe_url) in &unique_probes {
+            let _ =
+                crate::probe::validate_probe_url(probe_url, allow_private, allowed_private_addrs)?;
+        }
+
+        let unified = self.unified_delay();
+        let sem = Arc::new(Semaphore::new(16));
+        let mut futs = FuturesUnordered::new();
+        for (member, probe_url) in unique_probes {
+            let outbound_opt = self.outbounds.get(&member).cloned();
+            let sem_clone = Arc::clone(&sem);
+            futs.push(async move {
+                let Some(outbound) = outbound_opt else {
+                    return ((member, probe_url), Ok(None));
+                };
+                let _permit = sem_clone.acquire().await.ok();
+                match self
+                    .probe_concrete_outbound_with_policy(
+                        &outbound,
+                        &probe_url,
+                        timeout,
+                        unified,
+                        allow_private,
+                        allowed_private_addrs,
+                    )
+                    .await
+                {
+                    Ok(ms) => ((member, probe_url), Ok(Some(ms))),
+                    Err(ProxyError::Config(msg)) => {
+                        ((member, probe_url), Err(ProxyError::Config(msg)))
+                    }
+                    Err(_) => ((member, probe_url), Ok(None)),
+                }
+            });
+        }
+
+        let mut results: HashMap<(String, String), Option<u64>> = HashMap::new();
+        while let Some((key, outcome)) = futs.next().await {
+            match outcome {
+                Ok(val) => {
+                    results.insert(key, val);
+                }
+                Err(err) => {
+                    // Policy/SSRF rejection: abort remaining probes immediately without
+                    // poisoning recorded delays.
+                    return Err(err);
+                }
+            }
+        }
+
+        let mut member_best: HashMap<&str, Option<u64>> = HashMap::new();
+        for ((member, _), val) in &results {
+            if self.outbounds.contains_key(member) {
+                member_best
+                    .entry(member.as_str())
+                    .and_modify(|cur| {
+                        if let Some(ms) = *val {
+                            *cur = Some(cur.map_or(ms, |prev| prev.min(ms)));
+                        }
+                    })
+                    .or_insert(*val);
+            }
+        }
+        for (member, val) in member_best {
+            match val {
+                Some(ms) => self.delays.record(member, ms),
+                None => self.delays.record_failure(member),
+            }
+        }
+        Ok(results)
+    }
+
     async fn run_concrete_probes(
         &self,
         unique_probes: HashSet<(String, String)>,
         timeout: Duration,
     ) -> HashMap<(String, String), Option<u64>> {
-        let unified = self.unified_delay();
-        let sem = Arc::new(Semaphore::new(16));
-        let delays = &self.delays;
-        let futs = unique_probes.into_iter().map(|(member, probe_url)| {
-            let outbound_opt = self.outbounds.get(&member).cloned();
-            let sem_clone = Arc::clone(&sem);
-            async move {
-                let Some(outbound) = outbound_opt else {
-                    return ((member, probe_url), None);
-                };
-                let _permit = sem_clone.acquire().await.ok();
-                match outbound
-                    .latency_test_with_mode(&probe_url, timeout, unified)
-                    .await
-                {
-                    Ok(ms) => {
-                        delays.record(&member, ms);
-                        ((member, probe_url), Some(ms))
-                    }
-                    Err(_) => {
-                        delays.record_failure(&member);
-                        ((member, probe_url), None)
-                    }
-                }
-            }
-        });
-        join_all(futs).await.into_iter().collect()
+        self.run_concrete_probes_with_policy(unique_probes, timeout, true, &[])
+            .await
+            .unwrap_or_default()
     }
 
     fn evaluate_topo_groups_bottom_up(
@@ -1395,10 +1507,34 @@ impl Router {
     }
 
     pub async fn test_delay(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
+        self.test_delay_with_policy(name, url, timeout, true, &[])
+            .await
+    }
+
+    pub async fn test_delay_with_policy(
+        &self,
+        name: &str,
+        url: &str,
+        timeout: Duration,
+        allow_private: bool,
+        allowed_private_addrs: &[SocketAddr],
+    ) -> Result<u64> {
+        let _ = crate::probe::validate_probe_url(url, allow_private, allowed_private_addrs)?;
+
         let unified = self.unified_delay();
         if let Some(outbound) = self.outbounds.get(name) {
             let was_alive = self.delays.latest_delay(name).is_some();
-            match outbound.latency_test_with_mode(url, timeout, unified).await {
+            match self
+                .probe_concrete_outbound_with_policy(
+                    outbound,
+                    url,
+                    timeout,
+                    unified,
+                    allow_private,
+                    allowed_private_addrs,
+                )
+                .await
+            {
                 Ok(ms) => {
                     self.delays.record(name, ms);
                     let group_changed = self.reconcile_auto_groups_from_delays();
@@ -1408,6 +1544,9 @@ impl Router {
                     }
                     return Ok(ms);
                 }
+                Err(ProxyError::Config(msg)) => {
+                    return Err(ProxyError::Config(msg));
+                }
                 Err(e) => {
                     self.delays.record_failure(name);
                     let group_changed = self.reconcile_auto_groups_from_delays();
@@ -1415,7 +1554,7 @@ impl Router {
                     if was_alive || group_changed {
                         self.bump_epoch();
                     }
-                    return Err(ProxyError::Io(e));
+                    return Err(e);
                 }
             }
         }
@@ -1439,7 +1578,14 @@ impl Router {
                 &mut topo_groups,
             );
 
-            let probe_results = self.run_concrete_probes(unique_probes, timeout).await;
+            let probe_results = self
+                .run_concrete_probes_with_policy(
+                    unique_probes,
+                    timeout,
+                    allow_private,
+                    allowed_private_addrs,
+                )
+                .await?;
             let evaluated_at = Instant::now();
             let group_results = self.evaluate_topo_groups_bottom_up(
                 &topo_groups,
@@ -1726,10 +1872,17 @@ mod tests {
         // Screen-off low_power_mode preserves an existing node delay against RRC-idle heartbeat spikes,
         // while still allowing an unseeded node to record its first measurement and resuming normal
         // passive refreshes once interactive again.
+        let sleep_at_least = |min_elapsed: Duration| {
+            let start = Instant::now();
+            while start.elapsed() < min_elapsed {
+                let remaining = min_elapsed.saturating_sub(start.elapsed());
+                std::thread::sleep(remaining.max(Duration::from_millis(1)));
+            }
+        };
         router.delays().record("SG-01", 105);
         router.set_low_power_mode(true);
         assert!(router.is_low_power_mode());
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         router.record_passive_delay_if_stale("SG-01", 456, 1);
         assert_eq!(router.delays().latest_delay("SG-01"), Some(105));
         router.record_passive_delay_if_stale("SG-UNSEEDED", 180, 1);
@@ -1737,7 +1890,7 @@ mod tests {
 
         router.set_low_power_mode(false);
         assert!(!router.is_low_power_mode());
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        sleep_at_least(Duration::from_millis(2));
         router.record_passive_delay_if_stale("SG-01", 112, 1);
         assert_eq!(router.delays().latest_delay("SG-01"), Some(112));
     }

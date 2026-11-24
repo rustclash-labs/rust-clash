@@ -7,7 +7,6 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.PowerManager
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.rustclashlabs.rustclash.ui.model.AppUiState
@@ -25,6 +24,10 @@ import io.github.rustclashlabs.rustclash.vpn.NodeImportSupport
 import io.github.rustclashlabs.rustclash.vpn.PerAppMode
 import io.github.rustclashlabs.rustclash.vpn.RustClashVpnService
 import io.github.rustclashlabs.rustclash.vpn.VpnLifecycleState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -41,6 +44,94 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+
+/**
+ * Single-flight coordinator for loading the active redacted YAML off the main thread.
+ * Prevents overlapping IO coroutines on rapid double-taps while guaranteeing that failure,
+ * empty payloads, exceptions, and cancellation always release the guard and notify callers.
+ */
+internal class ActiveYamlExportRunner(
+    private val scope: CoroutineScope,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val ensureNativeLoaded: suspend () -> Boolean,
+    private val fetchActiveYamlJson: () -> String,
+    private val emitMessage: (String) -> Unit,
+) {
+    private var activeJob: Job? = null
+    private var inFlight: Boolean = false
+
+    val isExportInFlight: Boolean
+        get() = inFlight || activeJob?.isActive == true
+
+    /**
+     * Starts a single-flight active YAML fetch if one is not already running.
+     *
+     * @return `true` if a new export request was accepted (guaranteed to invoke either [onReady]
+     *         or [onFailure]); `false` if rejected because an earlier request is already in-flight
+     *         (in which case neither [onReady] nor [onFailure] is invoked).
+     */
+    fun start(
+        onReady: (String) -> Unit,
+        onFailure: (() -> Unit)? = null,
+    ): Boolean {
+        if (inFlight || activeJob?.isActive == true) {
+            return false
+        }
+        if (!scope.isActive) {
+            onFailure?.invoke()
+            return true
+        }
+        inFlight = true
+        var launchedJob: Job? = null
+        try {
+            launchedJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                var deliveredYaml = false
+                try {
+                    if (!ensureNativeLoaded()) {
+                        emitMessage("Rust 核心库未加载")
+                        return@launch
+                    }
+                    val raw = withContext(ioDispatcher) {
+                        fetchActiveYamlJson()
+                    }
+                    val obj = runCatching { JSONObject(raw) }.getOrNull()
+                    val yaml = obj?.takeIf { it.optBoolean("ok", false) }?.optString("yaml", "").orEmpty()
+                    if (yaml.isNotBlank()) {
+                        onReady(yaml)
+                        deliveredYaml = true
+                    } else {
+                        val err = obj?.optString("error")?.takeIf { it.isNotBlank() }
+                        emitMessage(err ?: "无法导出当前 YAML 配置")
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    emitMessage("无法导出当前 YAML 配置")
+                } finally {
+                    if (activeJob === launchedJob) {
+                        activeJob = null
+                    }
+                    inFlight = false
+                    if (!deliveredYaml) {
+                        onFailure?.invoke()
+                    }
+                }
+            }
+            if (launchedJob.isActive) {
+                activeJob = launchedJob
+            } else if (inFlight) {
+                inFlight = false
+                onFailure?.invoke()
+            }
+            return true
+        } catch (t: Throwable) {
+            inFlight = false
+            activeJob = null
+            onFailure?.invoke()
+            throw t
+        }
+    }
+}
 
 class RustClashViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext: Context = application.applicationContext
@@ -61,6 +152,13 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     private var importJob: Job? = null
     private var installedAppsJob: Job? = null
     private var exitIpJob: Job? = null
+    private val activeYamlExportRunner = ActiveYamlExportRunner(
+        scope = viewModelScope,
+        ioDispatcher = Dispatchers.IO,
+        ensureNativeLoaded = ::ensureNativeLoadedOnIo,
+        fetchActiveYamlJson = { NativeBridge.nativeGetActiveYamlJson(stateDir) },
+        emitMessage = ::emitMessage,
+    )
     private var importGeneration: Long = 0L
     private var exitIpGeneration: Long = 0L
     private var previousVpnRunning: Boolean = false
@@ -80,12 +178,23 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     fun shouldAutoSelectOnImport(): Boolean =
         _uiState.value.nodes.isEmpty() || _uiState.value.demoMode
 
+    private suspend fun ensureNativeLoadedOnIo(): Boolean {
+        if (NativeBridge.isLoadedFast) return true
+        val loaded = withContext(Dispatchers.IO) {
+            NativeBridge.ensureLoaded()
+        }
+        if (loaded && !_uiState.value.nativeLoaded) {
+            _uiState.update { it.copy(nativeLoaded = true) }
+        }
+        return loaded
+    }
+
     fun probeExitIp(forceRefresh: Boolean = false) {
-        if (!NativeBridge.ensureLoaded()) return
         if (!forceRefresh && _uiState.value.isProbingExitIp) return
         val gen = ++exitIpGeneration
         exitIpJob?.cancel()
         exitIpJob = viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo() || gen != exitIpGeneration) return@launch
             _uiState.update { it.copy(isProbingExitIp = true) }
             try {
                 val raw = withContext(Dispatchers.IO) {
@@ -342,44 +451,76 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private suspend fun pollLiveStatusAndDiagnostics(includeDiagnostics: Boolean) {
-        val state = RustClashVpnService.stateTracker.state
-        val err = RustClashVpnService.stateTracker.lastError
-        val warn = RustClashVpnService.lockdownWarning
+    companion object {
+        internal fun resolveEffectivePolledStatusJson(
+            postIoState: VpnLifecycleState,
+            capturedToken: Long,
+            postIoToken: Long,
+            polledRawJson: String?,
+        ): String {
+            if (postIoState != VpnLifecycleState.RUNNING) {
+                return "{\"running\":false}"
+            }
+            if (capturedToken == 0L || postIoToken != capturedToken || polledRawJson.isNullOrBlank()) {
+                return "{\"running\":false}"
+            }
+            return polledRawJson
+        }
+    }
 
-        val result = withContext(Dispatchers.IO) {
+    private suspend fun pollLiveStatusAndDiagnostics(includeDiagnostics: Boolean) {
+        val preIoState = RustClashVpnService.stateTracker.state
+        val sessionToken = RustClashVpnService.activeNativeSessionToken.get()
+
+        val ioResult = withContext(Dispatchers.IO) {
             if (!NativeBridge.ensureLoaded()) {
                 return@withContext null
             }
-            val statusJson = if (state == VpnLifecycleState.RUNNING) {
+            val polledRawJson = if (preIoState == VpnLifecycleState.RUNNING && sessionToken != 0L) {
                 NativeBridge.nativeGetStatusJson().also { fresh ->
-                    RustClashVpnService.publishFreshStatusSnapshot(fresh)
+                    RustClashVpnService.publishFreshStatusSnapshot(fresh, expectedToken = sessionToken)
                 }
             } else {
-                RustClashVpnService.latestStatusJson
+                null
             }
-            val parsedStatus = UiJsonParsers.parseLiveTelemetry(statusJson)
-            val parsedDiag = if (includeDiagnostics && parsedStatus.running) {
+            val preliminaryRunning = polledRawJson != null &&
+                UiJsonParsers.parseLiveTelemetry(polledRawJson).running
+            val parsedDiag = if (includeDiagnostics && preliminaryRunning) {
                 UiJsonParsers.parseDiagnosticsResponse(NativeBridge.nativeGetDiagnosticsJson(150))
-            } else if (!parsedStatus.running) {
-                _uiState.value.diagnostics.takeIf { it.isEmpty() } ?: emptyList()
             } else {
-                _uiState.value.diagnostics
+                null
             }
-            parsedStatus to parsedDiag
+            polledRawJson to parsedDiag
         }
-        if (result == null) {
+
+        val postIoState = RustClashVpnService.stateTracker.state
+        val postIoToken = RustClashVpnService.activeNativeSessionToken.get()
+        val err = RustClashVpnService.stateTracker.lastError
+        val warn = RustClashVpnService.lockdownWarning
+        if (ioResult == null) {
             _uiState.update {
                 it.copy(
                     nativeLoaded = false,
-                    vpnState = state,
+                    vpnState = postIoState,
                     lastError = err,
                     lockdownWarning = warn,
                 )
             }
             return
         }
-        val (telemetry, diagnostics) = result
+        val (polledRawJson, fetchedDiag) = ioResult
+        val effectiveStatusJson = resolveEffectivePolledStatusJson(
+            postIoState = postIoState,
+            capturedToken = sessionToken,
+            postIoToken = postIoToken,
+            polledRawJson = polledRawJson,
+        )
+        val telemetry = UiJsonParsers.parseLiveTelemetry(effectiveStatusJson)
+        val diagnostics = when {
+            !telemetry.running -> _uiState.value.diagnostics.takeIf { it.isEmpty() } ?: emptyList()
+            fetchedDiag != null -> fetchedDiag
+            else -> _uiState.value.diagnostics
+        }
 
         val prevTelemetry = _uiState.value.telemetry
         val transitioned = previousVpnRunning != telemetry.running
@@ -403,7 +544,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 emptyList()
             }
             prev.copy(
-                vpnState = state,
+                vpnState = postIoState,
                 lastError = err?.let(NodeImportSupport::redactSecretsForUi),
                 lockdownWarning = warn,
                 telemetry = telemetry,
@@ -512,46 +653,46 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun selectProxyInGroup(groupName: String, proxyName: String) {
-        if (!NativeBridge.ensureLoaded()) return
-        val curState = _uiState.value
-        val targetGroup = curState.groups.firstOrNull { it.name == groupName }
-        val selectionSteps = buildList {
-            if (targetGroup != null && proxyName !in targetGroup.members) {
-                val subSelectable = curState.groups.firstOrNull {
-                    it.name != "GLOBAL" &&
-                        it.isSelectable &&
-                        proxyName in it.members &&
-                        it.name in targetGroup.members
-                } ?: curState.groups.firstOrNull {
-                    it.name != "GLOBAL" &&
-                        it.isSelectable &&
-                        proxyName in it.members
-                }
-                if (subSelectable != null) {
-                    add(subSelectable.name to proxyName)
-                    if (targetGroup.isSelectable &&
-                        subSelectable.name in targetGroup.members &&
-                        targetGroup.now != subSelectable.name
-                    ) {
-                        add(targetGroup.name to subSelectable.name)
-                    }
-                } else {
-                    val autoSub = curState.groups.firstOrNull {
+        viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
+            val curState = _uiState.value
+            val targetGroup = curState.groups.firstOrNull { it.name == groupName }
+            val selectionSteps = buildList {
+                if (targetGroup != null && proxyName !in targetGroup.members) {
+                    val subSelectable = curState.groups.firstOrNull {
                         it.name != "GLOBAL" &&
+                            it.isSelectable &&
                             proxyName in it.members &&
                             it.name in targetGroup.members
+                    } ?: curState.groups.firstOrNull {
+                        it.name != "GLOBAL" &&
+                            it.isSelectable &&
+                            proxyName in it.members
                     }
-                    if (autoSub != null && targetGroup.isSelectable) {
-                        add(targetGroup.name to autoSub.name)
+                    if (subSelectable != null) {
+                        add(subSelectable.name to proxyName)
+                        if (targetGroup.isSelectable &&
+                            subSelectable.name in targetGroup.members &&
+                            targetGroup.now != subSelectable.name
+                        ) {
+                            add(targetGroup.name to subSelectable.name)
+                        }
                     } else {
-                        add(groupName to proxyName)
+                        val autoSub = curState.groups.firstOrNull {
+                            it.name != "GLOBAL" &&
+                                proxyName in it.members &&
+                                it.name in targetGroup.members
+                        }
+                        if (autoSub != null && targetGroup.isSelectable) {
+                            add(targetGroup.name to autoSub.name)
+                        } else {
+                            add(groupName to proxyName)
+                        }
                     }
+                } else {
+                    add(groupName to proxyName)
                 }
-            } else {
-                add(groupName to proxyName)
             }
-        }
-        viewModelScope.launch {
             var lastRaw = ""
             var lastObj: JSONObject? = null
             for ((grp, prx) in selectionSteps) {
@@ -642,16 +783,19 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             reportActionError("导入内容为空，请粘贴节点链接、Base64 订阅、YAML 或订阅地址", isModal)
             return
         }
-        if (!NativeBridge.ensureLoaded()) {
-            reportActionError("Rust 核心库未加载", isModal)
-            return
-        }
         val prevOutbound = _uiState.value.effectiveOutbound
         val prevProfileId = _uiState.value.activeProfileId
         val gen = ++importGeneration
         importJob = viewModelScope.launch {
             _uiState.update { it.copy(isImporting = true, modalError = null) }
             try {
+                if (!ensureNativeLoadedOnIo()) {
+                    if (gen == importGeneration) {
+                        reportActionError("Rust 核心库未加载", isModal)
+                    }
+                    return@launch
+                }
+                if (gen != importGeneration) return@launch
                 val respStr = withContext(Dispatchers.IO) {
                     NativeBridge.nativeImportUnifiedPayload(stateDir, trimmed, deduplicate, autoSelect)
                 }
@@ -749,15 +893,15 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     ) {
         if (_uiState.value.isSavingModal) return
         val isModal = onSuccess != null
-        if (!NativeBridge.ensureLoaded()) {
-            reportActionError("Rust 核心库未加载", isModal)
-            return
-        }
         val prevOutbound = _uiState.value.effectiveOutbound
         if (isModal) clearModalError()
         viewModelScope.launch {
             _uiState.update { it.copy(isSavingModal = true) }
             try {
+                if (!ensureNativeLoadedOnIo()) {
+                    reportActionError("Rust 核心库未加载", isModal)
+                    return@launch
+                }
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeUpsertNodeJson(
                         stateDir,
@@ -806,9 +950,9 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun deleteNode(nodeName: String) {
-        if (!NativeBridge.ensureLoaded()) return
         val prevOutbound = _uiState.value.effectiveOutbound
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeDeleteNodePersisted(stateDir, nodeName)
             }
@@ -830,8 +974,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun deduplicateNodes() {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeDeduplicateNodesPersisted(stateDir)
             }
@@ -862,7 +1006,6 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun testLatency(targetNodeName: String? = null) {
-        if (!NativeBridge.ensureLoaded()) return
         if (targetNodeName == null && _uiState.value.isTestingAllDelays) return
         if (targetNodeName != null && _uiState.value.testingNodeName == targetNodeName) return
         viewModelScope.launch {
@@ -872,6 +1015,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.update { it.copy(testingNodeName = targetNodeName) }
             }
             try {
+                if (!ensureNativeLoadedOnIo()) return@launch
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeTestLatencyJson(
                         stateDir,
@@ -909,8 +1053,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setRoutingPreset(preset: RoutingPresetUi) {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeSetRoutingPresetJson(stateDir, preset.wire)
             }
@@ -927,10 +1071,11 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateGeoDataNow() {
-        if (!NativeBridge.ensureLoaded() || _uiState.value.isUpdatingGeoData) return
+        if (_uiState.value.isUpdatingGeoData) return
         viewModelScope.launch {
             _uiState.update { it.copy(isUpdatingGeoData = true) }
             try {
+                if (!ensureNativeLoadedOnIo()) return@launch
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeUpdateGeoDataJson(stateDir)
                 }
@@ -957,10 +1102,11 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             emitMessage("请输入要测试的域名或 IP（例如 bilibili.com 或 google.com）")
             return
         }
-        if (!NativeBridge.ensureLoaded() || _uiState.value.isExplaining) return
+        if (_uiState.value.isExplaining) return
         viewModelScope.launch {
             _uiState.update { it.copy(isExplaining = true, explainResult = null) }
             try {
+                if (!ensureNativeLoadedOnIo()) return@launch
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeExplainRuleWithStateDirJson(stateDir, cleaned)
                 }
@@ -984,10 +1130,11 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
             emitMessage("请输入要诊断的网站域名或链接（例如 chatgpt.com 或 github.com）")
             return
         }
-        if (!NativeBridge.ensureLoaded() || _uiState.value.isDiagnosingSite) return
+        if (_uiState.value.isDiagnosingSite) return
         viewModelScope.launch {
             _uiState.update { it.copy(isDiagnosingSite = true) }
             try {
+                if (!ensureNativeLoadedOnIo()) return@launch
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeDiagnoseSiteJson(stateDir, cleaned)
                 }
@@ -1012,8 +1159,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun clearDiagnostics() {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             withContext(Dispatchers.IO) {
                 NativeBridge.nativeClearDiagnostics()
             }
@@ -1023,8 +1170,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun activateProfile(profileId: String) {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeActivateProfileJson(stateDir, profileId)
             }
@@ -1042,7 +1189,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun refreshProfileSubscription(profileId: String) {
-        if (!NativeBridge.ensureLoaded() || _uiState.value.refreshingProfileId != null) return
+        if (_uiState.value.refreshingProfileId != null) return
         val prevOutbound = _uiState.value.effectiveOutbound
         val fallbackName = _uiState.value.profiles
             .firstOrNull { it.id == profileId }
@@ -1051,6 +1198,7 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             _uiState.update { it.copy(refreshingProfileId = profileId) }
             try {
+                if (!ensureNativeLoadedOnIo()) return@launch
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeRefreshProfileJson(stateDir, profileId)
                 }
@@ -1086,8 +1234,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun deleteProfile(profileId: String) {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeDeleteProfileJson(stateDir, profileId)
             }
@@ -1104,8 +1252,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun loadActiveYamlAndRules(onLoaded: (() -> Unit)? = null) {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeGetActiveYamlJson(stateDir)
             }
@@ -1132,36 +1280,25 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun exportActiveYamlForSaf(onReady: (String) -> Unit) {
-        if (!NativeBridge.ensureLoaded()) {
-            emitMessage("Rust 核心库未加载")
-            return
-        }
-        viewModelScope.launch {
-            val raw = withContext(Dispatchers.IO) {
-                NativeBridge.nativeGetActiveYamlJson(stateDir)
-            }
-            val obj = runCatching { JSONObject(raw) }.getOrNull()
-            val yaml = obj?.takeIf { it.optBoolean("ok", false) }?.optString("yaml", "").orEmpty()
-            if (yaml.isNotBlank()) {
-                onReady(yaml)
-            } else {
-                emitMessage(obj?.optString("error") ?: "无法导出当前 YAML 配置")
-            }
-        }
-    }
+    fun exportActiveYamlForSaf(
+        onReady: (String) -> Unit,
+        onFailure: (() -> Unit)? = null,
+    ): Boolean = activeYamlExportRunner.start(
+        onReady = onReady,
+        onFailure = onFailure,
+    )
 
     fun saveCustomRules(rulesText: String, onSuccess: (() -> Unit)? = null) {
         if (_uiState.value.isSavingModal) return
         val isModal = onSuccess != null
-        if (!NativeBridge.ensureLoaded()) {
-            reportActionError("Rust 核心库未加载", isModal)
-            return
-        }
         if (isModal) clearModalError()
         viewModelScope.launch {
             _uiState.update { it.copy(isSavingModal = true) }
             try {
+                if (!ensureNativeLoadedOnIo()) {
+                    reportActionError("Rust 核心库未加载", isModal)
+                    return@launch
+                }
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeSaveCustomRulesJson(stateDir, rulesText)
                 }
@@ -1185,14 +1322,14 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     fun saveActiveYaml(yamlText: String, onSuccess: (() -> Unit)? = null) {
         if (_uiState.value.isSavingModal) return
         val isModal = onSuccess != null
-        if (!NativeBridge.ensureLoaded()) {
-            reportActionError("Rust 核心库未加载", isModal)
-            return
-        }
         if (isModal) clearModalError()
         viewModelScope.launch {
             _uiState.update { it.copy(isSavingModal = true) }
             try {
+                if (!ensureNativeLoadedOnIo()) {
+                    reportActionError("Rust 核心库未加载", isModal)
+                    return@launch
+                }
                 val raw = withContext(Dispatchers.IO) {
                     NativeBridge.nativeSaveActiveYamlJson(stateDir, yamlText)
                 }
@@ -1264,33 +1401,43 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         if (_uiState.value.vpnState != VpnLifecycleState.RUNNING) return false
         val prepared = runCatching { VpnService.prepare(appContext) == null }.getOrDefault(false)
         if (!prepared) return false
-        return runCatching {
-            val restartIntent = Intent(appContext, RustClashVpnService::class.java).apply {
-                action = RustClashVpnService.ACTION_START_VPN
-                putExtra(RustClashVpnService.EXTRA_DEMO_MODE, _uiState.value.demoMode)
-            }
-            ContextCompat.startForegroundService(appContext, restartIntent)
-            true
-        }.getOrDefault(false)
+        val restartIntent = Intent(appContext, RustClashVpnService::class.java).apply {
+            action = RustClashVpnService.ACTION_START_VPN
+            putExtra(RustClashVpnService.EXTRA_DEMO_MODE, _uiState.value.demoMode)
+        }
+        return RustClashVpnService.safeStartVpnForegroundService(appContext, restartIntent)
     }
 
     fun savePerAppPolicy(mode: PerAppMode, selectedPackages: Set<String>) {
-        prefs.edit()
-            .putString(RustClashVpnService.KEY_PER_APP_MODE, mode.name)
-            .putStringSet(RustClashVpnService.KEY_SELECTED_PACKAGES, selectedPackages)
-            .apply()
         val plan = io.github.rustclashlabs.rustclash.vpn.PerAppVpnPolicy.buildPlan(
             mode = mode,
             selectedPackages = selectedPackages,
             selfPackageName = appContext.packageName,
             isLockdownEnabled = RustClashVpnService.lockdownWarning?.contains("Lockdown") == true,
         )
+        if (plan.blockingError != null) {
+            val warningToKeep = plan.lockdownConflictWarning ?: plan.blockingError
+            RustClashVpnService.updateLockdownWarning(warningToKeep)
+            _uiState.update {
+                it.copy(
+                    lockdownWarning = warningToKeep,
+                    settingsSheetNotice = plan.blockingError,
+                )
+            }
+            emitMessage(plan.blockingError)
+            return
+        }
+        prefs.edit()
+            .putString(RustClashVpnService.KEY_PER_APP_MODE, mode.name)
+            .putStringSet(RustClashVpnService.KEY_SELECTED_PACKAGES, selectedPackages)
+            .apply()
         RustClashVpnService.updateLockdownWarning(plan.lockdownConflictWarning)
         _uiState.update {
             it.copy(
                 perAppMode = mode,
                 selectedPackages = selectedPackages,
                 lockdownWarning = plan.lockdownConflictWarning,
+                settingsSheetNotice = plan.lockdownConflictWarning,
             )
         }
         val restarted = requestLiveVpnTunnelRestartIfPermitted()
@@ -1319,8 +1466,12 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     fun setDemoMode(enabled: Boolean) {
         prefs.edit().putBoolean(RustClashVpnService.KEY_DEMO_MODE, enabled).apply()
         _uiState.update { it.copy(demoMode = enabled) }
-        if (_uiState.value.vpnState == VpnLifecycleState.RUNNING && NativeBridge.ensureLoaded()) {
+        if (_uiState.value.vpnState == VpnLifecycleState.RUNNING) {
             viewModelScope.launch {
+                if (!ensureNativeLoadedOnIo()) {
+                    clearExitIpState()
+                    return@launch
+                }
                 withContext(Dispatchers.IO) {
                     NativeBridge.nativeSetDemoSandboxJson(enabled)
                 }
@@ -1333,8 +1484,8 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun flushDnsCache() {
-        if (!NativeBridge.ensureLoaded()) return
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val flushed = withContext(Dispatchers.IO) {
                 NativeBridge.nativeFlushDns()
             }
@@ -1370,17 +1521,16 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
         nextAliases.forEach { (k, v) -> jsonObj.put(k, v) }
         prefs.edit().putString(RustClashVpnService.KEY_PROFILE_ALIASES, jsonObj.toString()).apply()
         _uiState.update { it.copy(profileAliases = nextAliases.toMap()) }
-        if (NativeBridge.ensureLoaded()) {
-            viewModelScope.launch {
-                val raw = withContext(Dispatchers.IO) {
-                    runCatching {
-                        NativeBridge.nativeUpdateProfileSettingsJson(stateDir, cleanId, cleanName, -1L)
-                    }.getOrNull()
-                }
-                if (!raw.isNullOrBlank()) {
-                    UiJsonParsers.parseProfilesSnapshot(raw)?.let { parsed ->
-                        _uiState.update { it.copy(activeProfileId = parsed.first, profiles = parsed.second) }
-                    }
+        viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
+            val raw = withContext(Dispatchers.IO) {
+                runCatching {
+                    NativeBridge.nativeUpdateProfileSettingsJson(stateDir, cleanId, cleanName, -1L)
+                }.getOrNull()
+            }
+            if (!raw.isNullOrBlank()) {
+                UiJsonParsers.parseProfilesSnapshot(raw)?.let { parsed ->
+                    _uiState.update { it.copy(activeProfileId = parsed.first, profiles = parsed.second) }
                 }
             }
         }
@@ -1397,9 +1547,10 @@ class RustClashViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun updateProfileAutoUpdate(profileId: String, intervalSecs: Long) {
         val cleanId = profileId.trim()
-        if (cleanId.isEmpty() || !NativeBridge.ensureLoaded()) return
+        if (cleanId.isEmpty()) return
         val targetSecs = if (intervalSecs <= 0L) 0L else intervalSecs.coerceAtLeast(60L)
         viewModelScope.launch {
+            if (!ensureNativeLoadedOnIo()) return@launch
             val raw = withContext(Dispatchers.IO) {
                 NativeBridge.nativeUpdateProfileSettingsJson(stateDir, cleanId, "", targetSecs)
             }

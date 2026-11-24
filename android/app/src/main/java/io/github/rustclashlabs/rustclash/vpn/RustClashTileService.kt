@@ -9,7 +9,6 @@ import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import androidx.core.content.ContextCompat
 import io.github.rustclashlabs.rustclash.MainActivity
 import io.github.rustclashlabs.rustclash.R
 import kotlinx.coroutines.CoroutineScope
@@ -58,7 +57,7 @@ class RustClashTileService : TileService() {
             val stopIntent = Intent(this, RustClashVpnService::class.java).apply {
                 action = RustClashVpnService.ACTION_STOP_VPN
             }
-            startService(stopIntent)
+            RustClashVpnService.safeRequestStopVpn(this, stopIntent)
             syncTileUi()
             return
         }
@@ -137,7 +136,16 @@ class RustClashTileService : TileService() {
                     action = RustClashVpnService.ACTION_START_VPN
                     putExtra(RustClashVpnService.EXTRA_DEMO_MODE, latestDemoMode)
                 }
-                ContextCompat.startForegroundService(appContext, startIntent)
+                val started = RustClashVpnService.safeStartVpnForegroundService(appContext, startIntent)
+                if (!started) {
+                    RustClashVpnService.stateTracker.onStopped()
+                    syncTileUi()
+                    val openIntent = Intent(this@RustClashTileService, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    }
+                    launchMainActivityAndCollapse(openIntent)
+                    return@launch
+                }
                 syncTileUi()
             } else {
                 // VPN permission has not yet been granted by the user; open MainActivity to show consent dialog.

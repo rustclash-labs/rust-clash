@@ -381,12 +381,11 @@ fn sniff_http_host(buf: &[u8]) -> SniffOutcome {
             if trimmed_bytes.is_empty() {
                 return SniffOutcome::NoHostname;
             }
-            if let Ok(line) = std::str::from_utf8(trimmed_bytes)
-                && line.len() >= 5
-                && line[..5].eq_ignore_ascii_case("host:")
+            if trimmed_bytes.len() >= 5
+                && trimmed_bytes[..5].eq_ignore_ascii_case(b"host:")
+                && let Ok(host_val) = std::str::from_utf8(&trimmed_bytes[5..])
             {
-                let host_val = line[5..].trim();
-                let host_only = strip_optional_port(host_val);
+                let host_only = strip_optional_port(host_val.trim());
                 return host_only
                     .and_then(normalize_valid_hostname)
                     .map(SniffOutcome::Domain)
@@ -1285,6 +1284,30 @@ mod tests {
         assert_eq!(sniff_quic_initial_sni(&[]), SniffOutcome::NoHostname);
         assert_eq!(
             sniff_quic_initial_sni(b"\x00\x01\x00\x00\x21\x12\xa4\x42stun-pkt"),
+            SniffOutcome::NoHostname
+        );
+    }
+
+    #[test]
+    fn http_sniffer_handles_multibyte_utf8_headers_spanning_byte_index_5_without_panic() {
+        // "你好: x" has UTF-8 bytes [0..3) = '你', [3..6) = '好', spanning byte index 5.
+        let req = "GET / HTTP/1.1\r\n你好: x\r\n你好世界: y\r\nHost: Example.COM:80\r\n\r\n";
+        assert_eq!(
+            sniff_client_hello_or_http_host(req.as_bytes()),
+            SniffOutcome::Domain("example.com".to_string())
+        );
+
+        // Multi-byte UTF-8 header without Host returns NoHostname cleanly instead of panicking.
+        let no_host = "GET / HTTP/1.1\r\n你好: x\r\n\r\n";
+        assert_eq!(
+            sniff_client_hello_or_http_host(no_host.as_bytes()),
+            SniffOutcome::NoHostname
+        );
+
+        // Non-ASCII Host value also safely returns NoHostname without panicking.
+        let utf8_host = "GET / HTTP/1.1\r\nHost: 你好.example.com\r\n\r\n";
+        assert_eq!(
+            sniff_client_hello_or_http_host(utf8_host.as_bytes()),
             SniffOutcome::NoHostname
         );
     }

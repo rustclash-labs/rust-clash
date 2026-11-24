@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -3353,63 +3353,103 @@ fn save_index_atomic(index_path: &Path, index: &ProfileIndex) -> Result<()> {
     Ok(())
 }
 
+enum DirectFetchError {
+    SsrfBlocked(ProxyError),
+    Transport(ProxyError),
+}
+
 fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
+    let clean = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if clean.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    let clean = host.trim_start_matches('[').trim_end_matches(']');
-    clean.parse::<IpAddr>().is_ok_and(|ip| match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-    })
+    clean
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
-/// Rejects link-local/cloud-metadata (`169.254.0.0/16`, `fe80::/10`), unspecified (`0.0.0.0`, `::`),
-/// multicast, and loopback destinations for remote (non-loopback) subscription hosts to prevent
-/// SSRF and DNS-rebinding attacks against local Control APIs or instance metadata services.
+/// Rejects loopback, RFC1918 private, link-local/cloud-metadata (`169.254.0.0/16`, `fe80::/10`),
+/// CGNAT (`100.64.0.0/10`), Fake-IP (`198.18.0.0/15`), IPv6 ULA (`fc00::/7` incl. `fd00:ec2::254`),
+/// NAT64/6to4/Teredo embedded restricted IPv4s, unspecified, multicast, and reserved addresses for
+/// remote (non-loopback) subscription hosts to prevent SSRF and DNS-rebinding attacks.
 fn is_disallowed_remote_subscription_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_multicast()
-        }
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return mapped.is_loopback()
-                    || mapped.is_link_local()
-                    || mapped.is_unspecified()
-                    || mapped.is_multicast();
-            }
-            v6.is_loopback()
-                || v6.is_unicast_link_local()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-        }
-    }
+    crate::probe::is_restricted_probe_ip(ip)
 }
 
-fn validate_subscription_resolved_ip(host: &str, ip: IpAddr) -> Result<()> {
-    if !is_loopback_host(host) && is_disallowed_remote_subscription_ip(ip) {
+fn validate_subscription_host(host: &str, allow_loopback: bool) -> Result<()> {
+    let clean = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if clean.is_empty() {
+        return Err(ProxyError::Config("subscription URL missing host".into()));
+    }
+    if let Ok(ip) = clean.parse::<IpAddr>() {
+        if allow_loopback && ip.to_canonical().is_loopback() {
+            return Ok(());
+        }
+        if is_disallowed_remote_subscription_ip(ip) {
+            return Err(ProxyError::Config(
+                "refusing subscription connection to disallowed local, private, link-local, or metadata IP address"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
+    if allow_loopback && is_loopback_host(clean) {
+        return Ok(());
+    }
+    if crate::probe::is_restricted_probe_hostname(clean) {
+        return Err(ProxyError::Config(format!(
+            "refusing subscription connection to restricted internal hostname '{clean}' (blocked by SSRF protection)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_subscription_resolved_ip_with_policy(
+    host: &str,
+    ip: IpAddr,
+    allow_loopback: bool,
+) -> Result<()> {
+    if allow_loopback && is_loopback_host(host) && ip.to_canonical().is_loopback() {
+        return Ok(());
+    }
+    if is_disallowed_remote_subscription_ip(ip) {
         return Err(ProxyError::Config(
-            "refusing subscription connection to disallowed local, link-local, or metadata IP address"
+            "refusing subscription connection to disallowed local, private, link-local, or metadata IP address"
                 .into(),
         ));
     }
     Ok(())
 }
 
-async fn connect_protected_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
-    let addrs = crate::router::geodata::resolve_host_bypassing_fake_ip(host, port).await?;
+#[cfg(test)]
+fn validate_subscription_resolved_ip(host: &str, ip: IpAddr) -> Result<()> {
+    validate_subscription_resolved_ip_with_policy(host, ip, is_loopback_host(host))
+}
+
+async fn connect_protected_tcp_with_addrs(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+    allow_loopback: bool,
+) -> std::result::Result<tokio::net::TcpStream, DirectFetchError> {
     if addrs.is_empty() {
-        return Err(ProxyError::Config(
+        return Err(DirectFetchError::Transport(ProxyError::Config(
             "unable to resolve subscription host".into(),
-        ));
+        )));
+    }
+    for target in &addrs {
+        if let Err(err) =
+            validate_subscription_resolved_ip_with_policy(host, target.ip(), allow_loopback)
+        {
+            return Err(DirectFetchError::SsrfBlocked(err));
+        }
     }
 
     let mut last_err = None;
     for target in addrs {
-        validate_subscription_resolved_ip(host, target.ip())?;
         let domain = if target.is_ipv6() {
             socket2::Domain::IPV6
         } else {
@@ -3445,8 +3485,9 @@ async fn connect_protected_tcp(host: &str, port: u16) -> Result<tokio::net::TcpS
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| ProxyError::Config("failed connecting to subscription server".into())))
+    Err(DirectFetchError::Transport(last_err.unwrap_or_else(|| {
+        ProxyError::Config("failed connecting to subscription server".into())
+    })))
 }
 
 /// Fetch a subscription URL via `rustls` HTTPS (with strict certificate verification; cleartext
@@ -3466,19 +3507,42 @@ pub async fn fetch_subscription_http_with_proxy(
     extra_ca_der: &[CertificateDer<'static>],
     fallback_proxy: Option<&DynOutbound>,
 ) -> Result<(String, Option<SubscriptionUserInfo>)> {
+    fetch_subscription_http_inner(raw_url, extra_ca_der, fallback_proxy, |h, p| async move {
+        crate::router::geodata::resolve_host_bypassing_fake_ip(&h, p).await
+    })
+    .await
+}
+
+async fn fetch_subscription_http_inner<F, Fut>(
+    raw_url: &str,
+    extra_ca_der: &[CertificateDer<'static>],
+    fallback_proxy: Option<&DynOutbound>,
+    mut resolver: F,
+) -> Result<(String, Option<SubscriptionUserInfo>)>
+where
+    F: FnMut(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<SocketAddr>>>,
+{
     let mut current = Url::parse(raw_url.trim())
         .map_err(|e| ProxyError::Config(format!("invalid subscription URL: {e}")))?;
+    let mut allow_loopback = current.host_str().is_some_and(is_loopback_host);
 
     for _redirect_hop in 0..=3 {
+        if !current.username().is_empty() || current.password().is_some() {
+            return Err(ProxyError::Config(
+                "subscription URL must not contain userinfo credentials".into(),
+            ));
+        }
         let scheme = current.scheme().to_ascii_lowercase();
         let host = current
             .host_str()
             .ok_or_else(|| ProxyError::Config("subscription URL missing host".into()))?
             .to_string();
+        allow_loopback = allow_loopback && is_loopback_host(&host);
 
         let is_https = match scheme.as_str() {
             "https" => true,
-            "http" if is_loopback_host(&host) => false,
+            "http" if allow_loopback && is_loopback_host(&host) => false,
             "http" => {
                 return Err(ProxyError::Config(
                     "cleartext http:// subscriptions are rejected for security; use https://"
@@ -3492,10 +3556,7 @@ pub async fn fetch_subscription_http_with_proxy(
             }
         };
 
-        let clean_literal = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(literal_ip) = clean_literal.parse::<IpAddr>() {
-            validate_subscription_resolved_ip(&host, literal_ip)?;
-        }
+        validate_subscription_host(&host, allow_loopback)?;
 
         let port = current
             .port_or_known_default()
@@ -3520,24 +3581,41 @@ pub async fn fetch_subscription_http_with_proxy(
             env!("CARGO_PKG_VERSION")
         );
 
-        let direct_attempt: Result<Vec<u8>> = async {
-            let tcp = connect_protected_tcp(&host, port).await?;
-            if is_https {
-                exchange_sub_https_over_stream(tcp, &host, &req_bytes, extra_ca_der).await
-            } else {
-                let mut tcp = tcp;
-                tcp.write_all(req_bytes.as_bytes())
-                    .await
-                    .map_err(ProxyError::Io)?;
-                let _ = tcp.flush().await;
-                read_bounded_stream(&mut tcp).await
+        let resolved_direct = resolver(host.clone(), port)
+            .await
+            .map_err(DirectFetchError::Transport);
+        let direct_attempt: std::result::Result<Vec<u8>, DirectFetchError> = match resolved_direct {
+            Ok(addrs) => {
+                let tcp = connect_protected_tcp_with_addrs(&host, addrs, allow_loopback).await;
+                match tcp {
+                    Ok(tcp) => {
+                        if is_https {
+                            exchange_sub_https_over_stream(tcp, &host, &req_bytes, extra_ca_der)
+                                .await
+                                .map_err(DirectFetchError::Transport)
+                        } else {
+                            let mut tcp = tcp;
+                            match tcp.write_all(req_bytes.as_bytes()).await {
+                                Ok(()) => {
+                                    let _ = tcp.flush().await;
+                                    read_bounded_stream(&mut tcp)
+                                        .await
+                                        .map_err(DirectFetchError::Transport)
+                                }
+                                Err(e) => Err(DirectFetchError::Transport(ProxyError::Io(e))),
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
             }
-        }
-        .await;
+            Err(err) => Err(err),
+        };
 
         let raw_resp = match direct_attempt {
             Ok(bytes) => bytes,
-            Err(direct_err) => {
+            Err(DirectFetchError::SsrfBlocked(err)) => return Err(err),
+            Err(DirectFetchError::Transport(direct_err)) => {
                 if is_https
                     && !is_loopback_host(&host)
                     && let Some(proxy_ob) = fallback_proxy
@@ -3590,16 +3668,39 @@ pub async fn fetch_subscription_http_with_proxy(
             let next_url = current
                 .join(loc)
                 .map_err(|e| ProxyError::Config(format!("invalid redirect Location: {e}")))?;
-            if is_https && next_url.scheme().eq_ignore_ascii_case("http") {
+            if !next_url.username().is_empty() || next_url.password().is_some() {
+                return Err(ProxyError::Config(
+                    "subscription redirect URL must not contain userinfo credentials".into(),
+                ));
+            }
+            let next_scheme = next_url.scheme().to_ascii_lowercase();
+            if is_https && next_scheme == "http" {
                 return Err(ProxyError::Config(
                     "refusing HTTPS-to-HTTP downgrade redirect on subscription URL".into(),
                 ));
             }
-            if !is_loopback_host(&host) && next_url.host_str().is_some_and(is_loopback_host) {
+            if !matches!(next_scheme.as_str(), "https" | "http") {
+                return Err(ProxyError::Config(format!(
+                    "unsupported subscription redirect URL scheme '{next_scheme}'"
+                )));
+            }
+            let next_host = next_url.host_str().ok_or_else(|| {
+                ProxyError::Config("subscription redirect URL missing host".into())
+            })?;
+            if !allow_loopback && is_loopback_host(next_host) {
                 return Err(ProxyError::Config(
                     "refusing remote subscription redirect to local loopback host".into(),
                 ));
             }
+            let next_allow_loopback = allow_loopback && is_loopback_host(next_host);
+            if next_scheme == "http" && !(next_allow_loopback && is_loopback_host(next_host)) {
+                return Err(ProxyError::Config(
+                    "cleartext http:// subscription redirects are rejected for security; use https://"
+                        .into(),
+                ));
+            }
+            validate_subscription_host(next_host, next_allow_loopback)?;
+            allow_loopback = next_allow_loopback;
             current = next_url;
             continue;
         }
@@ -3746,45 +3847,262 @@ where
     read_bounded_stream(&mut tls_stream).await
 }
 
-fn http11_response_is_complete(raw: &[u8]) -> bool {
-    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(head_str) = std::str::from_utf8(&raw[..hdr_end]) else {
-        return false;
-    };
-    let body_raw = &raw[hdr_end + 4..];
-    let mut is_chunked = false;
-    let mut content_length: Option<usize> = None;
-    for line in head_str.split("\r\n").skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if key.eq_ignore_ascii_case("transfer-encoding")
-                && val
-                    .split(',')
-                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
-            {
-                is_chunked = true;
-            } else if key.eq_ignore_ascii_case("content-length")
-                && let Ok(len) = val.parse::<usize>()
-            {
-                content_length = Some(len);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramingProgress {
+    NeedMore,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkedCursorState {
+    ReadSizeLine,
+    SkipData(usize),
+    ExpectCrlf,
+    ReadTrailers,
+    Done,
+}
+
+/// Incremental O(N) HTTP/1.1 response framing state machine for [`read_bounded_stream`].
+///
+/// Parses response headers exactly once when `\r\n\r\n` first arrives and then tracks
+/// `Content-Length` or `Transfer-Encoding: chunked` framing via a monotonic cursor so each
+/// received byte is inspected at most once with O(1) extra memory.
+#[derive(Debug, Clone)]
+enum Http11StreamFramingState {
+    ReadingHeaders {
+        scan_pos: usize,
+    },
+    FixedLength {
+        body_start: usize,
+        content_length: usize,
+    },
+    Chunked {
+        cursor: usize,
+        scan_pos: usize,
+        decoded_bytes: usize,
+        state: ChunkedCursorState,
+    },
+    CloseDelimited,
+}
+
+impl Http11StreamFramingState {
+    fn new() -> Self {
+        Self::ReadingHeaders { scan_pos: 0 }
+    }
+
+    fn headers_complete(&self) -> bool {
+        !matches!(self, Self::ReadingHeaders { .. })
+    }
+
+    fn advance(&mut self, buf: &[u8]) -> Result<FramingProgress> {
+        loop {
+            match self {
+                Self::ReadingHeaders { scan_pos } => {
+                    let search_start = *scan_pos;
+                    let Some(rel) = buf[search_start..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                    else {
+                        *scan_pos = buf.len().saturating_sub(3);
+                        return Ok(FramingProgress::NeedMore);
+                    };
+                    let hdr_end = search_start + rel;
+                    let body_start = hdr_end + 4;
+                    let head_str = std::str::from_utf8(&buf[..hdr_end]).map_err(|_| {
+                        ProxyError::Config("non-ASCII HTTP headers in subscription response".into())
+                    })?;
+
+                    let mut has_transfer_encoding = false;
+                    let mut is_chunked = false;
+                    let mut content_length: Option<usize> = None;
+                    for line in head_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            let key = k.trim();
+                            let val = v.trim();
+                            if key.eq_ignore_ascii_case("transfer-encoding") {
+                                has_transfer_encoding = true;
+                                if val
+                                    .split(',')
+                                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+                                {
+                                    is_chunked = true;
+                                } else {
+                                    return Err(ProxyError::Config(format!(
+                                        "unsupported Transfer-Encoding '{val}' in subscription response"
+                                    )));
+                                }
+                            } else if key.eq_ignore_ascii_case("content-length") {
+                                if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                                    return Err(ProxyError::Config(format!(
+                                        "invalid Content-Length header '{val}' in subscription response"
+                                    )));
+                                }
+                                let parsed_len = val.parse::<usize>().map_err(|_| {
+                                    ProxyError::Config(format!(
+                                        "invalid Content-Length header '{val}' in subscription response"
+                                    ))
+                                })?;
+                                if parsed_len > MAX_SUBSCRIPTION_BYTES {
+                                    return Err(ProxyError::Config(
+                                        "subscription Content-Length exceeds 8 MiB safety limit"
+                                            .into(),
+                                    ));
+                                }
+                                if let Some(prev_len) = content_length
+                                    && prev_len != parsed_len
+                                {
+                                    return Err(ProxyError::Config(
+                                        "conflicting duplicate Content-Length headers in subscription response"
+                                            .into(),
+                                    ));
+                                }
+                                content_length = Some(parsed_len);
+                            }
+                        }
+                    }
+
+                    if has_transfer_encoding && content_length.is_some() {
+                        return Err(ProxyError::Config(
+                            "conflicting Transfer-Encoding and Content-Length headers in subscription response"
+                                .into(),
+                        ));
+                    }
+
+                    if is_chunked {
+                        *self = Self::Chunked {
+                            cursor: body_start,
+                            scan_pos: body_start,
+                            decoded_bytes: 0,
+                            state: ChunkedCursorState::ReadSizeLine,
+                        };
+                    } else if let Some(content_length) = content_length {
+                        *self = Self::FixedLength {
+                            body_start,
+                            content_length,
+                        };
+                    } else {
+                        *self = Self::CloseDelimited;
+                        return Ok(FramingProgress::NeedMore);
+                    }
+                }
+                Self::FixedLength {
+                    body_start,
+                    content_length,
+                } => {
+                    return if buf.len().saturating_sub(*body_start) >= *content_length {
+                        Ok(FramingProgress::Complete)
+                    } else {
+                        Ok(FramingProgress::NeedMore)
+                    };
+                }
+                Self::Chunked {
+                    cursor,
+                    scan_pos,
+                    decoded_bytes,
+                    state,
+                } => match *state {
+                    ChunkedCursorState::ReadSizeLine => {
+                        let search_start = (*scan_pos).max(*cursor);
+                        let Some(rel) = buf[search_start..].windows(2).position(|w| w == b"\r\n")
+                        else {
+                            *scan_pos = buf.len().saturating_sub(1).max(*cursor);
+                            return Ok(FramingProgress::NeedMore);
+                        };
+                        let line_end = search_start + rel;
+                        let len_str = std::str::from_utf8(&buf[*cursor..line_end])
+                            .map_err(|_| {
+                                ProxyError::Config("invalid HTTP chunk size header".into())
+                            })?
+                            .split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if len_str.is_empty() || !len_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            return Err(ProxyError::Config(
+                                "invalid chunked transfer hex length".into(),
+                            ));
+                        }
+                        let chunk_len = usize::from_str_radix(len_str, 16).map_err(|_| {
+                            ProxyError::Config("invalid chunked transfer hex length".into())
+                        })?;
+                        *cursor = line_end + 2;
+                        *scan_pos = *cursor;
+                        if chunk_len == 0 {
+                            *state = ChunkedCursorState::ReadTrailers;
+                        } else {
+                            let next_decoded = decoded_bytes
+                                .checked_add(chunk_len)
+                                .filter(|&n| n <= MAX_SUBSCRIPTION_BYTES)
+                                .ok_or_else(|| {
+                                    ProxyError::Config(format!(
+                                        "chunked HTTP body exceeds maximum allowed size ({MAX_SUBSCRIPTION_BYTES} bytes)"
+                                    ))
+                                })?;
+                            *decoded_bytes = next_decoded;
+                            *state = ChunkedCursorState::SkipData(chunk_len);
+                        }
+                    }
+                    ChunkedCursorState::SkipData(rem) => {
+                        let avail = buf.len().saturating_sub(*cursor);
+                        if avail < rem {
+                            *cursor += avail;
+                            *scan_pos = *cursor;
+                            *state = ChunkedCursorState::SkipData(rem - avail);
+                            return Ok(FramingProgress::NeedMore);
+                        }
+                        *cursor += rem;
+                        *scan_pos = *cursor;
+                        *state = ChunkedCursorState::ExpectCrlf;
+                    }
+                    ChunkedCursorState::ExpectCrlf => {
+                        let avail = buf.len().saturating_sub(*cursor);
+                        if avail < 2 {
+                            if avail == 1 && buf[*cursor] != b'\r' {
+                                return Err(ProxyError::Config(
+                                    "invalid HTTP chunk delimiter".into(),
+                                ));
+                            }
+                            return Ok(FramingProgress::NeedMore);
+                        }
+                        if &buf[*cursor..*cursor + 2] != b"\r\n" {
+                            return Err(ProxyError::Config("invalid HTTP chunk delimiter".into()));
+                        }
+                        *cursor += 2;
+                        *scan_pos = *cursor;
+                        *state = ChunkedCursorState::ReadSizeLine;
+                    }
+                    ChunkedCursorState::ReadTrailers => {
+                        let search_start = (*scan_pos).max(*cursor);
+                        let Some(rel) = buf[search_start..].windows(2).position(|w| w == b"\r\n")
+                        else {
+                            *scan_pos = buf.len().saturating_sub(1).max(*cursor);
+                            return Ok(FramingProgress::NeedMore);
+                        };
+                        let line_end = search_start + rel;
+                        let is_empty_line = line_end == *cursor;
+                        *cursor = line_end + 2;
+                        *scan_pos = *cursor;
+                        if is_empty_line {
+                            *state = ChunkedCursorState::Done;
+                            return Ok(FramingProgress::Complete);
+                        }
+                    }
+                    ChunkedCursorState::Done => {
+                        return Ok(FramingProgress::Complete);
+                    }
+                },
+                Self::CloseDelimited => {
+                    return Ok(FramingProgress::NeedMore);
+                }
             }
         }
-    }
-    if is_chunked {
-        decode_chunked_body(body_raw).is_ok()
-    } else if let Some(expected_len) = content_length {
-        body_raw.len() >= expected_len
-    } else {
-        false
     }
 }
 
 async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(8192);
     let mut chunk = [0u8; 16384];
+    let mut framing = Http11StreamFramingState::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -3800,8 +4118,7 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
             Ok(n) => n,
             Err(io_err)
                 if io_err.kind() == std::io::ErrorKind::UnexpectedEof
-                    && !out.is_empty()
-                    && out.windows(4).any(|w| w == b"\r\n\r\n") =>
+                    && framing.headers_complete() =>
             {
                 break;
             }
@@ -3816,7 +4133,7 @@ async fn read_bounded_stream<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec
             ));
         }
         out.extend_from_slice(&chunk[..n]);
-        if http11_response_is_complete(&out) {
+        if framing.advance(&out)? == FramingProgress::Complete {
             break;
         }
     }
@@ -5367,5 +5684,318 @@ rules:
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn subscription_ssrf_blocks_rfc1918_ula_internal_redirects_and_never_uses_fallback_proxy()
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // RFC1918, CGNAT, Fake-IP, 0.0.0.0/8, IPv6 ULA (`fd00:ec2::254`), deprecated IPv4-compatible/translated,
+        // site-local, discard-only, and NAT64-embedded metadata MUST be blocked!
+        for bad_ip in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "fd00:ec2::254",
+            "::127.0.0.1",
+            "::ffff:0:127.0.0.1",
+            "fec0::1",
+            "100::1",
+            "64:ff9b::169.254.169.254",
+        ] {
+            let parsed: IpAddr = bad_ip.parse().unwrap();
+            assert!(
+                validate_subscription_resolved_ip("evil-sub.example.com", parsed).is_err(),
+                "expected remote subscription to reject {bad_ip}"
+            );
+        }
+
+        struct CountingSubFallbackProxy {
+            hits: Arc<AtomicUsize>,
+            forward_to: Option<SocketAddr>,
+        }
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for CountingSubFallbackProxy {
+            fn name(&self) -> &str {
+                "CountingSubFallback"
+            }
+            fn protocol(&self) -> &'static str {
+                "socks5"
+            }
+            async fn connect_tcp(
+                &self,
+                _target: &TargetAddr,
+            ) -> std::io::Result<crate::outbound::BoxedStream> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                if let Some(addr) = self.forward_to {
+                    let s = tokio::net::TcpStream::connect(addr).await?;
+                    Ok(Box::new(s))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "mock proxy refused",
+                    ))
+                }
+            }
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counting_proxy: DynOutbound = Arc::new(CountingSubFallbackProxy {
+            hits: Arc::clone(&hits),
+            forward_to: None,
+        });
+
+        // Loopback trap server to prove userinfo initial URLs make 0 TCP hits even on loopback!
+        let trap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trap_addr = trap_listener.local_addr().unwrap();
+        let trap_hits = Arc::new(AtomicUsize::new(0));
+        let trap_hits_bg = Arc::clone(&trap_hits);
+        let trap_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = trap_listener.accept().await {
+                trap_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+
+        // 1. Restricted literal IPs, internal hostnames, and URL userinfo MUST be rejected without invoking
+        //    `fallback_proxy` or touching the loopback trap!
+        let loopback_userinfo_url = format!("http://user:pass@127.0.0.1:{}/", trap_addr.port());
+        for blocked_url in [
+            loopback_userinfo_url.as_str(),
+            "https://user:pass@example.com/sub",
+            "https://user@example.com/sub",
+            "https://:pass@example.com/sub",
+            "https://0.1.2.3/sub",
+            "https://[::127.0.0.1]/sub",
+            "https://[::ffff:0:127.0.0.1]/sub",
+            "https://[fec0::1]/sub",
+            "https://[100::1]/sub",
+            "https://10.0.0.1/sub",
+            "https://172.16.0.1/sub",
+            "https://192.168.1.1/sub",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[fd00:ec2::254]/latest/meta-data/",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://secret-panel.local/sub",
+        ] {
+            let err = fetch_subscription_http_with_proxy(blocked_url, &[], Some(&counting_proxy))
+                .await
+                .expect_err("restricted subscription URL must be blocked");
+            assert!(
+                matches!(err, ProxyError::Config(_)),
+                "expected Config error for {blocked_url}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "fallback_proxy must NEVER be invoked on SSRF-blocked or userinfo subscription URLs"
+        );
+        assert_eq!(
+            trap_hits.load(Ordering::SeqCst),
+            0,
+            "loopback trap must NEVER receive a hit for userinfo subscription URL"
+        );
+        trap_task.abort();
+
+        // 2. Post-DNS resolution to loopback / 0.0.0.0/8 / RFC1918 / IMDS / IPv6 ULA / IPv4-embedded IPv6
+        //    triggers SsrfBlocked and MUST NOT fall back to `fallback_proxy`!
+        for rebound_ip in [
+            "0.1.2.3",
+            "127.0.0.1",
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "::ffff:0:127.0.0.1",
+            "fec0::1",
+            "100::1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "fd00:ec2::254",
+        ] {
+            let ip: IpAddr = rebound_ip.parse().unwrap();
+            let err = fetch_subscription_http_inner(
+                "https://rebind-sub.example.com/api/sub",
+                &[],
+                Some(&counting_proxy),
+                move |_h, port| async move { Ok(vec![SocketAddr::new(ip, port)]) },
+            )
+            .await
+            .expect_err("DNS-rebound subscription IP must be blocked");
+            assert!(
+                matches!(err, ProxyError::Config(_)),
+                "expected Config error for rebinding to {rebound_ip}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "fallback_proxy must NEVER be invoked when DNS resolution triggers SsrfBlocked"
+        );
+
+        // 3. Proxied remote subscription redirecting to loopback / private / ULA / IPv4-embedded IPv6 /
+        //    internal hostname / userinfo MUST be rejected on hop 1 before dialing the redirect target!
+        let (tls_cfg, ca_der) =
+            generate_self_signed_server_config(&["redirect-sub.invalid".into()], &[]).unwrap();
+        let acceptor = TlsAcceptor::from(tls_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        let redirect_locations = Arc::new(parking_lot::Mutex::new(
+            std::collections::VecDeque::from(vec![
+                "https://127.0.0.1:9090/configs".to_string(),
+                "https://10.0.0.1/internal".to_string(),
+                "https://[fd00:ec2::254]/latest/meta-data/".to_string(),
+                "https://metadata.google.internal/computeMetadata/v1/".to_string(),
+                "https://0.1.2.3/".to_string(),
+                "https://[::127.0.0.1]/".to_string(),
+                "https://[::ffff:0:127.0.0.1]/".to_string(),
+                "https://[fec0::1]/".to_string(),
+                "https://[100::1]/".to_string(),
+                "https://user:pass@example.com/sub".to_string(),
+            ]),
+        ));
+        let redirect_count = redirect_locations.lock().len();
+        let locs_bg = Arc::clone(&redirect_locations);
+        let srv_task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                let loc = locs_bg
+                    .lock()
+                    .pop_front()
+                    .unwrap_or_else(|| "https://127.0.0.1:9090/".into());
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acc.accept(tcp).await {
+                        let mut buf = [0u8; 1024];
+                        let _ = tls.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = tls.write_all(resp.as_bytes()).await;
+                        let _ = tls.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        for i in 1..=redirect_count {
+            let redir_hits = Arc::new(AtomicUsize::new(0));
+            let redir_proxy: DynOutbound = Arc::new(CountingSubFallbackProxy {
+                hits: Arc::clone(&redir_hits),
+                forward_to: Some(srv_addr),
+            });
+            let err = fetch_subscription_http_inner(
+                "https://redirect-sub.invalid/api/sub",
+                std::slice::from_ref(&ca_der),
+                Some(&redir_proxy),
+                |_h, _p| async { Err(ProxyError::Dns("direct blocked".into())) },
+            )
+            .await
+            .expect_err("proxied subscription redirect to restricted target must fail");
+            assert!(
+                matches!(err, ProxyError::Config(_)),
+                "case #{i}: expected Config error on restricted redirect, got {err:?}"
+            );
+            assert_eq!(
+                redir_hits.load(Ordering::SeqCst),
+                1,
+                "case #{i}: fallback_proxy must not dial restricted redirect target"
+            );
+        }
+
+        srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn incremental_http11_chunked_framing_handles_byte_splits_trailers_rejections_and_large_bodies()
+     {
+        use tokio::io::AsyncWriteExt;
+
+        // 1. Feed chunked response with chunk extension + multi-line trailers 1 byte at a time.
+        let sample = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0;last=yes\r\nX-Trailer-One: a\r\nX-Trailer-Two: b\r\n\r\n";
+        let mut st = Http11StreamFramingState::new();
+        let mut acc = Vec::new();
+        for (idx, &b) in sample.iter().enumerate() {
+            acc.push(b);
+            let prog = st.advance(&acc).unwrap();
+            if idx + 1 < sample.len() {
+                assert_eq!(
+                    prog,
+                    FramingProgress::NeedMore,
+                    "premature completion at byte {idx}"
+                );
+            } else {
+                assert_eq!(prog, FramingProgress::Complete);
+            }
+        }
+        let (code, _, body) = parse_http11_response(&acc).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(body, b"hello world");
+
+        // 2. Malformed chunk size, bad chunk delimiter, oversized chunk size, and conflicting TE+CL fail fast.
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffff\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"[..],
+        ] {
+            let mut bad_st = Http11StreamFramingState::new();
+            assert!(
+                bad_st.advance(bad).is_err(),
+                "malformed/oversized framing must be rejected: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
+        // 3. Large streaming chunked body (3 MiB across 3,072 x 1 KiB chunks) on a keep-alive
+        //    duplex stream completes rapidly in O(N) time without waiting for EOF.
+        let (mut client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let chunk_count = 3072usize;
+        let chunk_payload = vec![b'A'; 1024];
+        let payload_copy = chunk_payload.clone();
+        let writer_task = tokio::spawn(async move {
+            server_io
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let hdr = format!("{:x}\r\n", payload_copy.len());
+            for _ in 0..chunk_count {
+                server_io.write_all(hdr.as_bytes()).await.unwrap();
+                server_io.write_all(&payload_copy).await.unwrap();
+                server_io.write_all(b"\r\n").await.unwrap();
+            }
+            server_io
+                .write_all(b"0\r\nX-Checksum: ok\r\n\r\n")
+                .await
+                .unwrap();
+            server_io.flush().await.unwrap();
+            // Keep connection open so completion depends purely on incremental framing detection.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let raw = tokio::time::timeout(Duration::from_secs(5), read_bounded_stream(&mut client_io))
+            .await
+            .expect("3 MiB chunked keep-alive stream must complete promptly in O(N)")
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "incremental chunked framing took unexpectedly long: {:?}",
+            started.elapsed()
+        );
+        let (status, _, decoded) = parse_http11_response(&raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(decoded.len(), chunk_count * chunk_payload.len());
+        writer_task.abort();
     }
 }

@@ -2,7 +2,7 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Wake, Waker, ready},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +48,8 @@ const TLS_HS_CERTIFICATE: u8 = 0x0b;
 const TLS_HS_CERTIFICATE_VERIFY: u8 = 0x0f;
 const TLS_HS_FINISHED: u8 = 0x14;
 const TLS_HS_KEY_UPDATE: u8 = 0x18;
+
+const MAX_POST_HANDSHAKE_BUF: usize = 64 * 1024;
 
 const CIPHER_TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 const CIPHER_TLS_AES_256_GCM_SHA384: u16 = 0x1302;
@@ -677,7 +679,13 @@ fn parse_tls13_certificate_list(body: &[u8]) -> io::Result<Vec<CertificateDer<'s
         ));
     }
     let ctx_len = body[0] as usize;
-    if body.len() < 1 + ctx_len + 3 {
+    let Some(list_hdr_end) = 1usize.checked_add(ctx_len).and_then(|v| v.checked_add(3)) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS 1.3 Certificate context length overflow",
+        ));
+    };
+    if body.len() < list_hdr_end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated TLS 1.3 Certificate context",
@@ -687,29 +695,70 @@ fn parse_tls13_certificate_list(body: &[u8]) -> io::Result<Vec<CertificateDer<'s
     let list_len =
         ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
     pos += 3;
-    if body.len() < pos + list_len {
+    let Some(end) = pos.checked_add(list_len) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS 1.3 Certificate list length overflow",
+        ));
+    };
+    if body.len() < end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated TLS 1.3 Certificate list",
         ));
     }
-    let end = pos + list_len;
     let mut certs = Vec::new();
-    while pos + 3 <= end {
+    while pos < end {
+        let Some(clen_end) = pos.checked_add(3) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate entry offset overflow",
+            ));
+        };
+        if clen_end > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated TLS 1.3 Certificate entry header",
+            ));
+        }
         let clen = ((body[pos] as usize) << 16)
             | ((body[pos + 1] as usize) << 8)
             | (body[pos + 2] as usize);
-        pos += 3;
-        if pos + clen + 2 > end {
+        pos = clen_end;
+        let Some(cert_end) = pos.checked_add(clen) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate entry length overflow",
+            ));
+        };
+        let Some(ext_hdr_end) = cert_end.checked_add(2) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate extensions offset overflow",
+            ));
+        };
+        if ext_hdr_end > end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated TLS 1.3 Certificate entry",
             ));
         }
-        certs.push(CertificateDer::from(body[pos..pos + clen].to_vec()));
-        pos += clen;
+        certs.push(CertificateDer::from(body[pos..cert_end].to_vec()));
+        pos = cert_end;
         let ext_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
-        pos += 2 + ext_len;
+        let Some(next_pos) = ext_hdr_end.checked_add(ext_len) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 Certificate extensions length overflow",
+            ));
+        };
+        if next_pos > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated TLS 1.3 Certificate extensions",
+            ));
+        }
+        pos = next_pos;
     }
     if certs.is_empty() {
         return Err(io::Error::new(
@@ -739,19 +788,31 @@ fn read_der_tlv(input: &[u8]) -> io::Result<(u8, &[u8], &[u8])> {
                 "invalid ASN.1 DER length octets",
             ));
         }
-        let mut l = 0usize;
+        let mut l = 0u64;
         for &b in &input[2..2 + num_octets] {
-            l = (l << 8) | (b as usize);
+            l = (l << 8) | u64::from(b);
         }
+        let l = usize::try_from(l).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ASN.1 DER element length exceeds platform limit",
+            )
+        })?;
         (l, 2 + num_octets)
     };
-    if input.len() < hdr_len + len {
+    let Some(end) = hdr_len.checked_add(len) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ASN.1 DER element length overflow",
+        ));
+    };
+    if end > input.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ASN.1 DER element exceeds buffer",
         ));
     }
-    Ok((tag, &input[hdr_len..hdr_len + len], &input[hdr_len + len..]))
+    Ok((tag, &input[hdr_len..end], &input[end..]))
 }
 
 /// Extract `(ed25519_public_key_32B, certificate_signature_bytes)` from a REALITY X.509 leaf DER cert.
@@ -914,6 +975,146 @@ async fn read_raw_tls_record<S: AsyncRead + Unpin>(
     }
 }
 
+/// Waker fanout coordinating split-stream `poll_read` opportunistic TX flushing with concurrent
+/// `poll_write` / `poll_flush` / `poll_shutdown`:
+/// - slot `0` (`read_tx`): reader waiting on `self.inner` TX write-readiness (woken by
+///   `wake_by_ref` and writer completion).
+/// - slot `1` (`write_tx`): writer waiting on `self.inner` TX write-readiness (woken by
+///   `wake_by_ref` and reader drain/flush completion).
+/// - slot `2` (`parked_read`): reader currently parked in `Tls13VisionStream::poll_read`
+///   (`Poll::Pending`); NOT woken by `wake_by_ref` (avoiding spurious wakeups during streaming
+///   uploads), ONLY woken when a writer returns `Poll::Ready` leaving pending TX work or when
+///   `poll_shutdown` newly queues a TLS 1.3 `close_notify` record and parks `Poll::Pending`.
+#[derive(Default)]
+struct FanoutWaker {
+    wakers: parking_lot::Mutex<(Option<Waker>, Option<Waker>, Option<Waker>)>,
+}
+
+impl FanoutWaker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn set_slot(slot: &mut Option<Waker>, waker: &Waker) {
+        match slot {
+            Some(existing) if existing.will_wake(waker) => {}
+            slot => *slot = Some(waker.clone()),
+        }
+    }
+
+    fn register_read(&self, waker: &Waker) {
+        let mut guard = self.wakers.lock();
+        Self::set_slot(&mut guard.0, waker);
+    }
+
+    fn register_parked_read(&self, waker: &Waker) {
+        let mut guard = self.wakers.lock();
+        Self::set_slot(&mut guard.2, waker);
+    }
+
+    fn register_write(&self, waker: &Waker) {
+        let mut guard = self.wakers.lock();
+        Self::set_slot(&mut guard.1, waker);
+    }
+
+    /// Atomically check if another task (`!w.will_wake(waker)`) holds the write-readiness slot
+    /// and, if so, register `waker` in the read TX slot inside the same lock acquisition.
+    /// Eliminates both missing-registration deadlocks and multi-thread check-then-register
+    /// lost-wakeup races with [`FanoutWaker::wake_by_ref`].
+    fn register_read_if_other_writer(&self, waker: &Waker) -> bool {
+        let mut guard = self.wakers.lock();
+        if guard.1.as_ref().is_some_and(|w| !w.will_wake(waker)) {
+            Self::set_slot(&mut guard.0, waker);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_read_tx(&self) {
+        self.wakers.lock().0 = None;
+    }
+
+    fn clear_read(&self) {
+        let mut guard = self.wakers.lock();
+        guard.0 = None;
+        guard.2 = None;
+    }
+
+    fn clear_write_and_wake_read(&self) {
+        let (w_tx, w_parked) = {
+            let mut guard = self.wakers.lock();
+            guard.1 = None;
+            (guard.0.take(), guard.2.take())
+        };
+        match (w_tx, w_parked) {
+            (Some(a), Some(b)) if a.will_wake(&b) => a.wake(),
+            (w_tx, w_parked) => {
+                if let Some(w) = w_tx {
+                    w.wake();
+                }
+                if let Some(w) = w_parked {
+                    w.wake();
+                }
+            }
+        }
+    }
+
+    fn clear_write_and_wake_read_tx(&self) {
+        let w = {
+            let mut guard = self.wakers.lock();
+            guard.1 = None;
+            guard.0.take()
+        };
+        if let Some(w) = w {
+            w.wake();
+        }
+    }
+
+    fn wake_write(&self) {
+        let w = self.wakers.lock().1.take();
+        if let Some(w) = w {
+            w.wake();
+        }
+    }
+
+    /// Wake ONLY a reader parked in `poll_read` (`guard.2`), preserving both `read_tx`
+    /// (`guard.0`) and `write_tx` (`guard.1`) and always dropping the mutex guard before `.wake()`.
+    fn wake_parked_read(&self) {
+        let w = {
+            let mut guard = self.wakers.lock();
+            guard.2.take()
+        };
+        if let Some(w) = w {
+            w.wake();
+        }
+    }
+}
+
+impl Wake for FanoutWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let (w_rd, w_wr) = {
+            let mut guard = self.wakers.lock();
+            (guard.0.take(), guard.1.take())
+        };
+        match (w_rd, w_wr) {
+            (Some(r), Some(w)) if r.will_wake(&w) => r.wake(),
+            (w_rd, w_wr) => {
+                if let Some(w) = w_wr {
+                    w.wake();
+                }
+                if let Some(w) = w_rd {
+                    w.wake();
+                }
+            }
+        }
+    }
+}
+
 /// TLS 1.3 client stream supporting REALITY authentication AND XTLS Vision direct-copy unwrap.
 pub struct Tls13VisionStream<S> {
     inner: S,
@@ -921,16 +1122,50 @@ pub struct Tls13VisionStream<S> {
     write_keys: RecordTrafficKeys,
     raw_rx_buf: BytesMut,
     dec_rx_buf: BytesMut,
+    post_hs_buf: BytesMut,
     enc_tx_buf: BytesMut,
-    pending_write_plain: Option<usize>,
+    tx_fanout: Arc<FanoutWaker>,
+    tx_fanout_waker: Waker,
     direct_read: bool,
     direct_write: bool,
     suppress_close_notify: bool,
     close_notify_sent: bool,
     read_eof: bool,
+    any_read_bytes: bool,
+    uplink_drain_failed: bool,
+    inner_needs_flush: bool,
 }
 
 impl<S> Tls13VisionStream<S> {
+    fn from_parts(
+        inner: S,
+        read_keys: RecordTrafficKeys,
+        write_keys: RecordTrafficKeys,
+        raw_rx_buf: BytesMut,
+    ) -> Self {
+        let tx_fanout = FanoutWaker::new();
+        let tx_fanout_waker = Waker::from(Arc::clone(&tx_fanout));
+        Self {
+            inner,
+            read_keys,
+            write_keys,
+            raw_rx_buf,
+            dec_rx_buf: BytesMut::with_capacity(16 * 1024),
+            post_hs_buf: BytesMut::new(),
+            enc_tx_buf: BytesMut::with_capacity(16 * 1024),
+            tx_fanout,
+            tx_fanout_waker,
+            direct_read: false,
+            direct_write: false,
+            suppress_close_notify: false,
+            close_notify_sent: false,
+            read_eof: false,
+            any_read_bytes: false,
+            uplink_drain_failed: false,
+            inner_needs_flush: false,
+        }
+    }
+
     /// Switch downlink to direct raw-TCP reads (used by `xtls-rprx-vision` after receiving `CommandPaddingDirect`).
     /// Preserves any already-decrypted bytes in `dec_rx_buf` followed by any unparsed raw TCP bytes in `raw_rx_buf`.
     pub fn enable_direct_read(&mut self) {
@@ -951,12 +1186,28 @@ impl<S> Tls13VisionStream<S> {
         self.suppress_close_notify = true;
     }
 
+    pub(crate) fn is_direct_write(&self) -> bool {
+        self.direct_write
+    }
+
     pub fn suppress_close_notify(&mut self) {
         self.suppress_close_notify = true;
     }
 
     pub fn has_queued_tx(&self) -> bool {
         !self.enc_tx_buf.is_empty()
+    }
+
+    pub(crate) fn inner_needs_flush(&self) -> bool {
+        self.inner_needs_flush
+    }
+
+    pub(crate) fn is_uplink_drain_failed(&self) -> bool {
+        self.uplink_drain_failed
+    }
+
+    pub(crate) fn clear_write_waker(&self) {
+        self.tx_fanout.clear_write_and_wake_read();
     }
 
     /// Seal `data` into outer TLS 1.3 `ApplicationData` records in `enc_tx_buf` (max 16 KiB per record).
@@ -973,13 +1224,36 @@ impl<S> Tls13VisionStream<S> {
             )?;
             data = &data[take..];
         }
+        self.uplink_drain_failed = false;
         Ok(())
     }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Tls13VisionStream<S> {
     pub fn poll_drain_tx(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_drain_tx_buf(cx)
+        self.uplink_drain_failed = false;
+        self.poll_drain_tx_from_write(cx)
+    }
+
+    pub(crate) fn poll_flush_tx_from_read(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.poll_drain_tx_from_read(cx))?;
+        if !self.inner_needs_flush {
+            return Poll::Ready(Ok(()));
+        }
+        if self.direct_write && self.tx_fanout.register_read_if_other_writer(cx.waker()) {
+            return Poll::Pending;
+        }
+        self.tx_fanout.register_read(cx.waker());
+        let mut fanout_cx = Context::from_waker(&self.tx_fanout_waker);
+        let res = Pin::new(&mut self.inner).poll_flush(&mut fanout_cx);
+        if res.is_ready() {
+            if matches!(res, Poll::Ready(Ok(()))) {
+                self.inner_needs_flush = false;
+            }
+            self.tx_fanout.clear_read_tx();
+            self.tx_fanout.wake_write();
+        }
+        res
     }
 }
 
@@ -1480,26 +1754,19 @@ where
     let app_read_keys = RecordTrafficKeys::from_traffic_secret(suite, s_ap_secret)?;
     let app_write_keys = RecordTrafficKeys::from_traffic_secret(suite, c_ap_secret)?;
 
-    Ok(Tls13VisionStream {
-        inner: io_stream,
-        read_keys: app_read_keys,
-        write_keys: app_write_keys,
+    Ok(Tls13VisionStream::from_parts(
+        io_stream,
+        app_read_keys,
+        app_write_keys,
         raw_rx_buf,
-        dec_rx_buf: BytesMut::with_capacity(16 * 1024),
-        enc_tx_buf: BytesMut::with_capacity(16 * 1024),
-        pending_write_plain: None,
-        direct_read: false,
-        direct_write: false,
-        suppress_close_notify: false,
-        close_notify_sent: false,
-        read_eof: false,
-    })
+    ))
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Tls13VisionStream<S> {
-    fn poll_drain_tx_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_drain_tx_with_fanout(&mut self) -> Poll<io::Result<()>> {
+        let mut fanout_cx = Context::from_waker(&self.tx_fanout_waker);
         while !self.enc_tx_buf.is_empty() {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.enc_tx_buf))?;
+            let n = ready!(Pin::new(&mut self.inner).poll_write(&mut fanout_cx, &self.enc_tx_buf))?;
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -1507,27 +1774,92 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13VisionStream<S> {
                 )));
             }
             self.enc_tx_buf.advance(n);
+            self.inner_needs_flush = true;
+            self.uplink_drain_failed = false;
         }
         Poll::Ready(Ok(()))
     }
 
-    fn handle_post_handshake_messages(&mut self, mut hs_bytes: &[u8]) -> io::Result<()> {
-        while hs_bytes.len() >= 4 {
-            let mtype = hs_bytes[0];
-            let mlen = ((hs_bytes[1] as usize) << 16)
-                | ((hs_bytes[2] as usize) << 8)
-                | (hs_bytes[3] as usize);
-            if hs_bytes.len() < 4 + mlen {
+    fn poll_drain_tx_from_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.enc_tx_buf.is_empty() {
+            self.tx_fanout.clear_write_and_wake_read_tx();
+            return Poll::Ready(Ok(()));
+        }
+        self.tx_fanout.register_write(cx.waker());
+        let res = self.poll_drain_tx_with_fanout();
+        if res.is_ready() {
+            self.tx_fanout.clear_write_and_wake_read();
+        }
+        res
+    }
+
+    fn poll_drain_tx_from_read(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.enc_tx_buf.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        self.tx_fanout.register_read(cx.waker());
+        let res = self.poll_drain_tx_with_fanout();
+        if res.is_ready() {
+            self.tx_fanout.clear_read_tx();
+            self.tx_fanout.wake_write();
+        }
+        res
+    }
+
+    fn handle_post_handshake_messages(&mut self, hs_bytes: &[u8]) -> io::Result<()> {
+        if self
+            .post_hs_buf
+            .len()
+            .checked_add(hs_bytes.len())
+            .is_none_or(|n| n > MAX_POST_HANDSHAKE_BUF)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS 1.3 post-handshake buffer exceeds 64 KiB limit",
+            ));
+        }
+        self.post_hs_buf.extend_from_slice(hs_bytes);
+
+        while self.post_hs_buf.len() >= 4 {
+            let mtype = self.post_hs_buf[0];
+            let mlen = ((self.post_hs_buf[1] as usize) << 16)
+                | ((self.post_hs_buf[2] as usize) << 8)
+                | (self.post_hs_buf[3] as usize);
+            let Some(msg_len) = 4usize.checked_add(mlen) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TLS 1.3 post-handshake message length overflow",
+                ));
+            };
+            if msg_len > MAX_POST_HANDSHAKE_BUF {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "TLS 1.3 post-handshake message length {msg_len} exceeds {MAX_POST_HANDSHAKE_BUF} byte limit"
+                    ),
+                ));
+            }
+            if self.post_hs_buf.len() < msg_len {
                 break;
             }
-            let body = &hs_bytes[4..4 + mlen];
-            hs_bytes = &hs_bytes[4 + mlen..];
             match mtype {
                 TLS_HS_NEW_SESSION_TICKET => {
                     // Ignore NewSessionTicket (REALITY / Vision opens fresh ephemeral handshakes)
                 }
                 TLS_HS_KEY_UPDATE => {
-                    let req = body.first().copied().unwrap_or(0);
+                    if mlen != 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid TLS 1.3 KeyUpdate length {mlen}"),
+                        ));
+                    }
+                    let req = self.post_hs_buf[4];
+                    if req > 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid TLS 1.3 KeyUpdate request_update value {req}"),
+                        ));
+                    }
                     self.read_keys.roll_key_update()?;
                     if req == 1 {
                         let ku_resp = [TLS_HS_KEY_UPDATE, 0, 0, 1, 0];
@@ -1541,6 +1873,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13VisionStream<S> {
                 }
                 _ => {}
             }
+            self.post_hs_buf.advance(msg_len);
         }
         Ok(())
     }
@@ -1556,9 +1889,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
             return Poll::Ready(Ok(()));
         }
 
-        // Flush any queued KeyUpdate response before waiting on peer
-        if !self.enc_tx_buf.is_empty() {
-            let _ = self.poll_drain_tx_buf(cx)?;
+        // Always drain already-decrypted plaintext (or already-reached EOF) FIRST, before any
+        // opportunistic uplink drain, so an uplink error can never discard bytes already
+        // decrypted in `dec_rx_buf`.
+        if !self.dec_rx_buf.is_empty() {
+            let to_copy = self.dec_rx_buf.len().min(buf.remaining());
+            let chunk = self.dec_rx_buf.split_to(to_copy);
+            buf.put_slice(&chunk);
+            self.any_read_bytes = true;
+            self.tx_fanout.clear_read();
+            return Poll::Ready(Ok(()));
+        }
+        if self.read_eof {
+            self.tx_fanout.clear_read();
+            return Poll::Ready(Ok(()));
+        }
+
+        // Opportunistically drain/flush any queued outer TLS records (e.g. KeyUpdate responses,
+        // server-speaks-first VLESS headers, or un-flushed writes) using FanoutWaker so we never
+        // steal a split writer's waker and never block or abort downlink reads behind a congested
+        // or half-closed/broken uplink.
+        let mut pending_tx_err: Option<io::Error> = None;
+        if !self.uplink_drain_failed
+            && (!self.enc_tx_buf.is_empty() || self.inner_needs_flush)
+            && let Poll::Ready(Err(e)) = self.poll_flush_tx_from_read(cx)
+        {
+            if self.any_read_bytes {
+                self.uplink_drain_failed = true;
+            }
+            pending_tx_err = Some(e);
         }
 
         loop {
@@ -1566,19 +1925,61 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
                 let to_copy = self.dec_rx_buf.len().min(buf.remaining());
                 let chunk = self.dec_rx_buf.split_to(to_copy);
                 buf.put_slice(&chunk);
+                self.any_read_bytes = true;
+                if pending_tx_err.is_some() {
+                    self.uplink_drain_failed = true;
+                }
+                self.tx_fanout.clear_read();
                 return Poll::Ready(Ok(()));
             }
             if self.read_eof {
+                self.tx_fanout.clear_read();
                 return Poll::Ready(Ok(()));
             }
             if self.direct_read {
-                return Pin::new(&mut self.inner).poll_read(cx, buf);
+                let before = buf.filled().len();
+                match Pin::new(&mut self.inner).poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) => {
+                        self.tx_fanout.clear_read();
+                        if buf.filled().len() > before {
+                            self.any_read_bytes = true;
+                            if pending_tx_err.is_some() {
+                                self.uplink_drain_failed = true;
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
+                        self.read_eof = true;
+                        if let Some(err) = pending_tx_err {
+                            if !self.any_read_bytes {
+                                return Poll::Ready(Err(err));
+                            }
+                            self.uplink_drain_failed = true;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.tx_fanout.clear_read();
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        if let Some(err) = pending_tx_err {
+                            if !self.any_read_bytes {
+                                self.tx_fanout.clear_read();
+                                return Poll::Ready(Err(err));
+                            }
+                            self.uplink_drain_failed = true;
+                        }
+                        self.tx_fanout.register_parked_read(cx.waker());
+                        return Poll::Pending;
+                    }
+                }
             }
 
             if self.raw_rx_buf.len() >= 5 {
                 let rtype = self.raw_rx_buf[0];
                 let rlen = u16::from_be_bytes([self.raw_rx_buf[3], self.raw_rx_buf[4]]) as usize;
                 if rlen > 16384 + 2048 {
+                    self.tx_fanout.clear_read();
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("TLS 1.3 record length {rlen} exceeds limit"),
@@ -1591,6 +1992,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
                         continue;
                     }
                     if rtype != TLS_RECORD_APPLICATION_DATA {
+                        self.tx_fanout.clear_read();
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("unexpected outer TLS record type 0x{rtype:02x}"),
@@ -1603,23 +2005,62 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
                         hdr_bytes[3],
                         hdr_bytes[4],
                     ];
-                    let (inner_type, plain_len) = self.read_keys.open_record(&header, &mut body)?;
+                    let (inner_type, plain_len) =
+                        match self.read_keys.open_record(&header, &mut body) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                self.tx_fanout.clear_read();
+                                return Poll::Ready(Err(e));
+                            }
+                        };
                     match inner_type {
                         TLS_RECORD_APPLICATION_DATA => {
+                            if !self.post_hs_buf.is_empty() {
+                                self.tx_fanout.clear_read();
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "TLS 1.3 application data interleaved with incomplete post-handshake message",
+                                )));
+                            }
                             if plain_len > 0 {
+                                self.any_read_bytes = true;
+                                if pending_tx_err.is_some() {
+                                    self.uplink_drain_failed = true;
+                                }
                                 self.dec_rx_buf.extend_from_slice(&body[..plain_len]);
                             }
                             continue;
                         }
                         TLS_RECORD_HANDSHAKE => {
-                            self.handle_post_handshake_messages(&body[..plain_len])?;
+                            if let Err(e) = self.handle_post_handshake_messages(&body[..plain_len])
+                            {
+                                self.tx_fanout.clear_read();
+                                return Poll::Ready(Err(e));
+                            }
+                            if !self.uplink_drain_failed
+                                && pending_tx_err.is_none()
+                                && (!self.enc_tx_buf.is_empty() || self.inner_needs_flush)
+                                && let Poll::Ready(Err(e)) = self.poll_flush_tx_from_read(cx)
+                            {
+                                if self.any_read_bytes {
+                                    self.uplink_drain_failed = true;
+                                }
+                                pending_tx_err = Some(e);
+                            }
                             continue;
                         }
                         TLS_RECORD_ALERT => {
                             let code = body.get(1).copied().unwrap_or(0);
+                            self.tx_fanout.clear_read();
                             if code == 0 {
                                 // close_notify
                                 self.read_eof = true;
+                                if let Some(err) = pending_tx_err {
+                                    if !self.any_read_bytes {
+                                        return Poll::Ready(Err(err));
+                                    }
+                                    self.uplink_drain_failed = true;
+                                }
                                 return Poll::Ready(Ok(()));
                             }
                             return Poll::Ready(Err(io::Error::new(
@@ -1634,16 +2075,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13VisionStream<S> {
 
             let mut tmp = [0u8; 16 * 1024];
             let mut rb = ReadBuf::new(&mut tmp);
-            ready!(Pin::new(&mut self.inner).poll_read(cx, &mut rb))?;
+            match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
+                Poll::Pending => {
+                    if let Some(err) = pending_tx_err {
+                        if !self.any_read_bytes && self.raw_rx_buf.is_empty() {
+                            self.tx_fanout.clear_read();
+                            return Poll::Ready(Err(err));
+                        }
+                        if self.any_read_bytes {
+                            self.uplink_drain_failed = true;
+                        }
+                    }
+                    self.tx_fanout.register_parked_read(cx.waker());
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    self.tx_fanout.clear_read();
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
             let filled = rb.filled();
             if filled.is_empty() {
-                if !self.raw_rx_buf.is_empty() {
+                self.tx_fanout.clear_read();
+                if !self.raw_rx_buf.is_empty() || !self.post_hs_buf.is_empty() {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "truncated TLS 1.3 record on EOF",
                     )));
                 }
                 self.read_eof = true;
+                if let Some(err) = pending_tx_err {
+                    if !self.any_read_bytes {
+                        return Poll::Ready(Err(err));
+                    }
+                    self.uplink_drain_failed = true;
+                }
                 return Poll::Ready(Ok(()));
             }
             self.raw_rx_buf.extend_from_slice(filled);
@@ -1658,62 +2125,133 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13VisionStream<S> {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         if data.is_empty() {
+            self.tx_fanout.clear_write_and_wake_read_tx();
             return Poll::Ready(Ok(0));
         }
 
-        if let Some(accepted) = self.pending_write_plain {
-            ready!(self.poll_drain_tx_buf(cx))?;
-            self.pending_write_plain = None;
-            return Poll::Ready(Ok(accepted));
-        }
+        self.uplink_drain_failed = false;
 
+        // First drain any previously buffered outer TLS record BEFORE consuming bytes from `data`,
+        // keeping backpressure strictly bounded to one record while remaining 100% cancel-safe.
         if !self.enc_tx_buf.is_empty() {
-            ready!(self.poll_drain_tx_buf(cx))?;
+            ready!(self.poll_drain_tx_from_write(cx))?;
         }
 
         if self.direct_write {
-            return Pin::new(&mut self.inner).poll_write(cx, data);
+            let this = &mut *self;
+            this.tx_fanout.register_write(cx.waker());
+            let mut fanout_cx = Context::from_waker(&this.tx_fanout_waker);
+            let res = Pin::new(&mut this.inner).poll_write(&mut fanout_cx, data);
+            if let Poll::Ready(ref r) = res {
+                if matches!(r, Ok(n) if *n > 0) {
+                    this.inner_needs_flush = true;
+                }
+                this.tx_fanout.clear_write_and_wake_read();
+            }
+            return res;
         }
 
         let chunk_len = data.len().min(16 * 1024);
         {
             let this = &mut *self;
-            this.write_keys.seal_record(
+            if let Err(e) = this.write_keys.seal_record(
                 TLS_RECORD_APPLICATION_DATA,
                 &data[..chunk_len],
                 &mut this.enc_tx_buf,
-            )?;
+            ) {
+                this.tx_fanout.clear_write_and_wake_read();
+                return Poll::Ready(Err(e));
+            }
         }
-        self.pending_write_plain = Some(chunk_len);
 
-        match self.poll_drain_tx_buf(cx) {
-            Poll::Ready(Ok(())) => {
-                self.pending_write_plain = None;
+        // Attempt one opportunistic drain and immediately acknowledge `chunk_len` so cancelling
+        // a later `Pending` write can never return `Ok(n > buf.len())` on a smaller retry buffer.
+        match self.poll_drain_tx_from_write(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_len)),
+            Poll::Pending => {
+                // Returning `Ready(Ok(chunk_len))` immediately — writer is not parked, so clear
+                // its slot and wake any parked reader so queued `enc_tx_buf` bytes can drain
+                // even if the writer never calls `flush()`.
+                self.tx_fanout.clear_write_and_wake_read();
                 Poll::Ready(Ok(chunk_len))
             }
-            Poll::Ready(Err(e)) => {
-                self.pending_write_plain = None;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_drain_tx_buf(cx))?;
-        Pin::new(&mut self.inner).poll_flush(cx)
+        self.uplink_drain_failed = false;
+        ready!(self.poll_drain_tx_from_write(cx))?;
+        let this = &mut *self;
+        this.tx_fanout.register_write(cx.waker());
+        let mut fanout_cx = Context::from_waker(&this.tx_fanout_waker);
+        let res = Pin::new(&mut this.inner).poll_flush(&mut fanout_cx);
+        if res.is_ready() {
+            if matches!(res, Poll::Ready(Ok(()))) {
+                this.inner_needs_flush = false;
+                this.tx_fanout.clear_write_and_wake_read_tx();
+            } else {
+                this.tx_fanout.clear_write_and_wake_read();
+            }
+        }
+        res
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.uplink_drain_failed = false;
+        let mut newly_queued_close_notify = false;
         if !self.suppress_close_notify && !self.direct_write && !self.close_notify_sent {
             let this = &mut *self;
-            this.write_keys
-                .seal_record(TLS_RECORD_ALERT, &[0x01, 0x00], &mut this.enc_tx_buf)?;
+            if let Err(e) =
+                this.write_keys
+                    .seal_record(TLS_RECORD_ALERT, &[0x01, 0x00], &mut this.enc_tx_buf)
+            {
+                this.tx_fanout.clear_write_and_wake_read();
+                return Poll::Ready(Err(e));
+            }
             self.close_notify_sent = true;
+            newly_queued_close_notify = true;
         }
-        ready!(self.poll_drain_tx_buf(cx))?;
-        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        match self.poll_drain_tx_from_write(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {
+                // One-shot wakeup of any pre-parked split reader (`guard.2`) so cancelling
+                // `shutdown()` cannot strand the newly sealed `close_notify` in `enc_tx_buf`.
+                if newly_queued_close_notify {
+                    self.tx_fanout.wake_parked_read();
+                }
+                return Poll::Pending;
+            }
+        }
+        let this = &mut *self;
+        this.tx_fanout.register_write(cx.waker());
+        let mut fanout_cx = Context::from_waker(&this.tx_fanout_waker);
+        match Pin::new(&mut this.inner).poll_flush(&mut fanout_cx) {
+            Poll::Pending => {
+                if newly_queued_close_notify {
+                    this.tx_fanout.wake_parked_read();
+                }
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(e)) => {
+                this.tx_fanout.clear_write_and_wake_read();
+                return Poll::Ready(Err(e));
+            }
+            Poll::Ready(Ok(())) => {
+                this.inner_needs_flush = false;
+            }
+        }
+        this.tx_fanout.register_write(cx.waker());
+        let res = Pin::new(&mut this.inner).poll_shutdown(&mut fanout_cx);
+        if res.is_ready() {
+            if matches!(res, Poll::Ready(Ok(()))) {
+                this.tx_fanout.clear_write_and_wake_read_tx();
+            } else {
+                this.tx_fanout.clear_write_and_wake_read();
+            }
+        }
+        res
     }
 }
 
@@ -2097,35 +2635,32 @@ where
         break;
     }
 
-    Ok(Tls13VisionStream {
-        inner: io_stream,
-        read_keys: RecordTrafficKeys::from_traffic_secret(suite, c_ap_secret)?,
-        write_keys: RecordTrafficKeys::from_traffic_secret(suite, s_ap_secret)?,
+    Ok(Tls13VisionStream::from_parts(
+        io_stream,
+        RecordTrafficKeys::from_traffic_secret(suite, c_ap_secret)?,
+        RecordTrafficKeys::from_traffic_secret(suite, s_ap_secret)?,
         raw_rx_buf,
-        dec_rx_buf: BytesMut::with_capacity(16 * 1024),
-        enc_tx_buf: BytesMut::with_capacity(16 * 1024),
-        pending_write_plain: None,
-        direct_read: false,
-        direct_write: false,
-        suppress_close_notify: false,
-        close_notify_sent: false,
-        read_eof: false,
-    })
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    #[tokio::test]
-    async fn reality_tls13_hybrid_pq_handshake_and_direct_unwrap_roundtrip() {
+    async fn establish_reality_pair(
+        duplex_buf: usize,
+    ) -> (
+        Tls13VisionStream<tokio::io::DuplexStream>,
+        Tls13VisionStream<tokio::io::DuplexStream>,
+    ) {
         let mut srv_sk_bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut srv_sk_bytes);
         let srv_sk = X25519Secret::from(srv_sk_bytes);
         let srv_pk = X25519PublicKey::from(&srv_sk);
         let short_id = decode_reality_short_id("a1b2c3d4").unwrap();
 
-        let (c_io, s_io) = tokio::io::duplex(64 * 1024);
+        let (c_io, s_io) = tokio::io::duplex(duplex_buf);
         let mode = Tls13HandshakeMode::Reality(RealityClientConfig {
             public_key: *srv_pk.as_bytes(),
             short_id,
@@ -2138,8 +2673,14 @@ mod tests {
         let srv_task = tokio::spawn(async move {
             accept_reality_tls13_server(s_io, &srv_sk_bytes, &short_id, "www.microsoft.com").await
         });
-        let mut cli = connect_tls13_vision_stream(c_io, &mode).await.unwrap();
-        let mut srv = srv_task.await.unwrap().unwrap();
+        let cli = connect_tls13_vision_stream(c_io, &mode).await.unwrap();
+        let srv = srv_task.await.unwrap().unwrap();
+        (cli, srv)
+    }
+
+    #[tokio::test]
+    async fn reality_tls13_hybrid_pq_handshake_and_direct_unwrap_roundtrip() {
+        let (mut cli, mut srv) = establish_reality_pair(64 * 1024).await;
 
         cli.write_all(b"encrypted reality ping").await.unwrap();
         cli.flush().await.unwrap();
@@ -2156,5 +2697,987 @@ mod tests {
         cli.flush().await.unwrap();
         let n2 = srv.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n2], b"raw zero-copy vision payload");
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_split_stream_backpressure_never_deadlocks() {
+        let (cli, srv) = establish_reality_pair(256).await;
+        let (mut cli_rd, mut cli_wr) = tokio::io::split(cli);
+        let (mut srv_rd, mut srv_wr) = tokio::io::split(srv);
+
+        let upload_payload: Vec<u8> = (0..(256 * 1024))
+            .map(|i| ((i * 37 + 11) & 0xff) as u8)
+            .collect();
+        let download_payload: Vec<u8> = (0..(64 * 1024))
+            .map(|i| ((i * 53 + 7) & 0xff) as u8)
+            .collect();
+
+        let expected_upload = upload_payload.clone();
+        let expected_download = download_payload.clone();
+        let upload_len = upload_payload.len();
+        let download_len = download_payload.len();
+
+        // Server writes continuously while reading in small backpressured chunks.
+        let srv_rd_task = tokio::spawn(async move {
+            let mut got = Vec::with_capacity(upload_len);
+            let mut tmp = [0u8; 192];
+            while got.len() < upload_len {
+                let n = srv_rd.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "unexpected EOF while reading client upload");
+                got.extend_from_slice(&tmp[..n]);
+                if got.len() % 4096 < 192 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            got
+        });
+
+        let srv_wr_task = tokio::spawn(async move {
+            for chunk in download_payload.chunks(512) {
+                srv_wr.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            srv_wr.flush().await.unwrap();
+        });
+
+        let cli_wr_task = tokio::spawn(async move {
+            cli_wr.write_all(&upload_payload).await.unwrap();
+            cli_wr.flush().await.unwrap();
+        });
+
+        let cli_rd_task = tokio::spawn(async move {
+            let mut got = vec![0u8; download_len];
+            cli_rd.read_exact(&mut got).await.unwrap();
+            got
+        });
+
+        let (srv_got, (), (), cli_got) = tokio::time::timeout(Duration::from_secs(2), async {
+            let (r1, r2, r3, r4) = tokio::join!(srv_rd_task, srv_wr_task, cli_wr_task, cli_rd_task);
+            (r1.unwrap(), r2.unwrap(), r3.unwrap(), r4.unwrap())
+        })
+        .await
+        .expect("split Tls13VisionStream deadlocked under duplex(256) backpressure");
+
+        assert_eq!(srv_got, expected_upload);
+        assert_eq!(cli_got, expected_download);
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_cancelled_pending_write_with_smaller_retry_never_panics() {
+        let (mut cli, mut srv) = establish_reality_pair(256).await;
+
+        let large_buf = vec![0x5Au8; 4096];
+        let mut acknowledged = Vec::new();
+        let mut hit_pending = false;
+
+        // Drive `poll_write` with a 4096-byte buffer until it returns `Poll::Pending`,
+        // then drop that pending write operation to simulate cancellation (e.g. `select!`).
+        for _ in 0..8 {
+            let mut single_poll_done = false;
+            let outcome = std::future::poll_fn(|cx| {
+                if single_poll_done {
+                    return Poll::Ready(None);
+                }
+                single_poll_done = true;
+                match Pin::new(&mut cli).poll_write(cx, &large_buf) {
+                    Poll::Ready(res) => Poll::Ready(Some(res)),
+                    Poll::Pending => Poll::Ready(None),
+                }
+            })
+            .await;
+
+            match outcome {
+                Some(Ok(n)) => {
+                    assert!(n <= large_buf.len());
+                    acknowledged.extend_from_slice(&large_buf[..n]);
+                }
+                Some(Err(e)) => panic!("unexpected write error before Pending: {e}"),
+                None => {
+                    hit_pending = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            hit_pending,
+            "expected poll_write(4096) to return Poll::Pending against full duplex(256)"
+        );
+
+        // Start draining server side, then retry with a 4-byte `write_all` (smaller than 4096!).
+        let srv_task = tokio::spawn(async move {
+            let mut all = Vec::new();
+            srv.read_to_end(&mut all).await.unwrap();
+            all
+        });
+
+        let tail = [1u8, 2, 3, 4];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            cli.write_all(&tail).await.unwrap();
+            cli.flush().await.unwrap();
+            cli.shutdown().await.unwrap();
+        })
+        .await
+        .expect("smaller retry write_all hung after cancelled Pending write");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = acknowledged;
+        expected.extend_from_slice(&tail);
+        assert_eq!(received, expected);
+    }
+
+    struct AsymmetricDuplex {
+        rd: Arc<parking_lot::Mutex<Option<tokio::io::DuplexStream>>>,
+        wr: tokio::io::DuplexStream,
+    }
+
+    struct HalfDropHandle(Arc<parking_lot::Mutex<Option<tokio::io::DuplexStream>>>);
+
+    impl HalfDropHandle {
+        fn drop_reader(&self) {
+            let _ = self.0.lock().take();
+        }
+    }
+
+    impl AsyncRead for AsymmetricDuplex {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let mut guard = self.rd.lock();
+            match guard.as_mut() {
+                Some(stream) => Pin::new(stream).poll_read(cx, buf),
+                None => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    impl AsyncWrite for AsymmetricDuplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.wr).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.wr).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.wr).poll_shutdown(cx)
+        }
+    }
+
+    fn asymmetric_duplex(
+        c2s_buf: usize,
+        s2c_buf: usize,
+    ) -> (AsymmetricDuplex, AsymmetricDuplex, HalfDropHandle) {
+        let (c2s_client, c2s_server) = tokio::io::duplex(c2s_buf);
+        let (s2c_server, s2c_client) = tokio::io::duplex(s2c_buf);
+        let srv_rd = Arc::new(parking_lot::Mutex::new(Some(c2s_server)));
+        let drop_srv_rd = HalfDropHandle(Arc::clone(&srv_rd));
+        let client = AsymmetricDuplex {
+            rd: Arc::new(parking_lot::Mutex::new(Some(s2c_client))),
+            wr: c2s_client,
+        };
+        let server = AsymmetricDuplex {
+            rd: srv_rd,
+            wr: s2c_server,
+        };
+        (client, server, drop_srv_rd)
+    }
+
+    async fn establish_reality_asymmetric_pair(
+        c2s_buf: usize,
+        s2c_buf: usize,
+    ) -> (
+        Tls13VisionStream<AsymmetricDuplex>,
+        Tls13VisionStream<AsymmetricDuplex>,
+        HalfDropHandle,
+    ) {
+        let mut srv_sk_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut srv_sk_bytes);
+        let srv_sk = X25519Secret::from(srv_sk_bytes);
+        let srv_pk = X25519PublicKey::from(&srv_sk);
+        let short_id = decode_reality_short_id("a1b2c3d4").unwrap();
+
+        let (c_io, s_io, drop_srv_rd) = asymmetric_duplex(c2s_buf, s2c_buf);
+        let mode = Tls13HandshakeMode::Reality(RealityClientConfig {
+            public_key: *srv_pk.as_bytes(),
+            short_id,
+            server_name: "www.microsoft.com".to_string(),
+            fingerprint: "chrome".to_string(),
+            spider_x: "/".to_string(),
+            alpn: Vec::new(),
+        });
+
+        let srv_task = tokio::spawn(async move {
+            accept_reality_tls13_server(s_io, &srv_sk_bytes, &short_id, "www.microsoft.com").await
+        });
+        let cli = connect_tls13_vision_stream(c_io, &mode).await.unwrap();
+        let srv = srv_task.await.unwrap().unwrap();
+        (cli, srv, drop_srv_rd)
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_asymmetric_broken_uplink_drains_buffered_and_async_gapped_response() {
+        let (cli, mut srv, drop_srv_rd) = establish_reality_asymmetric_pair(256, 4096).await;
+        let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+
+        // Client writes 16 KiB -> sealed in `enc_tx_buf` and acknowledged immediately while
+        // ~16 KiB remains queued behind the 256-byte uplink pipe.
+        let n = c_wr.write(&vec![0xAAu8; 16 * 1024]).await.unwrap();
+        assert_eq!(n, 16 * 1024);
+
+        // Server sends early HTTP 413 headers, closes client uplink (BrokenPipe), waits across
+        // an async gap, then sends the body + TLS 1.3 close_notify.
+        let srv_task = tokio::spawn(async move {
+            srv.write_all(b"HTTP/1.1 413 Payload Too Large\r\n\r\n")
+                .await
+                .unwrap();
+            srv.flush().await.unwrap();
+            drop_srv_rd.drop_reader();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            srv.write_all(b"entity too large after async gap")
+                .await
+                .unwrap();
+            srv.flush().await.unwrap();
+            srv.shutdown().await.unwrap();
+        });
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), c_rd.read_to_end(&mut got))
+            .await
+            .expect("read_to_end hung draining early TLS 1.3 response after broken uplink")
+            .expect("poll_read must drain buffered + async-gapped TLS 1.3 response cleanly");
+        assert_eq!(
+            got,
+            b"HTTP/1.1 413 Payload Too Large\r\n\r\nentity too large after async gap"
+        );
+        srv_task.await.unwrap();
+
+        // Write path MUST still surface the real BrokenPipe directly to the writer.
+        let flush_err = c_wr
+            .flush()
+            .await
+            .expect_err("flush must still surface BrokenPipe");
+        assert_eq!(flush_err.kind(), io::ErrorKind::BrokenPipe);
+        let write_err = c_wr
+            .write(b"after-broken")
+            .await
+            .expect_err("write must still surface BrokenPipe");
+        assert_eq!(write_err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_dec_rx_buf_already_decrypted_bytes_survive_uplink_broken_pipe() {
+        let (cli, mut srv, drop_srv_rd) = establish_reality_asymmetric_pair(256, 4096).await;
+        let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+
+        let payload: Vec<u8> = (0u8..64u8).collect();
+        srv.write_all(&payload).await.unwrap();
+        srv.flush().await.unwrap();
+
+        // Read only 8 bytes, leaving 56 already-decrypted bytes inside `dec_rx_buf`.
+        let mut head = [0u8; 8];
+        c_rd.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, &payload[..8]);
+
+        // Queue 16 KiB into `enc_tx_buf`, then break uplink and send close_notify.
+        let n = c_wr.write(&vec![0xBBu8; 16 * 1024]).await.unwrap();
+        assert_eq!(n, 16 * 1024);
+        drop_srv_rd.drop_reader();
+        srv.shutdown().await.unwrap();
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), c_rd.read_to_end(&mut rest))
+            .await
+            .expect("read_to_end hung draining dec_rx_buf")
+            .expect("already-decrypted dec_rx_buf bytes must survive uplink BrokenPipe");
+        assert_eq!(rest, payload[8..]);
+
+        let flush_err = c_wr
+            .flush()
+            .await
+            .expect_err("flush must still surface BrokenPipe");
+        assert_eq!(flush_err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_silent_broken_uplink_fast_fails_and_truncated_record_errors() {
+        // 1. Silent broken uplink: server drops uplink read half without sending any TLS data.
+        {
+            let (cli, _srv, drop_srv_rd) = establish_reality_asymmetric_pair(256, 4096).await;
+            let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+
+            let n = c_wr.write(&vec![0xCCu8; 16 * 1024]).await.unwrap();
+            assert_eq!(n, 16 * 1024);
+            drop_srv_rd.drop_reader();
+
+            let mut buf = [0u8; 64];
+            let err = tokio::time::timeout(Duration::from_millis(500), c_rd.read(&mut buf))
+                .await
+                .expect("silent broken uplink must fast-fail without hanging")
+                .expect_err("silent broken uplink must return BrokenPipe");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        }
+
+        // 2. Truncated TLS 1.3 record on EOF with broken uplink must still surface UnexpectedEof.
+        {
+            let (cli, mut srv, drop_srv_rd) = establish_reality_asymmetric_pair(256, 4096).await;
+            let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+
+            let n = c_wr.write(&vec![0xDDu8; 16 * 1024]).await.unwrap();
+            assert_eq!(n, 16 * 1024);
+            drop_srv_rd.drop_reader();
+
+            // Write an incomplete raw TLS 1.3 record header+partial body directly on server wire
+            // and drop the server stream to trigger abrupt mid-record EOF.
+            srv.inner
+                .write_all(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0x00, 0x40, 1, 2, 3])
+                .await
+                .unwrap();
+            srv.inner.flush().await.unwrap();
+            drop(srv);
+
+            let mut buf = [0u8; 64];
+            let err = tokio::time::timeout(Duration::from_millis(500), c_rd.read(&mut buf))
+                .await
+                .expect("truncated record read hung")
+                .expect_err("truncated TLS 1.3 record must return UnexpectedEof");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_post_key_update_broken_uplink_delivers_application_data() {
+        let (cli, mut srv, drop_srv_rd) = establish_reality_asymmetric_pair(256, 4096).await;
+        let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+
+        // Server initiates TLS 1.3 KeyUpdate(update_requested = 1), rolls its write keys,
+        // sends application data + close_notify under the new keys, and drops client's uplink
+        // so the client's post-KeyUpdate response drain hits BrokenPipe!
+        let ku_req = [TLS_HS_KEY_UPDATE, 0, 0, 1, 1];
+        srv.write_keys
+            .seal_record(TLS_RECORD_HANDSHAKE, &ku_req, &mut srv.enc_tx_buf)
+            .unwrap();
+        srv.write_keys.roll_key_update().unwrap();
+        srv.flush().await.unwrap();
+        srv.write_all(b"post-key-update-payload").await.unwrap();
+        srv.flush().await.unwrap();
+        srv.shutdown().await.unwrap();
+        drop_srv_rd.drop_reader();
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), c_rd.read_to_end(&mut got))
+            .await
+            .expect("read_to_end hung after post-KeyUpdate broken uplink")
+            .expect("post-KeyUpdate application data must be delivered despite uplink BrokenPipe");
+        assert_eq!(got, b"post-key-update-payload");
+
+        let flush_err = c_wr
+            .flush()
+            .await
+            .expect_err("writer flush must still surface BrokenPipe for queued KeyUpdate ack");
+        assert_eq!(flush_err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_buffered_transport_flush_and_split_dropped_reader_waker_isolation() {
+        // 1. Buffered underlying transport (`BufStream`): client writes without explicit `flush()`
+        //    and immediately calls `read()`; opportunistic `poll_flush_tx_from_read` must flush
+        //    through `BufStream` so the server receives the request and replies.
+        {
+            let mut srv_sk_bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut srv_sk_bytes);
+            let srv_sk = X25519Secret::from(srv_sk_bytes);
+            let srv_pk = X25519PublicKey::from(&srv_sk);
+            let short_id = decode_reality_short_id("a1b2c3d4").unwrap();
+            let (c_raw, s_raw) = tokio::io::duplex(64 * 1024);
+            let c_buf = tokio::io::BufStream::new(c_raw);
+            let mode = Tls13HandshakeMode::Reality(RealityClientConfig {
+                public_key: *srv_pk.as_bytes(),
+                short_id,
+                server_name: "www.microsoft.com".to_string(),
+                fingerprint: "chrome".to_string(),
+                spider_x: "/".to_string(),
+                alpn: Vec::new(),
+            });
+
+            let srv_task = tokio::spawn(async move {
+                let mut srv = accept_reality_tls13_server(
+                    s_raw,
+                    &srv_sk_bytes,
+                    &short_id,
+                    "www.microsoft.com",
+                )
+                .await
+                .unwrap();
+                let mut req = [0u8; 16];
+                srv.read_exact(&mut req).await.unwrap();
+                assert_eq!(&req, b"unflushed-buf-tx");
+                srv.write_all(b"buffered-ok").await.unwrap();
+                srv.flush().await.unwrap();
+            });
+
+            let mut cli = connect_tls13_vision_stream(c_buf, &mode).await.unwrap();
+            cli.write_all(b"unflushed-buf-tx").await.unwrap();
+            // Intentionally skip `cli.flush()` and go straight to `read_exact`!
+            let mut resp = [0u8; 11];
+            tokio::time::timeout(Duration::from_secs(2), cli.read_exact(&mut resp))
+                .await
+                .expect("read over BufStream hung waiting for opportunistic inner.poll_flush")
+                .unwrap();
+            assert_eq!(&resp, b"buffered-ok");
+            srv_task.await.unwrap();
+        }
+
+        // 2. Split-stream `Task W != Task R`: writer parked on saturated `duplex(256)` while reader
+        //    reads an early server push and exits/drops `c_rd` BEFORE server drains the upload.
+        //    `FanoutWaker` must preserve writer wakeup so upload completes without deadlock.
+        {
+            let (cli, srv) = establish_reality_pair(256).await;
+            let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+            let (mut s_rd, mut s_wr) = tokio::io::split(srv);
+
+            let upload: Vec<u8> = (0..(64 * 1024))
+                .map(|i| ((i * 17 + 5) & 0xff) as u8)
+                .collect();
+            let expected_upload = upload.clone();
+
+            let (rd_done_tx, rd_done_rx) = tokio::sync::oneshot::channel::<()>();
+            let wr_task = tokio::spawn(async move {
+                c_wr.write_all(&upload).await.unwrap();
+                c_wr.flush().await.unwrap();
+            });
+
+            // Let writer saturate `duplex(256)` and park in `poll_write`.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Reader reads early server push, then exits and drops `c_rd`!
+            let rd_task = tokio::spawn(async move {
+                let mut early = [0u8; 10];
+                c_rd.read_exact(&mut early).await.unwrap();
+                assert_eq!(&early, b"early-push");
+                drop(c_rd);
+                let _ = rd_done_tx.send(());
+            });
+
+            s_wr.write_all(b"early-push").await.unwrap();
+            s_wr.flush().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), rd_done_rx)
+                .await
+                .expect("reader did not finish early push")
+                .unwrap();
+            rd_task.await.unwrap();
+
+            // Now server drains the 64 KiB upload after `c_rd` has already been dropped!
+            let mut got = vec![0u8; expected_upload.len()];
+            tokio::time::timeout(Duration::from_secs(2), s_rd.read_exact(&mut got))
+                .await
+                .expect("split writer deadlocked after reader exited and dropped c_rd")
+                .unwrap();
+            assert_eq!(got, expected_upload);
+            tokio::time::timeout(Duration::from_secs(2), wr_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    async fn establish_reality_bufstream_pair(
+        duplex_buf: usize,
+    ) -> (
+        Tls13VisionStream<tokio::io::BufStream<tokio::io::DuplexStream>>,
+        Tls13VisionStream<tokio::io::DuplexStream>,
+    ) {
+        let mut srv_sk_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut srv_sk_bytes);
+        let srv_sk = X25519Secret::from(srv_sk_bytes);
+        let srv_pk = X25519PublicKey::from(&srv_sk);
+        let short_id = decode_reality_short_id("a1b2c3d4").unwrap();
+
+        let (c_raw, s_raw) = tokio::io::duplex(duplex_buf);
+        let c_buf = tokio::io::BufStream::new(c_raw);
+        let mode = Tls13HandshakeMode::Reality(RealityClientConfig {
+            public_key: *srv_pk.as_bytes(),
+            short_id,
+            server_name: "www.microsoft.com".to_string(),
+            fingerprint: "chrome".to_string(),
+            spider_x: "/".to_string(),
+            alpn: Vec::new(),
+        });
+
+        let srv_task = tokio::spawn(async move {
+            accept_reality_tls13_server(s_raw, &srv_sk_bytes, &short_id, "www.microsoft.com").await
+        });
+        let cli = connect_tls13_vision_stream(c_buf, &mode).await.unwrap();
+        let srv = srv_task.await.unwrap().unwrap();
+        (cli, srv)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls13_vision_direct_write_bufstream_split_uncancelled_write_never_deadlocks() {
+        let (mut cli, mut srv) = establish_reality_bufstream_pair(256).await;
+        cli.enable_direct_write();
+        srv.enable_direct_read();
+
+        let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+        let req1: Vec<u8> = (0..4096).map(|i| ((i * 13 + 3) & 0xff) as u8).collect();
+        let req2: Vec<u8> = (0..4097).map(|i| ((i * 29 + 7) & 0xff) as u8).collect();
+        let mut expected = Vec::with_capacity(req1.len() + req2.len());
+        expected.extend_from_slice(&req1);
+        expected.extend_from_slice(&req2);
+
+        let (wr_parked_tx, wr_parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let (start_srv_tx, start_srv_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let srv_task = tokio::spawn(async move {
+            start_srv_rx.await.unwrap();
+            let mut got = vec![0u8; expected.len()];
+            srv.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected);
+            srv.write_all(b"TLS13-DIRECT-OK!").await.unwrap();
+            srv.flush().await.unwrap();
+        });
+
+        // Task W writes 4096 B (buffered in BufStream, inner_needs_flush = true) followed by
+        // 4097 B (exceeding 8192 B BufWriter capacity -> flushes 256 B into duplex(256) and parks
+        // Pending in direct_write), then exits cleanly WITHOUT calling `flush()`.
+        let wr_task = tokio::spawn(async move {
+            c_wr.write_all(&req1).await.unwrap();
+            let _ = wr_parked_tx.send(());
+            c_wr.write_all(&req2).await.unwrap();
+        });
+
+        wr_parked_rx.await.unwrap();
+        // Let Task W enter `poll_write(&req2)` and park on saturated `duplex(256)`.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Task R polls `read_exact` while Task W owns `tx_fanout` write slot.
+        let rd_task = tokio::spawn(async move {
+            let mut reply = [0u8; 16];
+            c_rd.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        // Let Task R execute `poll_flush_tx_from_read` while Task W is parked in `poll_write`.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = start_srv_tx.send(());
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            let (wr_res, rd_res, srv_res) = tokio::join!(wr_task, rd_task, srv_task);
+            wr_res.unwrap();
+            srv_res.unwrap();
+            rd_res.unwrap()
+        })
+        .await
+        .expect(
+            "Tls13VisionStream direct_write + BufStream split reader deadlocked with zero-cancellation write without flush",
+        );
+        assert_eq!(&reply, b"TLS13-DIRECT-OK!");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls13_vision_direct_write_bufstream_split_cancelled_flush_never_deadlocks() {
+        let (mut cli, mut srv) = establish_reality_bufstream_pair(256).await;
+        cli.enable_direct_write();
+        cli.enable_direct_read();
+        srv.enable_direct_read();
+        srv.enable_direct_write();
+
+        let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+        let req: Vec<u8> = (0..4096).map(|i| ((i * 19 + 5) & 0xff) as u8).collect();
+        let expected = req.clone();
+
+        let (buffered_tx, buffered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (start_srv_tx, start_srv_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let srv_task = tokio::spawn(async move {
+            start_srv_rx.await.unwrap();
+            let mut got = vec![0u8; expected.len()];
+            srv.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected);
+            srv.write_all(b"TLS13-CANCEL-OK!").await.unwrap();
+            srv.flush().await.unwrap();
+        });
+
+        // Task W buffers 4096 B in BufStream, parks in `flush()` against saturated `duplex(256)`,
+        // and cancels `flush()` on timeout, leaving a stale writer waker in `tx_fanout`.
+        let wr_task = tokio::spawn(async move {
+            c_wr.write_all(&req).await.unwrap();
+            let _ = buffered_tx.send(());
+            let timed_out = tokio::time::timeout(Duration::from_millis(60), c_wr.flush())
+                .await
+                .is_err();
+            assert!(
+                timed_out,
+                "expected direct_write BufStream flush() to time out on full duplex(256)"
+            );
+        });
+
+        buffered_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Task R polls `read_exact` while Task W is parked in `flush()`.
+        let rd_task = tokio::spawn(async move {
+            let mut reply = [0u8; 16];
+            c_rd.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        // Wait for Task W's timeout cancellation to complete, then let server drain duplex(256).
+        wr_task.await.unwrap();
+        let _ = start_srv_tx.send(());
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            let (rd_res, srv_res) = tokio::join!(rd_task, srv_task);
+            srv_res.unwrap();
+            rd_res.unwrap()
+        })
+        .await
+        .expect(
+            "Tls13VisionStream direct_write + BufStream split reader deadlocked after timeout-cancelled flush()",
+        );
+        assert_eq!(&reply, b"TLS13-CANCEL-OK!");
+    }
+
+    async fn run_pre_parked_cancelled_shutdown_scenario<S>(
+        cli: Tls13VisionStream<S>,
+        mut srv: Tls13VisionStream<tokio::io::DuplexStream>,
+        expected_reply: &'static [u8],
+        label: &'static str,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut c_rd, mut c_wr) = tokio::io::split(cli);
+
+        // 234 B plaintext + 22 B TLS 1.3 outer header/inner type/AEAD tag = exact 256 B wire
+        // record -> saturates `duplex(256)` 256/256 while leaving `enc_tx_buf` empty and
+        // `inner_needs_flush == false`.
+        let req: Vec<u8> = (0..234).map(|i| ((i * 23 + 9) & 0xff) as u8).collect();
+        let expected_req = req.clone();
+        c_wr.write_all(&req).await.unwrap();
+        c_wr.flush().await.unwrap();
+
+        let (rd_started_tx, rd_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (start_srv_tx, start_srv_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let srv_task = tokio::spawn(async move {
+            start_srv_rx.await.unwrap();
+            // Server reads the 234-byte payload AND waits for client's TLS 1.3 close_notify (EOF)
+            // before sending its reply (standard half-close RPC/HTTP pattern).
+            let mut got = Vec::new();
+            srv.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, expected_req);
+            srv.write_all(expected_reply).await.unwrap();
+            srv.flush().await.unwrap();
+            srv.shutdown().await.unwrap();
+        });
+
+        // Pre-park split Task R in `read_to_end()` while `enc_tx_buf` is empty and
+        // `!inner_needs_flush` -> `tx_fanout` enters `(read_tx: None, write_tx: None, parked_read: Some(R))`.
+        let rd_task = tokio::spawn(async move {
+            let _ = rd_started_tx.send(());
+            let mut reply = Vec::new();
+            c_rd.read_to_end(&mut reply).await.unwrap();
+            reply
+        });
+
+        rd_started_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Split Task W attempts `shutdown()`, sealing TLS 1.3 `close_notify` into TX and parking
+        // `Pending` against saturated `duplex(256)`, then cancels on timeout.
+        let wr_task = tokio::spawn(async move {
+            let timed_out = tokio::time::timeout(Duration::from_millis(30), c_wr.shutdown())
+                .await
+                .is_err();
+            assert!(
+                timed_out,
+                "{label}: expected shutdown() to time out against saturated duplex(256)"
+            );
+            c_wr
+        });
+        let _c_wr = wr_task.await.unwrap();
+
+        // Now let the server drain the saturated pipe; Task R must drain the stranded
+        // `close_notify` and receive the complete server reply without deadlocking.
+        let _ = start_srv_tx.send(());
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            let (rd_res, srv_res) = tokio::join!(rd_task, srv_task);
+            srv_res.unwrap();
+            rd_res.unwrap()
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{label}: pre-parked split Task R deadlocked after timeout-cancelled shutdown() (close_notify stranded in TX)"
+            )
+        });
+        assert_eq!(reply, expected_reply);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls13_vision_raw_duplex_pre_parked_reader_cancelled_shutdown_never_deadlocks() {
+        let (cli, srv) = establish_reality_pair(256).await;
+        run_pre_parked_cancelled_shutdown_scenario(
+            cli,
+            srv,
+            b"TLS13-RAW-SHUTDOWN-OK!",
+            "Tls13VisionStream<DuplexStream>",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls13_vision_bufstream_pre_parked_reader_cancelled_shutdown_never_deadlocks() {
+        // 1. Default 8 KiB `BufStream<DuplexStream>` (`close_notify` enters BufStream write buffer
+        //    and `inner.poll_flush` returns `Poll::Pending`).
+        let (cli, srv) = establish_reality_bufstream_pair(256).await;
+        run_pre_parked_cancelled_shutdown_scenario(
+            cli,
+            srv,
+            b"TLS13-BUFSTREAM-SHUTDOWN-OK!",
+            "Tls13VisionStream<BufStream<DuplexStream>>",
+        )
+        .await;
+
+        // 2. Small-buffer `BufStream::with_capacity(16, 16, DuplexStream)` (24 B `close_notify`
+        //    exceeds BufWriter capacity, so `poll_drain_tx_from_write` itself hits `Poll::Pending`).
+        let mut srv_sk_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut srv_sk_bytes);
+        let srv_sk = X25519Secret::from(srv_sk_bytes);
+        let srv_pk = X25519PublicKey::from(&srv_sk);
+        let short_id = decode_reality_short_id("a1b2c3d4").unwrap();
+        let (c_raw, s_raw) = tokio::io::duplex(256);
+        let c_buf = tokio::io::BufStream::with_capacity(16, 16, c_raw);
+        let mode = Tls13HandshakeMode::Reality(RealityClientConfig {
+            public_key: *srv_pk.as_bytes(),
+            short_id,
+            server_name: "www.microsoft.com".to_string(),
+            fingerprint: "chrome".to_string(),
+            spider_x: "/".to_string(),
+            alpn: Vec::new(),
+        });
+        let srv_task = tokio::spawn(async move {
+            accept_reality_tls13_server(s_raw, &srv_sk_bytes, &short_id, "www.microsoft.com").await
+        });
+        let cli_small = connect_tls13_vision_stream(c_buf, &mode).await.unwrap();
+        let srv_small = srv_task.await.unwrap().unwrap();
+        run_pre_parked_cancelled_shutdown_scenario(
+            cli_small,
+            srv_small,
+            b"TLS13-BUFSTREAM-SMALL-OK!",
+            "Tls13VisionStream<BufStream(16)<DuplexStream>>",
+        )
+        .await;
+    }
+
+    #[test]
+    fn der_tlv_and_tls13_certificate_list_reject_overflow_and_truncated_lengths() {
+        // 1. Valid short-form and multi-octet DER TLV.
+        let (tag, val, rest) = read_der_tlv(&[0x30, 0x03, 0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
+        assert_eq!(tag, 0x30);
+        assert_eq!(val, &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(rest, &[0xdd]);
+
+        let (tag2, val2, rest2) = read_der_tlv(&[0x04, 0x81, 0x02, 0x11, 0x22]).unwrap();
+        assert_eq!(tag2, 0x04);
+        assert_eq!(val2, &[0x11, 0x22]);
+        assert!(rest2.is_empty());
+
+        // 2. Crafted 4-octet u32::MAX / near-u32::MAX lengths must fail cleanly without overflow
+        //    or OOB panic on both 32-bit and 64-bit targets.
+        for bad_der in [
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xfa][..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xf9, 0x00][..],
+            &[0x30, 0x80][..],
+            &[0x30, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01][..],
+            &[0x30, 0x05, 0x01, 0x02][..],
+        ] {
+            let err = read_der_tlv(bad_der).expect_err("crafted DER TLV must return InvalidData");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 3. Valid TLS 1.3 Certificate list with 2 entries and extensions.
+        let mut valid_body = vec![
+            0x00, // request_context len = 0
+            0x00, 0x00, 15, // certificate_list len = 15
+            // Entry 1: 3B cert + 2B ext = 10B total
+            0x00, 0x00, 0x03, 0x30, 0x01, 0x02, 0x00, 0x02, 0xaa, 0xbb,
+            // Entry 2: 0B cert + 0B ext = 5B total
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let certs = parse_tls13_certificate_list(&valid_body).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), &[0x30, 0x01, 0x02]);
+
+        // 4. Crafted `ext_len` exceeding the certificate list boundary must be rejected cleanly.
+        let bad_ext_body = vec![
+            0x00, // request_context len = 0
+            0x00, 0x00, 0x07, // certificate_list len = 7
+            0x00, 0x00, 0x02, 0x30, 0x00, // 2-byte cert
+            0xff, 0xff, // ext_len = 65535 > remaining 0 bytes!
+        ];
+        let err = parse_tls13_certificate_list(&bad_ext_body)
+            .expect_err("oversized CertificateEntry extensions length must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 5. Trailing truncated entry header (< 3 bytes) inside certificate_list must be rejected.
+        valid_body[3] = 17; // list_len = 17
+        valid_body.extend_from_slice(&[0x00, 0x01]);
+        let err = parse_tls13_certificate_list(&valid_body)
+            .expect_err("truncated trailing CertificateEntry header must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn tls13_vision_split_post_handshake_key_update_and_interleaving_rules() {
+        // 1. KeyUpdate(request_update = 0) split across 2 TLS 1.3 handshake records (2 B + 3 B)
+        //    followed by AEAD application data encrypted with the rolled key.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            let ku = [TLS_HS_KEY_UPDATE, 0, 0, 1, 0];
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &ku[..2], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &ku[2..], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys.roll_key_update().unwrap();
+            srv.flush().await.unwrap();
+            srv.write_all(b"decrypted-after-split-key-update")
+                .await
+                .unwrap();
+            srv.flush().await.unwrap();
+            srv.shutdown().await.unwrap();
+
+            let mut got = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), cli.read_to_end(&mut got))
+                .await
+                .expect("read_to_end timed out after split KeyUpdate")
+                .expect("split KeyUpdate must roll read keys cleanly");
+            assert_eq!(got, b"decrypted-after-split-key-update");
+        }
+
+        // 2. Coalesced NewSessionTicket + split KeyUpdate(request_update = 1) across 3 records,
+        //    verifying BOTH directions roll keys and exchange post-KeyUpdate traffic cleanly.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            let mut nst_and_ku = vec![TLS_HS_NEW_SESSION_TICKET, 0, 0, 4, 1, 2, 3, 4];
+            let ku1 = [TLS_HS_KEY_UPDATE, 0, 0, 1, 1];
+            nst_and_ku.extend_from_slice(&ku1);
+
+            // Split mid-NST, mid-KU-header, and mid-KU-body.
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &nst_and_ku[..6], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys
+                .seal_record(
+                    TLS_RECORD_HANDSHAKE,
+                    &nst_and_ku[6..10],
+                    &mut srv.enc_tx_buf,
+                )
+                .unwrap();
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &nst_and_ku[10..], &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys.roll_key_update().unwrap();
+            srv.flush().await.unwrap();
+            srv.write_all(b"s2c-rolled").await.unwrap();
+            srv.flush().await.unwrap();
+
+            let mut s2c = [0u8; 10];
+            tokio::time::timeout(Duration::from_secs(2), cli.read_exact(&mut s2c))
+                .await
+                .expect("client read after split KeyUpdate(1) timed out")
+                .unwrap();
+            assert_eq!(&s2c, b"s2c-rolled");
+
+            // Client also rolled its write keys and queued KeyUpdate(0); verify server decrypts
+            // both the KeyUpdate(0) ack and subsequent client-to-server application data.
+            cli.write_all(b"c2s-rolled").await.unwrap();
+            cli.flush().await.unwrap();
+            let mut c2s = [0u8; 10];
+            tokio::time::timeout(Duration::from_secs(2), srv.read_exact(&mut c2s))
+                .await
+                .expect("server read after client KeyUpdate ack timed out")
+                .unwrap();
+            assert_eq!(&c2s, b"c2s-rolled");
+        }
+
+        // 3. RFC 8446 §5.1: ApplicationData interleaved while a post-handshake message is
+        //    incomplete MUST be rejected with InvalidData.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            let partial_ku = [TLS_HS_KEY_UPDATE, 0];
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &partial_ku, &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.write_keys
+                .seal_record(
+                    TLS_RECORD_APPLICATION_DATA,
+                    b"illegal-interleave",
+                    &mut srv.enc_tx_buf,
+                )
+                .unwrap();
+            srv.flush().await.unwrap();
+
+            let mut buf = [0u8; 32];
+            let err = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect_err("interleaved ApplicationData mid-handshake message must fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 4. Oversized post-handshake message header (> MAX_POST_HANDSHAKE_BUF) must be rejected
+        //    immediately with InvalidData.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            // NewSessionTicket header declaring 64 KiB body -> 4 + 65536 > 65536 cap.
+            let oversized_hdr = [TLS_HS_NEW_SESSION_TICKET, 0x01, 0x00, 0x00];
+            srv.write_keys
+                .seal_record(TLS_RECORD_HANDSHAKE, &oversized_hdr, &mut srv.enc_tx_buf)
+                .unwrap();
+            srv.flush().await.unwrap();
+
+            let mut buf = [0u8; 32];
+            let err = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect_err("oversized post-handshake message must fail with InvalidData");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 5. Abrupt EOF with an incomplete buffered post-handshake message must return
+        //    UnexpectedEof rather than clean EOF.
+        {
+            let (mut cli, mut srv) = establish_reality_pair(16 * 1024).await;
+            srv.write_keys
+                .seal_record(
+                    TLS_RECORD_HANDSHAKE,
+                    &[TLS_HS_KEY_UPDATE, 0, 0],
+                    &mut srv.enc_tx_buf,
+                )
+                .unwrap();
+            srv.flush().await.unwrap();
+            drop(srv);
+
+            let mut buf = [0u8; 32];
+            let err = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect_err("EOF mid-post-handshake message must return UnexpectedEof");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
     }
 }

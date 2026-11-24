@@ -221,17 +221,20 @@ pub async fn spawn_mixed_inbound_with_policy(
                     };
 
                     let _ = tcp.set_nodelay(true);
-                    let current_router = Arc::clone(&router.read());
+                    let router_slot = Arc::clone(&router);
+                    let policy_slot = Arc::clone(&policy);
                     let hub_clone = Arc::clone(&hub);
+                    let shutdown_conn = shutdown.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(err) = handle_mixed_conn(
                             tcp,
                             peer,
                             local_mixed_port,
-                            current_router,
-                            snap_policy,
+                            router_slot,
+                            policy_slot,
                             hub_clone,
+                            shutdown_conn,
                         )
                         .await
                         {
@@ -337,9 +340,10 @@ async fn handle_mixed_conn(
     mut tcp: TcpStream,
     peer: SocketAddr,
     local_mixed_port: u16,
-    router: Arc<Router>,
-    policy: MixedInboundPolicy,
+    router: Arc<RwLock<Arc<Router>>>,
+    policy: Arc<RwLock<MixedInboundPolicy>>,
     hub: Arc<TelemetryHub>,
+    shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut first = [0u8; 1];
     let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, tcp.peek(&mut first))
@@ -350,9 +354,28 @@ async fn handle_mixed_conn(
     }
 
     if first[0] == 0x05 {
-        handle_socks5(&mut tcp, peer, local_mixed_port, router, &policy, hub).await
+        handle_socks5(
+            &mut tcp,
+            peer,
+            local_mixed_port,
+            router,
+            policy,
+            hub,
+            shutdown,
+        )
+        .await
     } else {
-        handle_http_proxy(&mut tcp, peer, local_mixed_port, router, &policy, hub).await
+        let current_router = Arc::clone(&router.read());
+        let snap_policy = policy.read().clone();
+        handle_http_proxy(
+            &mut tcp,
+            peer,
+            local_mixed_port,
+            current_router,
+            &snap_policy,
+            hub,
+        )
+        .await
     }
 }
 
@@ -649,13 +672,15 @@ async fn handle_socks5(
     tcp: &mut TcpStream,
     peer: SocketAddr,
     local_mixed_port: u16,
-    router: Arc<Router>,
-    policy: &MixedInboundPolicy,
+    router: Arc<RwLock<Arc<Router>>>,
+    policy: Arc<RwLock<MixedInboundPolicy>>,
     hub: Arc<TelemetryHub>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
+    let handshake_policy = policy.read().clone();
     let (cmd, raw_target) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        negotiate_socks5_and_read_target(tcp, policy),
+        negotiate_socks5_and_read_target(tcp, &handshake_policy),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 handshake timed out"))??;
@@ -663,6 +688,9 @@ async fn handle_socks5(
     match cmd {
         0x01 => {
             // TCP CONNECT
+            let router = Arc::clone(&router.read());
+            let snap_policy = policy.read().clone();
+            let policy = &snap_policy;
             if let Err(err) =
                 reject_forbidden_proxy_target(peer, local_mixed_port, policy, &raw_target)
             {
@@ -822,6 +850,9 @@ async fn handle_socks5(
         }
         0x03 => {
             // UDP ASSOCIATE: bind ephemeral relay socket on the local interface facing `peer`
+            if *shutdown.borrow() {
+                return Ok(());
+            }
             let expected_client_ip = canonical_ip(peer.ip());
             if let Some(hint_ip) = raw_target.host.as_ip() {
                 let hint_canon = canonical_ip(hint_ip);
@@ -880,13 +911,15 @@ async fn handle_socks5(
                 }),
             );
 
+            let (udp_done_tx, mut udp_done_rx) = tokio::sync::oneshot::channel::<()>();
             let udp_task = {
                 let udp_clone = Arc::clone(&udp_sock);
-                let router_clone = Arc::clone(&router);
+                let router_slot = Arc::clone(&router);
+                let policy_slot = Arc::clone(&policy);
                 let inflight_sem = Arc::new(Semaphore::new(MAX_UDP_ASSOC_INFLIGHT));
                 let nat_clone = Arc::clone(&udp_nat);
-                let policy_for_udp = Arc::new(policy.clone());
                 tokio::spawn(async move {
+                    let _done_guard = udp_done_tx;
                     let mut buf = vec![0u8; 65535];
                     let mut locked_client_port: Option<u16> = initial_port_lock;
                     let mut pkt_tasks = JoinSet::<()>::new();
@@ -901,6 +934,17 @@ async fn handle_socks5(
                         {
                             continue;
                         }
+                        // Evaluate the live policy & router on each datagram so hot reloads of
+                        // `allow-lan`, CIDR ACLs, `blocked_local_ports`, and routing rules apply
+                        // immediately to long-lived SOCKS5 UDP ASSOCIATE sessions.
+                        let current_policy = policy_slot.read().clone();
+                        if !current_policy.allows_peer(peer.ip()) {
+                            tracing::debug!(
+                                "[SOCKS5-UDP] terminating association for revoked peer {peer} after policy reload"
+                            );
+                            let _ = nat_clone.reset_all_sessions();
+                            break;
+                        }
                         if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
                             continue; // Ignore fragmented or malformed SOCKS5 UDP frames
                         }
@@ -911,7 +955,7 @@ async fn handle_socks5(
                         if let Err(err) = reject_forbidden_proxy_target(
                             peer,
                             local_mixed_port,
-                            &policy_for_udp,
+                            &current_policy,
                             &raw_dst,
                         ) {
                             tracing::debug!(
@@ -923,13 +967,14 @@ async fn handle_socks5(
                             locked_client_port = Some(client_udp_addr.port());
                         }
 
+                        let current_router = Arc::clone(&router_slot.read());
                         let payload = buf[3 + hdr_used..n].to_vec();
                         let payload = if let HostName::Ip(dst_ip) = raw_dst.host {
                             let raw_dst_sock = SocketAddr::new(dst_ip, raw_dst.port);
                             match nat_clone.try_send_fast(
                                 client_udp_addr,
                                 raw_dst_sock,
-                                router_clone.epoch(),
+                                current_router.epoch(),
                                 payload,
                             ) {
                                 Ok(()) => continue,
@@ -943,9 +988,9 @@ async fn handle_socks5(
                             continue;
                         };
 
-                        let router_for_pkt = Arc::clone(&router_clone);
+                        let router_for_pkt = current_router;
                         let nat_inner = Arc::clone(&nat_clone);
-                        let policy_for_pkt = Arc::clone(&policy_for_udp);
+                        let policy_for_pkt = current_policy;
                         pkt_tasks.spawn(async move {
                             let _permit = permit;
                             let route_epoch = router_for_pkt.epoch();
@@ -991,12 +1036,22 @@ async fn handle_socks5(
             };
             let _cleanup_guard = UdpAssocCleanupGuard { udp_task, udp_nat };
 
-            // Keep UDP association alive until the TCP control stream closes
-            let mut drain = [0u8; 64];
-            loop {
-                match tcp.read(&mut drain).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
+            // Keep UDP association alive until the TCP control stream closes,
+            // the mixed inbound shuts down, or `udp_task` terminates.
+            if !*shutdown.borrow() {
+                let mut drain = [0u8; 64];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait_for(|&s| s) => break,
+                        _ = &mut udp_done_rx => break,
+                        res = tcp.read(&mut drain) => {
+                            match res {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => continue,
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
@@ -1305,7 +1360,11 @@ async fn handle_http_proxy(
         relay_bidirectional_coalesced(tcp, &mut tracked, &conn_entry, had_prefetched).await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://example.com/foo HTTP/1.1`)
-        if uri_part.len() >= 8 && uri_part[..8].eq_ignore_ascii_case("https://") {
+        if uri_part
+            .as_bytes()
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"))
+        {
             let _ = tcp
                 .write_all(
                     b"HTTP/1.1 400 Bad Request\r\nX-Proxy-Error: https-uri-requires-connect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1317,44 +1376,47 @@ async fn handle_http_proxy(
             ));
         }
 
-        let (raw_target, origin_path) =
-            if uri_part.len() >= 7 && uri_part[..7].eq_ignore_ascii_case("http://") {
-                let url = Url::parse(uri_part).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid HTTP proxy URL: {e}"),
-                    )
-                })?;
-                let host = url.host_str().ok_or_else(|| {
-                    io::Error::new(
-                        io::Error::other("missing host in HTTP proxy URL").kind(),
-                        "missing host in HTTP proxy URL",
-                    )
-                })?;
-                let port = url.port_or_known_default().unwrap_or(80);
-                let p = extract_raw_http_origin_path(uri_part);
-                let clean_host = host.trim_start_matches('[').trim_end_matches(']');
-                (TargetAddr::new_domain(clean_host, port)?, p)
-            } else {
-                // Fallback to Host header
-                let mut host_hdr = None;
-                for line in lines.clone() {
-                    if let Some((k, v)) = line.split_once(':')
-                        && k.trim().eq_ignore_ascii_case("host")
-                    {
-                        host_hdr = Some(v.trim());
-                        break;
-                    }
+        let (raw_target, origin_path) = if uri_part
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"http://"))
+        {
+            let url = Url::parse(uri_part).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid HTTP proxy URL: {e}"),
+                )
+            })?;
+            let host = url.host_str().ok_or_else(|| {
+                io::Error::new(
+                    io::Error::other("missing host in HTTP proxy URL").kind(),
+                    "missing host in HTTP proxy URL",
+                )
+            })?;
+            let port = url.port_or_known_default().unwrap_or(80);
+            let p = extract_raw_http_origin_path(uri_part);
+            let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+            (TargetAddr::new_domain(clean_host, port)?, p)
+        } else {
+            // Fallback to Host header
+            let mut host_hdr = None;
+            for line in lines.clone() {
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("host")
+                {
+                    host_hdr = Some(v.trim());
+                    break;
                 }
-                let host_val = host_hdr.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing Host header in HTTP request",
-                    )
-                })?;
-                let target = parse_host_or_authority_with_default_port(host_val, 80)?;
-                (target, uri_part.to_string())
-            };
+            }
+            let host_val = host_hdr.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing Host header in HTTP request",
+                )
+            })?;
+            let target = parse_host_or_authority_with_default_port(host_val, 80)?;
+            (target, uri_part.to_string())
+        };
 
         // Validate HTTP/1.1 framing headers before dialing so CL/TE smuggling or invalid
         // Content-Length / Transfer-Encoding headers are rejected cleanly with 400 Bad Request.
@@ -2860,5 +2922,399 @@ mod tests {
         mixed_jh.abort();
         echo_jh.abort();
         http_jh.abort();
+    }
+
+    #[tokio::test]
+    async fn plain_http_proxy_handles_multibyte_utf8_uri_spanning_scheme_boundaries_without_panic()
+    {
+        let (origin_addr, captured_reqs, origin_jh) = spawn_capturing_http_origin("utf8").await;
+
+        let mut host_map = std::collections::HashMap::new();
+        host_map.insert("utf8.example:80".to_string(), origin_addr);
+
+        let mut outbounds: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        outbounds.insert(
+            "test-exit".to_string(),
+            Arc::new(LoopbackTestOutbound {
+                host_map,
+                udp_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+        );
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &["MATCH,test-exit".to_string()],
+                dns,
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let policy = Arc::new(RwLock::new(MixedInboundPolicy::default()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mixed_addr, mixed_jh) = spawn_mixed_inbound_with_policy(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(router)),
+            policy,
+            hub,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        // Both URIs have multi-byte UTF-8 characters spanning byte indices 7 and/or 8:
+        // - "/你好世界/test": byte 0='/', [1..4)='你', [4..7)='好', [7..10)='世' (index 8 inside '世')
+        // - "你好世界foo": [0..3)='你', [3..6)='好', [6..9)='世' (both index 7 and 8 inside '世')
+        for uri in ["/你好世界/test", "你好世界foo"] {
+            let mut client = TcpStream::connect(mixed_addr).await.unwrap();
+            let req = format!("GET {uri} HTTP/1.1\r\nHost: utf8.example\r\n\r\n");
+            client.write_all(req.as_bytes()).await.unwrap();
+
+            let mut resp = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut resp))
+                .await
+                .expect("mixed HTTP proxy must not panic or stall on UTF-8 URI")
+                .unwrap();
+            assert!(
+                resp.starts_with("HTTP/1.1 200 OK\r\n"),
+                "expected 200 OK for URI '{uri}', got: {resp}"
+            );
+            assert!(resp.ends_with(&format!("utf8:{uri}:body=")));
+        }
+        assert_eq!(captured_reqs.lock().await.len(), 2);
+
+        let _ = shutdown_tx.send(true);
+        mixed_jh.abort();
+        origin_jh.abort();
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_inbound_shutdown_tears_down_open_session_and_releases_relay_port()
+    {
+        let udp_origin = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let udp_origin_addr = udp_origin.local_addr().unwrap();
+        let udp_origin_srv = Arc::clone(&udp_origin);
+        let echo_jh = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            while let Ok((n, peer)) = udp_origin_srv.recv_from(&mut buf).await {
+                let _ = udp_origin_srv.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let udp_session_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut outbounds: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        outbounds.insert(
+            "test-exit".to_string(),
+            Arc::new(LoopbackTestOutbound {
+                host_map: std::collections::HashMap::new(),
+                udp_dropped: Arc::clone(&udp_session_dropped),
+            }),
+        );
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let router = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                outbounds,
+                &[],
+                &["MATCH,test-exit".to_string()],
+                dns,
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let policy = Arc::new(RwLock::new(MixedInboundPolicy::default()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mixed_addr, mixed_jh) = spawn_mixed_inbound_with_policy(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(router)),
+            policy,
+            Arc::clone(&hub),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        // Open SOCKS5 TCP control connection and establish UDP ASSOCIATE (keep TCP OPEN!)
+        let mut socks_tcp = TcpStream::connect(mixed_addr).await.unwrap();
+        socks_tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greet = [0u8; 2];
+        socks_tcp.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet, [0x05, 0x00]);
+
+        socks_tcp
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut assoc_hdr = [0u8; 3];
+        socks_tcp.read_exact(&mut assoc_hdr).await.unwrap();
+        assert_eq!(assoc_hdr, [0x05, 0x00, 0x00]);
+        let relay_target = TargetAddr::read_socks5(&mut socks_tcp).await.unwrap();
+        let relay_addr = SocketAddr::new(relay_target.host.as_ip().unwrap(), relay_target.port);
+
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut dgram = BytesMut::new();
+        dgram.put_slice(&[0x00, 0x00, 0x00]);
+        TargetAddr::from(udp_origin_addr)
+            .encode_socks5(&mut dgram)
+            .unwrap();
+        dgram.put_slice(b"ping-before-shutdown");
+        client_udp.send_to(&dgram, relay_addr).await.unwrap();
+
+        let mut rbuf = [0u8; 256];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut rbuf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rbuf[..n].ends_with(b"ping-before-shutdown"));
+        assert_eq!(hub.active_connection_count(), 1);
+
+        // Trigger inbound shutdown WITHOUT closing `socks_tcp`.
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while hub.active_connection_count() != 0
+                || !udp_session_dropped.load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("inbound shutdown must tear down open SOCKS5 UDP ASSOCIATE sessions");
+
+        // Control TCP connection must see EOF because the connection handler exited.
+        let mut eof_buf = [0u8; 8];
+        let eof_n = tokio::time::timeout(Duration::from_millis(500), socks_tcp.read(&mut eof_buf))
+            .await
+            .expect("TCP control connection should close on inbound shutdown")
+            .unwrap();
+        assert_eq!(eof_n, 0);
+
+        // The ephemeral UDP relay socket must be dropped so `relay_addr` can be rebound.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if UdpSocket::bind(relay_addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("UDP ASSOCIATE relay port must be released on inbound shutdown");
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), mixed_jh).await;
+        echo_jh.abort();
+    }
+
+    struct TaggedEchoUdpSession {
+        tag: &'static [u8],
+        tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, TargetAddr)>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, TargetAddr)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outbound::OutboundUdpSession for TaggedEchoUdpSession {
+        async fn send_to(&self, payload: &[u8], target: &TargetAddr) -> io::Result<()> {
+            let mut reply = Vec::with_capacity(self.tag.len() + payload.len());
+            reply.extend_from_slice(self.tag);
+            reply.extend_from_slice(payload);
+            let _ = self.tx.send((reply, target.clone()));
+            Ok(())
+        }
+
+        async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
+            self.rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "tagged echo closed"))
+        }
+    }
+
+    struct TaggedEchoOutbound {
+        name: &'static str,
+        tag: &'static [u8],
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for TaggedEchoOutbound {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn protocol(&self) -> &'static str {
+            "vless"
+        }
+
+        fn udp_supported(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(&self, _target: &TargetAddr) -> io::Result<BoxedStream> {
+            Err(io::Error::other("unused"))
+        }
+
+        async fn open_udp_session(
+            &self,
+        ) -> io::Result<Box<dyn crate::outbound::OutboundUdpSession>> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(Box::new(TaggedEchoUdpSession {
+                tag: self.tag,
+                tx,
+                rx: tokio::sync::Mutex::new(rx),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_hot_reloads_router_and_policy_on_live_session() {
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let hits_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut ob_a: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        ob_a.insert(
+            "exit-a".to_string(),
+            Arc::new(TaggedEchoOutbound {
+                name: "exit-a",
+                tag: b"A:",
+                hits: Arc::clone(&hits_a),
+            }),
+        );
+        let router_a = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                ob_a,
+                &[],
+                &["MATCH,exit-a".to_string()],
+                Arc::clone(&dns),
+            )
+            .unwrap(),
+        );
+
+        let mut ob_b: std::collections::HashMap<String, crate::outbound::DynOutbound> =
+            std::collections::HashMap::new();
+        ob_b.insert(
+            "exit-b".to_string(),
+            Arc::new(TaggedEchoOutbound {
+                name: "exit-b",
+                tag: b"B:",
+                hits: Arc::clone(&hits_b),
+            }),
+        );
+        let router_b = Arc::new(
+            Router::new(
+                crate::config::RunMode::Rule,
+                ob_b,
+                &[],
+                &["MATCH,exit-b".to_string()],
+                dns,
+            )
+            .unwrap(),
+        );
+        assert_ne!(router_a.epoch(), router_b.epoch());
+
+        let router_slot = Arc::new(RwLock::new(router_a));
+        let policy_slot = Arc::new(RwLock::new(MixedInboundPolicy::default()));
+        let hub = Arc::new(TelemetryHub::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mixed_addr, mixed_jh) = spawn_mixed_inbound_with_policy(
+            "127.0.0.1:0",
+            Arc::clone(&router_slot),
+            Arc::clone(&policy_slot),
+            Arc::clone(&hub),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        // Establish ONE long-lived SOCKS5 UDP ASSOCIATE session.
+        let mut socks_tcp = TcpStream::connect(mixed_addr).await.unwrap();
+        socks_tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greet = [0u8; 2];
+        socks_tcp.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet, [0x05, 0x00]);
+        socks_tcp
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut assoc_hdr = [0u8; 3];
+        socks_tcp.read_exact(&mut assoc_hdr).await.unwrap();
+        assert_eq!(assoc_hdr, [0x05, 0x00, 0x00]);
+        let relay_target = TargetAddr::read_socks5(&mut socks_tcp).await.unwrap();
+        let relay_addr = SocketAddr::new(relay_target.host.as_ip().unwrap(), relay_target.port);
+
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr: SocketAddr = "127.0.0.1:45678".parse().unwrap();
+        let build_dgram = |payload: &[u8]| {
+            let mut d = BytesMut::new();
+            d.put_slice(&[0x00, 0x00, 0x00]);
+            TargetAddr::from(target_addr).encode_socks5(&mut d).unwrap();
+            d.put_slice(payload);
+            d
+        };
+
+        // 1. Before hot reload, datagram routes via `exit-a` and populates `fast_routes`.
+        client_udp
+            .send_to(&build_dgram(b"one"), relay_addr)
+            .await
+            .unwrap();
+        let mut rbuf = [0u8; 256];
+        let (n1, _) = tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut rbuf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rbuf[..n1].ends_with(b"A:one"));
+        assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // 2. Hot-swap `*router_slot.write()` while keeping the same SOCKS5 UDP ASSOCIATE open.
+        //    Subsequent datagrams to the SAME IP:port must invalidate `fast_routes` via the new
+        //    router epoch and immediately route via `exit-b`.
+        *router_slot.write() = router_b;
+        client_udp
+            .send_to(&build_dgram(b"two"), relay_addr)
+            .await
+            .unwrap();
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut rbuf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rbuf[..n2].ends_with(b"B:two"),
+            "hot-reloaded router must immediately reroute existing SOCKS5 UDP ASSOCIATE"
+        );
+        assert_eq!(hits_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 3. Hot-swap `*policy_slot.write()` to block `target_addr.port()` in `blocked_local_ports`.
+        //    Even with `fast_routes` hot for `target_addr`, the new policy must block the datagram!
+        *policy_slot.write() =
+            MixedInboundPolicy::default().with_blocked_local_ports(vec![target_addr.port()]);
+        client_udp
+            .send_to(&build_dgram(b"three-blocked"), relay_addr)
+            .await
+            .unwrap();
+        let blocked_res =
+            tokio::time::timeout(Duration::from_millis(120), client_udp.recv_from(&mut rbuf)).await;
+        assert!(
+            blocked_res.is_err(),
+            "hot-reloaded MixedInboundPolicy must immediately block forbidden UDP targets on live association"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), mixed_jh).await;
     }
 }

@@ -539,3 +539,439 @@ async fn control_plane_audit_diff_waterfall_and_matrix_e2e() {
     let _ = shutdown_tx.send(true);
     engine.shutdown();
 }
+
+async fn connect_ws_and_read_header(
+    addr: SocketAddr,
+    path_and_query: &str,
+) -> (TcpStream, Vec<u8>) {
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET {path_and_query} HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let hdr_end = loop {
+        let n = tokio::time::timeout(Duration::from_secs(3), tcp.read(&mut tmp))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0, "unexpected EOF waiting for WS 101 response");
+        raw.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..hdr_end]);
+    assert!(
+        head.starts_with("HTTP/1.1 101 Switching Protocols"),
+        "expected WS 101, got: {head}"
+    );
+    let leftover = raw[hdr_end + 4..].to_vec();
+    (tcp, leftover)
+}
+
+async fn read_next_ws_text_frame(
+    tcp: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if buf.len() >= 2 {
+            let opcode = buf[0] & 0x0f;
+            let masked = (buf[1] & 0x80) != 0;
+            let len_code = (buf[1] & 0x7f) as usize;
+            let (payload_len, mut hdr_len) = if len_code <= 125 {
+                (len_code, 2usize)
+            } else if len_code == 126 {
+                if buf.len() < 4 {
+                    (0, usize::MAX)
+                } else {
+                    (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4usize)
+                }
+            } else if buf.len() < 10 {
+                (0, usize::MAX)
+            } else {
+                (
+                    u64::from_be_bytes(buf[2..10].try_into().unwrap()) as usize,
+                    10usize,
+                )
+            };
+            if hdr_len != usize::MAX {
+                if masked {
+                    hdr_len += 4;
+                }
+                if buf.len() >= hdr_len + payload_len {
+                    let payload = buf[hdr_len..hdr_len + payload_len].to_vec();
+                    buf.drain(..hdr_len + payload_len);
+                    if opcode == 0x1 {
+                        return Some(String::from_utf8_lossy(&payload).into_owned());
+                    }
+                    if opcode == 0x8 {
+                        return None;
+                    }
+                    continue;
+                }
+            }
+        }
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            return None;
+        }
+        let mut tmp = [0u8; 4096];
+        match tokio::time::timeout(rem, tcp.read(&mut tmp)).await {
+            Ok(Ok(0)) | Err(_) => return None,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) => return None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn ws_logs_level_filtering_and_zero_drop_snapshot_subscribe_e2e() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "rust-clash-ws-logs-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let yaml = r#"
+mixed-port: 0
+external-controller: "127.0.0.1:0"
+log-level: debug
+mode: rule
+dns:
+  enable: false
+proxies: []
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["DIRECT"]
+rules:
+  - "MATCH,DIRECT"
+"#;
+    let cfg = proxy_core::config::ClashConfig::from_yaml_str(yaml).unwrap();
+    let engine = ProxyEngine::start_with_state_dir(cfg, state_dir.clone())
+        .await
+        .unwrap();
+    engine.hub().clear_logs();
+
+    // Seed snapshot backlog with mixed severities (including warn/error before info noise).
+    engine.hub().push_log("debug", "snap-debug-0");
+    engine.hub().push_log("info", "snap-info-0");
+    engine.hub().push_log("warn", "snap-warn-0");
+    engine.hub().push_log("error", "snap-error-0");
+    for i in 0..12 {
+        engine.hub().push_log("info", format!("snap-info-fill-{i}"));
+    }
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (api_addr, _api_task) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), shutdown_rx)
+        .await
+        .unwrap();
+
+    // 1. Connect WS `/logs?level=warn` while concurrently emitting a burst of mixed logs across
+    //    the handshake/snapshot boundary. Every warn/error must arrive with ZERO drops, ZERO dupes,
+    //    and ZERO info/debug leakage!
+    let burst_engine = Arc::clone(&engine);
+    let burst_task = tokio::spawn(async move {
+        for i in 0..25 {
+            burst_engine
+                .hub()
+                .push_log("debug", format!("burst-debug-{i}"));
+            burst_engine
+                .hub()
+                .push_log("info", format!("burst-info-{i}"));
+            burst_engine
+                .hub()
+                .push_log("warn", format!("burst-warn-{i}"));
+            burst_engine
+                .hub()
+                .push_log("error", format!("burst-error-{i}"));
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let (mut ws_warn, mut ws_warn_buf) =
+        connect_ws_and_read_header(api_addr, "/logs?level=warn").await;
+    burst_task.await.unwrap();
+
+    // Emit one final sentinel error after burst completes so we know when all queued entries arrived.
+    engine.hub().push_log("error", "burst-sentinel-end");
+
+    let mut received_warn_payloads = Vec::new();
+    while let Some(frame) =
+        read_next_ws_text_frame(&mut ws_warn, &mut ws_warn_buf, Duration::from_secs(3)).await
+    {
+        let entry: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let lvl = entry["type"].as_str().unwrap();
+        let payload = entry["payload"].as_str().unwrap().to_string();
+        assert!(
+            matches!(lvl, "warn" | "warning" | "error" | "err"),
+            "WS /logs?level=warn leaked non-warn/error entry: {frame}"
+        );
+        received_warn_payloads.push(payload.clone());
+        if payload == "burst-sentinel-end" {
+            break;
+        }
+    }
+
+    // Verify all expected snapshot + burst warn/error items arrived once (zero drops, zero duplicates).
+    let mut expected = vec![
+        "snap-warn-0".to_string(),
+        "snap-error-0".to_string(),
+        "burst-sentinel-end".to_string(),
+    ];
+    for i in 0..25 {
+        expected.push(format!("burst-warn-{i}"));
+        expected.push(format!("burst-error-{i}"));
+    }
+    for exp in &expected {
+        let count = received_warn_payloads.iter().filter(|p| *p == exp).count();
+        assert_eq!(
+            count, 1,
+            "expected '{exp}' exactly once on WS /logs?level=warn, got {count} (all={received_warn_payloads:?})"
+        );
+    }
+
+    // 2. Verify WS `/logs?level=error` filters out `warn`, `info`, and `debug`.
+    let (mut ws_err, mut ws_err_buf) =
+        connect_ws_and_read_header(api_addr, "/logs?level=error").await;
+    engine.hub().push_log("warn", "err-only-should-skip-warn");
+    engine.hub().push_log("info", "err-only-should-skip-info");
+    engine.hub().push_log("error", "err-only-sentinel");
+
+    let mut saw_err_sentinel = false;
+    while let Some(frame) =
+        read_next_ws_text_frame(&mut ws_err, &mut ws_err_buf, Duration::from_secs(3)).await
+    {
+        let entry: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let lvl = entry["type"].as_str().unwrap();
+        let payload = entry["payload"].as_str().unwrap();
+        assert!(
+            matches!(lvl, "error" | "err"),
+            "WS /logs?level=error leaked non-error entry: {frame}"
+        );
+        if payload == "err-only-sentinel" {
+            saw_err_sentinel = true;
+            break;
+        }
+    }
+    assert!(
+        saw_err_sentinel,
+        "missing err-only-sentinel on WS /logs?level=error"
+    );
+
+    let _ = shutdown_tx.send(true);
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn online_country_mmdb_update_applies_immediately_without_router_rebuild_e2e() {
+    use proxy_core::{
+        addr::TargetAddr,
+        router::{
+            geodata::{GeoDataset, GeoUpdateUrls, current_geodata, install_live_geodata},
+            mmdb::{MmdbReader, build_synthetic_country_mmdb},
+        },
+    };
+    use tokio::net::TcpListener;
+
+    struct LiveGeodataRestoreGuard(Arc<GeoDataset>);
+    impl Drop for LiveGeodataRestoreGuard {
+        fn drop(&mut self) {
+            install_live_geodata(Arc::clone(&self.0));
+        }
+    }
+    let _restore = LiveGeodataRestoreGuard(current_geodata());
+
+    let state_dir = std::env::temp_dir().join(format!(
+        "rust-clash-live-mmdb-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let geodata_dir = state_dir.join("geodata");
+    std::fs::create_dir_all(&geodata_dir).unwrap();
+
+    // 1. Seed startup `state_dir/geodata/Country.mmdb` mapping `198.51.100.0/24 -> JP`.
+    let mmdb_jp_bytes = build_synthetic_country_mmdb(&[("198.51.100.0/24".parse().unwrap(), "JP")]);
+    let mmdb_sg_bytes = build_synthetic_country_mmdb(&[("198.51.100.0/24".parse().unwrap(), "SG")]);
+    let mmdb_de_bytes = build_synthetic_country_mmdb(&[("198.51.100.0/24".parse().unwrap(), "DE")]);
+    std::fs::write(geodata_dir.join("Country.mmdb"), &mmdb_jp_bytes).unwrap();
+
+    let base_yaml = r#"
+mixed-port: 0
+external-controller: "127.0.0.1:0"
+mode: rule
+dns:
+  enable: false
+proxies:
+  - name: "Node-JP"
+    type: socks5
+    server: "127.0.0.1"
+    port: 1081
+  - name: "Node-SG"
+    type: socks5
+    server: "127.0.0.1"
+    port: 1082
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: ["Node-JP", "Node-SG", "DIRECT"]
+rules:
+  - "GEOIP,JP,Node-JP,no-resolve"
+  - "GEOIP,SG,Node-SG,no-resolve"
+  - "MATCH,DIRECT"
+"#;
+    let cfg = proxy_core::config::ClashConfig::from_yaml_str(base_yaml).unwrap();
+    assert!(cfg.mmdb_path.is_none());
+
+    let engine = ProxyEngine::start_with_state_dir(cfg.clone(), state_dir.clone())
+        .await
+        .unwrap();
+    let router_before = engine.router();
+    let target = TargetAddr::new_ip("198.51.100.42".parse().unwrap(), 443);
+
+    // Startup persisted `Country.mmdb` resolves `198.51.100.42` to `JP` -> `Node-JP`.
+    let d1 = router_before.route_async(None, &target).await;
+    assert_eq!(d1.outbound.name(), "Node-JP");
+
+    // 2. Serve a local HTTP mock GeoData mirror delivering updated `Country.mmdb` (`SG`) and run
+    //    `GeoDataManager::update_from_urls` WITHOUT rebuilding or reloading the router!
+    let mirror_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mirror_addr = mirror_listener.local_addr().unwrap();
+    let mmdb_sg_srv = mmdb_sg_bytes.clone();
+    let mirror_task = tokio::spawn(async move {
+        while let Ok((mut s, _)) = mirror_listener.accept().await {
+            let mmdb_payload = mmdb_sg_srv.clone();
+            tokio::spawn(async move {
+                let mut req_buf = [0u8; 2048];
+                let Ok(n) = s.read(&mut req_buf).await else {
+                    return;
+                };
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let body: Vec<u8> = match path {
+                    "/direct.txt" => b"domain:example.cn\n".to_vec(),
+                    "/proxy.txt" => b"domain:example.org\n".to_vec(),
+                    "/cncidr.txt" => b"223.5.5.0/24\n".to_vec(),
+                    "/Country.mmdb" => mmdb_payload,
+                    _ => Vec::new(),
+                };
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&body).await;
+            });
+        }
+    });
+
+    let epoch_before = router_before.epoch();
+    let gm = engine.geodata_manager().expect("geodata manager present");
+    let urls = GeoUpdateUrls {
+        label: "local-mmdb-test".to_string(),
+        geosite_cn_url: format!("http://{mirror_addr}/direct.txt"),
+        geosite_non_cn_url: format!("http://{mirror_addr}/proxy.txt"),
+        geoip_cn_url: format!("http://{mirror_addr}/cncidr.txt"),
+        mmdb_url: Some(format!("http://{mirror_addr}/Country.mmdb")),
+    };
+    let status = gm.update_from_urls(&urls).await.unwrap();
+    assert!(status.mmdb_present);
+
+    // The EXACT same pre-existing `router_before` immediately routes `198.51.100.42` to `Node-SG`!
+    assert!(
+        router_before.epoch() > epoch_before,
+        "GeoDataManager update must bump attached router epoch"
+    );
+    let d2 = router_before.route_async(None, &target).await;
+    assert_eq!(
+        d2.outbound.name(),
+        "Node-SG",
+        "online Country.mmdb update must take effect immediately without router rebuild"
+    );
+
+    // 3. Hot-reload via `reload_yaml` (exercising `transition_config_locked`) must also keep
+    //    `rule_mmdb == None` so subsequent live `Country.mmdb` updates apply immediately!
+    engine.reload_yaml(base_yaml).await.unwrap();
+    let router_reloaded = engine.router();
+    assert_eq!(
+        router_reloaded
+            .route_async(None, &target)
+            .await
+            .outbound
+            .name(),
+        "Node-SG"
+    );
+    let cur = current_geodata();
+    install_live_geodata(Arc::new(GeoDataset {
+        geosite_cn: cur.geosite_cn.clone(),
+        geosite_non_cn: cur.geosite_non_cn.clone(),
+        geoip_cn: cur.geoip_cn.clone(),
+        mmdb: Some(Arc::new(MmdbReader::from_bytes(mmdb_de_bytes).unwrap())),
+        using_persisted_data: true,
+    }));
+    assert_eq!(
+        router_reloaded
+            .route_async(None, &target)
+            .await
+            .outbound
+            .name(),
+        "DIRECT",
+        "post-reload router must dynamically pick up live Country.mmdb updates"
+    );
+
+    // 4. Standalone router (`build_standalone_router`) also tracks `LIVE_GEODATA` dynamically.
+    let standalone = ProxyEngine::build_standalone_router(&cfg).unwrap();
+    assert_eq!(
+        standalone.route_async(None, &target).await.outbound.name(),
+        "DIRECT"
+    );
+    install_live_geodata(Arc::new(GeoDataset {
+        geosite_cn: cur.geosite_cn.clone(),
+        geosite_non_cn: cur.geosite_non_cn.clone(),
+        geoip_cn: cur.geoip_cn.clone(),
+        mmdb: Some(Arc::new(MmdbReader::from_bytes(mmdb_sg_bytes).unwrap())),
+        using_persisted_data: true,
+    }));
+    assert_eq!(
+        standalone.route_async(None, &target).await.outbound.name(),
+        "Node-SG"
+    );
+
+    // 5. Explicit `cfg.mmdb_path` continues to take precedence over `LIVE_GEODATA` (`SG`).
+    let explicit_mmdb_path = state_dir.join("explicit-jp.mmdb");
+    std::fs::write(&explicit_mmdb_path, &mmdb_jp_bytes).unwrap();
+    let mut explicit_cfg = cfg;
+    explicit_cfg.mmdb_path = Some(explicit_mmdb_path.display().to_string());
+    let explicit_router = ProxyEngine::build_standalone_router(&explicit_cfg).unwrap();
+    assert_eq!(
+        explicit_router
+            .route_async(None, &target)
+            .await
+            .outbound
+            .name(),
+        "Node-JP",
+        "explicit cfg.mmdb_path must override LIVE_GEODATA"
+    );
+
+    mirror_task.abort();
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

@@ -517,7 +517,7 @@ rule-providers:
     type: file
     behavior: domain
     format: yaml
-    path: "{ruleset}"
+    path: "corp_domains.yaml"
   blocked-cidrs:
     type: inline
     behavior: ipcidr
@@ -533,12 +533,13 @@ rules:
   - MATCH,REJECT
 "#,
         mmdb = mmdb_path.display().to_string().replace('\\', "/"),
-        ruleset = ruleset_path.display().to_string().replace('\\', "/"),
         exe = current_exe_name,
     );
 
     let cfg = ClashConfig::from_yaml_str(&yaml).expect("valid Milestone 2 config");
-    let engine = ProxyEngine::start(cfg).await.expect("start engine");
+    let engine = ProxyEngine::start_with_state_dir(cfg, temp_dir.clone())
+        .await
+        .expect("start engine");
     let (api_stop_tx, api_stop_rx) = watch::channel(false);
     let (api_addr, _api_handle) = spawn_api_server("127.0.0.1:0", Arc::clone(&engine), api_stop_rx)
         .await
