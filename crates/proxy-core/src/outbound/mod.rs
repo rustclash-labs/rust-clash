@@ -1334,7 +1334,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn latency_test_with_policy_blocks_bad_schemes_userinfo_and_direct_dns_rebinding() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use crate::{

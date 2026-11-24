@@ -5194,12 +5194,31 @@ mod tests {
             // an InvalidData error and marks the session closed.
             {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let _hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
+                let hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
                     .await
                     .unwrap();
+                let mut rd_codec =
+                    VmessChunkCodec::new(&hdr.req_key, &hdr.req_iv, hdr.security, hdr.option)
+                        .unwrap();
+                let mut wire_buf = BytesMut::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    if let Some(Some(_)) = rd_codec.try_decode_chunk(&mut wire_buf).unwrap() {
+                        break;
+                    }
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    assert!(n > 0);
+                    wire_buf.extend_from_slice(&tmp[..n]);
+                }
                 // Write 32 garbage bytes so `try_open_vmess_aead_response_header` fails with InvalidData.
                 sock.write_all(&[0xde; 32]).await.unwrap();
                 sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
+                let mut drain = [0u8; 64];
+                while matches!(
+                    tokio::time::timeout(Duration::from_millis(500), sock.read(&mut drain)).await,
+                    Ok(Ok(n)) if n > 0
+                ) {}
             }
 
             // Connection 2: valid VMess UDP echo for the reconnected stream.
@@ -5233,6 +5252,7 @@ mod tests {
                 wr_codec.encode_eof_chunk(&mut resp).unwrap();
                 sock.write_all(&resp).await.unwrap();
                 sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
             }
 
             // Connection 3: valid VMess UDP echo while recv_from() is already concurrently parked.
@@ -5266,16 +5286,36 @@ mod tests {
                 wr_codec.encode_eof_chunk(&mut resp).unwrap();
                 sock.write_all(&resp).await.unwrap();
                 sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
             }
 
             // Connection 4: fails without reconnect -> current-generation error MUST surface!
             {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let _hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
+                let hdr = read_vmess_aead_request_header(&cmd_key, &mut sock)
                     .await
                     .unwrap();
+                let mut rd_codec =
+                    VmessChunkCodec::new(&hdr.req_key, &hdr.req_iv, hdr.security, hdr.option)
+                        .unwrap();
+                let mut wire_buf = BytesMut::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    if let Some(Some(_)) = rd_codec.try_decode_chunk(&mut wire_buf).unwrap() {
+                        break;
+                    }
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    assert!(n > 0);
+                    wire_buf.extend_from_slice(&tmp[..n]);
+                }
                 sock.write_all(&[0xfe; 32]).await.unwrap();
                 sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
+                let mut drain = [0u8; 64];
+                while matches!(
+                    tokio::time::timeout(Duration::from_millis(500), sock.read(&mut drain)).await,
+                    Ok(Ok(n)) if n > 0
+                ) {}
             }
         });
 

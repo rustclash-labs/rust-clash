@@ -90,11 +90,13 @@ impl ControllerClient {
         }
         req.push_str("\r\n");
 
+        let mut req_buf = req.into_bytes();
+        if !body_bytes.is_empty() {
+            req_buf.extend_from_slice(&body_bytes);
+        }
+
         let io_fut = async {
-            stream.write_all(req.as_bytes()).await?;
-            if !body_bytes.is_empty() {
-                stream.write_all(&body_bytes).await?;
-            }
+            stream.write_all(&req_buf).await?;
             stream.flush().await?;
 
             let mut resp = Vec::with_capacity(4096);

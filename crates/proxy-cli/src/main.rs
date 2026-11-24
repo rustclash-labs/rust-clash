@@ -1265,9 +1265,38 @@ mod tests {
                 let Ok((mut s, _)) = live_listener.accept().await else {
                     break;
                 };
-                let mut buf = vec![0u8; 4096];
-                let n = s.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
+                let mut req_bytes = Vec::with_capacity(512);
+                let mut chunk = [0u8; 1024];
+                let mut expected_total: Option<usize> = None;
+                loop {
+                    let n = s.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    req_bytes.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none()
+                        && let Some(hdr_end) = req_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let hdr_str = String::from_utf8_lossy(&req_bytes[..hdr_end]);
+                        let content_len = hdr_str
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        expected_total = Some(hdr_end + 4 + content_len);
+                    }
+                    if let Some(total) = expected_total
+                        && req_bytes.len() >= total
+                    {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&req_bytes);
                 if req.contains("Authorization: Bearer good-secret") {
                     let body = r#"{"ok":true,"node":"HK-01"}"#;
                     let resp = format!(
@@ -1285,6 +1314,8 @@ mod tests {
                     );
                     let _ = s.write_all(resp.as_bytes()).await;
                 }
+                let _ = s.flush().await;
+                let _ = s.shutdown().await;
             }
         });
 

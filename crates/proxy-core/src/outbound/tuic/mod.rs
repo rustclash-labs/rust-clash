@@ -2193,7 +2193,21 @@ mod tests {
             let mut client_backends: HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> =
                 HashMap::new();
             let mut buf = [0u8; 4096];
-            while let Ok((n, client_addr)) = front_bg.recv_from(&mut buf).await {
+            loop {
+                let (n, client_addr) = match front_bg.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                };
                 let backend = if let Some(b) = client_backends.get(&client_addr) {
                     Arc::clone(b)
                 } else {
@@ -2211,7 +2225,21 @@ mod tests {
                     });
                     tokio::spawn(async move {
                         let mut rbuf = [0u8; 4096];
-                        while let Ok((rn, _)) = b_rx.recv_from(&mut rbuf).await {
+                        loop {
+                            let rn = match b_rx.recv_from(&mut rbuf).await {
+                                Ok((rn, _)) => rn,
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        io::ErrorKind::ConnectionReset
+                                            | io::ErrorKind::WouldBlock
+                                            | io::ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    continue;
+                                }
+                                Err(_) => break,
+                            };
                             let d = d_cfg.load(Ordering::Acquire);
                             let release_at = tokio::time::Instant::now() + Duration::from_millis(d);
                             if delay_tx.send((release_at, rbuf[..rn].to_vec())).is_err() {
