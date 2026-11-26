@@ -20,7 +20,10 @@ use url::Url;
 use crate::{
     addr::{HostName, TargetAddr},
     error::{ProxyError, Result},
-    inbound::sniff::{MAX_SNIFF_BYTES, SniffOutcomeWithProto, SniffedProtocol, sniff_tcp_protocol},
+    inbound::sniff::{
+        MAX_SNIFF_BYTES, RealIpTlsOverrideGuard, RealIpTlsOverrideTracker, SniffOutcomeWithProto,
+        SniffedProtocol, resolve_real_ip_tcp_dial_target, sniff_tcp_protocol,
+    },
     outbound::{BoxedStream, OutboundHandler},
     router::Router,
     tracker::{ActiveConnection, TelemetryHub},
@@ -641,19 +644,17 @@ fn resolve_mixed_dial_target(
     raw_target: &TargetAddr,
     decision: &crate::router::RouteDecision,
     sniffer_cfg: &crate::config::SnifferConfig,
+    router: &Router,
     sniffed_real_ip: Option<&(String, SniffedProtocol)>,
-) -> TargetAddr {
-    if let Some((domain, proto)) = sniffed_real_ip {
-        if decision.outbound.exit_category() == "PROXY"
-            && sniffer_cfg.should_override_destination(*proto, domain)
-        {
-            decision.target.clone()
-        } else {
-            raw_target.clone()
-        }
-    } else {
-        decision.target.clone()
-    }
+) -> (TargetAddr, Option<RealIpTlsOverrideTracker>) {
+    resolve_real_ip_tcp_dial_target(
+        raw_target,
+        &decision.target,
+        decision.outbound.exit_category(),
+        sniffer_cfg,
+        router.sniff_override_guard(),
+        sniffed_real_ip,
+    )
 }
 
 struct UdpAssocCleanupGuard {
@@ -780,10 +781,11 @@ async fn handle_socks5(
                 }
                 return Err(err);
             }
-            let dial_target = resolve_mixed_dial_target(
+            let (dial_target, sniff_override_tracker) = resolve_mixed_dial_target(
                 &raw_target,
                 &decision,
                 &sniffer_cfg,
+                &router,
                 sniffed_real_ip.as_ref(),
             );
             let conn_guard = hub.register_connection_with_outbound_guard_sniffed(
@@ -799,6 +801,14 @@ async fn handle_socks5(
                 sniffed_real_ip.is_some(),
             );
             let conn_entry = Arc::clone(conn_guard.connection());
+            let mut sniff_override_guard = sniff_override_tracker.map(|tracker| {
+                RealIpTlsOverrideGuard::new(
+                    Arc::clone(router.sniff_override_guard()),
+                    Arc::clone(&hub),
+                    Arc::clone(&conn_entry),
+                    tracker,
+                )
+            });
             hub.push_log(
                 "info",
                 format!(
@@ -821,6 +831,9 @@ async fn handle_socks5(
             {
                 Ok(s) => s,
                 Err(err) => {
+                    if let Some(g) = sniff_override_guard.as_mut() {
+                        g.mark_dial_failed();
+                    }
                     conn_guard.record_failed(&err.to_string());
                     if !reply_sent {
                         let rep = socks5_reply_code_for_io_error(&err);
@@ -832,6 +845,9 @@ async fn handle_socks5(
                 }
             };
             conn_guard.mark_established();
+            if let Some(g) = sniff_override_guard.as_mut() {
+                g.mark_established();
+            }
             record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
             if !reply_sent {
@@ -1295,10 +1311,11 @@ async fn handle_http_proxy(
             }
             return Err(err);
         }
-        let dial_target = resolve_mixed_dial_target(
+        let (dial_target, sniff_override_tracker) = resolve_mixed_dial_target(
             &raw_target,
             &decision,
             &sniffer_cfg,
+            &router,
             sniffed_real_ip.as_ref(),
         );
         let conn_guard = hub.register_connection_with_outbound_guard_sniffed(
@@ -1314,6 +1331,14 @@ async fn handle_http_proxy(
             sniffed_real_ip.is_some(),
         );
         let conn_entry = Arc::clone(conn_guard.connection());
+        let mut sniff_override_guard = sniff_override_tracker.map(|tracker| {
+            RealIpTlsOverrideGuard::new(
+                Arc::clone(router.sniff_override_guard()),
+                Arc::clone(&hub),
+                Arc::clone(&conn_entry),
+                tracker,
+            )
+        });
         hub.push_log(
             "info",
             format!(
@@ -1336,6 +1361,9 @@ async fn handle_http_proxy(
         {
             Ok(s) => s,
             Err(err) => {
+                if let Some(g) = sniff_override_guard.as_mut() {
+                    g.mark_dial_failed();
+                }
                 conn_guard.record_failed(&err.to_string());
                 if !reply_sent {
                     let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
@@ -1344,6 +1372,9 @@ async fn handle_http_proxy(
             }
         };
         conn_guard.mark_established();
+        if let Some(g) = sniff_override_guard.as_mut() {
+            g.mark_established();
+        }
         record_passive_proxy_delay(&router, decision.outbound.as_ref(), dial_start.elapsed());
 
         if !reply_sent {
@@ -1579,10 +1610,11 @@ async fn handle_http_proxy(
             let _ = tcp.write_all(http_error_response_for_io_error(&err)).await;
             return Err(err);
         }
-        let dial_target = resolve_mixed_dial_target(
+        let (dial_target, _) = resolve_mixed_dial_target(
             &raw_target,
             &decision,
             &sniffer_cfg,
+            &router,
             sniffed_real_ip.as_ref(),
         );
         let conn_guard = hub.register_connection_with_outbound_guard_sniffed(

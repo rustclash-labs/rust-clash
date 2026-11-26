@@ -31,7 +31,10 @@ use tokio::{
 use crate::{
     addr::{HostName, TargetAddr},
     inbound::{
-        sniff::{MAX_SNIFF_BYTES, SniffOutcomeWithProto, SniffedProtocol, sniff_tcp_protocol},
+        sniff::{
+            MAX_SNIFF_BYTES, RealIpTlsOverrideGuard, SniffOutcomeWithProto, SniffedProtocol,
+            resolve_real_ip_tcp_dial_target, sniff_tcp_protocol,
+        },
         udp_nat::UdpNatManager,
     },
     platform::process::SocketTransport,
@@ -1150,6 +1153,11 @@ fn handle_ingress_packet(
                     if let Ok(udp) = UdpPacket::new_checked(ip4.payload())
                         && udp.verify_checksum(&IpAddress::Ipv4(src_v4), &IpAddress::Ipv4(dst_v4))
                     {
+                        // Ignore empty 0-byte UDP datagrams (e.g. OS/SDK route reachability probes
+                        // like `8.8.8.8:65535`) so they never open pointless proxy UDP NAT tunnels.
+                        if udp.payload().is_empty() {
+                            return;
+                        }
                         let src_port = udp.src_port();
                         let dst_port = udp.dst_port();
                         let dst_sock = SocketAddr::new(IpAddr::V4(dst_v4), dst_port);
@@ -1262,6 +1270,11 @@ fn handle_ingress_packet(
                         return;
                     };
                     if !udp.verify_checksum(&IpAddress::Ipv6(src_v6), &IpAddress::Ipv6(dst_v6)) {
+                        return;
+                    }
+                    // Ignore empty 0-byte UDP datagrams (e.g. OS/SDK route reachability probes
+                    // like `[2000::]:65535`) so they never open pointless proxy UDP NAT tunnels.
+                    if udp.payload().is_empty() {
                         return;
                     }
                     let src_port = udp.src_port();
@@ -1735,18 +1748,16 @@ fn register_syn_flow(
         // - Always use the sniffed domain for rule matching and connection telemetry.
         // - Override the remote dial destination with the sniffed domain on PROXY outbounds
         //   when `override-destination` is enabled and the domain is not in `skip-domain`
-        //   (defeating local poisoned-IP DNS without adding extra DNS lookups on DIRECT).
-        let dial_target = if let Some((ref domain, proto)) = sniffed_real_ip {
-            if decision.outbound.exit_category() == "PROXY"
-                && sniffer_cfg.should_override_destination(proto, domain)
-            {
-                decision.target.clone()
-            } else {
-                raw_target.clone()
-            }
-        } else {
-            decision.target.clone()
-        };
+        //   (defeating local poisoned-IP DNS without adding extra DNS lookups on DIRECT),
+        //   while guarding pure-IP TLS flows against hijacking Fake-TLS / REALITY / domain-fronting.
+        let (dial_target, sniff_override_tracker) = resolve_real_ip_tcp_dial_target(
+            &raw_target,
+            &decision.target,
+            decision.outbound.exit_category(),
+            &sniffer_cfg,
+            current_router.sniff_override_guard(),
+            sniffed_real_ip.as_ref(),
+        );
 
         let conn_guard = hub_clone.register_connection_with_outbound_guard_sniffed(
             "TUN(smoltcp)",
@@ -1761,6 +1772,14 @@ fn register_syn_flow(
             sniffed_real_ip.is_some(),
         );
         let conn_entry = Arc::clone(conn_guard.connection());
+        let mut sniff_override_guard = sniff_override_tracker.map(|tracker| {
+            RealIpTlsOverrideGuard::new(
+                Arc::clone(current_router.sniff_override_guard()),
+                Arc::clone(&hub_clone),
+                Arc::clone(&conn_entry),
+                tracker,
+            )
+        });
         hub_clone.push_log(
             "info",
             format!(
@@ -1798,11 +1817,17 @@ fn register_syn_flow(
             tokio::select! {
                 biased;
                 _ = conn_entry.closed() => {
+                    if let Some(g) = sniff_override_guard.as_mut() {
+                        g.disarm();
+                    }
                     remote_failed_task.store(true, Ordering::Release);
                     wake_task.notify_one();
                     return;
                 }
                 _ = bridge_closed_tx.closed() => {
+                    if let Some(g) = sniff_override_guard.as_mut() {
+                        g.disarm();
+                    }
                     return;
                 }
                 _ = dial_timeout_task.notified() => {
@@ -1823,6 +1848,9 @@ fn register_syn_flow(
         let outbound = match dial_res {
             Ok(s) => s,
             Err(err) => {
+                if let Some(g) = sniff_override_guard.as_mut() {
+                    g.mark_dial_failed();
+                }
                 tracing::debug!(
                     "[TUN] outbound connect failed for {} -> {}: {}",
                     tuple.src,
@@ -1837,6 +1865,9 @@ fn register_syn_flow(
         };
         remote_connected_task.store(true, Ordering::Release);
         conn_guard.mark_established();
+        if let Some(g) = sniff_override_guard.as_mut() {
+            g.mark_established();
+        }
         let leaf_outbound = decision.outbound.name();
         if decision.outbound.exit_category() == "PROXY"
             && !matches!(leaf_outbound, "DIRECT" | "REJECT")
@@ -1939,9 +1970,15 @@ fn register_syn_flow(
         tokio::select! {
             _ = async { tokio::join!(writer_fut, reader_fut) } => {}
             _ = conn_entry.closed() => {
+                if let Some(g) = sniff_override_guard.as_mut() {
+                    g.mark_externally_cancelled();
+                }
                 remote_failed_task.store(true, Ordering::Release);
                 wake_task.notify_one();
             }
+        }
+        if let Some(g) = sniff_override_guard.as_mut() {
+            g.finish();
         }
     });
 
@@ -6135,5 +6172,315 @@ mod tests {
         let trunc_601 = truncate_tun_udp_dns_response(&edns_600_q, vec![0u8; 601]);
         assert_eq!(trunc_601[2] & 0x82, 0x82);
         assert!(trunc_601.len() <= 512);
+    }
+
+    #[tokio::test]
+    async fn tun_real_ip_camouflage_sni_loop_auto_bypasses_to_raw_ip_after_three_short_closes() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct RecordingShortReplyProxy {
+            dialed_targets: Arc<parking_lot::Mutex<Vec<String>>>,
+            reply_len: usize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for RecordingShortReplyProxy {
+            fn name(&self) -> &str {
+                "MOCK-PROXY"
+            }
+            fn protocol(&self) -> &'static str {
+                "MockProxy"
+            }
+            async fn connect_tcp(
+                &self,
+                target: &TargetAddr,
+            ) -> io::Result<crate::outbound::BoxedStream> {
+                self.dialed_targets.lock().push(target.to_string());
+                let (client_half, mut server_half) = tokio::io::duplex(16 * 1024);
+                let reply = vec![0x16u8; self.reply_len];
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = server_half.read(&mut buf).await;
+                    let _ = server_half.write_all(&reply).await;
+                    let _ = server_half.shutdown().await;
+                });
+                Ok(Box::new(client_half))
+            }
+        }
+
+        let dialed_targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let proxy = Arc::new(RecordingShortReplyProxy {
+            dialed_targets: Arc::clone(&dialed_targets),
+            reply_len: 4096,
+        });
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert("MOCK-PROXY".to_string(), proxy);
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec![
+            "DOMAIN-SUFFIX,google.com,MOCK-PROXY".to_string(),
+            "MATCH,MOCK-PROXY".to_string(),
+        ];
+        let router = Arc::new(
+            Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (mut vtun, task) = spawn_userspace_tun(
+            1500,
+            Arc::new(RwLock::new(Arc::clone(&router))),
+            Arc::clone(&hub),
+            sd_rx,
+        );
+
+        let hello = crate::inbound::sniff::test_helpers::build_tls_client_hello("www.google.com");
+        let raw_ip = Ipv4Addr::new(194, 221, 250, 50);
+        let seq_counter = AtomicUsize::new(0);
+
+        // Run 4 short-lived connections to 194.221.250.50:443 with decoy SNI `www.google.com`.
+        for idx in 0..4u16 {
+            let client = (Ipv4Addr::new(198, 18, 0, 55), 52_000 + idx);
+            let dst = (raw_ip, 443u16);
+            let isn = 10_000i32 + (seq_counter.fetch_add(1, Ordering::Relaxed) as i32) * 50_000;
+
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    isn,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+
+            // Wait for SYN-ACK
+            let mut sseq = None;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(Some(pkt)) =
+                    tokio::time::timeout(Duration::from_millis(200), vtun.egress_rx.recv()).await
+                    && let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                    && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                    && tcp.dst_port() == client.1
+                    && tcp.syn()
+                    && tcp.ack()
+                {
+                    sseq = Some(tcp.seq_number().0.wrapping_add(1));
+                    break;
+                }
+            }
+            let sseq = sseq.expect("expected SYN-ACK for camouflage TLS flow");
+
+            // Send ClientHello (PSH|ACK)
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Psh,
+                    isn + 1,
+                    Some(sseq),
+                    &hello,
+                ))
+                .await
+                .unwrap();
+
+            // Wait until we receive the mock server's reply or FIN, then send client FIN|ACK.
+            let mut rx_bytes = 0usize;
+            let mut peer_seq = sseq;
+            let reply_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while rx_bytes < 4096 && tokio::time::Instant::now() < reply_deadline {
+                if let Ok(Some(pkt)) =
+                    tokio::time::timeout(Duration::from_millis(200), vtun.egress_rx.recv()).await
+                    && let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                    && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                    && tcp.dst_port() == client.1
+                {
+                    let plen = tcp.payload().len();
+                    if plen > 0 {
+                        rx_bytes += plen;
+                        peer_seq = tcp.seq_number().0.wrapping_add(plen as i32);
+                    }
+                    if tcp.fin() {
+                        peer_seq = peer_seq.wrapping_add(1);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                rx_bytes > 0,
+                "attempt #{idx} must receive server reply bytes"
+            );
+
+            // Client immediately aborts/closes (simulating Fake-TLS HMAC rejection).
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Fin,
+                    isn + 1 + hello.len() as i32,
+                    Some(peer_seq),
+                    &[],
+                ))
+                .await
+                .unwrap();
+
+            // Give flow_task a brief moment to record outcome in SniffOverrideGuard before next attempt.
+            let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while hub.active_connection_count() > 0 && tokio::time::Instant::now() < settle_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let dialed = dialed_targets.lock().clone();
+        assert_eq!(
+            dialed,
+            vec![
+                "www.google.com:443",
+                "www.google.com:443",
+                "www.google.com:443",
+                "194.221.250.50:443",
+            ],
+            "after 3 rapid short closes under override, 4th attempt must auto-bypass to raw IP dial"
+        );
+
+        let _ = sd_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn tun_drops_empty_zero_byte_ipv4_and_ipv6_udp_probes_without_opening_outbound_sessions()
+    {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingUdpProxy {
+            opened_sessions: Arc<AtomicUsize>,
+            sent_targets: Arc<parking_lot::Mutex<Vec<String>>>,
+            non_empty_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        }
+
+        struct CountingUdpSession {
+            sent_targets: Arc<parking_lot::Mutex<Vec<String>>>,
+            non_empty_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundUdpSession for CountingUdpSession {
+            async fn send_to(&self, data: &[u8], target: &TargetAddr) -> io::Result<()> {
+                let target_s = format!("{target}({}B)", data.len());
+                self.sent_targets.lock().push(target_s.clone());
+                if !data.is_empty()
+                    && let Some(tx) = self.non_empty_tx.lock().take()
+                {
+                    let _ = tx.send(target_s);
+                }
+                Ok(())
+            }
+
+            async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
+                std::future::pending().await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for CountingUdpProxy {
+            fn name(&self) -> &str {
+                "MOCK-UDP-PROXY"
+            }
+            fn protocol(&self) -> &'static str {
+                "MockProxy"
+            }
+            fn udp_supported(&self) -> bool {
+                true
+            }
+            async fn connect_tcp(
+                &self,
+                _target: &TargetAddr,
+            ) -> io::Result<crate::outbound::BoxedStream> {
+                Err(io::Error::other("unused"))
+            }
+            async fn open_udp_session(
+                &self,
+            ) -> io::Result<Box<dyn crate::outbound::OutboundUdpSession>> {
+                self.opened_sessions.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(CountingUdpSession {
+                    sent_targets: Arc::clone(&self.sent_targets),
+                    non_empty_tx: Arc::clone(&self.non_empty_tx),
+                }))
+            }
+        }
+
+        let opened_sessions = Arc::new(AtomicUsize::new(0));
+        let sent_targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        let proxy = Arc::new(CountingUdpProxy {
+            opened_sessions: Arc::clone(&opened_sessions),
+            sent_targets: Arc::clone(&sent_targets),
+            non_empty_tx: Arc::new(parking_lot::Mutex::new(Some(barrier_tx))),
+        });
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert("MOCK-UDP-PROXY".to_string(), proxy);
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec!["MATCH,MOCK-UDP-PROXY".to_string()];
+        let router = Arc::new(
+            Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (vtun, task) =
+            spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), Arc::clone(&hub), sd_rx);
+
+        // 1. Send 0-byte IPv4 probe `8.8.8.8:65535` and 0-byte IPv6 probe `[2000::]:65535`.
+        let empty_v4 = build_ipv4_udp_packet(
+            Ipv4Addr::new(198, 18, 0, 1),
+            49_001,
+            Ipv4Addr::new(8, 8, 8, 8),
+            65535,
+            &[],
+        )
+        .unwrap();
+        let empty_v6 = build_ipv6_udp_packet(
+            "fdfe:dcba:9876::1".parse().unwrap(),
+            49_002,
+            "2000::".parse().unwrap(),
+            65535,
+            &[],
+        )
+        .unwrap();
+        vtun.ingress_tx.send(empty_v4).await.unwrap();
+        vtun.ingress_tx.send(empty_v6).await.unwrap();
+
+        // 2. Send a real non-empty UDP datagram afterwards as a synchronization barrier.
+        let real_v4 = build_ipv4_udp_packet(
+            Ipv4Addr::new(198, 18, 0, 1),
+            49_003,
+            Ipv4Addr::new(1, 1, 1, 1),
+            443,
+            b"hello-udp",
+        )
+        .unwrap();
+        vtun.ingress_tx.send(real_v4).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("non-empty UDP barrier packet must be forwarded")
+            .unwrap();
+        assert_eq!(got, "1.1.1.1:443(9B)");
+        assert_eq!(
+            opened_sessions.load(Ordering::SeqCst),
+            1,
+            "0-byte IPv4/IPv6 UDP probes must be dropped without opening outbound UDP sessions"
+        );
+        assert_eq!(*sent_targets.lock(), vec!["1.1.1.1:443(9B)".to_string()]);
+        assert_eq!(hub.total_connections(), 1);
+
+        let _ = sd_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 }
