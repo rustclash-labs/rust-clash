@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.5.16)"
+        description: "Release tag to publish (e.g. v0.5.17)"
         required: true
         type: string
-        default: "v0.5.16"
+        default: "v0.5.17"
       target_platforms:
         description: "Platforms to build & publish (saves private-repo Actions minutes)"
         required: false
