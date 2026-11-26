@@ -868,6 +868,8 @@ object DebugLogManager {
         if (reason == "USER_STOPPED" ||
             reason == "USER_FORCE_STOP" ||
             reason == "PERMISSION_CHANGE" ||
+            reason == "PACKAGE_UPDATED" ||
+            reason == "PACKAGE_STATE_CHANGE" ||
             desc.contains("killDueToPackageUpdate", ignoreCase = true) ||
             desc.contains("installPackageLI", ignoreCase = true)
         ) {
@@ -1577,6 +1579,26 @@ object DebugLogManager {
         )
     }
 
+    internal fun formatExitReasonName(reason: Int, status: Int = 0): String = when (reason) {
+        1 -> "EXIT_SELF" // ApplicationExitInfo.REASON_EXIT_SELF
+        2 -> "SIGNALED($status)" // ApplicationExitInfo.REASON_SIGNALED
+        3 -> "LOW_MEMORY_LMK" // ApplicationExitInfo.REASON_LOW_MEMORY
+        4 -> "JVM_CRASH" // ApplicationExitInfo.REASON_CRASH
+        5 -> "NATIVE_CRASH" // ApplicationExitInfo.REASON_CRASH_NATIVE
+        6 -> "ANR" // ApplicationExitInfo.REASON_ANR
+        7 -> "INIT_FAILURE" // ApplicationExitInfo.REASON_INITIALIZATION_FAILURE
+        8 -> "PERMISSION_CHANGE" // ApplicationExitInfo.REASON_PERMISSION_CHANGE
+        9 -> "EXCESSIVE_RESOURCE" // ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE
+        10 -> "USER_STOPPED" // ApplicationExitInfo.REASON_USER_REQUESTED
+        11 -> "USER_FORCE_STOP" // ApplicationExitInfo.REASON_USER_STOPPED
+        12 -> "DEPENDENCY_DIED" // ApplicationExitInfo.REASON_DEPENDENCY_DIED
+        13 -> "OTHER_OEM_KILL" // ApplicationExitInfo.REASON_OTHER
+        14 -> "FREEZER" // ApplicationExitInfo.REASON_FREEZER (API 33+)
+        15 -> "PACKAGE_STATE_CHANGE" // ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE (API 34+)
+        16 -> "PACKAGE_UPDATED" // ApplicationExitInfo.REASON_PACKAGE_UPDATED (API 34+)
+        else -> "REASON_$reason"
+    }
+
     @RequiresApi(Build.VERSION_CODES.R)
     private object Api30ExitInfoHelper {
         fun readRecentExitReasons(context: Context): List<String> = runCatching {
@@ -1587,19 +1609,7 @@ object DebugLogManager {
         }.getOrDefault(emptyList())
 
         private fun formatExitInfo(info: ApplicationExitInfo): String {
-            val reasonName = when (info.reason) {
-                ApplicationExitInfo.REASON_ANR -> "ANR"
-                ApplicationExitInfo.REASON_CRASH -> "JVM_CRASH"
-                ApplicationExitInfo.REASON_CRASH_NATIVE -> "NATIVE_CRASH"
-                ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE"
-                ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY_LMK"
-                ApplicationExitInfo.REASON_OTHER -> "OTHER_OEM_KILL"
-                ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "PERMISSION_CHANGE"
-                ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED(${info.status})"
-                ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_STOPPED"
-                ApplicationExitInfo.REASON_USER_STOPPED -> "USER_FORCE_STOP"
-                else -> "REASON_${info.reason}"
-            }
+            val reasonName = formatExitReasonName(info.reason, info.status)
             val ts = formatTimestamp(info.timestamp)
             val desc = NodeImportSupport.redactSecretsForUi(info.description ?: "")
             return "[$ts] reason=$reasonName importance=${info.importance} pss=${info.pss}KB rss=${info.rss}KB desc=$desc"

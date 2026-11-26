@@ -31,6 +31,7 @@ use crate::{
     },
     dns::FakeIpDnsEngine,
     error::{ProxyError, Result},
+    inbound::sniff::SniffOverrideGuard,
     outbound::{DirectOutbound, DynOutbound, ErrorOutbound, RejectOutbound},
     platform::process::SocketTransport,
     router::{
@@ -141,6 +142,7 @@ pub struct Router {
     tun_dns_hijack: AtomicBool,
     low_power_mode: AtomicBool,
     sniffer: RwLock<SnifferConfig>,
+    sniff_override_guard: Arc<SniffOverrideGuard>,
     outbounds: HashMap<String, DynOutbound>,
     groups: HashMap<String, Arc<ProxyGroup>>,
     group_order: Vec<String>,
@@ -276,6 +278,7 @@ impl Router {
             tun_dns_hijack: AtomicBool::new(true),
             low_power_mode: AtomicBool::new(false),
             sniffer: RwLock::new(SnifferConfig::default()),
+            sniff_override_guard: Arc::new(SniffOverrideGuard::new()),
             outbounds,
             groups,
             group_order,
@@ -347,6 +350,11 @@ impl Router {
 
     pub fn set_sniffer(&self, cfg: SnifferConfig) {
         *self.sniffer.write() = cfg;
+        self.sniff_override_guard.clear();
+    }
+
+    pub fn sniff_override_guard(&self) -> &Arc<SniffOverrideGuard> {
+        &self.sniff_override_guard
     }
 
     pub fn is_low_power_mode(&self) -> bool {
@@ -397,6 +405,7 @@ impl Router {
     pub fn notify_network_change(&self) -> usize {
         crate::platform::socket_protect::reset_direct_ipv6_reachability();
         self.dns.flush_cache();
+        self.sniff_override_guard.clear();
         self.bump_epoch();
         self.outbounds.values().map(|o| o.on_network_change()).sum()
     }
@@ -405,6 +414,7 @@ impl Router {
     /// without mutating process-wide socket reachability or shared DoT/DoH upstream pools.
     pub fn shutdown_cleanup(&self) -> usize {
         self.dns.clear_local_caches();
+        self.sniff_override_guard.clear();
         self.bump_epoch();
         self.outbounds.values().map(|o| o.on_network_change()).sum()
     }

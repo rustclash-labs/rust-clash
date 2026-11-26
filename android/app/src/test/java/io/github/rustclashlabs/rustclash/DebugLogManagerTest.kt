@@ -1512,4 +1512,76 @@ class DebugLogManagerTest {
         )
         assertTrue(reportWithoutDelta.contains("#### Outbound Node Performance (Window, truncated, cap=3000, sampled 3000 newest conns)"))
     }
+
+    @Test
+    fun formatExitReasonNameMapsApi30To37ExitCodesAndSuppressesBenignPackageUpdateExits() {
+        assertEquals("EXIT_SELF", DebugLogManager.formatExitReasonName(1))
+        assertEquals("SIGNALED(9)", DebugLogManager.formatExitReasonName(2, 9))
+        assertEquals("LOW_MEMORY_LMK", DebugLogManager.formatExitReasonName(3))
+        assertEquals("JVM_CRASH", DebugLogManager.formatExitReasonName(4))
+        assertEquals("NATIVE_CRASH", DebugLogManager.formatExitReasonName(5))
+        assertEquals("ANR", DebugLogManager.formatExitReasonName(6))
+        assertEquals("INIT_FAILURE", DebugLogManager.formatExitReasonName(7))
+        assertEquals("PERMISSION_CHANGE", DebugLogManager.formatExitReasonName(8))
+        assertEquals("EXCESSIVE_RESOURCE", DebugLogManager.formatExitReasonName(9))
+        assertEquals("USER_STOPPED", DebugLogManager.formatExitReasonName(10))
+        assertEquals("USER_FORCE_STOP", DebugLogManager.formatExitReasonName(11))
+        assertEquals("DEPENDENCY_DIED", DebugLogManager.formatExitReasonName(12))
+        assertEquals("OTHER_OEM_KILL", DebugLogManager.formatExitReasonName(13))
+        assertEquals("FREEZER", DebugLogManager.formatExitReasonName(14))
+        assertEquals("PACKAGE_STATE_CHANGE", DebugLogManager.formatExitReasonName(15))
+        assertEquals("PACKAGE_UPDATED", DebugLogManager.formatExitReasonName(16))
+        assertEquals("REASON_99", DebugLogManager.formatExitReasonName(99))
+
+        val nowMs = 1_795_000_000_000L
+        val healthyJson = """{"ok":true,"vpnRunning":true,"rssBytes":75497472,"outboundStats":[]}"""
+        val meta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "HONOR",
+            deviceModel = "BVL-AN00",
+            androidRelease = "17",
+            sdkInt = 37,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.5.16",
+            appVersionCode = 45,
+            battery = DebugLogManager.BatterySnapshot(85, false, 30.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 8L * 1024L * 1024L,
+            jvmMaxBytes = 384L * 1024L * 1024L,
+            nativeHeapBytes = 48L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = listOf(
+                "[${DebugLogManager.formatTimestamp(nowMs - 30_000L)}] reason=PACKAGE_UPDATED importance=125 pss=0KB rss=200000KB desc=upgrade",
+            ),
+        )
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "startup-check",
+                capturedAtMs = nowMs,
+                sessionStartMs = 0L,
+                systemMeta = meta,
+                nativeSnapshotRawJson = healthyJson,
+                crashBreadcrumb = null,
+            ),
+        )
+        assertNull(
+            DebugLogManager.evaluateSliceAnomalies(
+                trigger = "startup-check",
+                capturedAtMs = nowMs,
+                sessionStartMs = 0L,
+                systemMeta = meta.copy(
+                    recentProcessExits = listOf(
+                        "[${DebugLogManager.formatTimestamp(nowMs - 30_000L)}] reason=PACKAGE_STATE_CHANGE importance=125 pss=0KB rss=200000KB desc=disabled",
+                    ),
+                ),
+                nativeSnapshotRawJson = healthyJson,
+                crashBreadcrumb = null,
+            ),
+        )
+    }
 }

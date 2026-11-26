@@ -1,9 +1,18 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use aws_lc_rs::{
     aead::{self, AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
     hkdf,
 };
+use parking_lot::Mutex;
+
+use crate::addr::TargetAddr;
+use crate::config::SnifferConfig;
+use crate::tracker::{ActiveConnection, TelemetryHub};
 
 pub const MAX_SNIFF_BYTES: usize = 16 * 1024;
 const MAX_HTTP_SNIFF_BYTES: usize = 8 * 1024;
@@ -788,6 +797,479 @@ pub fn sniff_quic_initial_sni(pkt: &[u8]) -> SniffOutcome {
     SniffOutcome::NoHostname
 }
 
+const MAX_SNIFF_OVERRIDE_GUARD_ENTRIES: usize = 256;
+const SNIFF_OVERRIDE_SHORT_CLOSE_WINDOW: Duration = Duration::from_secs(15);
+const SNIFF_OVERRIDE_TRIP_STRIKES: u8 = 3;
+const SNIFF_OVERRIDE_SUSPICIOUS_MAX_LIFETIME: Duration = Duration::from_secs(3);
+const SNIFF_OVERRIDE_SUSPICIOUS_MAX_UPLOAD_BYTES: u64 = 8 * 1024;
+const SNIFF_OVERRIDE_SUSPICIOUS_MAX_DOWNLOAD_BYTES: u64 = 16 * 1024;
+const SNIFF_OVERRIDE_HEALTHY_MIN_LIFETIME: Duration = Duration::from_secs(5);
+const SNIFF_OVERRIDE_HEALTHY_MIN_BYTES: u64 = 16 * 1024;
+const SNIFF_OVERRIDE_RAW_IP_PROBE_TTL: Duration = Duration::from_secs(30);
+const SNIFF_OVERRIDE_RAW_IP_BYPASS_TTL: Duration = Duration::from_secs(600);
+const SNIFF_OVERRIDE_PINNED_TTL: Duration = Duration::from_secs(300);
+
+/// Decision returned by [`SniffOverrideGuard`] for a pure-IP TLS connection eligible for
+/// SNI destination override on a `PROXY` outbound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SniffOverrideMode {
+    /// Dial the sniffed SNI domain (standard `override-destination` behavior).
+    Override,
+    /// Temporarily bypass SNI destination override and dial the original raw IP instead.
+    BypassToRawIp,
+}
+
+/// State transition emitted by [`SniffOverrideGuard::record_outcome`] for diagnostic logging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SniffOverrideFeedback {
+    /// Repeated rapid handshake-sized closes under override triggered raw-IP probing.
+    TrippedToRawIp { strikes: u8 },
+    /// Raw-IP probe connected and received data (or stayed open); raw-IP bypass confirmed.
+    ConfirmedRawIpBypass,
+    /// Raw-IP dial failed or closed quickly with zero received bytes; restored override.
+    RevertedToOverride,
+}
+
+/// Completed connection metrics reported back to [`SniffOverrideGuard`].
+#[derive(Clone, Copy, Debug)]
+pub struct SniffOverrideOutcome {
+    pub mode: SniffOverrideMode,
+    pub connected: bool,
+    pub lifetime: Duration,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub externally_cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GuardEntry {
+    Normal {
+        strikes: u8,
+        window_start: Instant,
+        last_seen: Instant,
+    },
+    ProbingRawIp {
+        since: Instant,
+    },
+    BypassActive {
+        expires_at: Instant,
+        last_seen: Instant,
+    },
+    OverridePinned {
+        expires_at: Instant,
+        last_seen: Instant,
+    },
+}
+
+impl GuardEntry {
+    fn is_expired(&self, now: Instant) -> bool {
+        match *self {
+            Self::Normal { window_start, .. } => {
+                now.saturating_duration_since(window_start) > SNIFF_OVERRIDE_SHORT_CLOSE_WINDOW
+            }
+            Self::ProbingRawIp { since } => {
+                now.saturating_duration_since(since) >= SNIFF_OVERRIDE_RAW_IP_PROBE_TTL
+            }
+            Self::BypassActive { expires_at, .. } | Self::OverridePinned { expires_at, .. } => {
+                now >= expires_at
+            }
+        }
+    }
+
+    fn last_touched(&self) -> Instant {
+        match *self {
+            Self::Normal { last_seen, .. }
+            | Self::BypassActive { last_seen, .. }
+            | Self::OverridePinned { last_seen, .. } => last_seen,
+            Self::ProbingRawIp { since } => since,
+        }
+    }
+}
+
+/// Adaptive per-router guard that protects pure-IP camouflage/pinned TLS protocols
+/// (such as Telegram MTProto Fake-TLS `0xee`, nested REALITY, or domain fronting) from
+/// being hijacked into reconnect storms when `sniffer.override-destination` rewrites the
+/// dial target from the real destination IP to a decoy SNI domain.
+///
+/// Self-verifying state machine per `(raw_ip, port, sniffed_domain)`:
+/// 1. Starts in `Normal` (override enabled, preserving poisoned-DNS recovery).
+/// 2. If 3 consecutive overridden connections close within 3s after transferring only
+///    handshake-sized bytes (`up <= 8 KiB`, `down <= 16 KiB`) within a 15s window, transitions
+///    to `ProbingRawIp` so the next attempt dials `raw_ip:port` via the matched `PROXY`.
+/// 3. If the raw IP responds (`down > 0` or `lifetime >= 3s`), confirms `BypassActive` (10m TTL).
+///    If the raw IP fails to connect or yields `0` bytes quickly (a genuinely poisoned/dead IP),
+///    immediately restores override and pins `OverridePinned` (5m TTL).
+#[derive(Default)]
+pub struct SniffOverrideGuard {
+    entries: Mutex<HashMap<(IpAddr, u16, String), GuardEntry>>,
+}
+
+impl SniffOverrideGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+    }
+
+    pub fn decide(
+        &self,
+        raw_ip: IpAddr,
+        port: u16,
+        domain: &str,
+        force_overridden: bool,
+    ) -> SniffOverrideMode {
+        self.decide_at(raw_ip, port, domain, force_overridden, Instant::now())
+    }
+
+    pub(crate) fn decide_at(
+        &self,
+        raw_ip: IpAddr,
+        port: u16,
+        domain: &str,
+        force_overridden: bool,
+        now: Instant,
+    ) -> SniffOverrideMode {
+        if force_overridden {
+            return SniffOverrideMode::Override;
+        }
+        let key = (raw_ip, port, Self::normalize_domain_key(domain));
+        let mut map = self.entries.lock();
+        if let Some(entry) = map.get(&key).copied() {
+            if entry.is_expired(now) {
+                map.remove(&key);
+                return SniffOverrideMode::Override;
+            }
+            return match entry {
+                GuardEntry::ProbingRawIp { .. } | GuardEntry::BypassActive { .. } => {
+                    SniffOverrideMode::BypassToRawIp
+                }
+                GuardEntry::Normal { .. } | GuardEntry::OverridePinned { .. } => {
+                    SniffOverrideMode::Override
+                }
+            };
+        }
+        SniffOverrideMode::Override
+    }
+
+    pub fn record_outcome(
+        &self,
+        raw_ip: IpAddr,
+        port: u16,
+        domain: &str,
+        outcome: SniffOverrideOutcome,
+    ) -> Option<SniffOverrideFeedback> {
+        self.record_outcome_at(raw_ip, port, domain, outcome, Instant::now())
+    }
+
+    pub(crate) fn record_outcome_at(
+        &self,
+        raw_ip: IpAddr,
+        port: u16,
+        domain: &str,
+        outcome: SniffOverrideOutcome,
+        now: Instant,
+    ) -> Option<SniffOverrideFeedback> {
+        if outcome.externally_cancelled {
+            return None;
+        }
+        let key = (raw_ip, port, Self::normalize_domain_key(domain));
+        let mut map = self.entries.lock();
+
+        if map.get(&key).is_some_and(|e| e.is_expired(now)) {
+            map.remove(&key);
+        }
+
+        match outcome.mode {
+            SniffOverrideMode::Override => {
+                if matches!(
+                    map.get(&key),
+                    Some(
+                        GuardEntry::OverridePinned { .. }
+                            | GuardEntry::ProbingRawIp { .. }
+                            | GuardEntry::BypassActive { .. }
+                    )
+                ) {
+                    return None;
+                }
+
+                let is_healthy = outcome.connected
+                    && (outcome.lifetime >= SNIFF_OVERRIDE_HEALTHY_MIN_LIFETIME
+                        || outcome.upload_bytes > SNIFF_OVERRIDE_HEALTHY_MIN_BYTES
+                        || outcome.download_bytes > SNIFF_OVERRIDE_HEALTHY_MIN_BYTES);
+                if is_healthy {
+                    map.remove(&key);
+                    return None;
+                }
+
+                let is_suspicious_short_close = outcome.connected
+                    && outcome.lifetime < SNIFF_OVERRIDE_SUSPICIOUS_MAX_LIFETIME
+                    && outcome.upload_bytes > 0
+                    && outcome.upload_bytes <= SNIFF_OVERRIDE_SUSPICIOUS_MAX_UPLOAD_BYTES
+                    && outcome.download_bytes <= SNIFF_OVERRIDE_SUSPICIOUS_MAX_DOWNLOAD_BYTES;
+                if !is_suspicious_short_close {
+                    return None;
+                }
+
+                let (strikes, window_start) = match map.get(&key).copied() {
+                    Some(GuardEntry::Normal {
+                        strikes,
+                        window_start,
+                        ..
+                    }) if now.saturating_duration_since(window_start)
+                        <= SNIFF_OVERRIDE_SHORT_CLOSE_WINDOW =>
+                    {
+                        (strikes.saturating_add(1), window_start)
+                    }
+                    _ => (1, now),
+                };
+
+                Self::evict_if_full(&mut map, &key, now);
+                if strikes >= SNIFF_OVERRIDE_TRIP_STRIKES {
+                    map.insert(key, GuardEntry::ProbingRawIp { since: now });
+                    return Some(SniffOverrideFeedback::TrippedToRawIp { strikes });
+                }
+
+                map.insert(
+                    key,
+                    GuardEntry::Normal {
+                        strikes,
+                        window_start,
+                        last_seen: now,
+                    },
+                );
+                None
+            }
+            SniffOverrideMode::BypassToRawIp => {
+                let raw_ip_failed = !outcome.connected
+                    || (outcome.download_bytes == 0
+                        && outcome.lifetime < SNIFF_OVERRIDE_SUSPICIOUS_MAX_LIFETIME);
+                if raw_ip_failed {
+                    let was_bypassing = matches!(
+                        map.get(&key),
+                        Some(GuardEntry::ProbingRawIp { .. } | GuardEntry::BypassActive { .. })
+                    );
+                    Self::evict_if_full(&mut map, &key, now);
+                    map.insert(
+                        key,
+                        GuardEntry::OverridePinned {
+                            expires_at: now + SNIFF_OVERRIDE_PINNED_TTL,
+                            last_seen: now,
+                        },
+                    );
+                    return was_bypassing.then_some(SniffOverrideFeedback::RevertedToOverride);
+                }
+
+                let was_probing = matches!(map.get(&key), Some(GuardEntry::ProbingRawIp { .. }));
+                Self::evict_if_full(&mut map, &key, now);
+                map.insert(
+                    key,
+                    GuardEntry::BypassActive {
+                        expires_at: now + SNIFF_OVERRIDE_RAW_IP_BYPASS_TTL,
+                        last_seen: now,
+                    },
+                );
+                was_probing.then_some(SniffOverrideFeedback::ConfirmedRawIpBypass)
+            }
+        }
+    }
+
+    fn normalize_domain_key(domain: &str) -> String {
+        domain.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    fn evict_if_full(
+        map: &mut HashMap<(IpAddr, u16, String), GuardEntry>,
+        incoming_key: &(IpAddr, u16, String),
+        now: Instant,
+    ) {
+        if map.len() < MAX_SNIFF_OVERRIDE_GUARD_ENTRIES || map.contains_key(incoming_key) {
+            return;
+        }
+        map.retain(|_, entry| !entry.is_expired(now));
+        while map.len() >= MAX_SNIFF_OVERRIDE_GUARD_ENTRIES {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touched())
+                .map(|(k, _)| k.clone());
+            let Some(victim) = oldest else {
+                break;
+            };
+            map.remove(&victim);
+        }
+    }
+}
+
+/// Tracking descriptor returned alongside a resolved dial target for pure-IP TLS flows
+/// guarded by [`SniffOverrideGuard`].
+#[derive(Clone, Debug)]
+pub struct RealIpTlsOverrideTracker {
+    pub mode: SniffOverrideMode,
+    pub raw_ip: IpAddr,
+    pub port: u16,
+    pub domain: String,
+}
+
+/// Resolve the effective remote dial destination for a TCP flow after optional real-IP
+/// TLS/HTTP sniffing.
+///
+/// - `DIRECT` / `REJECT` outbounds preserve `raw_target` (avoiding extra DNS lookups).
+/// - `PROXY` outbounds with `override-destination` enabled dial the sniffed domain unless
+///   excluded by `skip-domain` or temporarily bypassed by [`SniffOverrideGuard`] for a
+///   suspected camouflage/pinned TLS server (which `force-domain` always overrides).
+pub fn resolve_real_ip_tcp_dial_target(
+    raw_target: &TargetAddr,
+    decision_target: &TargetAddr,
+    exit_category: &str,
+    sniffer_cfg: &SnifferConfig,
+    override_guard: &SniffOverrideGuard,
+    sniffed_real_ip: Option<&(String, SniffedProtocol)>,
+) -> (TargetAddr, Option<RealIpTlsOverrideTracker>) {
+    let Some((domain, proto)) = sniffed_real_ip else {
+        return (decision_target.clone(), None);
+    };
+    if exit_category != "PROXY" || !sniffer_cfg.should_override_destination(*proto, domain) {
+        return (raw_target.clone(), None);
+    }
+    if *proto == SniffedProtocol::Tls
+        && let Some(raw_ip) = raw_target.host.as_ip()
+    {
+        let force_overridden = sniffer_cfg.is_force_domain(domain);
+        let mode = override_guard.decide(raw_ip, raw_target.port, domain, force_overridden);
+        let dial_target = match mode {
+            SniffOverrideMode::Override => decision_target.clone(),
+            SniffOverrideMode::BypassToRawIp => raw_target.clone(),
+        };
+        let tracker = (!force_overridden).then(|| RealIpTlsOverrideTracker {
+            mode,
+            raw_ip,
+            port: raw_target.port,
+            domain: domain.clone(),
+        });
+        return (dial_target, tracker);
+    }
+    (decision_target.clone(), None)
+}
+
+/// RAII guard that reports the outcome of a guarded pure-IP TLS flow back to
+/// [`SniffOverrideGuard`] even if the enclosing Tokio task is aborted on client `RST` or
+/// early error returns.
+pub struct RealIpTlsOverrideGuard {
+    guard: Arc<SniffOverrideGuard>,
+    hub: Arc<TelemetryHub>,
+    conn: Arc<ActiveConnection>,
+    tracker: RealIpTlsOverrideTracker,
+    started_at: Instant,
+    established_at: Option<Instant>,
+    dial_failed: bool,
+    externally_cancelled: bool,
+    finished: bool,
+}
+
+impl RealIpTlsOverrideGuard {
+    pub fn new(
+        guard: Arc<SniffOverrideGuard>,
+        hub: Arc<TelemetryHub>,
+        conn: Arc<ActiveConnection>,
+        tracker: RealIpTlsOverrideTracker,
+    ) -> Self {
+        Self {
+            guard,
+            hub,
+            conn,
+            tracker,
+            started_at: Instant::now(),
+            established_at: None,
+            dial_failed: false,
+            externally_cancelled: false,
+            finished: false,
+        }
+    }
+
+    pub fn mark_established(&mut self) {
+        self.established_at = Some(Instant::now());
+    }
+
+    pub fn mark_dial_failed(&mut self) {
+        self.dial_failed = true;
+    }
+
+    pub fn mark_externally_cancelled(&mut self) {
+        self.externally_cancelled = true;
+    }
+
+    pub fn disarm(&mut self) {
+        self.finished = true;
+    }
+
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        let connected = self.established_at.is_some();
+        if !connected && !self.dial_failed {
+            return;
+        }
+        let lifetime = self.established_at.unwrap_or(self.started_at).elapsed();
+        let outcome = SniffOverrideOutcome {
+            mode: self.tracker.mode,
+            connected,
+            lifetime,
+            upload_bytes: self.conn.upload.load(Ordering::Relaxed),
+            download_bytes: self.conn.download.load(Ordering::Relaxed),
+            externally_cancelled: self.externally_cancelled || self.conn.is_closed(),
+        };
+        if let Some(feedback) = self.guard.record_outcome(
+            self.tracker.raw_ip,
+            self.tracker.port,
+            &self.tracker.domain,
+            outcome,
+        ) {
+            let raw_sock = std::net::SocketAddr::new(self.tracker.raw_ip, self.tracker.port);
+            match feedback {
+                SniffOverrideFeedback::TrippedToRawIp { strikes } => {
+                    self.hub.push_log(
+                        "info",
+                        format!(
+                            "[Sniffer] Suspected camouflage/pinned SNI loop on {} (SNI {}, {} rapid short closes); probing raw IP dial",
+                            raw_sock, self.tracker.domain, strikes
+                        ),
+                    );
+                }
+                SniffOverrideFeedback::ConfirmedRawIpBypass => {
+                    self.hub.push_log(
+                        "info",
+                        format!(
+                            "[Sniffer] Raw IP dial succeeded for {} (SNI {}); bypassing SNI destination override for {}m",
+                            raw_sock,
+                            self.tracker.domain,
+                            SNIFF_OVERRIDE_RAW_IP_BYPASS_TTL.as_secs() / 60
+                        ),
+                    );
+                }
+                SniffOverrideFeedback::RevertedToOverride => {
+                    self.hub.push_log(
+                        "info",
+                        format!(
+                            "[Sniffer] Raw IP probe failed for {} (SNI {}); restoring SNI destination override",
+                            raw_sock, self.tracker.domain
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RealIpTlsOverrideGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
@@ -1310,5 +1792,287 @@ mod tests {
             sniff_client_hello_or_http_host(utf8_host.as_bytes()),
             SniffOutcome::NoHostname
         );
+    }
+
+    #[test]
+    fn sniff_override_guard_trips_on_camouflage_loop_and_confirms_raw_ip_bypass() {
+        let guard = SniffOverrideGuard::new();
+        let ip: IpAddr = "194.221.250.50".parse().unwrap();
+        let port = 443;
+        let domain = "www.google.com";
+        let t0 = Instant::now();
+
+        assert_eq!(
+            guard.decide_at(ip, port, domain, false, t0),
+            SniffOverrideMode::Override
+        );
+
+        // Two rapid short handshake-sized closes stay below threshold (3).
+        for i in 0..2 {
+            let fb = guard.record_outcome_at(
+                ip,
+                port,
+                domain,
+                SniffOverrideOutcome {
+                    mode: SniffOverrideMode::Override,
+                    connected: true,
+                    lifetime: Duration::from_millis(220),
+                    upload_bytes: 1_800,
+                    download_bytes: 4_096,
+                    externally_cancelled: false,
+                },
+                t0 + Duration::from_millis(250 * i),
+            );
+            assert_eq!(fb, None);
+            assert_eq!(
+                guard.decide_at(ip, port, domain, false, t0 + Duration::from_millis(250 * i)),
+                SniffOverrideMode::Override
+            );
+        }
+
+        // Externally cancelled connections (e.g. network handoff) must NOT count as strikes.
+        assert_eq!(
+            guard.record_outcome_at(
+                ip,
+                port,
+                domain,
+                SniffOverrideOutcome {
+                    mode: SniffOverrideMode::Override,
+                    connected: true,
+                    lifetime: Duration::from_millis(100),
+                    upload_bytes: 1_800,
+                    download_bytes: 4_096,
+                    externally_cancelled: true,
+                },
+                t0 + Duration::from_millis(500),
+            ),
+            None
+        );
+
+        // Third rapid short close within 15s trips into raw-IP probe mode.
+        let tripped = guard.record_outcome_at(
+            ip,
+            port,
+            domain,
+            SniffOverrideOutcome {
+                mode: SniffOverrideMode::Override,
+                connected: true,
+                lifetime: Duration::from_millis(240),
+                upload_bytes: 1_750,
+                download_bytes: 4_000,
+                externally_cancelled: false,
+            },
+            t0 + Duration::from_millis(750),
+        );
+        assert_eq!(
+            tripped,
+            Some(SniffOverrideFeedback::TrippedToRawIp { strikes: 3 })
+        );
+        assert_eq!(
+            guard.decide_at(ip, port, domain, false, t0 + Duration::from_secs(1)),
+            SniffOverrideMode::BypassToRawIp
+        );
+
+        // Explicit `force-domain` always keeps Override even while guard is bypassing.
+        assert_eq!(
+            guard.decide_at(ip, port, domain, true, t0 + Duration::from_secs(1)),
+            SniffOverrideMode::Override
+        );
+
+        // Raw-IP probe receives bytes -> upgrades to confirmed 10m BypassActive.
+        let confirmed = guard.record_outcome_at(
+            ip,
+            port,
+            domain,
+            SniffOverrideOutcome {
+                mode: SniffOverrideMode::BypassToRawIp,
+                connected: true,
+                lifetime: Duration::from_secs(12),
+                upload_bytes: 2_048,
+                download_bytes: 8_192,
+                externally_cancelled: false,
+            },
+            t0 + Duration::from_secs(13),
+        );
+        assert_eq!(confirmed, Some(SniffOverrideFeedback::ConfirmedRawIpBypass));
+        assert_eq!(
+            guard.decide_at(ip, port, domain, false, t0 + Duration::from_secs(300)),
+            SniffOverrideMode::BypassToRawIp
+        );
+
+        // Bypass expires cleanly after TTL so future changes re-evaluate.
+        assert_eq!(
+            guard.decide_at(
+                ip,
+                port,
+                domain,
+                false,
+                t0 + Duration::from_secs(13)
+                    + SNIFF_OVERRIDE_RAW_IP_BYPASS_TTL
+                    + Duration::from_secs(1)
+            ),
+            SniffOverrideMode::Override
+        );
+    }
+
+    #[test]
+    fn sniff_override_guard_reverts_and_pins_override_when_raw_ip_probe_fails() {
+        let guard = SniffOverrideGuard::new();
+        let poisoned_ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let domain = "linux.do";
+        let t0 = Instant::now();
+
+        for i in 0..3 {
+            let _ = guard.record_outcome_at(
+                poisoned_ip,
+                443,
+                domain,
+                SniffOverrideOutcome {
+                    mode: SniffOverrideMode::Override,
+                    connected: true,
+                    lifetime: Duration::from_millis(300),
+                    upload_bytes: 1_200,
+                    download_bytes: 3_500,
+                    externally_cancelled: false,
+                },
+                t0 + Duration::from_secs(i),
+            );
+        }
+        assert_eq!(
+            guard.decide_at(poisoned_ip, 443, domain, false, t0 + Duration::from_secs(3)),
+            SniffOverrideMode::BypassToRawIp
+        );
+
+        // Poisoned IP fails to connect (or returns 0 bytes quickly) -> immediately restores override.
+        let reverted = guard.record_outcome_at(
+            poisoned_ip,
+            443,
+            domain,
+            SniffOverrideOutcome {
+                mode: SniffOverrideMode::BypassToRawIp,
+                connected: false,
+                lifetime: Duration::from_millis(120),
+                upload_bytes: 0,
+                download_bytes: 0,
+                externally_cancelled: false,
+            },
+            t0 + Duration::from_secs(4),
+        );
+        assert_eq!(reverted, Some(SniffOverrideFeedback::RevertedToOverride));
+        assert_eq!(
+            guard.decide_at(poisoned_ip, 443, domain, false, t0 + Duration::from_secs(5)),
+            SniffOverrideMode::Override
+        );
+
+        // While pinned (5m), further rapid short API calls must NOT re-trigger raw-IP probing.
+        for i in 0..5 {
+            assert_eq!(
+                guard.record_outcome_at(
+                    poisoned_ip,
+                    443,
+                    domain,
+                    SniffOverrideOutcome {
+                        mode: SniffOverrideMode::Override,
+                        connected: true,
+                        lifetime: Duration::from_millis(200),
+                        upload_bytes: 1_000,
+                        download_bytes: 2_000,
+                        externally_cancelled: false,
+                    },
+                    t0 + Duration::from_secs(10 + i),
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            guard.decide_at(
+                poisoned_ip,
+                443,
+                domain,
+                false,
+                t0 + Duration::from_secs(20)
+            ),
+            SniffOverrideMode::Override
+        );
+    }
+
+    #[test]
+    fn sniff_override_guard_resets_strikes_on_healthy_override_and_caps_entry_count() {
+        let guard = SniffOverrideGuard::new();
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        let t0 = Instant::now();
+
+        // 2 short closes followed by 1 healthy transfer (> 16 KiB) resets strikes.
+        for i in 0..2 {
+            let _ = guard.record_outcome_at(
+                ip,
+                443,
+                "example.com",
+                SniffOverrideOutcome {
+                    mode: SniffOverrideMode::Override,
+                    connected: true,
+                    lifetime: Duration::from_millis(200),
+                    upload_bytes: 1_500,
+                    download_bytes: 3_000,
+                    externally_cancelled: false,
+                },
+                t0 + Duration::from_secs(i),
+            );
+        }
+        let _ = guard.record_outcome_at(
+            ip,
+            443,
+            "example.com",
+            SniffOverrideOutcome {
+                mode: SniffOverrideMode::Override,
+                connected: true,
+                lifetime: Duration::from_secs(1),
+                upload_bytes: 2_000,
+                download_bytes: 32_768,
+                externally_cancelled: false,
+            },
+            t0 + Duration::from_secs(2),
+        );
+        // One more short close must NOT trip (strikes restarted at 1).
+        let fb = guard.record_outcome_at(
+            ip,
+            443,
+            "example.com",
+            SniffOverrideOutcome {
+                mode: SniffOverrideMode::Override,
+                connected: true,
+                lifetime: Duration::from_millis(200),
+                upload_bytes: 1_500,
+                download_bytes: 3_000,
+                externally_cancelled: false,
+            },
+            t0 + Duration::from_secs(3),
+        );
+        assert_eq!(fb, None);
+
+        // Bounded capacity check (> MAX_SNIFF_OVERRIDE_GUARD_ENTRIES distinct keys).
+        for idx in 0..(MAX_SNIFF_OVERRIDE_GUARD_ENTRIES + 32) {
+            let synth_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                100,
+                64,
+                ((idx >> 8) & 0xff) as u8,
+                (idx & 0xff) as u8,
+            ));
+            let _ = guard.record_outcome_at(
+                synth_ip,
+                443,
+                "cap.example.com",
+                SniffOverrideOutcome {
+                    mode: SniffOverrideMode::Override,
+                    connected: true,
+                    lifetime: Duration::from_millis(100),
+                    upload_bytes: 1_000,
+                    download_bytes: 2_000,
+                    externally_cancelled: false,
+                },
+                t0 + Duration::from_millis(idx as u64),
+            );
+        }
+        assert!(guard.entries.lock().len() <= MAX_SNIFF_OVERRIDE_GUARD_ENTRIES);
     }
 }

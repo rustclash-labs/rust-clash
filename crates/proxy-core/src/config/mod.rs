@@ -4413,10 +4413,16 @@ impl SnifferConfig {
         if !base_override {
             return false;
         }
-        if Self::domain_matches_any(domain, &self.force_domain) {
+        if self.is_force_domain(domain) {
             return true;
         }
         !Self::domain_matches_any(domain, &self.skip_domain)
+    }
+
+    /// Returns `true` if `domain` explicitly matches `sniffer.force-domain`, which forces
+    /// destination override even when adaptive camouflage-SNI protection would otherwise bypass it.
+    pub fn is_force_domain(&self, domain: &str) -> bool {
+        Self::domain_matches_any(domain, &self.force_domain)
     }
 
     fn domain_matches_any(domain: &str, patterns: &[String]) -> bool {
