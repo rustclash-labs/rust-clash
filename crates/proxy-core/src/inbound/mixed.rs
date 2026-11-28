@@ -21,8 +21,9 @@ use crate::{
     addr::{HostName, TargetAddr},
     error::{ProxyError, Result},
     inbound::sniff::{
-        MAX_SNIFF_BYTES, RealIpTlsOverrideGuard, RealIpTlsOverrideTracker, SniffOutcomeWithProto,
-        SniffedProtocol, resolve_real_ip_tcp_dial_target, sniff_tcp_protocol,
+        MAX_SNIFF_BYTES, RawIpDownloadObserver, RealIpTlsOverrideGuard, RealIpTlsOverrideTracker,
+        SniffOutcomeWithProto, SniffedProtocol, resolve_real_ip_tcp_dial_target,
+        sniff_tcp_protocol,
     },
     outbound::{BoxedStream, OutboundHandler},
     router::Router,
@@ -526,12 +527,15 @@ async fn enforce_post_route_target_policy(
 /// Relay `tcp <-> tracked` while preserving 0-RTT payload coalescing for client-speaks-first
 /// protocols (HTTP, TLS) and flushing pending proxy target headers after `15ms` when the client
 /// waits for a server banner first (SSH, SMTP, FTP, MySQL).
-async fn relay_bidirectional_coalesced(
+async fn relay_bidirectional_coalesced<S>(
     tcp: &mut TcpStream,
-    tracked: &mut crate::tracker::TrackedStream<BoxedStream>,
+    tracked: &mut S,
     conn_entry: &ActiveConnection,
     already_flushed_initial: bool,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     if !already_flushed_initial {
         tokio::select! {
             biased;
@@ -855,7 +859,12 @@ async fn handle_socks5(
                 tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                     .await?;
             }
-            let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
+            let mut tracked = RawIpDownloadObserver::new(
+                conn_guard.into_tracked_stream(outbound_stream),
+                sniff_override_guard
+                    .as_ref()
+                    .and_then(|g| g.raw_ip_progress_handle()),
+            );
             let had_prefetched = !prefetched_payload.is_empty();
             if had_prefetched {
                 tracked.write_all(&prefetched_payload).await?;
@@ -1381,7 +1390,12 @@ async fn handle_http_proxy(
             tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
         }
-        let mut tracked = conn_guard.into_tracked_stream(outbound_stream);
+        let mut tracked = RawIpDownloadObserver::new(
+            conn_guard.into_tracked_stream(outbound_stream),
+            sniff_override_guard
+                .as_ref()
+                .and_then(|g| g.raw_ip_progress_handle()),
+        );
         let had_prefetched = !prefetched_payload.is_empty();
         if had_prefetched {
             tracked.write_all(&prefetched_payload).await?;

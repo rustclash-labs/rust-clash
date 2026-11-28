@@ -18,8 +18,9 @@ use smoltcp::{
     socket::tcp,
     time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{
-        IpAddress, IpCidr, IpListenEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
-        Ipv6Address, Ipv6Packet, Ipv6Repr, TcpPacket, UdpPacket, UdpRepr,
+        Icmpv6DstUnreachable, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr, IpListenEndpoint,
+        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
+        TcpPacket, UdpPacket, UdpRepr,
     },
 };
 use tokio::{
@@ -1300,21 +1301,13 @@ fn handle_ingress_packet(
                     }
                     let fast_reject = !hijack_dns
                         && !is_unmapped_fake
-                        && should_fast_reject_unreachable_direct_ipv6(
+                        && should_fast_reject_unreachable_direct_ipv6_udp(
                             src_addr,
                             dst_v6,
                             dst_port,
-                            SocketTransport::Udp,
+                            udp.payload(),
                             router,
-                        )
-                        && !(router
-                            .read()
-                            .sniffer()
-                            .should_sniff_real_ip_udp(IpAddr::V6(dst_v6), dst_port)
-                            && matches!(
-                                crate::inbound::sniff::sniff_quic_initial_sni(udp.payload()),
-                                crate::inbound::sniff::SniffOutcome::Domain(_)
-                            ));
+                        );
                     if !is_unmapped_fake && !fast_reject {
                         let payload = udp.payload().to_vec();
                         spawn_tun_udp_handler(
@@ -1409,6 +1402,54 @@ fn should_fast_reject_unreachable_direct_ipv6(
     )
 }
 
+/// Evaluate whether an IPv6 UDP datagram on an IPv4-only physical network (`!is_direct_ipv6_reachable`)
+/// should be fast-rejected via `smoltcp` ICMPv6 `PortUnreachable`.
+///
+/// When QUIC Initial SNI sniffing extracts a domain:
+/// - If the sniffed domain itself synchronously routes `DIRECT` (e.g. `GeoSite(cn) -> DIRECT` for
+///   domestic QUIC endpoints like `shquic.weixin.qq.com`), fast-reject immediately regardless of
+///   whether the raw IPv6 matched `GeoIP(CN)` so the app falls back to IPv4 on packet #1.
+/// - If the sniffed domain routes `PROXY` (or requires async GeoIP resolution), exempt it so
+///   `spawn_tun_udp_handler` can route via `PROXY` or perform full async resolution (with an
+///   async ICMPv6 `PortUnreachable` safety net if async routing still ends up on `DIRECT`).
+fn should_fast_reject_unreachable_direct_ipv6_udp(
+    src_addr: SocketAddr,
+    dst_v6: Ipv6Addr,
+    dst_port: u16,
+    udp_payload: &[u8],
+    router_slot: &RwLock<Arc<Router>>,
+) -> bool {
+    if !crate::platform::socket_protect::is_global_unicast_ipv6(dst_v6)
+        || crate::platform::socket_protect::is_direct_ipv6_reachable()
+    {
+        return false;
+    }
+    let current_router = Arc::clone(&router_slot.read());
+    if (dst_port == 53 && current_router.tun_dns_hijack())
+        || current_router.dns().is_fake_ip(IpAddr::V6(dst_v6))
+    {
+        return false;
+    }
+    if current_router
+        .sniffer()
+        .should_sniff_real_ip_udp(IpAddr::V6(dst_v6), dst_port)
+        && let crate::inbound::sniff::SniffOutcome::Domain(domain) =
+            crate::inbound::sniff::sniff_quic_initial_sni(udp_payload)
+        && let Ok(domain_target) = TargetAddr::new_domain(domain, dst_port)
+    {
+        return current_router.will_route_target_direct(
+            src_addr,
+            SocketTransport::Udp,
+            &domain_target,
+        );
+    }
+    current_router.will_route_ip_direct(
+        src_addr,
+        SocketTransport::Udp,
+        SocketAddr::new(IpAddr::V6(dst_v6), dst_port),
+    )
+}
+
 fn truncate_tun_udp_dns_response(req: &[u8], dns_resp: Vec<u8>) -> Vec<u8> {
     let max_udp = crate::dns::wire::extract_edns0_udp_payload_size(req);
     if dns_resp.len() <= max_udp {
@@ -1495,6 +1536,28 @@ fn spawn_tun_udp_handler(
         )
         .await;
         if shutting_down_task.load(Ordering::Acquire) {
+            return;
+        }
+        // Layer-2 async safety net: if full async routing (e.g. GeoIP resolution on a sniffed
+        // QUIC domain) still routed a global-unicast raw IPv6 UDP target to `DIRECT` on an
+        // IPv4-only physical link, immediately emit `ICMPv6 Destination Unreachable (PortUnreachable)`
+        // instead of opening a doomed `DirectUdpSession` that fails with `ENETUNREACH (os error 101)`.
+        if resolved.decision.outbound.exit_category() == "DIRECT"
+            && resolved.decision.restored_from_fake_ip.is_none()
+            && !crate::platform::socket_protect::is_direct_ipv6_reachable()
+            && let (IpAddr::V6(src_v6), Some(IpAddr::V6(dst_v6))) =
+                (src.ip(), resolved.dial_target.host.as_ip())
+            && crate::platform::socket_protect::is_global_unicast_ipv6(dst_v6)
+        {
+            if let Some(icmp_pkt) = build_ipv6_udp_port_unreachable_packet(
+                src_v6,
+                src.port(),
+                dst_v6,
+                dst.port(),
+                &payload,
+            ) {
+                let _ = egress.send(icmp_pkt).await;
+            }
             return;
         }
         nat.send_datagram_with_options(
@@ -1947,6 +2010,9 @@ fn register_syn_flow(
         };
 
         let wake_rd = Arc::clone(&wake_task);
+        let mut raw_ip_progress = sniff_override_guard
+            .as_ref()
+            .and_then(|g| g.raw_ip_progress_handle());
         let reader_fut = async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -1958,6 +2024,9 @@ fn register_syn_flow(
                         Ok(n) => n,
                     },
                 };
+                if let Some(handle) = raw_ip_progress.take() {
+                    handle.confirm_download_received();
+                }
                 if from_remote_tx.send(buf[..n].to_vec()).await.is_err() {
                     break;
                 }
@@ -2227,6 +2296,41 @@ pub fn build_ipv6_udp_packet(
         |dst| dst.copy_from_slice(payload),
         &checksum_caps,
     );
+    Some(bytes)
+}
+
+/// Construct a checksummed RFC 4443 `ICMPv6 Destination Unreachable (PortUnreachable)` packet
+/// quoting an unreachable client IPv6 UDP datagram (`client_v6:client_port -> remote_v6:remote_port`).
+fn build_ipv6_udp_port_unreachable_packet(
+    client_v6: Ipv6Addr,
+    client_port: u16,
+    remote_v6: Ipv6Addr,
+    remote_port: u16,
+    udp_payload: &[u8],
+) -> Option<Vec<u8>> {
+    let checksum_caps = ChecksumCapabilities::default();
+    let orig_udp_pkt =
+        build_ipv6_udp_packet(client_v6, client_port, remote_v6, remote_port, udp_payload)?;
+    let orig_ip_pkt = Ipv6Packet::new_checked(&orig_udp_pkt).ok()?;
+    let orig_ip_repr = Ipv6Repr::parse(&orig_ip_pkt).ok()?;
+    let icmp_repr = Icmpv6Repr::DstUnreachable {
+        reason: Icmpv6DstUnreachable::PortUnreachable,
+        header: orig_ip_repr,
+        data: orig_ip_pkt.payload(),
+    };
+    let icmp_len = icmp_repr.buffer_len();
+    let outer_repr = Ipv6Repr {
+        src_addr: remote_v6,
+        dst_addr: client_v6,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp_len,
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0u8; outer_repr.buffer_len() + icmp_len];
+    let mut outer_pkt = Ipv6Packet::new_unchecked(&mut bytes);
+    outer_repr.emit(&mut outer_pkt);
+    let mut icmp_pkt = Icmpv6Packet::new_unchecked(outer_pkt.payload_mut());
+    icmp_repr.emit(&remote_v6, &client_v6, &mut icmp_pkt, &checksum_caps);
     Some(bytes)
 }
 
@@ -6480,6 +6584,390 @@ mod tests {
         assert_eq!(*sent_targets.lock(), vec!["1.1.1.1:443(9B)".to_string()]);
         assert_eq!(hub.total_connections(), 1);
 
+        let _ = sd_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tun_fast_rejects_unreachable_direct_ipv6_quic_initial_while_proxying_proxy_sni() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct RecordingUdpSession {
+            sent_targets: Arc<parking_lot::Mutex<Vec<String>>>,
+            notify_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundUdpSession for RecordingUdpSession {
+            async fn send_to(&self, _payload: &[u8], target: &TargetAddr) -> io::Result<()> {
+                let entry = target.to_string();
+                self.sent_targets.lock().push(entry.clone());
+                if let Some(tx) = self.notify_tx.lock().take() {
+                    let _ = tx.send(entry);
+                }
+                Ok(())
+            }
+            async fn recv_from(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
+                std::future::pending().await
+            }
+        }
+
+        struct RecordingUdpProxy {
+            opened_sessions: Arc<AtomicUsize>,
+            sent_targets: Arc<parking_lot::Mutex<Vec<String>>>,
+            notify_tx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for RecordingUdpProxy {
+            fn name(&self) -> &str {
+                "MOCK-PROXY"
+            }
+            fn protocol(&self) -> &'static str {
+                "MockProxy"
+            }
+            fn udp_supported(&self) -> bool {
+                true
+            }
+            async fn connect_tcp(
+                &self,
+                _target: &TargetAddr,
+            ) -> io::Result<crate::outbound::BoxedStream> {
+                Err(io::Error::other("unused"))
+            }
+            async fn open_udp_session(
+                &self,
+            ) -> io::Result<Box<dyn crate::outbound::OutboundUdpSession>> {
+                self.opened_sessions.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(RecordingUdpSession {
+                    sent_targets: Arc::clone(&self.sent_targets),
+                    notify_tx: Arc::clone(&self.notify_tx),
+                }))
+            }
+        }
+
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(false));
+
+        let opened_sessions = Arc::new(AtomicUsize::new(0));
+        let sent_targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (proxy_tx, proxy_rx) = tokio::sync::oneshot::channel();
+        let proxy = Arc::new(RecordingUdpProxy {
+            opened_sessions: Arc::clone(&opened_sessions),
+            sent_targets: Arc::clone(&sent_targets),
+            notify_tx: Arc::new(parking_lot::Mutex::new(Some(proxy_tx))),
+        });
+
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert("MOCK-PROXY".to_string(), proxy);
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec![
+            "DOMAIN-SUFFIX,weixin.qq.com,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,google.com,MOCK-PROXY".to_string(),
+            "IP-CIDR6,2409::/16,DIRECT,no-resolve".to_string(),
+            "MATCH,MOCK-PROXY".to_string(),
+        ];
+        let router = Arc::new(
+            Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (mut vtun, task) =
+            spawn_userspace_tun(1500, Arc::new(RwLock::new(router)), Arc::clone(&hub), sd_rx);
+
+        let client_v6: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
+        let cn_v6: Ipv6Addr = "2409:8c1e:75b0:1123::101".parse().unwrap();
+        let non_cn_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+
+        // 1. Real RFC 9001 QUIC Initial with domestic SNI (`shquic.weixin.qq.com -> DIRECT`) on
+        //    both a CN IPv6 and a non-CN IPv6 MUST be fast-rejected via ICMPv6 PortUnreachable
+        //    with ZERO failed connections (`os error 101`) instead of opening a doomed DIRECT session.
+        let wechat_quic = crate::inbound::sniff::test_helpers::build_quic_initial_packet(
+            crate::inbound::sniff::QUIC_VERSION_1,
+            &dcid,
+            "shquic.weixin.qq.com",
+        );
+        for (src_port, dst_v6) in [(54_001u16, cn_v6), (54_002u16, non_cn_v6)] {
+            let pkt = build_ipv6_udp_packet(client_v6, src_port, dst_v6, 443, &wechat_quic)
+                .expect("valid IPv6 QUIC packet");
+            vtun.ingress_tx.send(pkt).await.unwrap();
+            let icmp_pkt = tokio::time::timeout(Duration::from_secs(2), vtun.egress_rx.recv())
+                .await
+                .expect("expected immediate ICMPv6 PortUnreachable for DIRECT IPv6 QUIC")
+                .expect("egress packet");
+            let ip6_icmp = Ipv6Packet::new_checked(&icmp_pkt).unwrap();
+            assert_eq!(ip6_icmp.dst_addr(), client_v6);
+            assert_eq!(ip6_icmp.next_header(), IpProtocol::Icmpv6);
+            let icmp6 = Icmpv6Packet::new_checked(ip6_icmp.payload()).unwrap();
+            assert_eq!(
+                icmp6.msg_type(),
+                smoltcp::wire::Icmpv6Message::DstUnreachable
+            );
+            assert_eq!(
+                Icmpv6DstUnreachable::from(icmp6.msg_code()),
+                Icmpv6DstUnreachable::PortUnreachable
+            );
+        }
+        assert_eq!(hub.failed_connections_total(), 0);
+        assert_eq!(hub.total_connections(), 0);
+
+        // 2. Real RFC 9001 QUIC Initial to the same CN IPv6 carrying a PROXY SNI (`www.google.com`)
+        //    MUST NOT be fast-rejected and MUST forward through `MOCK-PROXY`.
+        let google_quic = crate::inbound::sniff::test_helpers::build_quic_initial_packet(
+            crate::inbound::sniff::QUIC_VERSION_1,
+            &dcid,
+            "www.google.com",
+        );
+        let pkt_proxy = build_ipv6_udp_packet(client_v6, 54_003, cn_v6, 443, &google_quic)
+            .expect("valid IPv6 QUIC packet");
+        vtun.ingress_tx.send(pkt_proxy).await.unwrap();
+
+        let dialed = tokio::time::timeout(Duration::from_secs(2), proxy_rx)
+            .await
+            .expect("PROXY-routed IPv6 QUIC SNI must bypass fast-reject and reach MOCK-PROXY")
+            .unwrap();
+        assert_eq!(dialed, "www.google.com:443");
+        assert_eq!(opened_sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(hub.failed_connections_total(), 0);
+
+        let _ = sd_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn tun_real_ip_long_lived_probe_confirms_bypass_immediately_on_first_response_byte() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct HoldOpenProbeProxy {
+            dialed_targets: Arc<parking_lot::Mutex<Vec<String>>>,
+            hold_open_raw_ip: Ipv4Addr,
+            release_rx: Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::outbound::OutboundHandler for HoldOpenProbeProxy {
+            fn name(&self) -> &str {
+                "MOCK-PROXY"
+            }
+            fn protocol(&self) -> &'static str {
+                "MockProxy"
+            }
+            async fn connect_tcp(
+                &self,
+                target: &TargetAddr,
+            ) -> io::Result<crate::outbound::BoxedStream> {
+                let label = target.to_string();
+                self.dialed_targets.lock().push(label.clone());
+                let (client_half, mut server_half) = tokio::io::duplex(16 * 1024);
+                let is_raw = target.host.as_ip() == Some(IpAddr::V4(self.hold_open_raw_ip));
+                let hold_rx = if is_raw {
+                    self.release_rx.lock().take()
+                } else {
+                    None
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = server_half.read(&mut buf).await;
+                    let _ = server_half.write_all(&[0x16u8; 2048]).await;
+                    let _ = server_half.flush().await;
+                    if let Some(rx) = hold_rx {
+                        let _ = rx.await;
+                    }
+                    let _ = server_half.shutdown().await;
+                });
+                Ok(Box::new(client_half))
+            }
+        }
+
+        let raw_ip = Ipv4Addr::new(194, 221, 250, 51);
+        let dialed_targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let proxy = Arc::new(HoldOpenProbeProxy {
+            dialed_targets: Arc::clone(&dialed_targets),
+            hold_open_raw_ip: raw_ip,
+            release_rx: Arc::new(parking_lot::Mutex::new(Some(release_rx))),
+        });
+        let mut outbounds: HashMap<String, crate::outbound::DynOutbound> = HashMap::new();
+        outbounds.insert("MOCK-PROXY".to_string(), proxy);
+        let dns = Arc::new(
+            crate::dns::FakeIpDnsEngine::new(&crate::config::DnsConfig::default()).unwrap(),
+        );
+        let rules = vec![
+            "DOMAIN-SUFFIX,google.com,MOCK-PROXY".to_string(),
+            "MATCH,MOCK-PROXY".to_string(),
+        ];
+        let router = Arc::new(
+            Router::new(crate::config::RunMode::Rule, outbounds, &[], &rules, dns).unwrap(),
+        );
+        let hub = Arc::new(TelemetryHub::new());
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let (mut vtun, task) = spawn_userspace_tun(
+            1500,
+            Arc::new(RwLock::new(Arc::clone(&router))),
+            Arc::clone(&hub),
+            sd_rx,
+        );
+
+        let hello = crate::inbound::sniff::test_helpers::build_tls_client_hello("www.google.com");
+        let seq_counter = AtomicUsize::new(0);
+
+        // 1. Trigger 3 rapid short closes under override so guard enters `ProbingRawIp`.
+        for idx in 0..3u16 {
+            let client = (Ipv4Addr::new(198, 18, 0, 56), 53_000 + idx);
+            let dst = (raw_ip, 443u16);
+            let isn = 20_000i32 + (seq_counter.fetch_add(1, Ordering::Relaxed) as i32) * 50_000;
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Syn,
+                    isn,
+                    None,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            let syn_ack = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let pkt = vtun.egress_rx.recv().await.unwrap();
+                    if let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                        && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                        && tcp.dst_port() == client.1
+                        && tcp.syn()
+                        && tcp.ack()
+                    {
+                        return tcp.seq_number().0;
+                    }
+                }
+            })
+            .await
+            .expect("SYN-ACK");
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::None,
+                    isn + 1,
+                    Some(syn_ack.wrapping_add(1)),
+                    &hello,
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let pkt = vtun.egress_rx.recv().await.unwrap();
+                    if let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                        && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                        && tcp.dst_port() == client.1
+                        && !tcp.payload().is_empty()
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("server reply");
+            vtun.ingress_tx
+                .send(build_ipv4_tcp_packet(
+                    client,
+                    dst,
+                    smoltcp::wire::TcpControl::Rst,
+                    isn + 1 + hello.len() as i32,
+                    Some(syn_ack.wrapping_add(1)),
+                    &[],
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+
+        // 2. Open the 4th connection (raw-IP probe) and KEEP IT OPEN (never send RST/FIN).
+        let probe_client = (Ipv4Addr::new(198, 18, 0, 56), 53_100);
+        let dst = (raw_ip, 443u16);
+        let isn = 400_000i32;
+        vtun.ingress_tx
+            .send(build_ipv4_tcp_packet(
+                probe_client,
+                dst,
+                smoltcp::wire::TcpControl::Syn,
+                isn,
+                None,
+                &[],
+            ))
+            .await
+            .unwrap();
+        let syn_ack = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pkt = vtun.egress_rx.recv().await.unwrap();
+                if let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                    && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                    && tcp.dst_port() == probe_client.1
+                    && tcp.syn()
+                    && tcp.ack()
+                {
+                    return tcp.seq_number().0;
+                }
+            }
+        })
+        .await
+        .expect("probe SYN-ACK");
+        vtun.ingress_tx
+            .send(build_ipv4_tcp_packet(
+                probe_client,
+                dst,
+                smoltcp::wire::TcpControl::None,
+                isn + 1,
+                Some(syn_ack.wrapping_add(1)),
+                &hello,
+            ))
+            .await
+            .unwrap();
+
+        // Wait for the server's first response bytes while the probe stream stays OPEN.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pkt = vtun.egress_rx.recv().await.unwrap();
+                if let Ok(ip4) = Ipv4Packet::new_checked(&pkt)
+                    && let Ok(tcp) = TcpPacket::new_checked(ip4.payload())
+                    && tcp.dst_port() == probe_client.1
+                    && !tcp.payload().is_empty()
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("probe response bytes");
+
+        // Guard MUST already have confirmed `BypassActive` and emitted the success log BEFORE close!
+        let confirmed_while_open = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let logs = hub.recent_logs();
+                if logs.iter().any(|e| {
+                    e.payload
+                        .contains("Raw IP dial succeeded for 194.221.250.51:443")
+                }) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            confirmed_while_open,
+            "long-lived raw-IP probe must confirm BypassActive immediately on first received byte before closing"
+        );
+        assert_eq!(
+            dialed_targets.lock().last().map(String::as_str),
+            Some("194.221.250.51:443")
+        );
+
+        let _ = release_tx.send(());
         let _ = sd_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }

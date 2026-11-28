@@ -1584,4 +1584,179 @@ class DebugLogManagerTest {
             ),
         )
     }
+
+    @Test
+    fun formatSliceReportFoldsBurstOfTcpPort7ReachabilityProbesWhileKeepingRealFailuresVerbatim() {
+        val t0 = 1_795_000_000_000L
+        val t1 = t0 + 900_000L
+        val window = DebugLogManager.WindowTelemetryState(
+            windowStartMs = t0,
+            capturedAtMs = t1,
+            sessionStartMs = t0,
+            screenOnMs = 600_000L,
+            screenOffMs = 300_000L,
+            startBatteryPct = 88,
+            events = emptyList(),
+        )
+        val sysMeta = DebugLogManager.SystemMetadata(
+            deviceManufacturer = "HONOR",
+            deviceModel = "BVL-AN00",
+            androidRelease = "17",
+            sdkInt = 37,
+            primaryAbi = "arm64-v8a",
+            appVersionName = "0.5.18",
+            appVersionCode = 47,
+            battery = DebugLogManager.BatterySnapshot(87, false, 31.0),
+            isInteractive = true,
+            isPowerSaveMode = false,
+            isDeviceIdleDoze = false,
+            ignoringBatteryOptimizations = true,
+            jvmUsedBytes = 10L * 1024L * 1024L,
+            jvmMaxBytes = 384L * 1024L * 1024L,
+            nativeHeapBytes = 32L * 1024L * 1024L,
+            perAppMode = "ALL_APPS",
+            selectedPackagesCount = 0,
+            enableIpv6 = true,
+            demoMode = false,
+            recentProcessExits = emptyList(),
+        )
+
+        // Case 1: >= 3 TCP :7 entries -> fold into one summary line while preserving real failure verbatim
+        val burstJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 900,
+              "mode": "rule",
+              "failedConnections": [
+                {
+                  "host": "api.weixin.qq.com",
+                  "destinationPort": 443,
+                  "network": "tcp",
+                  "rule": "GeoSite",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "connection reset by peer",
+                  "coalescedCount": 1,
+                  "startEpochMs": ${t0 + 10_000L}
+                },
+                {
+                  "host": "120.240.130.165",
+                  "destinationPort": 7,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "connection refused",
+                  "coalescedCount": 2,
+                  "startEpochMs": ${t0 + 11_000L}
+                },
+                {
+                  "host": "157.255.174.129",
+                  "destinationPort": 7,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "connection refused",
+                  "coalescedCount": 2,
+                  "startEpochMs": ${t0 + 12_000L}
+                },
+                {
+                  "host": "183.3.226.35",
+                  "destinationPort": 7,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "connection refused",
+                  "coalescedCount": 2,
+                  "startEpochMs": ${t0 + 13_000L}
+                },
+                {
+                  "host": "220.181.38.148",
+                  "destinationPort": 7,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "timed out",
+                  "coalescedCount": 2,
+                  "startEpochMs": ${t0 + 14_000L}
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val burstReport = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = burstJson,
+            crashBreadcrumb = null,
+        )
+        assertTrue(burstReport.contains("#### Failed Connections (5 entries, 9 total)"))
+        assertTrue(burstReport.contains("`api.weixin.qq.com:443`"))
+        assertFalse(burstReport.contains("120.240.130.165:7"))
+        assertFalse(burstReport.contains("157.255.174.129:7"))
+        assertTrue(
+            burstReport.contains(
+                "- `TCP *:7` reachability probes (`InetAddress.isReachable`, folded): " +
+                    "total=`8` hosts=`4` · outbounds=`DIRECT x8` · errors=`connection refused` x6, `timed out` x2",
+            ),
+        )
+
+        // Case 2: < 3 TCP :7 entries -> keep every entry verbatim without folding
+        val smallJson = """
+            {
+              "ok": true,
+              "vpnRunning": true,
+              "uptimeSecs": 900,
+              "mode": "rule",
+              "failedConnections": [
+                {
+                  "host": "120.240.130.165",
+                  "destinationPort": 7,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "connection refused",
+                  "coalescedCount": 1,
+                  "startEpochMs": ${t0 + 11_000L}
+                },
+                {
+                  "host": "157.255.174.129",
+                  "destinationPort": 7,
+                  "network": "tcp",
+                  "rule": "GeoIP",
+                  "rulePayload": "cn",
+                  "effectiveOutbound": "DIRECT",
+                  "effectiveProtocol": "Direct",
+                  "error": "connection refused",
+                  "coalescedCount": 1,
+                  "startEpochMs": ${t0 + 12_000L}
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val smallReport = DebugLogManager.formatSliceReport(
+            trigger = "periodic",
+            window = window,
+            systemMeta = sysMeta,
+            nativeSnapshotRawJson = smallJson,
+            crashBreadcrumb = null,
+        )
+        assertTrue(smallReport.contains("#### Failed Connections (2)"))
+        assertTrue(smallReport.contains("`120.240.130.165:7`"))
+        assertTrue(smallReport.contains("`157.255.174.129:7`"))
+        assertFalse(smallReport.contains("reachability probes (`InetAddress.isReachable`, folded)"))
+    }
 }

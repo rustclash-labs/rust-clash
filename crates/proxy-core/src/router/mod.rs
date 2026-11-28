@@ -419,19 +419,18 @@ impl Router {
         self.outbounds.values().map(|o| o.on_network_change()).sum()
     }
 
-    /// Synchronously evaluate whether raw IP target `dst` routes to an outbound whose
-    /// `exit_category() == "DIRECT"` without mutating rule hit counters or performing async I/O.
-    pub fn will_route_ip_direct(
+    /// Synchronously evaluate whether `raw_target` (raw IP or sniffed domain) routes to an outbound
+    /// whose `exit_category() == "DIRECT"` without mutating rule hit counters or performing async I/O.
+    pub fn will_route_target_direct(
         &self,
         src_addr: SocketAddr,
         transport: SocketTransport,
-        dst: SocketAddr,
+        raw_target: &TargetAddr,
     ) -> bool {
-        let raw_target = TargetAddr::from(dst);
-        if self.dns.is_unmapped_fake_ip(&raw_target) {
+        if self.dns.is_unmapped_fake_ip(raw_target) {
             return false;
         }
-        let (target, _) = self.dns.restore_target(&raw_target);
+        let (target, _) = self.dns.restore_target(raw_target);
         let entry_target: &str = match self.mode() {
             RunMode::Direct => "DIRECT",
             RunMode::Global => "GLOBAL",
@@ -467,6 +466,17 @@ impl Router {
 
         let (outbound, _) = self.resolve_chain(entry_target, &target);
         outbound.exit_category() == "DIRECT"
+    }
+
+    /// Synchronously evaluate whether raw IP target `dst` routes to an outbound whose
+    /// `exit_category() == "DIRECT"` without mutating rule hit counters or performing async I/O.
+    pub fn will_route_ip_direct(
+        &self,
+        src_addr: SocketAddr,
+        transport: SocketTransport,
+        dst: SocketAddr,
+    ) -> bool {
+        self.will_route_target_direct(src_addr, transport, &TargetAddr::from(dst))
     }
 
     /// Synchronous routing path (evaluates using O(1)/O(labels) domain index without blocking DNS lookups).
