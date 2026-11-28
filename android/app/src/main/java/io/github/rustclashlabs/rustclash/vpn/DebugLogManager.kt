@@ -1991,9 +1991,18 @@ object DebugLogManager {
     private fun appendFailedConnectionsSection(sb: StringBuilder, arr: JSONArray?) {
         if (arr == null || arr.length() == 0) return
         var totalFailedCount = 0L
+        val regularEntries = ArrayList<JSONObject>(arr.length())
+        val port7ProbeEntries = ArrayList<JSONObject>()
         for (i in 0 until arr.length()) {
             val c = arr.optJSONObject(i) ?: continue
             totalFailedCount += readCoalescedCount(c)
+            val isTcpPort7 = c.optString("network").equals("tcp", ignoreCase = true) &&
+                c.optInt("destinationPort", 0) == 7
+            if (isTcpPort7) {
+                port7ProbeEntries.add(c)
+            } else {
+                regularEntries.add(c)
+            }
         }
         sb.appendLine()
         if (totalFailedCount > arr.length().toLong()) {
@@ -2001,8 +2010,16 @@ object DebugLogManager {
         } else {
             sb.appendLine("#### Failed Connections (${arr.length()})")
         }
-        for (i in 0 until arr.length()) {
-            val c = arr.optJSONObject(i) ?: continue
+        val verbatimEntries = if (port7ProbeEntries.size >= 3) {
+            regularEntries
+        } else {
+            val all = ArrayList<JSONObject>(arr.length())
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { all.add(it) }
+            }
+            all
+        }
+        for (c in verbatimEntries) {
             val coalesced = readCoalescedCount(c)
             val coalescedSuffix = if (coalesced > 1L) " (x$coalesced)" else ""
             val rulePayload = c.optString("rulePayload")
@@ -2014,6 +2031,33 @@ object DebugLogManager {
                     "`$hostPort`$fakeNote · rule=`$ruleDesc` -> " +
                     "`${c.optString("effectiveOutbound")}` (${c.optString("effectiveProtocol")}) · " +
                     "error=`${c.optString("error", "unknown")}`$coalescedSuffix",
+            )
+        }
+        if (port7ProbeEntries.size >= 3) {
+            var probeTotal = 0L
+            val distinctHosts = LinkedHashSet<String>()
+            val outboundCounts = LinkedHashMap<String, Long>()
+            val errorCounts = LinkedHashMap<String, Long>()
+            for (c in port7ProbeEntries) {
+                val cnt = readCoalescedCount(c)
+                probeTotal += cnt
+                val host = c.optString("host")
+                if (host.isNotEmpty()) distinctHosts.add(host)
+                val ob = c.optString("effectiveOutbound", "unknown")
+                outboundCounts[ob] = (outboundCounts[ob] ?: 0L) + cnt
+                val err = c.optString("error", "unknown")
+                errorCounts[err] = (errorCounts[err] ?: 0L) + cnt
+            }
+            val outboundDesc = outboundCounts.entries
+                .sortedByDescending { it.value }
+                .joinToString(", ") { "${it.key} x${it.value}" }
+            val errorDesc = errorCounts.entries
+                .sortedByDescending { it.value }
+                .take(4)
+                .joinToString(", ") { "`${it.key}` x${it.value}" }
+            sb.appendLine(
+                "- `TCP *:7` reachability probes (`InetAddress.isReachable`, folded): " +
+                    "total=`$probeTotal` hosts=`${distinctHosts.size}` · outbounds=`$outboundDesc` · errors=$errorDesc",
             )
         }
     }

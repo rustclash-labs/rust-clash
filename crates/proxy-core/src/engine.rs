@@ -2763,13 +2763,16 @@ impl ProxyEngine {
         if enabled {
             self.persist_fake_ip_cache();
         }
-        self.router().set_low_power_mode(enabled);
+        let router = self.router();
+        router.set_low_power_mode(enabled);
         let prev = self
             .low_power_mode
             .swap(enabled, std::sync::atomic::Ordering::SeqCst);
         if prev != enabled {
             self.low_power_wake.notify_waiters();
             if prev && !enabled {
+                crate::platform::socket_protect::clear_recent_failed_addrs();
+                router.dns().clear_transient_failure_state();
                 self.trigger_preconnect();
             }
         }

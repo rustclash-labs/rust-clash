@@ -48,10 +48,52 @@ const SERVFAIL_NEGATIVE_TTL_SECS: u64 = 2;
 const STALE_IF_ERROR_MAX_AGE_SECS: u64 = 1800;
 const STALE_IF_ERROR_GRACE_TTL_SECS: u64 = 15;
 const FAKE_IP_TRANSIENT_FAILURE_PACE_MS: u64 = 80;
+/// RFC 8305 Happy Eyeballs v2 resolution delay: once one address family (`A` or `AAAA`) returns a
+/// usable IP, wait at most this long for the slower family so a stalled/timed-out `AAAA` query on
+/// mobile cellular never blocks a ready IPv4 dial for 3s-7.5s.
+const DUAL_STACK_DNS_RESOLUTION_DELAY: Duration = Duration::from_millis(150);
 const MAX_CONCURRENT_DNS_UDP_TASKS: usize = 256;
 const MAX_CONCURRENT_DNS_TCP_CONNS: usize = 128;
 const MAX_PERSISTED_FAKE_IP_ENTRIES: usize = 2048;
 const MAX_FAKE_IP_PERSIST_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+async fn join_dual_stack_resolution<FA, F6, RA, R6>(
+    fut_a: FA,
+    fut_aaaa: F6,
+    a_has_usable: impl Fn(&RA) -> bool,
+    aaaa_has_usable: impl Fn(&R6) -> bool,
+    fallback_a: impl FnOnce() -> RA,
+    fallback_aaaa: impl FnOnce() -> R6,
+) -> (RA, R6)
+where
+    FA: std::future::Future<Output = RA>,
+    F6: std::future::Future<Output = R6>,
+{
+    tokio::pin!(fut_a);
+    tokio::pin!(fut_aaaa);
+    tokio::select! {
+        res_a = &mut fut_a => {
+            let res_aaaa = if a_has_usable(&res_a) {
+                tokio::time::timeout(DUAL_STACK_DNS_RESOLUTION_DELAY, fut_aaaa)
+                    .await
+                    .unwrap_or_else(|_| fallback_aaaa())
+            } else {
+                fut_aaaa.await
+            };
+            (res_a, res_aaaa)
+        }
+        res_aaaa = &mut fut_aaaa => {
+            let res_a = if aaaa_has_usable(&res_aaaa) {
+                tokio::time::timeout(DUAL_STACK_DNS_RESOLUTION_DELAY, fut_a)
+                    .await
+                    .unwrap_or_else(|_| fallback_a())
+            } else {
+                fut_a.await
+            };
+            (res_a, res_aaaa)
+        }
+    }
+}
 
 fn compute_negative_ttl_secs(min_neg_ttl: Option<u64>, nxdomain: bool) -> u64 {
     if nxdomain {
@@ -1254,6 +1296,38 @@ impl FakeIpDnsEngine {
         clear_dns_upstream_pools();
     }
 
+    /// Clear transient upstream health cooldowns and short-lived `TransientFailure` / SERVFAIL
+    /// cache entries while preserving warm positive and authoritative `NXDOMAIN` records (e.g.
+    /// when waking from Android screen-off / OEM background-data sleep).
+    pub fn clear_transient_failure_state(&self) {
+        fn purge_transient_ip_entries(cache: &Mutex<LruCache<String, CachedIpResolution>>) {
+            let mut guard = cache.lock();
+            let transient_keys: Vec<String> = guard
+                .iter()
+                .filter(|(_, v)| matches!(v, CachedIpResolution::TransientFailure { .. }))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in transient_keys {
+                guard.pop(&key);
+            }
+        }
+
+        self.upstream_health.clear();
+        purge_transient_ip_entries(&self.real_ip_cache);
+        purge_transient_ip_entries(&self.direct_ip_cache);
+        purge_transient_ip_entries(&self.proxy_ip_cache);
+
+        let mut pkt_guard = self.packet_cache.lock();
+        let transient_pkt_keys: Vec<(String, u16, u16)> = pkt_guard
+            .iter()
+            .filter(|(_, v)| v.wire.len() >= 4 && matches!(v.wire[3] & 0x0f, 2 | 5))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in transient_pkt_keys {
+            pkt_guard.pop(&key);
+        }
+    }
+
     pub fn cached_record_count(&self) -> usize {
         self.real_ip_cache.lock().len()
             + self.direct_ip_cache.lock().len()
@@ -1823,10 +1897,15 @@ impl FakeIpDnsEngine {
                 }
 
                 let (res_a, res_aaaa) = if want_ipv6 {
-                    tokio::join!(
+                    join_dual_stack_resolution(
                         self.query_bootstrap_qtype(&norm, QTYPE_A),
-                        self.query_bootstrap_qtype(&norm, QTYPE_AAAA)
+                        self.query_bootstrap_qtype(&norm, QTYPE_AAAA),
+                        |r| r.as_ref().is_some_and(|(_, list)| !list.is_empty()),
+                        |r| r.as_ref().is_some_and(|(_, list)| !list.is_empty()),
+                        || None,
+                        || None,
                     )
+                    .await
                 } else {
                     (self.query_bootstrap_qtype(&norm, QTYPE_A).await, None)
                 };
@@ -2127,6 +2206,22 @@ impl FakeIpDnsEngine {
         extract_dns_response_meta(&resp).ok()
     }
 
+    fn meta_has_usable_ip(
+        &self,
+        meta: &Option<crate::dns::wire::DnsResponseMeta>,
+        is_v6: bool,
+    ) -> bool {
+        meta.as_ref().is_some_and(|m| {
+            !m.truncated
+                && m.rcode == 0
+                && m.answers.iter().any(|ans| match ans {
+                    DnsAnswerData::A(v4) if !is_v6 => !self.is_fake_ip(IpAddr::V4(*v4)),
+                    DnsAnswerData::Aaaa(v6) if is_v6 => !self.is_fake_ip(IpAddr::V6(*v6)),
+                    _ => false,
+                })
+        })
+    }
+
     fn collect_ips_from_metas(
         &self,
         metas: [Option<crate::dns::wire::DnsResponseMeta>; 2],
@@ -2139,6 +2234,16 @@ impl FakeIpDnsEngine {
         bool,
         Vec<String>,
     ) {
+        let is_authoritative_reply = |meta: &Option<crate::dns::wire::DnsResponseMeta>| -> bool {
+            meta.as_ref()
+                .is_some_and(|m| !m.truncated && (m.rcode == 0 || m.rcode == 3))
+        };
+        let had_transient_family_error = if want_ipv6 {
+            !is_authoritative_reply(&metas[0]) || !is_authoritative_reply(&metas[1])
+        } else {
+            !is_authoritative_reply(&metas[0])
+        };
+
         let mut resolved = Vec::new();
         let mut cnames = Vec::new();
         let mut saw_nxdomain = false;
@@ -2213,6 +2318,12 @@ impl FakeIpDnsEngine {
                 }
             }
         }
+        // Never treat a single-family `NODATA` (e.g. IPv4-only domain returning empty `AAAA`) as
+        // authoritative negative resolution when the sibling family (`A`) timed out or returned
+        // `SERVFAIL` — otherwise `stale-if-error` is bypassed and the cache is poisoned for 60s.
+        if resolved.is_empty() && !saw_nxdomain && had_transient_family_error {
+            saw_nodata = false;
+        }
         (
             resolved,
             min_pos_ttl,
@@ -2243,10 +2354,15 @@ impl FakeIpDnsEngine {
 
         for _ in 0..5 {
             let (metas, err_detail) = if want_ipv6 {
-                let ((m_a, e_a), (m_aaaa, e_aaaa)) = tokio::join!(
+                let ((m_a, e_a), (m_aaaa, e_aaaa)) = join_dual_stack_resolution(
                     self.query_slice_qtype(slice, &current, QTYPE_A),
-                    self.query_slice_qtype(slice, &current, QTYPE_AAAA)
-                );
+                    self.query_slice_qtype(slice, &current, QTYPE_AAAA),
+                    |(m, _)| self.meta_has_usable_ip(m, false),
+                    |(m, _)| self.meta_has_usable_ip(m, true),
+                    || (None, None),
+                    || (None, None),
+                )
+                .await;
                 ([m_a, m_aaaa], e_a.or(e_aaaa))
             } else {
                 let (m_a, e_a) = self.query_slice_qtype(slice, &current, QTYPE_A).await;
@@ -2300,10 +2416,15 @@ impl FakeIpDnsEngine {
 
         for _ in 0..5 {
             let metas = if want_ipv6 {
-                let (m_a, m_aaaa) = tokio::join!(
+                let (m_a, m_aaaa) = join_dual_stack_resolution(
                     self.query_upstream_qtype(&current, QTYPE_A),
-                    self.query_upstream_qtype(&current, QTYPE_AAAA)
-                );
+                    self.query_upstream_qtype(&current, QTYPE_AAAA),
+                    |m| self.meta_has_usable_ip(m, false),
+                    |m| self.meta_has_usable_ip(m, true),
+                    || None,
+                    || None,
+                )
+                .await;
                 [m_a, m_aaaa]
             } else {
                 [self.query_upstream_qtype(&current, QTYPE_A).await, None]
@@ -6073,5 +6194,304 @@ dns:
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), dns_task).await;
         upstream_task.abort();
+    }
+
+    #[test]
+    fn dual_stack_dns_does_not_stall_on_slow_aaaa_when_a_succeeds() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(true));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let upstream_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let upstream_addr = upstream_sock.local_addr().unwrap();
+
+            let sock_bg = Arc::clone(&upstream_sock);
+            let upstream_task = tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok((n, peer)) = sock_bg.recv_from(&mut buf).await {
+                    let req = buf[..n].to_vec();
+                    let Ok(parsed) = DnsQueryPacket::parse(&req) else {
+                        continue;
+                    };
+                    let sock_tx = Arc::clone(&sock_bg);
+                    tokio::spawn(async move {
+                        match parsed.question.qtype {
+                            QTYPE_A => {
+                                let resp = parsed.build_response(
+                                    &req,
+                                    0,
+                                    60,
+                                    &[DnsAnswerData::A(Ipv4Addr::new(203, 0, 113, 10))],
+                                );
+                                let _ = sock_tx.send_to(&resp, peer).await;
+                            }
+                            QTYPE_AAAA => {
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                let resp = parsed.build_response(
+                                    &req,
+                                    0,
+                                    60,
+                                    &[DnsAnswerData::Aaaa(
+                                        "2409:8c1e:75b0::10".parse().unwrap(),
+                                    )],
+                                );
+                                let _ = sock_tx.send_to(&resp, peer).await;
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+            });
+
+            let cfg = DnsConfig {
+                enable: true,
+                ipv6: true,
+                direct_nameserver: vec![upstream_addr.to_string()],
+                nameserver: vec![upstream_addr.to_string()],
+                fallback: vec![],
+                default_nameserver: vec![],
+                ..DnsConfig::default()
+            };
+            let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+            let start_direct = Instant::now();
+            let direct_ips = engine.resolve_direct_ips("slow-aaaa.cn").await.unwrap();
+            let direct_elapsed = start_direct.elapsed();
+            assert_eq!(direct_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]);
+            assert!(
+                direct_elapsed < Duration::from_millis(700),
+                "resolve_direct_ips must not stall waiting 1500ms on slow AAAA (elapsed={direct_elapsed:?})"
+            );
+
+            let start_real = Instant::now();
+            let real_ips = engine.resolve_real_ips("slow-aaaa-real.cn").await.unwrap();
+            let real_elapsed = start_real.elapsed();
+            assert_eq!(real_ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]);
+            assert!(
+                real_elapsed < Duration::from_millis(700),
+                "resolve_real_ips must not stall waiting 1500ms on slow AAAA (elapsed={real_elapsed:?})"
+            );
+
+            upstream_task.abort();
+        });
+
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(None);
+    }
+
+    #[test]
+    fn dual_stack_partial_servfail_with_aaaa_nodata_serves_stale_and_never_caches_nodata() {
+        let _ipv6_guard = crate::platform::socket_protect::lock_ipv6_reachability_for_test();
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(Some(true));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let upstream_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let upstream_addr = upstream_sock.local_addr().unwrap();
+
+            let sock_bg = Arc::clone(&upstream_sock);
+            let upstream_task = tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok((n, peer)) = sock_bg.recv_from(&mut buf).await {
+                    let req = buf[..n].to_vec();
+                    let Ok(parsed) = DnsQueryPacket::parse(&req) else {
+                        continue;
+                    };
+                    let qname = parsed.question.name.to_ascii_lowercase();
+                    let resp = if qname == "genuine-nodata.cn" {
+                        parsed.build_response(&req, 0, 60, &[])
+                    } else if parsed.question.qtype == QTYPE_A {
+                        // Simulate A query failing with SERVFAIL (rcode = 2)
+                        parsed.build_response(&req, 2, 0, &[])
+                    } else {
+                        // Simulate IPv4-only domain returning empty NOERROR (NODATA) for AAAA
+                        parsed.build_response(&req, 0, 60, &[])
+                    };
+                    let _ = sock_bg.send_to(&resp, peer).await;
+                }
+            });
+
+            let cfg = DnsConfig {
+                enable: true,
+                ipv6: true,
+                direct_nameserver: vec![upstream_addr.to_string()],
+                nameserver: vec![upstream_addr.to_string()],
+                fallback: vec![],
+                default_nameserver: vec![],
+                ..DnsConfig::default()
+            };
+            let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+
+            // 1. Cold domain: A=SERVFAIL + AAAA=NODATA must NOT poison cache with 60s `Negative`.
+            assert!(engine.resolve_direct_ips("cold-partial.cn").await.is_err());
+            {
+                let guard = engine.direct_ip_cache.lock();
+                match guard.peek("cold-partial.cn") {
+                    Some(CachedIpResolution::TransientFailure { .. }) | None => {}
+                    other => panic!(
+                        "partial A=SERVFAIL + AAAA=NODATA must never cache Negative/NoData, got: {other:?}"
+                    ),
+                }
+            }
+
+            // 2. Warm-then-expired domain: A=SERVFAIL + AAAA=NODATA must rescue stale positive IP.
+            let stale_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22));
+            let now = Instant::now();
+            let now_wall = current_epoch_ms();
+            engine.direct_ip_cache.lock().put(
+                "stale-partial.cn".to_string(),
+                CachedIpResolution::Positive {
+                    expires_at: now.checked_sub(Duration::from_secs(2)).unwrap_or(now),
+                    expires_wall_ms: now_wall.saturating_sub(2_000),
+                    stale_until: now + Duration::from_secs(1800),
+                    stale_until_wall_ms: now_wall + 1_800_000,
+                    ips: vec![stale_ip],
+                },
+            );
+            let rescued = engine
+                .resolve_direct_ips("stale-partial.cn")
+                .await
+                .expect("stale-if-error must rescue Positive entry on A=SERVFAIL + AAAA=NODATA");
+            assert_eq!(rescued, vec![stale_ip]);
+
+            // 3. Genuine dual-stack NODATA (both A and AAAA return empty NOERROR) still caches Negative(nxdomain=false).
+            assert!(
+                engine
+                    .resolve_direct_ips("genuine-nodata.cn")
+                    .await
+                    .is_err()
+            );
+            {
+                let guard = engine.direct_ip_cache.lock();
+                assert!(
+                    matches!(
+                        guard.peek("genuine-nodata.cn"),
+                        Some(CachedIpResolution::Negative {
+                            nxdomain: false,
+                            ..
+                        })
+                    ),
+                    "authoritative dual-stack empty NOERROR should still cache Negative(nxdomain=false)"
+                );
+            }
+
+            upstream_task.abort();
+        });
+
+        crate::platform::socket_protect::set_os_underlying_ipv6_available(None);
+    }
+
+    #[test]
+    fn clear_transient_failure_state_preserves_positive_and_nxdomain_while_clearing_servfail() {
+        let cfg = DnsConfig {
+            enable: true,
+            ipv6: false,
+            nameserver: vec!["127.0.0.1:5353".to_string()],
+            ..DnsConfig::default()
+        };
+        let engine = FakeIpDnsEngine::new(&cfg).unwrap();
+        let now = Instant::now();
+        let now_wall = current_epoch_ms();
+
+        // Seed upstream health cooldown state.
+        let upstream = engine.upstreams[0].clone();
+        engine.upstream_health.insert(
+            upstream,
+            UpstreamHealthState {
+                consecutive_failures: 3,
+                cooldown_until_mono: Some(now + Duration::from_secs(60)),
+                cooldown_until_wall_ms: now_wall + 60_000,
+            },
+        );
+        assert_eq!(engine.upstream_health.len(), 1);
+
+        // Seed IP caches with Positive, NxDomain, NoData, and TransientFailure entries.
+        let pos_entry =
+            CachedIpResolution::new_positive(120, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+        let nx_entry = CachedIpResolution::new_negative(60, true);
+        let nodata_entry = CachedIpResolution::new_negative(60, false);
+        let transient_entry = CachedIpResolution::new_transient_failure();
+
+        for cache in [
+            &engine.real_ip_cache,
+            &engine.direct_ip_cache,
+            &engine.proxy_ip_cache,
+        ] {
+            let mut guard = cache.lock();
+            guard.put("ok.example".to_string(), pos_entry.clone());
+            guard.put("missing.example".to_string(), nx_entry.clone());
+            guard.put("empty.example".to_string(), nodata_entry.clone());
+            guard.put("flaky.example".to_string(), transient_entry.clone());
+        }
+
+        // Seed packet_cache with NOERROR (0), NXDOMAIN (3), SERVFAIL (2), REFUSED (5).
+        let make_pkt = |name: &str, rcode: u8| {
+            let q = build_dns_query(0x4242, name, QTYPE_A);
+            let parsed = DnsQueryPacket::parse(&q).unwrap();
+            CachedWirePacket::new(60, parsed.build_response(&q, rcode, 60, &[]))
+        };
+        {
+            let mut guard = engine.packet_cache.lock();
+            guard.put(
+                ("ok.example".to_string(), QTYPE_A, 1),
+                make_pkt("ok.example", 0),
+            );
+            guard.put(
+                ("missing.example".to_string(), QTYPE_A, 1),
+                make_pkt("missing.example", 3),
+            );
+            guard.put(
+                ("servfail.example".to_string(), QTYPE_A, 1),
+                make_pkt("servfail.example", 2),
+            );
+            guard.put(
+                ("refused.example".to_string(), QTYPE_A, 1),
+                make_pkt("refused.example", 5),
+            );
+        }
+
+        engine.clear_transient_failure_state();
+
+        assert!(engine.upstream_health.is_empty());
+        for cache in [
+            &engine.real_ip_cache,
+            &engine.direct_ip_cache,
+            &engine.proxy_ip_cache,
+        ] {
+            let guard = cache.lock();
+            assert!(guard.peek("ok.example").is_some());
+            assert!(guard.peek("missing.example").is_some());
+            assert!(guard.peek("empty.example").is_some());
+            assert!(guard.peek("flaky.example").is_none());
+        }
+        {
+            let guard = engine.packet_cache.lock();
+            assert!(
+                guard
+                    .peek(&("ok.example".to_string(), QTYPE_A, 1))
+                    .is_some()
+            );
+            assert!(
+                guard
+                    .peek(&("missing.example".to_string(), QTYPE_A, 1))
+                    .is_some()
+            );
+            assert!(
+                guard
+                    .peek(&("servfail.example".to_string(), QTYPE_A, 1))
+                    .is_none()
+            );
+            assert!(
+                guard
+                    .peek(&("refused.example".to_string(), QTYPE_A, 1))
+                    .is_none()
+            );
+        }
     }
 }

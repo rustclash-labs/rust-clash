@@ -3699,7 +3699,15 @@ fn build_window_diagnostic_sections(
         .sum();
     window_failed = window_failed.max(failed_in_window_total);
 
-    let failed_connections_json: Vec<serde_json::Value> = failed_in_window
+    let mut prioritized_failed = failed_in_window;
+    // Keep non-port-7 failures ahead of repetitive Java `InetAddress.isReachable()` TCP `:7`
+    // probes (preserving newest-first order within each partition) so `:7` bursts never crowd out
+    // real connection failures from the 80-entry diagnostic slice.
+    prioritized_failed.sort_by_key(|c| {
+        c.metadata.destination_port == 7 && c.metadata.network.eq_ignore_ascii_case("tcp")
+    });
+
+    let failed_connections_json: Vec<serde_json::Value> = prioritized_failed
         .into_iter()
         .take(80)
         .map(|c| {
@@ -5933,5 +5941,100 @@ rules:
 
         assert!(stop_android_vpn_core());
         cleanup.stopped = true;
+    }
+
+    #[test]
+    fn window_diagnostic_sections_prioritizes_non_port_7_failures_ahead_of_reachability_probe_burst()
+     {
+        let since_ms = 10_000;
+        let until_ms = 20_000;
+        let mut conns = Vec::new();
+
+        // 85 TCP :7 `InetAddress.isReachable()` probes interleaved with 3 real failures.
+        for i in 0..85usize {
+            let mut probe = sample_conn(
+                &format!("probe-{i}"),
+                "tcp",
+                &format!("120.240.130.{}", 10 + i),
+                "DIRECT",
+                15_000 - i as u64,
+                Some(15_100 - i as u64),
+                None,
+                0,
+                0,
+                None,
+                "failed",
+                Some("connection refused"),
+            );
+            probe.metadata.destination_port = 7;
+            conns.push(probe);
+
+            if i == 10 {
+                conns.push(sample_conn(
+                    "real-tcp-443",
+                    "tcp",
+                    "api.example.com",
+                    "PROXY-HK",
+                    14_990,
+                    Some(15_050),
+                    None,
+                    0,
+                    0,
+                    None,
+                    "failed",
+                    Some("tls handshake eof"),
+                ));
+            } else if i == 50 {
+                conns.push(sample_conn(
+                    "real-udp-443",
+                    "udp",
+                    "quic.example.com",
+                    "DIRECT",
+                    14_950,
+                    Some(15_010),
+                    None,
+                    0,
+                    0,
+                    None,
+                    "failed",
+                    Some("Network is unreachable (os error 101)"),
+                ));
+            } else if i == 84 {
+                let mut udp_port7 = sample_conn(
+                    "real-udp-7",
+                    "udp",
+                    "echo.example.com",
+                    "DIRECT",
+                    14_900,
+                    Some(14_910),
+                    None,
+                    0,
+                    0,
+                    None,
+                    "failed",
+                    Some("udp timeout"),
+                );
+                udp_port7.metadata.destination_port = 7;
+                conns.push(udp_port7);
+            }
+        }
+
+        let sec = build_window_diagnostic_sections(&conns, since_ms, until_ms, &HashMap::new());
+        assert_eq!(sec.window_failed, 88);
+        assert_eq!(sec.failed_connections_json.len(), 80);
+
+        // All 3 non-TCP-port-7 failures must appear first, in their original relative order,
+        // even though they occurred after >80 TCP :7 probes in the slice.
+        assert_eq!(sec.failed_connections_json[0]["host"], "api.example.com");
+        assert_eq!(sec.failed_connections_json[1]["host"], "quic.example.com");
+        assert_eq!(sec.failed_connections_json[2]["host"], "echo.example.com");
+        assert_eq!(sec.failed_connections_json[2]["network"], "udp");
+        assert_eq!(sec.failed_connections_json[2]["destinationPort"], 7);
+
+        // Remaining 77 slots are filled by the TCP :7 probes.
+        for entry in &sec.failed_connections_json[3..] {
+            assert_eq!(entry["network"], "tcp");
+            assert_eq!(entry["destinationPort"], 7);
+        }
     }
 }
